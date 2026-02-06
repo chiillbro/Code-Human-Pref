@@ -1,0 +1,444 @@
+diff --git a/Local Development Instructions.md b/LocalDevelopmentInstructions.md
+similarity index 100%
+rename from Local Development Instructions.md
+rename to LocalDevelopmentInstructions.md
+diff --git a/packages/markitdown-sample-plugin/tests/test_files/test.rtf b/packages/markitdown-sample-plugin/tests/test_files/test.rtf
+old mode 100755
+new mode 100644
+diff --git a/packages/markitdown/pyproject.toml b/packages/markitdown/pyproject.toml
+index 0d9bb61..4ab142c 100644
+--- a/packages/markitdown/pyproject.toml
++++ b/packages/markitdown/pyproject.toml
+@@ -35,32 +35,33 @@ dependencies = [
+ 
+ [project.optional-dependencies]
+ all = [
+   "python-pptx",
+   "mammoth~=1.10.0",
+   "pandas",
+   "openpyxl",
+   "xlrd",
+   "lxml",
+   "pdfminer.six",
++  "pdfplumber",
+   "olefile",
+   "pydub",
+   "SpeechRecognition",
+   "youtube-transcript-api~=1.0.0",
+   "azure-ai-documentintelligence",
+   "azure-identity"
+ ]
+ pptx = ["python-pptx"]
+ docx = ["mammoth", "lxml"]
+ xlsx = ["pandas", "openpyxl"]
+ xls = ["pandas", "xlrd"]
+-pdf = ["pdfminer.six"]
++pdf = ["pdfminer.six", "pdfplumber"]
+ outlook = ["olefile"]
+ audio-transcription = ["pydub", "SpeechRecognition"]
+ youtube-transcription = ["youtube-transcript-api"]
+ az-doc-intel = ["azure-ai-documentintelligence", "azure-identity"]
+ 
+ [project.urls]
+ Documentation = "https://github.com/microsoft/markitdown#readme"
+ Issues = "https://github.com/microsoft/markitdown/issues"
+ Source = "https://github.com/microsoft/markitdown"
+ 
+diff --git a/packages/markitdown/src/markitdown/converters/_pdf_converter.py b/packages/markitdown/src/markitdown/converters/_pdf_converter.py
+index 63162d5..fece1b2 100644
+--- a/packages/markitdown/src/markitdown/converters/_pdf_converter.py
++++ b/packages/markitdown/src/markitdown/converters/_pdf_converter.py
+@@ -1,43 +1,53 @@
+ import sys
+ import io
+ 
+-from typing import BinaryIO, Any
+-
++from typing import BinaryIO, Any, List, Tuple, Optional
+ 
+ from .._base_converter import DocumentConverter, DocumentConverterResult
+ from .._stream_info import StreamInfo
+ from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
+ 
+ 
+ # Try loading optional (but in this case, required) dependencies
+ # Save reporting of any exceptions for later
+ _dependency_exc_info = None
+ try:
+     import pdfminer
+     import pdfminer.high_level
+ except ImportError:
+     # Preserve the error and stack trace for later
+     _dependency_exc_info = sys.exc_info()
+ 
++# pdfplumber is optional - used for table extraction
++_pdfplumber_available = False
++try:
++    import pdfplumber
++
++    _pdfplumber_available = True
++except ImportError:
++    pass
++
+ 
+ ACCEPTED_MIME_TYPE_PREFIXES = [
+     "application/pdf",
+     "application/x-pdf",
+ ]
+ 
+ ACCEPTED_FILE_EXTENSIONS = [".pdf"]
+ 
+ 
+ class PdfConverter(DocumentConverter):
+     """
+-    Converts PDFs to Markdown. Most style information is ignored, so the results are essentially plain-text.
++    Converts PDFs to Markdown. When pdfplumber is available, tables are detected
++    and rendered as proper Markdown tables. Otherwise, falls back to plain text
++    extraction via pdfminer.
+     """
+ 
+     def accepts(
+         self,
+         file_stream: BinaryIO,
+         stream_info: StreamInfo,
+         **kwargs: Any,  # Options to pass to the converter
+     ) -> bool:
+         mimetype = (stream_info.mimetype or "").lower()
+         extension = (stream_info.extension or "").lower()
+@@ -65,13 +75,209 @@ class PdfConverter(DocumentConverter):
+                     extension=".pdf",
+                     feature="pdf",
+                 )
+             ) from _dependency_exc_info[
+                 1
+             ].with_traceback(  # type: ignore[union-attr]
+                 _dependency_exc_info[2]
+             )
+ 
+         assert isinstance(file_stream, io.IOBase)  # for mypy
++
++        # If pdfplumber is available, use enhanced extraction with table support
++        if _pdfplumber_available:
++            return self._convert_with_tables(file_stream)
++
++        # Fall back to simple pdfminer extraction
+         return DocumentConverterResult(
+             markdown=pdfminer.high_level.extract_text(file_stream),
+         )
++
++    def _convert_with_tables(self, file_stream: BinaryIO) -> DocumentConverterResult:
++        """
++        Convert PDF with table detection using pdfplumber.
++        Tables are rendered as Markdown tables, text outside tables is preserved.
++        """
++        output_parts: List[str] = []
++
++        with pdfplumber.open(file_stream) as pdf:
++            for page_num, page in enumerate(pdf.pages):
++                page_content = self._extract_page_content(page)
++                if page_content:
++                    output_parts.append(page_content)
++
++        return DocumentConverterResult(markdown="\n\n".join(output_parts))
++
++    def _extract_page_content(self, page) -> str:
++        """
++        Extract content from a single PDF page, preserving tables as Markdown.
++        """
++        # Find tables on this page
++        tables = page.find_tables()
++        table_bboxes = [t.bbox for t in tables]
++
++        # Build list of content elements with vertical positions
++        # Each element is (top_position, content)
++        elements: List[Tuple[float, str]] = []
++
++        # Add tables as markdown
++        for table in tables:
++            top_pos = table.bbox[1]
++            data = table.extract()
++            md_table = self._table_to_markdown(data)
++            if md_table:
++                elements.append((top_pos, md_table))
++
++        # Add text blocks outside of tables
++        text_blocks = self._extract_text_outside_tables(page, table_bboxes)
++        for top_pos, text in text_blocks:
++            if text.strip():
++                elements.append((top_pos, text))
++
++        # Sort by vertical position to maintain reading order
++        elements.sort(key=lambda x: x[0])
++
++        # Combine all elements
++        return "\n\n".join(content for _, content in elements)
++
++    def _extract_text_outside_tables(
++        self, page, table_bboxes: List[Tuple[float, float, float, float]]
++    ) -> List[Tuple[float, str]]:
++        """
++        Extract text that is outside any table region.
++        Returns a list of (top_position, text) tuples for each text block.
++        """
++
++        def not_in_table(obj) -> bool:
++            """Filter function to exclude objects inside tables."""
++            for bbox in table_bboxes:
++                tx0, ttop, tx1, tbottom = bbox
++                obj_x = obj.get("x0", obj.get("x", 0))
++                obj_top = obj.get("top", 0)
++                if tx0 <= obj_x <= tx1 and ttop <= obj_top <= tbottom:
++                    return False
++            return True
++
++        # Filter page to exclude table regions
++        if table_bboxes:
++            filtered_page = page.filter(not_in_table)
++        else:
++            filtered_page = page
++
++        # Extract words with positions
++        words = filtered_page.extract_words()
++        if not words:
++            return []
++
++        # Group words into lines based on vertical position
++        lines = self._group_words_into_lines(words)
++
++        # Group lines into paragraphs
++        return self._group_lines_into_paragraphs(lines)
++
++    def _group_words_into_lines(
++        self, words: List[dict], tolerance: float = 3.0
++    ) -> List[Tuple[float, str]]:
++        """
++        Group words into lines based on their vertical position.
++        Returns list of (top_position, line_text) tuples.
++        """
++        if not words:
++            return []
++
++        # Sort words by vertical then horizontal position
++        sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
++
++        lines: List[Tuple[float, str]] = []
++        current_line_words: List[dict] = []
++        current_line_top: Optional[float] = None
++
++        for word in sorted_words:
++            if current_line_top is None:
++                current_line_top = word["top"]
++                current_line_words = [word]
++            elif abs(word["top"] - current_line_top) <= tolerance:
++                current_line_words.append(word)
++            else:
++                # Finalize current line
++                line_text = " ".join(
++                    w["text"] for w in sorted(current_line_words, key=lambda w: w["x0"])
++                )
++                lines.append((current_line_top, line_text))
++                current_line_top = word["top"]
++                current_line_words = [word]
++
++        # Don't forget the last line
++        if current_line_words and current_line_top is not None:
++            line_text = " ".join(
++                w["text"] for w in sorted(current_line_words, key=lambda w: w["x0"])
++            )
++            lines.append((current_line_top, line_text))
++
++        return lines
++
++    def _group_lines_into_paragraphs(
++        self, lines: List[Tuple[float, str]], tolerance: float = 15.0
++    ) -> List[Tuple[float, str]]:
++        """
++        Group consecutive lines into paragraphs.
++        Lines with larger vertical gaps are considered separate paragraphs.
++        Returns list of (top_position, paragraph_text) tuples.
++        """
++        if not lines:
++            return []
++
++        paragraphs: List[Tuple[float, str]] = []
++        current_para_lines: List[Tuple[float, str]] = []
++        current_para_top: Optional[float] = None
++
++        for top, text in lines:
++            if current_para_top is None:
++                current_para_top = top
++                current_para_lines = [(top, text)]
++            elif current_para_lines and (top - current_para_lines[-1][0]) <= tolerance:
++                current_para_lines.append((top, text))
++            else:
++                # Finalize current paragraph
++                para_text = "\n".join(t for _, t in current_para_lines)
++                paragraphs.append((current_para_top, para_text))
++                current_para_top = top
++                current_para_lines = [(top, text)]
++
++        # Don't forget the last paragraph
++        if current_para_lines and current_para_top is not None:
++            para_text = "\n".join(t for _, t in current_para_lines)
++            paragraphs.append((current_para_top, para_text))
++
++        return paragraphs
++
++    def _table_to_markdown(self, table_data: List[List[Any]]) -> str:
++        """
++        Convert extracted table data to a Markdown table.
++        """
++        if not table_data or not table_data[0]:
++            return ""
++
++        # Clean cells: handle None, escape pipes, normalize whitespace
++        def clean_cell(cell: Any) -> str:
++            if cell is None:
++                return ""
++            return str(cell).replace("|", "\\|").replace("\n", " ").strip()
++
++        cleaned = [[clean_cell(cell) for cell in row] for row in table_data]
++
++        # Ensure all rows have the same number of columns
++        max_cols = max(len(row) for row in cleaned)
++        for row in cleaned:
++            while len(row) < max_cols:
++                row.append("")
++
++        lines = []
++        # Header row
++        lines.append("| " + " | ".join(cleaned[0]) + " |")
++        # Separator row
++        lines.append("| " + " | ".join(["---"] * max_cols) + " |")
++        # Data rows
++        for row in cleaned[1:]:
++            lines.append("| " + " | ".join(row) + " |")
++
++        return "\n".join(lines)
+diff --git a/packages/markitdown/tests/_test_vectors.py b/packages/markitdown/tests/_test_vectors.py
+index 74fa9bd..163611d 100644
+--- a/packages/markitdown/tests/_test_vectors.py
++++ b/packages/markitdown/tests/_test_vectors.py
+@@ -90,20 +90,36 @@ GENERAL_TEST_VECTORS = [
+     FileTestVector(
+         filename="test.pdf",
+         mimetype="application/pdf",
+         charset=None,
+         url=None,
+         must_include=[
+             "While there is contemporaneous exploration of multi-agent approaches"
+         ],
+         must_not_include=[],
+     ),
++    FileTestVector(
++        filename="test_table.pdf",
++        mimetype="application/pdf",
++        charset=None,
++        url=None,
++        must_include=[
++            "| Product | SKU | Quantity | Price |",
++            "| --- | --- | --- | --- |",
++            "| Widget A | WA-001 | 150 | $12.99 |",
++            "| Name | Department | Email |",
++            "| John Smith | Engineering | john.smith@example.com |",
++            "Product Inventory",
++            "Employee Directory",
++        ],
++        must_not_include=[],
++    ),
+     FileTestVector(
+         filename="test_blog.html",
+         mimetype="text/html",
+         charset="utf-8",
+         url="https://microsoft.github.io/autogen/blog/2023/04/21/LLM-tuning-math",
+         must_include=[
+             "Large language models (LLMs) are powerful tools that can generate natural language texts for various applications, such as chatbots, summarization, translation, and more. GPT-4 is currently the state of the art LLM in the world. Is model selection irrelevant? What about inference parameters?",
+             "an example where high cost can easily prevent a generic complex",
+         ],
+         must_not_include=[],
+diff --git a/packages/markitdown/tests/test_files/test.docx b/packages/markitdown/tests/test_files/test.docx
+old mode 100755
+new mode 100644
+diff --git a/packages/markitdown/tests/test_files/test.m4a b/packages/markitdown/tests/test_files/test.m4a
+old mode 100755
+new mode 100644
+diff --git a/packages/markitdown/tests/test_files/test_table.pdf b/packages/markitdown/tests/test_files/test_table.pdf
+new file mode 100644
+index 0000000..acdcd9b
+--- /dev/null
++++ b/packages/markitdown/tests/test_files/test_table.pdf
+@@ -0,0 +1,74 @@
++%PDF-1.4
++%“Œ‹ž ReportLab Generated PDF document http://www.reportlab.com
++1 0 obj
++<<
++/F1 2 0 R /F2 3 0 R
++>>
++endobj
++2 0 obj
++<<
++/BaseFont /Helvetica /Encoding /WinAnsiEncoding /Name /F1 /Subtype /Type1 /Type /Font
++>>
++endobj
++3 0 obj
++<<
++/BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding /Name /F2 /Subtype /Type1 /Type /Font
++>>
++endobj
++4 0 obj
++<<
++/Contents 8 0 R /MediaBox [ 0 0 612 792 ] /Parent 7 0 R /Resources <<
++/Font 1 0 R /ProcSet [ /PDF /Text /ImageB /ImageC /ImageI ]
++>> /Rotate 0 /Trans <<
++
++>> 
++  /Type /Page
++>>
++endobj
++5 0 obj
++<<
++/PageMode /UseNone /Pages 7 0 R /Type /Catalog
++>>
++endobj
++6 0 obj
++<<
++/Author (\(anonymous\)) /CreationDate (D:20260206161302+00'00') /Creator (\(unspecified\)) /Keywords () /ModDate (D:20260206161302+00'00') /Producer (ReportLab PDF Library - www.reportlab.com) 
++  /Subject (\(unspecified\)) /Title (\(anonymous\)) /Trapped /False
++>>
++endobj
++7 0 obj
++<<
++/Count 1 /Kids [ 4 0 R ] /Type /Pages
++>>
++endobj
++8 0 obj
++<<
++/Filter [ /ASCII85Decode /FlateDecode ] /Length 1206
++>>
++stream
++Gat=*a`?,q&A@B[qVX^f<CQs"ghmdjS^_nI.6CQ[acRcUM].`IOH^L[rA6cY&OS7OPSXtWfA3X8]ESIq5Ks%$$\7mShRm@63,BXd#pNdK!NnA^s&R>f_[(j],8b:IfW)t,]!4F3q@jd#",h78c?5(I)d,+=V:&isb6C^eZ\(uX4imI1f^*&<>%bC`TCY`BTJK<E^0&P(g\b.W2-&<,]=\@G9q]m-ZAqMVasP6R]R5CqUrq5mL;r_77^^TT-fOdaSOPfdWf\$!V!Npub&id:0P/*tNXY%(8nH&MJ\NmWfr41I.Bag^e%D2+&r6NU'Xu2@:K\YkQp-X-M&pYq/eJD("ID6(9#AL3'o<#27KWF!'_"roSPR<3++/;-fOnEsWKRicK@Po-,CmkZ7T]PejtR3AH6)SUn'CSR`Y];:+7\cdPYL#I35?[bU#8<74I%/PGi>NhlTA!3]Z:1>2IX>\fqWBAXeQ;cG[Aa,hd04'*:.p+V=4u;I-RkdnYj?20M^VP*np0!Cs6t6aKrdeOXGA6pF+uAn"?Ah9[gj2\0.r36K/@`\7^?\'1;AlK;Kb"'r/Zq]k#VM9m/QLPWNlY+>N;$Mn?cAkGY>Ul&Str>@_HAhiOXLc0\cEaIfV[b>@upX;EMo2u'kk48@9O*1XV3?M(-3#7%atFuhD-1FjJR"(4"kC;F;u6"`^P*pblMm'sY33t=;59&X0u6#63^ZQF=-qq@r[e2M#HJ*YsHO$R19b'^Sbp>atiOt-BS7`pDjJ#E1b[]Mg#<R2<CSN>;oNYSA1WmZ;DmmNb_=ru28oVteto;Sghl'Y]Rn0!]XQ8H]m-PAP3U$osYo]J<`Fn'QM02fYe?HMhPXiQFQ1bka+GVgHsj(\$t*0&[.TG0"5h_2GMVZ?ICqG1![fD4l$=7Rf>)LWEhL[kIl>pT7)[sCBESMt:b_L6u.kpC#9fB$LK8m1-'`6HM8pDB4G3p`L0H\/:E8ZE,QrcDmuPE`SOC12uNn7,Ap/"8sK(:hJI,ZF88=L<[f<a3q7;QFhHWS0P.S6m)1Me#(W[3b].SqFt5+r]"[)f_ZUe=*7,fL+AR5PQ+me$c6uC"lVG[&mCg`nQ%?fa$Tha9UaaAFXV6ZFK?VSTuR;2eK_pVMAZYYJVbsg"H>;]dFK?imqIs[Bpqb)*Cp)Q5*"4qUMm`;^XF:\=#*pl<!kJ%5Uiq=T&b%CZhc~>endstream
++endobj
++xref
++0 9
++0000000000 65535 f 
++0000000073 00000 n 
++0000000114 00000 n 
++0000000221 00000 n 
++0000000333 00000 n 
++0000000526 00000 n 
++0000000594 00000 n 
++0000000877 00000 n 
++0000000936 00000 n 
++trailer
++<<
++/ID 
++[<5bd9ade0d5ca3e99853377cd7fdbb930><5bd9ade0d5ca3e99853377cd7fdbb930>]
++% ReportLab generated PDF document -- digest (http://www.reportlab.com)
++
++/Info 6 0 R
++/Root 5 0 R
++/Size 9
++>>
++startxref
++2233
++%%EOF
