@@ -1,0 +1,93 @@
+diff --git a/monkeytype/tracing.py b/monkeytype/tracing.py
+index f99c7c1..1360d08 100644
+--- a/monkeytype/tracing.py
++++ b/monkeytype/tracing.py
+@@ -130,6 +130,17 @@ def _has_code(
+     return None
+ 
+ 
++def get_previous_frames(frame: Optional[FrameType]) -> Iterator[FrameType]:
++    while frame is not None:
++        yield frame
++        frame = frame.f_back
++
++
++def get_locals_from_previous_frames(frame: FrameType) -> Iterator[Any]:
++    for previous_frame in get_previous_frames(frame):
++        yield from previous_frame.f_locals.values()
++
++
+ def get_func(frame: FrameType) -> Optional[Callable[..., Any]]:
+     """Return the function whose code object corresponds to the supplied stack frame."""
+     code = frame.f_code
+@@ -154,6 +165,14 @@ def get_func(frame: FrameType) -> Optional[Callable[..., Any]]:
+             func = get_func_in_mro(v, code)
+             if func is not None:
+                 break
++    # If we still can't find the function, try looking at the locals of all previous frames.
++    if func is None:
++        for v in get_locals_from_previous_frames(frame):
++            if not callable(v):
++                continue
++            func = _has_code(v, code)
++            if func is not None:
++                break
+     return func
+ 
+ 
+diff --git a/tests/test_tracing.py b/tests/test_tracing.py
+index 6ddaf78..efd4552 100644
+--- a/tests/test_tracing.py
++++ b/tests/test_tracing.py
+@@ -6,8 +6,10 @@
+ import inspect
+ from types import FrameType
+ from typing import (
++    Callable,
+     Iterator,
+     Optional,
++    Tuple,
+ )
+ 
+ import pytest
+@@ -128,6 +130,21 @@ async def sum_squares(n: int) -> int:
+     return tot
+ 
+ 
++def call_method_on_locally_defined_class(n: int) -> Tuple[type, Callable]:
++    class Math:
++        def square(self, n: int) -> int:
++            return n * n
++    Math().square(n)
++    return Math, Math.square
++
++
++def call_locally_defined_function(n: int) -> Callable:
++    def square(n: int) -> int:
++        return n * n
++    square(n)
++    return square
++
++
+ def implicit_return_none() -> None:
+     pass
+ 
+@@ -247,6 +264,18 @@ class TestTraceCalls:
+                 pass
+         assert collector.traces == [CallTrace(squares, {'n': int}, NoneType, int)]
+ 
++    def test_locally_defined_class_trace(self, collector):
++        with trace_calls(collector, max_typed_dict_size=0):
++            cls, method = call_method_on_locally_defined_class(3)
++        assert len(collector.traces) == 2
++        assert collector.traces[0] == CallTrace(method, {'self': cls, 'n': int}, int)
++
++    def test_locally_defined_function_trace(self, collector):
++        with trace_calls(collector, max_typed_dict_size=0):
++            function = call_locally_defined_function(3)
++        assert len(collector.traces) == 2
++        assert collector.traces[0] == CallTrace(function, {'n': int}, int)
++
+     def test_return_none(self, collector):
+         """Ensure traces have a return_type of NoneType for functions that return a value of None"""
+         with trace_calls(collector, max_typed_dict_size=0):
