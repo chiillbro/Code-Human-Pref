@@ -1,38 +1,130 @@
-This pull request enhances the handling of MasterFormat-style partial numbering (e.g., .1, .2) in PDF document conversion to Markdown, ensuring that such numbering is merged with its associated text rather than split into separate lines or table columns. It also introduces comprehensive tests to verify correct behavior and bumps the package version.
+### PR 227
 
-Testing and validation:
+Contributor:
 
-Added test_pdf_masterformat.py with extensive tests to verify correct regex matching, merging logic, and content preservation for MasterFormat-style partial numbering in converted documents.
-Version update:
+This PR introduces an improvement in the race selection GUI by adding a race-wise filter that allows users to view the same Grand Prix across different years, enabling easier historical comparison.
 
-Bumped the package version from 0.1.4 to 0.1.5 in **about**.py to reflect the new functionality and fixes.
+Additionally, minor UI improvement are introduced for a better user experience
+
+Changes Introduced
+
+1. Race-Wise Filtering
+   Added a race-name based filter in the Race Selection UI.
+   Enables easier cross-year performance comparison and historical analysis.
+   Implemented independent filtering logic so users can filter either by Year or Race Name, avoiding conflicting filters.
+2. Automatic Window Minimization
+   Automatically minimizing the Race Selection Window when the arcade is fully initialized.
+   Preventing visual clutter and improving the overall UX flow.
+3. Race Replay Paused By Default
+   Letting the race replay be paused by default, giving the user the freedom to
+   start the replay on their own,
+   setup customizations for the display before starting
+   not miss the initial lap
+   Improved User Experience
+4. Minor Fixes
+   Cleaned up unused imports.
+   Motivation
+   These changes aim to improve both usability and workflow efficiency for users exploring race replays, especially for multi-year comparisons and smoother UI transitions.
+
+P.S.
+This is my first-ever open source contribution and would love some feedback.
+Love Formula 1, and Love the project ❤️
 
 ---
 
-## Prompt Ideas (to be rewritten in your own words)
+Reviewer:
 
-### Option A — MasterFormat Partial Numbering Fix (Focused, Bug-Fix Style)
+Hey! Thanks for submission!! I love the idea for the country-based filtering in the menu.
 
-The PDF converter in markitdown uses pdfminer to extract text from PDF files. When converting documents that follow MasterFormat-style conventions (common in construction/engineering specs), partial numbering like `.1`, `.2`, `.10` gets extracted on its own line, separated from the text it belongs to. For example, a PDF that visually reads:
-
-```
-.1  The intent of this Request for Proposal is to...
-.2  Available information relative to the existing...
-```
-
-gets extracted as:
-
-```
-.1
-The intent of this Request for Proposal is to...
-.2
-Available information relative to the existing...
-```
-
-This breaks the semantic meaning of the content. Add post-processing to the PDF converter that detects when a line consists solely of a MasterFormat-style partial number (matching the pattern `^\.\d+$`) and merges it with the following non-empty text line. The fix should be applied after text extraction, handle edge cases like consecutive partial numbers or a partial number at the end of the document with no following text, and include tests that verify the merging logic works correctly. Make sure existing PDF conversion behavior is not broken.
+I've tried to select a race, but I get hit with this error. Are you able to check this for me? :)
 
 ---
 
-### Option B — PDF Table Extraction as Markdown (Feature Extension)
+Contributor:
 
-The PDF converter currently extracts all content as flat plain text using pdfminer, which means any tables present in PDF documents are completely lost — columns get smashed together or scattered across lines with no structure. Enhance the PDF converter to detect and extract tables from PDF pages and render them as properly formatted Markdown tables with pipe-separated columns and header separator rows. You may use pdfplumber as an additional dependency for word-position analysis to identify tabular layouts. The solution should handle both bordered and borderless tables, fall back gracefully to the existing pdfminer text extraction for pages that don't contain tables, and include tests. Ensure the existing conversion behavior for non-tabular PDFs remains unchanged.
+Hi Tom, I’ve addressed the error that was occurring. It was likely caused by two things:
+
+1. Selecting races where telemetry data isn’t available (for example, seasons before 2018).
+2. A small logic issue when switching back and forth between the Year and Race filters.
+   Both cases are now handled, and I’ve tested the overall flow to make sure the filters and session loading works smoothly. Please review. <3
+
+---
+
+Reviewer:
+
+Love the hard work that's gone into this!
+
+I've removed the minimise feature because it feels like the window should still be there after I close the replay screen (personal preference).
+
+I've also made sure that the race autoplays when the window loads :)
+
+---
+
+## Scope Validation
+
+**Verdict: ✅ GOOD — Proceed**
+
+The task is well-scoped: it adds a single cohesive feature (race-name-based filtering for cross-year comparison) to an existing GUI module, touching two files (`f1_data.py` and `gui/race_selection.py`). It's not too broad (it's not "redesign the GUI") and not too trivial (it requires new data functions, a new UI widget, and coordination logic between two filter controls). It aligns with the project's goals — the `Local_Setup_Guide.md` lists GUI improvements as desired feature ideas.
+
+**Key things the gold-standard solution does:**
+
+1. Adds `get_race_weekends_by_place(place)` and `get_all_unique_race_names()` to `f1_data.py`
+2. Adds a "Select Race" combo box to the GUI alongside the year combo
+3. Implements mutual-exclusion logic: selecting a race resets year to "All Years" and vice versa, using `blockSignals()` to prevent cascading events
+4. Adjusts `_on_session_button_clicked` to pull `year` from event data when filtering by race name
+5. Removes unused `QInputDialog` import, comments out unused `QPixmap, QFont`
+
+**Weaknesses in the gold-standard to watch for models improving upon:**
+
+- Naming: `place` is misleading — it filters by _race event name_, not geographic place
+- Hardcoded `end_year=2025` and `current_year=2025` instead of using `date.today().year`
+- Inconsistent code style: no spaces around `=` in assignments (e.g., `place=place.lower()`)
+- No docstring on `get_all_unique_race_names()`
+- Noise comment `#check` on `FetchScheduleWorker.run()`
+- No tests whatsoever (repo has no test suite, but new pure functions are easily testable)
+- `get_race_weekends_by_place` matches only exact event names (case-insensitive), no fuzzy/partial matching
+- `get_all_unique_race_names()` is called at import/init time (each startup hits the cache for all years 2018–2025)
+- Both modified files lose trailing newline
+
+**What I'd want an ideal model response to do:**
+
+1. Use `race_name` instead of `place` throughout
+2. Use `date.today().year` dynamically instead of hardcoded year constants
+3. Follow existing code style (4-space indent, spaces around `=`)
+4. Add proper docstrings to new functions
+5. Consider a background thread for `get_all_unique_race_names()` since it could be slow
+6. Include a "Year" column in the schedule tree when filtering by race name (so users see which year each result is from)
+7. Write unit tests for the new data functions
+
+---
+
+## Initial Prompt (Draft)
+
+```
+Add a race-name-based filter to the Race Selection GUI that lets users view the same
+Grand Prix across different years for historical comparison.
+
+Specifically:
+- Add a new "Select Race" dropdown in `src/gui/race_selection.py` that lists all unique
+  race event names from 2018 to present.
+- When a user selects a race name, the schedule tree should display all instances of that
+  race across available years, replacing the current year-filtered view.
+- The year and race-name filters should be independent — selecting one should reset the
+  other to an "All" default, so the filters don't conflict.
+- Add the necessary data-fetching functions in `src/f1_data.py` to support retrieving
+  race weekends by event name and listing all unique race names.
+- Ensure the session launch logic correctly determines the year for sessions loaded via
+  the race-name filter (since entries span multiple years).
+- Clean up any unused imports you find in the files you touch.
+- Make sure any year references are dynamic (use the current year) rather than hardcoded
+  constants that need manual updates.
+```
+
+---
+
+## My Opinions / Notes
+
+- **Scope trimming from the PR:** The original PR also included "auto-minimize window" and "paused-by-default" changes. The reviewer removed both. I've scoped the prompt to only the race-name filter feature + import cleanup, which is the final accepted scope. This keeps the task focused and avoids models introducing features that would be reverted.
+- **Testing expectation:** The repo has zero tests. Since the new `get_all_unique_race_names()` and `get_race_weekends_by_place()` are pure-ish functions (they call FastF1 but return simple dicts/lists), asking for tests in Turn 2 or 3 is reasonable. We should push for at least mocked unit tests.
+- **Turn strategy:** Turn 1 = implement the feature. Turn 2 = code review feedback (style, naming, edge cases, robustness). Turn 3 = tests + final polish for PR readiness.
+- **Performance concern:** Loading all unique race names from 2018–present on startup could be slow. A good model might suggest lazy-loading or background threading. Worth noting in review but not critical to block on.
