@@ -1,0 +1,369 @@
+diff --git a/src/gui/race_selection.py b/src/gui/race_selection.py
+index 8d6d2b8..abd9679 100644
+--- a/src/gui/race_selection.py
++++ b/src/gui/race_selection.py
+@@ -29,26 +29,65 @@ class FetchScheduleWorker(QThread):
+             try:
+                 from src.f1_data import enable_cache
+                 enable_cache()
+             except Exception:
+                 pass
+             events = get_race_weekends_by_year(self.year)
+             self.result.emit(events)
+         except Exception as e:
+             self.error.emit(str(e))
+ 
++
++class FetchMultiYearScheduleWorker(QThread):
++    """Worker thread to fetch schedules from multiple years for race name filtering."""
++    result = Signal(object)
++    error = Signal(str)
++
++    def __init__(self, years, parent=None):
++        super().__init__(parent)
++        self.years = years
++
++    def run(self):
++        try:
++            try:
++                from src.f1_data import enable_cache
++                enable_cache()
++            except Exception:
++                pass
++            
++            all_events = []
++            for year in self.years:
++                try:
++                    events = get_race_weekends_by_year(year)
++                    for event in events:
++                        event["year"] = year
++                    all_events.extend(events)
++                except Exception:
++                    # Skip years that fail to load
++                    continue
++            self.result.emit(all_events)
++        except Exception as e:
++            self.error.emit(str(e))
++
+ class RaceSelectionWindow(QMainWindow):
++    # Standard race name suffixes to normalize for matching
++    RACE_NAME_SUFFIXES = ["Grand Prix", "GP"]
++
+     def __init__(self):
+         super().__init__()
+         self.worker = None
++        self.multi_year_worker = None
+         self.loading_session = False
+         self.selected_session_title = None
++        self.all_events_cache = {}  # Cache events by year
++        self.unique_race_names = []  # List of unique normalized race names
++        self.filter_mode = False  # True when filtering by race name
+ 
+         self.setWindowTitle("F1 Race Replay - Session Selection")
+         self._setup_ui()
+         self.resize(1000, 700)
+         self.setMinimumSize(800, 600)
+         self.setWindowState(self.windowState())
+ 
+     def _setup_ui(self):
+         central_widget = QWidget()
+         self.setCentralWidget(central_widget)
+@@ -67,33 +106,51 @@ class RaceSelectionWindow(QMainWindow):
+         font.setPointSize(18)
+         font.setBold(True)
+         header_label.setFont(font)
+         header_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+         
+         header_layout.addWidget(header_label)
+         header_layout.addStretch()
+         header_layout.addWidget(settings_btn)
+         main_layout.addLayout(header_layout)
+ 
++        # Filter controls layout
++        filter_layout = QHBoxLayout()
++        
+         # Year selection
+-        year_layout = QHBoxLayout()
+         year_label = QLabel("Select Year:")
+         self.year_combo = QComboBox()
+         current_year = 2025  # Update as needed
+-        for year in range(2010, current_year + 1):
++        self.min_year = 2010
++        for year in range(self.min_year, current_year + 1):
+             self.year_combo.addItem(str(year))
+         self.year_combo.setCurrentText(str(current_year))
+-        self.year_combo.currentTextChanged.connect(self.load_schedule)
++        self.year_combo.currentTextChanged.connect(self._on_year_changed)
+ 
+-        year_layout.addWidget(year_label)
+-        year_layout.addWidget(self.year_combo)
+-        main_layout.addLayout(year_layout)
++        filter_layout.addWidget(year_label)
++        filter_layout.addWidget(self.year_combo)
++        
++        filter_layout.addSpacing(20)
++        
++        # Race name filter
++        race_filter_label = QLabel("Filter by Race:")
++        self.race_filter_combo = QComboBox()
++        self.race_filter_combo.setMinimumWidth(200)
++        self.race_filter_combo.addItem("All Races")
++        self.race_filter_combo.setEnabled(False)  # Disabled until race names are loaded
++        self.race_filter_combo.currentTextChanged.connect(self._on_race_filter_changed)
++        
++        filter_layout.addWidget(race_filter_label)
++        filter_layout.addWidget(self.race_filter_combo)
++        
++        filter_layout.addStretch()
++        main_layout.addLayout(filter_layout)
+ 
+         # Main content: left = schedule, right = session list
+         content_layout = QHBoxLayout()
+ 
+         # Schedule tree (left)
+         self.schedule_tree = QTreeWidget()
+         self.schedule_tree.setHeaderLabels(["Round", "Event", "Country", "Start Date"])
+         self.schedule_tree.setRootIsDecorated(False)
+         content_layout.addWidget(self.schedule_tree, 3)
+         self.schedule_tree.setColumnWidth(2, 180)
+@@ -121,54 +178,214 @@ class RaceSelectionWindow(QMainWindow):
+         main_layout.addLayout(content_layout)
+ 
+         # connect click handler
+         self.schedule_tree.itemClicked.connect(self.on_race_clicked)
+ 
+         # Load initial schedule
+         # hide sessions panel until a weekend is selected
+         self.session_panel.hide()
+         self.load_schedule(str(current_year))
+         
++        # Start loading all years in background to populate race name filter
++        self._load_all_years_for_filter()
++        
++    def _normalize_race_name(self, event_name):
++        """Extract a normalized race name for matching across years.
++        
++        Handles variations like 'Monaco Grand Prix', 'British Grand Prix', etc.
++        Returns a canonical name that can be used for matching.
++        """
++        name = event_name.strip()
++        # Remove common suffixes for comparison
++        for suffix in self.RACE_NAME_SUFFIXES:
++            if name.endswith(suffix):
++                name = name[:-len(suffix)].strip()
++                break
++        return name
++
++    def _load_all_years_for_filter(self):
++        """Load events from all available years to populate the race name filter."""
++        current_year = int(self.year_combo.currentText())
++        years = list(range(self.min_year, current_year + 1))
++        
++        self.multi_year_worker = FetchMultiYearScheduleWorker(years)
++        self.multi_year_worker.result.connect(self._on_all_years_loaded)
++        self.multi_year_worker.error.connect(lambda _: None)  # Silently ignore errors
++        self.multi_year_worker.start()
++
++    def _on_all_years_loaded(self, all_events):
++        """Handle completion of multi-year event loading."""
++        # Cache events by year
++        for event in all_events:
++            year = event.get("year")
++            if year not in self.all_events_cache:
++                self.all_events_cache[year] = []
++            self.all_events_cache[year].append(event)
++        
++        # Extract unique race names
++        race_names = set()
++        for event in all_events:
++            normalized = self._normalize_race_name(event.get("event_name", ""))
++            if normalized:
++                race_names.add(normalized)
++        
++        self.unique_race_names = sorted(race_names)
++        
++        # Populate the filter combobox
++        self.race_filter_combo.blockSignals(True)
++        self.race_filter_combo.clear()
++        self.race_filter_combo.addItem("All Races")
++        for name in self.unique_race_names:
++            self.race_filter_combo.addItem(name)
++        self.race_filter_combo.blockSignals(False)
++        self.race_filter_combo.setEnabled(True)
++
++    def _on_year_changed(self, year):
++        """Handle year selection change."""
++        if self.filter_mode:
++            # If in filter mode, exit filter mode and show the selected year
++            self.filter_mode = False
++            self.race_filter_combo.blockSignals(True)
++            self.race_filter_combo.setCurrentText("All Races")
++            self.race_filter_combo.blockSignals(False)
++        self.load_schedule(year)
++
++    def _on_race_filter_changed(self, race_name):
++        """Handle race name filter selection."""
++        if race_name == "All Races":
++            self.filter_mode = False
++            # Reload the currently selected year
++            self.load_schedule(self.year_combo.currentText())
++        else:
++            self.filter_mode = True
++            self._show_filtered_races(race_name)
++
++    def _show_filtered_races(self, race_name):
++        """Display all instances of a specific race across years."""
++        self.schedule_tree.clear()
++        try:
++            self.session_panel.hide()
++        except Exception:
++            pass
++        
++        # Update tree headers for historical comparison view
++        self.schedule_tree.setHeaderLabels(["Year", "Event", "Country", "Date"])
++        
++        # Find all events matching the race name
++        matching_events = []
++        for year, events in self.all_events_cache.items():
++            for event in events:
++                normalized = self._normalize_race_name(event.get("event_name", ""))
++                if normalized == race_name:
++                    matching_events.append(event)
++        
++        # Sort by year (most recent first)
++        matching_events.sort(key=lambda e: e.get("year", 0), reverse=True)
++        
++        for event in matching_events:
++            year_str = str(event.get("year", ""))
++            name = str(event.get("event_name", ""))
++            country = str(event.get("country", ""))
++            date = str(event.get("date", ""))
++            
++            event_item = QTreeWidgetItem([year_str, name, country, date])
++            event_item.setData(0, Qt.UserRole, event)
++            self.schedule_tree.addTopLevelItem(event_item)
++        
++        try:
++            self.schedule_tree.resizeColumnToContents(0)
++            self.schedule_tree.resizeColumnToContents(1)
++        except Exception:
++            pass
++
+     def load_schedule(self, year):
+         if self.loading_session:
+             return
+         self.loading_session = True
+         self.schedule_tree.clear()
++        
++        # Reset tree headers for standard year view
++        self.schedule_tree.setHeaderLabels(["Round", "Event", "Country", "Start Date"])
++        
+         # hide sessions panel while loading / when nothing selected
+         try:
+             self.session_panel.hide()
+         except Exception:
+             pass
+         self.worker = FetchScheduleWorker(int(year))
+         self.worker.result.connect(self.populate_schedule)
+         self.worker.error.connect(self.show_error)
+         self.worker.start()
+     def populate_schedule(self, events):
++        year = int(self.year_combo.currentText())
++        
++        # Cache events with year info for filtering
++        events_with_year = []
++        for event in events:
++            event_copy = dict(event)
++            event_copy["year"] = year
++            events_with_year.append(event_copy)
++        self.all_events_cache[year] = events_with_year
++        
+         for event in events:
+             # Ensure all columns are strings (QTreeWidgetItem expects text)
+             round_str = str(event.get("round_number", ""))
+             name = str(event.get("event_name", ""))
+             country = str(event.get("country", ""))
+             date = str(event.get("date", ""))
+ 
+             event_item = QTreeWidgetItem([round_str, name, country, date])
+-            event_item.setData(0, Qt.UserRole, event)
++            # Store event with year for session launching
++            event_with_year = dict(event)
++            event_with_year["year"] = year
++            event_item.setData(0, Qt.UserRole, event_with_year)
+             self.schedule_tree.addTopLevelItem(event_item)
+ 
+         # Make sure the round column is wide enough to be visible
+         try:
+             self.schedule_tree.resizeColumnToContents(0)
+             self.schedule_tree.resizeColumnToContents(1)
+         except Exception:
+             pass
+ 
+         self.loading_session = False
++        
++        # Update race filter with any new race names
++        self._update_race_filter_options()
++    
++    def _update_race_filter_options(self):
++        """Update the race filter combobox with unique race names from cached events."""
++        race_names = set()
++        for events in self.all_events_cache.values():
++            for event in events:
++                normalized = self._normalize_race_name(event.get("event_name", ""))
++                if normalized:
++                    race_names.add(normalized)
++        
++        # Only update if we have new names
++        if sorted(race_names) != self.unique_race_names:
++            self.unique_race_names = sorted(race_names)
++            
++            current_selection = self.race_filter_combo.currentText()
++            self.race_filter_combo.blockSignals(True)
++            self.race_filter_combo.clear()
++            self.race_filter_combo.addItem("All Races")
++            for name in self.unique_race_names:
++                self.race_filter_combo.addItem(name)
++            
++            # Restore previous selection if still valid
++            idx = self.race_filter_combo.findText(current_selection)
++            if idx >= 0:
++                self.race_filter_combo.setCurrentIndex(idx)
++            
++            self.race_filter_combo.blockSignals(False)
++            self.race_filter_combo.setEnabled(True)
+ 
+     def on_race_clicked(self, item, column):
+         ev = item.data(0, Qt.UserRole)
+         # ensure the sessions panel is visible when a race is selected
+         try:
+             self.session_panel.show()
+         except Exception:
+             pass
+         # determine sessions to show
+         ev_type = (ev.get("type") or "").lower()
+@@ -192,22 +409,23 @@ class RaceSelectionWindow(QMainWindow):
+             )
+             self.session_list_layout.addWidget(btn)
+ 
+     def _on_session_button_clicked(self, ev, session_label):
+         """Launch main.py in a separate process to run the selected session.
+ 
+         Uses the same CLI flags that `main.py` understands: `--qualifying`,
+         `--sprint-qualifying`, `--sprint`. Runs the command detached so the
+         Qt UI remains responsive.
+         """
++        # Use year from event data (important for filter mode), fallback to combo
+         try:
+-            year = int(self.year_combo.currentText())
++            year = int(ev.get("year")) if ev.get("year") else int(self.year_combo.currentText())
+         except Exception:
+             year = None
+ 
+         try:
+             round_no = int(ev.get("round_number"))
+         except Exception:
+             round_no = None
+ 
+         # map button labels to CLI flags
+         flag = None
