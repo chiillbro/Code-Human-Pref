@@ -1,0 +1,560 @@
+diff --git a/src/f1_data.py b/src/f1_data.py
+index 5535590..82255e0 100644
+--- a/src/f1_data.py
++++ b/src/f1_data.py
+@@ -963,20 +963,103 @@ def get_race_weekends_by_year(year):
+                 "round_number": event["RoundNumber"],
+                 "event_name": event["EventName"],
+                 "date": str(event["EventDate"].date()),
+                 "country": event["Country"],
+                 "type": event["EventFormat"],
+             }
+         )
+     return weekends
+ 
+ 
++# Standard suffixes to strip when normalizing race names
++_RACE_NAME_SUFFIXES = ["Grand Prix", "GP"]
++
++
++def _normalize_race_name(event_name):
++    """Normalize a race event name for consistent matching across years.
++    
++    Strips common suffixes like 'Grand Prix' and 'GP' to enable matching
++    events like 'Monaco Grand Prix' across different years.
++    """
++    name = event_name.strip()
++    for suffix in _RACE_NAME_SUFFIXES:
++        if name.endswith(suffix):
++            return name[:-len(suffix)].strip()
++    return name
++
++
++def get_unique_race_names(years):
++    """Get all unique normalized race event names across the specified years.
++    
++    Args:
++        years: List of years to scan for race events.
++        
++    Returns:
++        Sorted list of unique normalized race names (e.g., ['Australian', 'Bahrain', ...]).
++    """
++    enable_cache()
++    race_names = set()
++    
++    for year in years:
++        try:
++            schedule = fastf1.get_event_schedule(year)
++            for _, event in schedule.iterrows():
++                if event.is_testing():
++                    continue
++                normalized = _normalize_race_name(event["EventName"])
++                if normalized:
++                    race_names.add(normalized)
++        except Exception:
++            # Skip years that fail to load
++            continue
++    
++    return sorted(race_names)
++
++
++def get_race_weekends_by_name(race_name, years):
++    """Get all race weekends matching a specific race name across years.
++    
++    Args:
++        race_name: Normalized race name to filter by (e.g., 'Monaco').
++        years: List of years to search.
++        
++    Returns:
++        List of race weekend dicts with 'year' included, sorted by year descending.
++    """
++    enable_cache()
++    matching_events = []
++    
++    for year in years:
++        try:
++            schedule = fastf1.get_event_schedule(year)
++            for _, event in schedule.iterrows():
++                if event.is_testing():
++                    continue
++                normalized = _normalize_race_name(event["EventName"])
++                if normalized == race_name:
++                    matching_events.append({
++                        "year": year,
++                        "round_number": event["RoundNumber"],
++                        "event_name": event["EventName"],
++                        "date": str(event["EventDate"].date()),
++                        "country": event["Country"],
++                        "type": event["EventFormat"],
++                    })
++        except Exception:
++            # Skip years that fail to load
++            continue
++    
++    # Sort by year descending (most recent first)
++    matching_events.sort(key=lambda e: e["year"], reverse=True)
++    return matching_events
++
++
+ def list_rounds(year):
+     """Lists all rounds for a given year."""
+     enable_cache()
+     print(f"F1 Schedule {year}")
+     schedule = fastf1.get_event_schedule(year)
+     for _, event in schedule.iterrows():
+         print(f"{event['RoundNumber']}: {event['EventName']}")
+ 
+ 
+ def list_sprints(year):
+diff --git a/src/gui/race_selection.py b/src/gui/race_selection.py
+index 8d6d2b8..9f1054e 100644
+--- a/src/gui/race_selection.py
++++ b/src/gui/race_selection.py
+@@ -1,54 +1,149 @@
+ from PySide6.QtWidgets import (
+     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+-    QLabel, QComboBox, QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox, QInputDialog
++    QLabel, QComboBox, QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox
+ )
+ from PySide6.QtWidgets import QProgressDialog
+ from PySide6.QtCore import QThread, Signal, Qt, QTimer
+ from PySide6.QtGui import QPixmap, QFont
+ import sys
+ import os
+ import subprocess
+ import tempfile
+ import uuid
+-from src.f1_data import get_race_weekends_by_year, load_session
++import logging
++from datetime import date
++from src.f1_data import (
++    get_race_weekends_by_year, 
++    load_session,
++    get_unique_race_names,
++    get_race_weekends_by_name,
++)
+ from src.gui.settings_dialog import SettingsDialog
+ 
++logger = logging.getLogger(__name__)
++
+ 
+-# Worker thread to fetch schedule without blocking UI
+ class FetchScheduleWorker(QThread):
++    """Worker thread to fetch schedule for a single year without blocking UI."""
+     result = Signal(object)
+     error = Signal(str)
+ 
+     def __init__(self, year, parent=None):
+         super().__init__(parent)
+         self.year = year
+ 
+     def run(self):
+         try:
+-            # enable cache if available in project
+             try:
+                 from src.f1_data import enable_cache
+                 enable_cache()
+             except Exception:
+                 pass
+             events = get_race_weekends_by_year(self.year)
+             self.result.emit(events)
+         except Exception as e:
+             self.error.emit(str(e))
+ 
++
++class FetchUniqueRaceNamesWorker(QThread):
++    """Worker thread to fetch unique race names across multiple years."""
++    result = Signal(object)
++    error = Signal(str)
++
++    def __init__(self, years, parent=None):
++        super().__init__(parent)
++        self.years = years
++
++    def run(self):
++        try:
++            try:
++                from src.f1_data import enable_cache
++                enable_cache()
++            except Exception:
++                pass
++            race_names = get_unique_race_names(self.years)
++            self.result.emit(race_names)
++        except Exception as e:
++            logger.error(f"Failed to fetch unique race names: {e}")
++            self.error.emit(str(e))
++
++
++class FetchRacesByNameWorker(QThread):
++    """Worker thread to fetch race weekends filtered by race name."""
++    result = Signal(object)
++    error = Signal(str)
++
++    def __init__(self, race_name, years, parent=None):
++        super().__init__(parent)
++        self.race_name = race_name
++        self.years = years
++
++    def run(self):
++        try:
++            try:
++                from src.f1_data import enable_cache
++                enable_cache()
++            except Exception:
++                pass
++            events = get_race_weekends_by_name(self.race_name, self.years)
++            self.result.emit(events)
++        except Exception as e:
++            logger.error(f"Failed to fetch races by name '{self.race_name}': {e}")
++            self.error.emit(str(e))
++
++
++class _FetchAllYearsWorker(QThread):
++    """Worker thread to fetch all race weekends from multiple years."""
++    result = Signal(object)
++    error = Signal(str)
++
++    def __init__(self, years, parent=None):
++        super().__init__(parent)
++        self.years = years
++
++    def run(self):
++        try:
++            try:
++                from src.f1_data import enable_cache
++                enable_cache()
++            except Exception:
++                pass
++            
++            all_events = []
++            for year in sorted(self.years, reverse=True):
++                try:
++                    events = get_race_weekends_by_year(year)
++                    for event in events:
++                        event_with_year = dict(event)
++                        event_with_year["year"] = year
++                        all_events.append(event_with_year)
++                except Exception as e:
++                    logger.warning(f"Failed to fetch schedule for year {year}: {e}")
++                    continue
++            self.result.emit(all_events)
++        except Exception as e:
++            logger.error(f"Failed to fetch all years: {e}")
++            self.error.emit(str(e))
++
+ class RaceSelectionWindow(QMainWindow):
++    MIN_YEAR = 2018  # FastF1 data before 2018 is incomplete
++
+     def __init__(self):
+         super().__init__()
+         self.worker = None
++        self.race_names_worker = None
++        self.races_by_name_worker = None
+         self.loading_session = False
+         self.selected_session_title = None
++        self.unique_race_names = []
++        self.filter_mode = False  # True when filtering by race name
+ 
+         self.setWindowTitle("F1 Race Replay - Session Selection")
+         self._setup_ui()
+         self.resize(1000, 700)
+         self.setMinimumSize(800, 600)
+         self.setWindowState(self.windowState())
+ 
+     def _setup_ui(self):
+         central_widget = QWidget()
+         self.setCentralWidget(central_widget)
+@@ -67,33 +162,51 @@ class RaceSelectionWindow(QMainWindow):
+         font.setPointSize(18)
+         font.setBold(True)
+         header_label.setFont(font)
+         header_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+         
+         header_layout.addWidget(header_label)
+         header_layout.addStretch()
+         header_layout.addWidget(settings_btn)
+         main_layout.addLayout(header_layout)
+ 
++        # Filter controls layout
++        filter_layout = QHBoxLayout()
++        
+         # Year selection
+-        year_layout = QHBoxLayout()
+         year_label = QLabel("Select Year:")
+         self.year_combo = QComboBox()
+-        current_year = 2025  # Update as needed
+-        for year in range(2010, current_year + 1):
++        self.current_year = date.today().year
++        self.year_combo.addItem("All Years")
++        for year in range(self.MIN_YEAR, self.current_year + 1):
+             self.year_combo.addItem(str(year))
+-        self.year_combo.setCurrentText(str(current_year))
+-        self.year_combo.currentTextChanged.connect(self.load_schedule)
++        self.year_combo.setCurrentText(str(self.current_year))
++        self.year_combo.currentTextChanged.connect(self._on_year_changed)
+ 
+-        year_layout.addWidget(year_label)
+-        year_layout.addWidget(self.year_combo)
+-        main_layout.addLayout(year_layout)
++        filter_layout.addWidget(year_label)
++        filter_layout.addWidget(self.year_combo)
++        
++        filter_layout.addSpacing(20)
++        
++        # Race name filter
++        race_filter_label = QLabel("Filter by Race:")
++        self.race_filter_combo = QComboBox()
++        self.race_filter_combo.setMinimumWidth(200)
++        self.race_filter_combo.addItem("All Races")
++        self.race_filter_combo.setEnabled(False)  # Disabled until race names are loaded
++        self.race_filter_combo.currentTextChanged.connect(self._on_race_filter_changed)
++        
++        filter_layout.addWidget(race_filter_label)
++        filter_layout.addWidget(self.race_filter_combo)
++        
++        filter_layout.addStretch()
++        main_layout.addLayout(filter_layout)
+ 
+         # Main content: left = schedule, right = session list
+         content_layout = QHBoxLayout()
+ 
+         # Schedule tree (left)
+         self.schedule_tree = QTreeWidget()
+         self.schedule_tree.setHeaderLabels(["Round", "Event", "Country", "Start Date"])
+         self.schedule_tree.setRootIsDecorated(False)
+         content_layout.addWidget(self.schedule_tree, 3)
+         self.schedule_tree.setColumnWidth(2, 180)
+@@ -119,49 +232,199 @@ class RaceSelectionWindow(QMainWindow):
+         content_layout.addWidget(self.session_panel, 1)
+ 
+         main_layout.addLayout(content_layout)
+ 
+         # connect click handler
+         self.schedule_tree.itemClicked.connect(self.on_race_clicked)
+ 
+         # Load initial schedule
+         # hide sessions panel until a weekend is selected
+         self.session_panel.hide()
+-        self.load_schedule(str(current_year))
++        self.load_schedule(str(self.current_year))
++        
++        # Start loading race names in background to populate the filter
++        self._load_race_names_for_filter()
++
++    def _get_year_range(self):
++        """Get the list of years to search."""
++        return list(range(self.MIN_YEAR, self.current_year + 1))
++
++    def _load_race_names_for_filter(self):
++        """Load unique race names from all available years to populate the filter."""
++        years = self._get_year_range()
++        
++        self.race_names_worker = FetchUniqueRaceNamesWorker(years)
++        self.race_names_worker.result.connect(self._on_race_names_loaded)
++        self.race_names_worker.error.connect(self._on_race_names_error)
++        self.race_names_worker.start()
++
++    def _on_race_names_loaded(self, race_names):
++        """Handle completion of race names loading."""
++        self.unique_race_names = race_names
++        
++        # Populate the filter combobox
++        self.race_filter_combo.blockSignals(True)
++        self.race_filter_combo.clear()
++        self.race_filter_combo.addItem("All Races")
++        for name in self.unique_race_names:
++            self.race_filter_combo.addItem(name)
++        self.race_filter_combo.blockSignals(False)
++        self.race_filter_combo.setEnabled(True)
++
++    def _on_race_names_error(self, message):
++        """Handle error when loading race names."""
++        logger.error(f"Failed to load race names for filter: {message}")
++
++    def _on_year_changed(self, year):
++        """Handle year selection change."""
++        if self.filter_mode:
++            # Exit filter mode when year is explicitly selected
++            self.filter_mode = False
++            self.race_filter_combo.blockSignals(True)
++            self.race_filter_combo.setCurrentText("All Races")
++            self.race_filter_combo.blockSignals(False)
++        
++        if year == "All Years":
++            # Show all races from all years
++            self._show_all_years()
++        else:
++            self.load_schedule(year)
++
++    def _on_race_filter_changed(self, race_name):
++        """Handle race name filter selection."""
++        if race_name == "All Races":
++            self.filter_mode = False
++            current_year = self.year_combo.currentText()
++            if current_year == "All Years":
++                self._show_all_years()
++            else:
++                self.load_schedule(current_year)
++        else:
++            self.filter_mode = True
++            self._show_filtered_races(race_name)
++
++    def _show_all_years(self):
++        """Display all races from all years."""
++        self.schedule_tree.clear()
++        try:
++            self.session_panel.hide()
++        except Exception:
++            pass
++        
++        # Update tree headers for all-years view
++        self.schedule_tree.setHeaderLabels(["Year", "Event", "Country", "Date"])
++        
++        # Fetch all events from all years using the data layer
++        years = self._get_year_range()
+         
++        # Use the race names worker to show a combined view
++        # For "All Years", we fetch each year and combine
++        self.races_by_name_worker = _FetchAllYearsWorker(years)
++        self.races_by_name_worker.result.connect(self._on_all_years_events_loaded)
++        self.races_by_name_worker.error.connect(self._on_filtered_races_error)
++        self.races_by_name_worker.start()
++
++    def _on_all_years_events_loaded(self, events):
++        """Handle completion of all years event loading."""
++        self.schedule_tree.clear()
++        
++        for event in events:
++            year_str = str(event.get("year", ""))
++            name = str(event.get("event_name", ""))
++            country = str(event.get("country", ""))
++            date_str = str(event.get("date", ""))
++            
++            event_item = QTreeWidgetItem([year_str, name, country, date_str])
++            event_item.setData(0, Qt.UserRole, event)
++            self.schedule_tree.addTopLevelItem(event_item)
++        
++        try:
++            self.schedule_tree.resizeColumnToContents(0)
++            self.schedule_tree.resizeColumnToContents(1)
++        except Exception:
++            pass
++
++    def _show_filtered_races(self, race_name):
++        """Display all instances of a specific race across years."""
++        self.schedule_tree.clear()
++        try:
++            self.session_panel.hide()
++        except Exception:
++            pass
++        
++        # Update tree headers for historical comparison view
++        self.schedule_tree.setHeaderLabels(["Year", "Event", "Country", "Date"])
++        
++        years = self._get_year_range()
++        self.races_by_name_worker = FetchRacesByNameWorker(race_name, years)
++        self.races_by_name_worker.result.connect(self._on_filtered_races_loaded)
++        self.races_by_name_worker.error.connect(self._on_filtered_races_error)
++        self.races_by_name_worker.start()
++
++    def _on_filtered_races_loaded(self, events):
++        """Handle completion of filtered races loading."""
++        self.schedule_tree.clear()
++        
++        for event in events:
++            year_str = str(event.get("year", ""))
++            name = str(event.get("event_name", ""))
++            country = str(event.get("country", ""))
++            date_str = str(event.get("date", ""))
++            
++            event_item = QTreeWidgetItem([year_str, name, country, date_str])
++            event_item.setData(0, Qt.UserRole, event)
++            self.schedule_tree.addTopLevelItem(event_item)
++        
++        try:
++            self.schedule_tree.resizeColumnToContents(0)
++            self.schedule_tree.resizeColumnToContents(1)
++        except Exception:
++            pass
++
++    def _on_filtered_races_error(self, message):
++        """Handle error when loading filtered races."""
++        logger.error(f"Failed to load filtered races: {message}")
++        QMessageBox.warning(self, "Warning", f"Failed to load races: {message}")
++
+     def load_schedule(self, year):
+         if self.loading_session:
+             return
+         self.loading_session = True
+         self.schedule_tree.clear()
+-        # hide sessions panel while loading / when nothing selected
++        
++        # Reset tree headers for standard year view
++        self.schedule_tree.setHeaderLabels(["Round", "Event", "Country", "Start Date"])
++        
+         try:
+             self.session_panel.hide()
+         except Exception:
+             pass
++        
+         self.worker = FetchScheduleWorker(int(year))
+-        self.worker.result.connect(self.populate_schedule)
++        self.worker.result.connect(lambda events: self.populate_schedule(events, int(year)))
+         self.worker.error.connect(self.show_error)
+         self.worker.start()
+-    def populate_schedule(self, events):
++
++    def populate_schedule(self, events, year):
+         for event in events:
+-            # Ensure all columns are strings (QTreeWidgetItem expects text)
+             round_str = str(event.get("round_number", ""))
+             name = str(event.get("event_name", ""))
+             country = str(event.get("country", ""))
+-            date = str(event.get("date", ""))
++            date_str = str(event.get("date", ""))
+ 
+-            event_item = QTreeWidgetItem([round_str, name, country, date])
+-            event_item.setData(0, Qt.UserRole, event)
++            event_item = QTreeWidgetItem([round_str, name, country, date_str])
++            # Store event with year for session launching
++            event_with_year = dict(event)
++            event_with_year["year"] = year
++            event_item.setData(0, Qt.UserRole, event_with_year)
+             self.schedule_tree.addTopLevelItem(event_item)
+ 
+-        # Make sure the round column is wide enough to be visible
+         try:
+             self.schedule_tree.resizeColumnToContents(0)
+             self.schedule_tree.resizeColumnToContents(1)
+         except Exception:
+             pass
+ 
+         self.loading_session = False
+ 
+     def on_race_clicked(self, item, column):
+         ev = item.data(0, Qt.UserRole)
+@@ -192,22 +455,23 @@ class RaceSelectionWindow(QMainWindow):
+             )
+             self.session_list_layout.addWidget(btn)
+ 
+     def _on_session_button_clicked(self, ev, session_label):
+         """Launch main.py in a separate process to run the selected session.
+ 
+         Uses the same CLI flags that `main.py` understands: `--qualifying`,
+         `--sprint-qualifying`, `--sprint`. Runs the command detached so the
+         Qt UI remains responsive.
+         """
++        # Use year from event data (important for filter mode), fallback to combo
+         try:
+-            year = int(self.year_combo.currentText())
++            year = int(ev.get("year")) if ev.get("year") else int(self.year_combo.currentText())
+         except Exception:
+             year = None
+ 
+         try:
+             round_no = int(ev.get("round_number"))
+         except Exception:
+             round_no = None
+ 
+         # map button labels to CLI flags
+         flag = None
