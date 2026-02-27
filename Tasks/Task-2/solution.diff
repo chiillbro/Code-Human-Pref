@@ -1,0 +1,221 @@
+diff --git a/main.py b/main.py
+index 7c2f1a1..a73ceba 100644
+--- a/main.py
++++ b/main.py
+@@ -71,6 +71,17 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
+     # Get circuit rotation
+ 
+     circuit_rotation = get_circuit_rotation(session)
++    
++    # Prepare session info for display banner
++    session_info = {
++        'event_name': session.event.get('EventName', ''),
++        'circuit_name': session.event.get('Location', ''),  # Circuit location/name
++        'country': session.event.get('Country', ''),
++        'year': year,
++        'round': round_number,
++        'date': session.event.get('EventDate', '').strftime('%B %d, %Y') if session.event.get('EventDate') else '',
++        'total_laps': race_telemetry['total_laps']
++    }
+ 
+     # Run the arcade replay
+ 
+@@ -84,8 +95,9 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
+       title=f"{session.event['EventName']} - {'Sprint' if session_type == 'S' else 'Race'}",
+       total_laps=race_telemetry['total_laps'],
+       circuit_rotation=circuit_rotation,
+-      visible_hud=visible_hud
+-      ,ready_file=ready_file
++      visible_hud=visible_hud,
++      ready_file=ready_file,
++      session_info=session_info
+     )
+ 
+ if __name__ == "__main__":
+diff --git a/src/arcade_replay.py b/src/arcade_replay.py
+index 8f4c70a..2eab154 100644
+--- a/src/arcade_replay.py
++++ b/src/arcade_replay.py
+@@ -4,7 +4,7 @@
+ 
+ def run_arcade_replay(frames, track_statuses, example_lap, drivers, title,
+                       playback_speed=1.0, driver_colors=None, circuit_rotation=0.0, total_laps=None,
+-                      visible_hud=True, ready_file=None):
++                      visible_hud=True, ready_file=None, session_info=None):
+     window = F1RaceReplayWindow(
+         frames=frames,
+         track_statuses=track_statuses,
+@@ -16,6 +16,7 @@ def run_arcade_replay(frames, track_statuses, example_lap, drivers, title,
+         total_laps=total_laps,
+         circuit_rotation=circuit_rotation,
+         visible_hud=visible_hud,
++        session_info=session_info,
+     )
+     # Signal readiness to parent process (if requested) after window created
+     if ready_file:
+diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
+index e189494..7397a4b 100644
+--- a/src/interfaces/race_replay.py
++++ b/src/interfaces/race_replay.py
+@@ -10,6 +10,7 @@
+     RaceProgressBarComponent,
+     RaceControlsComponent,
+     ControlsPopupComponent,
++    SessionInfoComponent,
+     extract_race_events,
+     build_track_from_example_lap,
+     draw_finish_line
+@@ -24,7 +25,8 @@
+ class F1RaceReplayWindow(arcade.Window):
+     def __init__(self, frames, track_statuses, example_lap, drivers, title,
+                  playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
+-                 left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True):
++                 left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
++                 session_info=None):
+         # Set resizable to True so the user can adjust mid-sim
+         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
+         self.maximize()
+@@ -77,6 +79,19 @@ def __init__(self, frames, track_statuses, example_lap, drivers, title,
+             center_y=100,
+             visible = visible_hud
+         )
++        
++        # Session info banner component
++        self.session_info_comp = SessionInfoComponent(visible=visible_hud)
++        if session_info:
++            self.session_info_comp.set_info(
++                event_name=session_info.get('event_name', ''),
++                circuit_name=session_info.get('circuit_name', ''),
++                country=session_info.get('country', ''),
++                year=session_info.get('year'),
++                round_num=session_info.get('round'),
++                date=session_info.get('date', ''),
++                total_laps=total_laps
++            )
+ 
+         self.is_rewinding = False
+         self.is_forwarding = False
+@@ -447,6 +462,9 @@ def on_draw(self):
+         
+         # Race playback control buttons
+         self.race_controls_comp.draw(self)
++        
++        # Session info banner (top of screen)
++        self.session_info_comp.draw(self)
+ 
+         # Draw Controls popup box
+         self.controls_popup_comp.draw(self)
+@@ -535,6 +553,8 @@ def on_key_press(self, symbol: int, modifiers: int):
+                 self.controls_popup_comp.show_over(left_pos, top_pos)
+         elif symbol == arcade.key.B:
+             self.progress_bar_comp.toggle_visibility() # toggle progress bar visibility
++        elif symbol == arcade.key.I:
++            self.session_info_comp.toggle_visibility() # toggle session info banner
+ 
+     def on_key_release(self, symbol: int, modifiers: int):
+         if symbol == arcade.key.RIGHT:
+diff --git a/src/ui_components.py b/src/ui_components.py
+index 0545112..2acee61 100644
+--- a/src/ui_components.py
++++ b/src/ui_components.py
+@@ -865,6 +865,100 @@ def on_mouse_press(self, window, x: float, y: float, button: int, modifiers: int
+         return True
+ 
+ 
++class SessionInfoComponent(BaseComponent):
++    """
++    Displays session information banner at the top-center of the screen.
++    Shows: Circuit name, Country, Event name, Year, Round, Date, Total laps
++    """
++    def __init__(self, visible=True):
++        self.visible = visible
++        self.session_info = {}
++        self._text = arcade.Text("", 0, 0, arcade.color.WHITE, 14)
++        
++    def set_info(self, event_name: str = "", circuit_name: str = "", country: str = "",
++                 year: int = None, round_num: int = None, date: str = "", total_laps: int = None):
++        """Set session information to display"""
++        self.session_info = {
++            'event_name': event_name,
++            'circuit_name': circuit_name,
++            'country': country,
++            'year': year,
++            'round': round_num,
++            'date': date,
++            'total_laps': total_laps
++        }
++    
++    def toggle_visibility(self) -> bool:
++        """Toggle visibility of session info banner"""
++        self.visible = not self.visible
++        return self.visible
++    
++    def draw(self, window):
++        if not self.visible or not self.session_info:
++            return
++        
++        # Banner dimensions
++        banner_height = 60
++        banner_width = min(900, window.width - 40)
++        center_x = window.width / 2
++        top_y = window.height - 10
++        bottom_y = top_y - banner_height
++        
++        # Draw semi-transparent background
++        rect = arcade.XYWH(center_x, top_y - banner_height/2, banner_width, banner_height)
++        arcade.draw_rect_filled(rect, (20, 20, 20, 220))
++        arcade.draw_rect_outline(rect, arcade.color.GRAY, 2)
++        
++        # Get info
++        event = self.session_info.get('event_name', '')
++        circuit = self.session_info.get('circuit_name', '')
++        country = self.session_info.get('country', '')
++        year = self.session_info.get('year', '')
++        round_num = self.session_info.get('round', '')
++        date = self.session_info.get('date', '')
++        total_laps = self.session_info.get('total_laps', '')
++        
++        # Line 1: Event Name | Circuit | Country
++        line1_parts = []
++        if event:
++            line1_parts.append(f"🏁 {event}")
++        if circuit:
++            line1_parts.append(circuit)
++        if country:
++            line1_parts.append(f"🌍 {country}")
++        
++        line1 = " | ".join(line1_parts)
++        
++        # Line 2: Year Round X | Date | X Laps
++        line2_parts = []
++        if year and round_num:
++            line2_parts.append(f"📅 {year} Round {round_num}")
++        elif year:
++            line2_parts.append(f"📅 {year}")
++        if date:
++            line2_parts.append(date)
++        if total_laps:
++            line2_parts.append(f"{total_laps} Laps")
++        
++        line2 = " | ".join(line2_parts)
++        
++        # Draw text lines
++        self._text.font_size = 16
++        self._text.bold = True
++        self._text.color = arcade.color.WHITE
++        self._text.text = line1
++        self._text.x = center_x
++        self._text.y = top_y - 18
++        self._text.anchor_x = "center"
++        self._text.anchor_y = "center"
++        self._text.draw()
++        
++        self._text.font_size = 13
++        self._text.bold = False
++        self._text.color = arcade.color.LIGHT_GRAY
++        self._text.text = line2
++        self._text.y = top_y - 40
++        self._text.draw()
+ 
+ 
+ # Feature: race progress bar with event markers
