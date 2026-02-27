@@ -1,0 +1,879 @@
+diff --git a/src/commands/__init__.py b/src/commands/__init__.py
+new file mode 100644
+index 0000000..89196f9
+--- /dev/null
++++ b/src/commands/__init__.py
+@@ -0,0 +1,49 @@
++from .base import Command
++from .playback import (
++    PlayPauseCommand,
++    StartRewindCommand,
++    StopRewindCommand,
++    StartForwardCommand,
++    StopForwardCommand,
++    IncreaseSpeedCommand,
++    DecreaseSpeedCommand,
++    SetSpeedCommand,
++    RestartCommand,
++    StopSeekingCommand,
++)
++from .ui import (
++    ToggleDrsZonesCommand,
++    ToggleDriverLabelsCommand,
++    ToggleHelpPopupCommand,
++    ToggleProgressBarCommand,
++    ToggleSessionInfoCommand,
++)
++from .input_handler import (
++    InputHandler,
++    InputEventType,
++    KeyboardInputMapper,
++    RaceControlsCommandAdapter,
++)
++
++__all__ = [
++    "Command",
++    "PlayPauseCommand",
++    "StartRewindCommand",
++    "StopRewindCommand",
++    "StartForwardCommand",
++    "StopForwardCommand",
++    "IncreaseSpeedCommand",
++    "DecreaseSpeedCommand",
++    "SetSpeedCommand",
++    "RestartCommand",
++    "StopSeekingCommand",
++    "ToggleDrsZonesCommand",
++    "ToggleDriverLabelsCommand",
++    "ToggleHelpPopupCommand",
++    "ToggleProgressBarCommand",
++    "ToggleSessionInfoCommand",
++    "InputHandler",
++    "InputEventType",
++    "KeyboardInputMapper",
++    "RaceControlsCommandAdapter",
++]
+diff --git a/src/commands/base.py b/src/commands/base.py
+new file mode 100644
+index 0000000..445f891
+--- /dev/null
++++ b/src/commands/base.py
+@@ -0,0 +1,11 @@
++from abc import ABC, abstractmethod
++from typing import Any
++
++
++class Command(ABC):
++    """Base command interface for all playback and UI commands."""
++    
++    @abstractmethod
++    def execute(self, window: Any) -> None:
++        """Execute the command."""
++        pass
+diff --git a/src/commands/input_handler.py b/src/commands/input_handler.py
+new file mode 100644
+index 0000000..408730b
+--- /dev/null
++++ b/src/commands/input_handler.py
+@@ -0,0 +1,146 @@
++from enum import Enum, auto
++from typing import Any, Dict, Optional
++
++import arcade
++
++from .base import Command
++from .playback import (
++    PlayPauseCommand,
++    StartRewindCommand,
++    StopRewindCommand,
++    StartForwardCommand,
++    StopForwardCommand,
++    IncreaseSpeedCommand,
++    DecreaseSpeedCommand,
++    SetSpeedCommand,
++    RestartCommand,
++    StopSeekingCommand,
++)
++from .ui import (
++    ToggleDrsZonesCommand,
++    ToggleDriverLabelsCommand,
++    ToggleHelpPopupCommand,
++    ToggleProgressBarCommand,
++    ToggleSessionInfoCommand,
++)
++
++
++class InputEventType(Enum):
++    KEY_PRESS = auto()
++    KEY_RELEASE = auto()
++
++
++class KeyboardInputMapper:
++    """Maps keyboard inputs to commands."""
++    
++    def __init__(self):
++        self._key_press_bindings: Dict[int, Command] = {}
++        self._key_release_bindings: Dict[int, Command] = {}
++        self._setup_default_bindings()
++    
++    def _setup_default_bindings(self) -> None:
++        self._key_press_bindings = {
++            arcade.key.SPACE: PlayPauseCommand(),
++            arcade.key.RIGHT: StartForwardCommand(),
++            arcade.key.LEFT: StartRewindCommand(),
++            arcade.key.UP: IncreaseSpeedCommand(),
++            arcade.key.DOWN: DecreaseSpeedCommand(),
++            arcade.key.KEY_1: SetSpeedCommand(0.5),
++            arcade.key.KEY_2: SetSpeedCommand(1.0),
++            arcade.key.KEY_3: SetSpeedCommand(2.0),
++            arcade.key.KEY_4: SetSpeedCommand(4.0),
++            arcade.key.R: RestartCommand(),
++            arcade.key.D: ToggleDrsZonesCommand(),
++            arcade.key.L: ToggleDriverLabelsCommand(),
++            arcade.key.H: ToggleHelpPopupCommand(),
++            arcade.key.B: ToggleProgressBarCommand(),
++            arcade.key.I: ToggleSessionInfoCommand(),
++        }
++        
++        self._key_release_bindings = {
++            arcade.key.RIGHT: StopForwardCommand(),
++            arcade.key.LEFT: StopRewindCommand(),
++        }
++    
++    def get_command(self, event_type: InputEventType, key: int) -> Optional[Command]:
++        if event_type == InputEventType.KEY_PRESS:
++            return self._key_press_bindings.get(key)
++        elif event_type == InputEventType.KEY_RELEASE:
++            return self._key_release_bindings.get(key)
++        return None
++    
++    def bind_key_press(self, key: int, command: Command) -> None:
++        self._key_press_bindings[key] = command
++    
++    def bind_key_release(self, key: int, command: Command) -> None:
++        self._key_release_bindings[key] = command
++
++
++class InputHandler:
++    """Main input handler that coordinates input processing."""
++    
++    def __init__(self):
++        self._keyboard_mapper = KeyboardInputMapper()
++        self._stop_seeking_command = StopSeekingCommand()
++    
++    @property
++    def keyboard_mapper(self) -> KeyboardInputMapper:
++        return self._keyboard_mapper
++    
++    def handle_key_press(self, window: Any, symbol: int, modifiers: int) -> bool:
++        """Handle key press event. Returns True if handled."""
++        if symbol == arcade.key.ESCAPE:
++            arcade.close_window()
++            return True
++        
++        command = self._keyboard_mapper.get_command(InputEventType.KEY_PRESS, symbol)
++        if command:
++            command.execute(window)
++            return True
++        return False
++    
++    def handle_key_release(self, window: Any, symbol: int, modifiers: int) -> bool:
++        """Handle key release event. Returns True if handled."""
++        command = self._keyboard_mapper.get_command(InputEventType.KEY_RELEASE, symbol)
++        if command:
++            command.execute(window)
++            return True
++        return False
++    
++    def handle_mouse_release_seeking(self, window: Any, x: float, y: float, button: int, modifiers: int) -> bool:
++        """Handle mouse release to stop seeking. Returns True if seeking was active."""
++        is_seeking = (
++            getattr(window, 'is_forwarding', False) or 
++            getattr(window, 'is_rewinding', False)
++        )
++        
++        if is_seeking:
++            self._stop_seeking_command.execute(window)
++            return True
++        return False
++
++
++class RaceControlsCommandAdapter:
++    """Adapter that provides commands for the RaceControlsComponent mouse interactions."""
++    
++    def __init__(self):
++        self._play_pause = PlayPauseCommand()
++        self._start_rewind = StartRewindCommand()
++        self._start_forward = StartForwardCommand()
++        self._increase_speed = IncreaseSpeedCommand()
++        self._decrease_speed = DecreaseSpeedCommand()
++    
++    def execute_play_pause(self, window: Any) -> None:
++        self._play_pause.execute(window)
++    
++    def execute_start_rewind(self, window: Any) -> None:
++        self._start_rewind.execute(window)
++    
++    def execute_start_forward(self, window: Any) -> None:
++        self._start_forward.execute(window)
++    
++    def execute_increase_speed(self, window: Any) -> None:
++        self._increase_speed.execute(window)
++    
++    def execute_decrease_speed(self, window: Any) -> None:
++        self._decrease_speed.execute(window)
+diff --git a/src/commands/playback.py b/src/commands/playback.py
+new file mode 100644
+index 0000000..8cccf92
+--- /dev/null
++++ b/src/commands/playback.py
+@@ -0,0 +1,127 @@
++from typing import Any, List
++from .base import Command
++
++PLAYBACK_SPEEDS: List[float] = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
++
++
++class PlaybackCommand(Command):
++    """Base class for playback-related commands."""
++    
++    def _broadcast_telemetry(self, window: Any) -> None:
++        if hasattr(window, '_broadcast_telemetry_state'):
++            window._broadcast_telemetry_state()
++    
++    def _flash_button(self, window: Any, button_name: str) -> None:
++        if hasattr(window, 'race_controls_comp') and window.race_controls_comp:
++            window.race_controls_comp.flash_button(button_name)
++
++
++class PlayPauseCommand(PlaybackCommand):
++    """Toggle play/pause state."""
++    
++    def execute(self, window: Any) -> None:
++        window.paused = not getattr(window, 'paused', False)
++        self._broadcast_telemetry(window)
++        self._flash_button(window, 'play_pause')
++
++
++class StartRewindCommand(PlaybackCommand):
++    """Start rewinding (hold-to-rewind behavior)."""
++    
++    def execute(self, window: Any) -> None:
++        window.was_paused_before_hold = getattr(window, 'paused', False)
++        window.is_rewinding = True
++        window.paused = True
++
++
++class StopRewindCommand(PlaybackCommand):
++    """Stop rewinding and restore previous pause state."""
++    
++    def execute(self, window: Any) -> None:
++        window.is_rewinding = False
++        window.paused = getattr(window, 'was_paused_before_hold', False)
++
++
++class StartForwardCommand(PlaybackCommand):
++    """Start fast-forwarding (hold-to-forward behavior)."""
++    
++    def execute(self, window: Any) -> None:
++        window.was_paused_before_hold = getattr(window, 'paused', False)
++        window.is_forwarding = True
++        window.paused = True
++
++
++class StopForwardCommand(PlaybackCommand):
++    """Stop fast-forwarding and restore previous pause state."""
++    
++    def execute(self, window: Any) -> None:
++        window.is_forwarding = False
++        window.paused = getattr(window, 'was_paused_before_hold', False)
++
++
++class IncreaseSpeedCommand(PlaybackCommand):
++    """Increase playback speed to next level."""
++    
++    def execute(self, window: Any) -> None:
++        current_speed = getattr(window, 'playback_speed', 1.0)
++        if current_speed < PLAYBACK_SPEEDS[-1]:
++            for speed in PLAYBACK_SPEEDS:
++                if speed > current_speed:
++                    window.playback_speed = speed
++                    break
++        self._broadcast_telemetry(window)
++        self._flash_button(window, 'speed_increase')
++
++
++class DecreaseSpeedCommand(PlaybackCommand):
++    """Decrease playback speed to previous level."""
++    
++    def execute(self, window: Any) -> None:
++        current_speed = getattr(window, 'playback_speed', 1.0)
++        if current_speed > PLAYBACK_SPEEDS[0]:
++            for speed in reversed(PLAYBACK_SPEEDS):
++                if speed < current_speed:
++                    window.playback_speed = speed
++                    break
++        self._broadcast_telemetry(window)
++        self._flash_button(window, 'speed_decrease')
++
++
++class SetSpeedCommand(PlaybackCommand):
++    """Set playback speed to a specific value."""
++    
++    def __init__(self, speed: float):
++        self._speed = speed
++    
++    def execute(self, window: Any) -> None:
++        window.playback_speed = self._speed
++        self._broadcast_telemetry(window)
++        button = 'speed_increase' if self._speed > 1.0 else 'speed_decrease'
++        self._flash_button(window, button)
++
++
++class RestartCommand(PlaybackCommand):
++    """Restart playback from the beginning."""
++    
++    def execute(self, window: Any) -> None:
++        window.frame_index = 0.0
++        window.playback_speed = 1.0
++        self._broadcast_telemetry(window)
++        
++        if hasattr(window, 'degradation_integrator') and window.degradation_integrator:
++            window.degradation_integrator.clear_cache()
++        
++        self._flash_button(window, 'rewind')
++
++
++class StopSeekingCommand(PlaybackCommand):
++    """Stop any active seeking (rewind or forward) and restore pause state."""
++    
++    def execute(self, window: Any) -> None:
++        is_forwarding = getattr(window, 'is_forwarding', False)
++        is_rewinding = getattr(window, 'is_rewinding', False)
++        
++        if is_forwarding or is_rewinding:
++            window.is_forwarding = False
++            window.is_rewinding = False
++            window.paused = getattr(window, 'was_paused_before_hold', False)
+diff --git a/src/commands/ui.py b/src/commands/ui.py
+new file mode 100644
+index 0000000..1500328
+--- /dev/null
++++ b/src/commands/ui.py
+@@ -0,0 +1,53 @@
++from typing import Any
++from .base import Command
++
++
++class ToggleDrsZonesCommand(Command):
++    """Toggle DRS zones visibility on track."""
++    
++    def execute(self, window: Any) -> None:
++        window.toggle_drs_zones = not getattr(window, 'toggle_drs_zones', True)
++
++
++class ToggleDriverLabelsCommand(Command):
++    """Toggle driver labels visibility on track."""
++    
++    def execute(self, window: Any) -> None:
++        window.show_driver_labels = not getattr(window, 'show_driver_labels', False)
++
++
++class ToggleHelpPopupCommand(Command):
++    """Toggle help/controls popup visibility."""
++    
++    def execute(self, window: Any) -> None:
++        popup = getattr(window, 'controls_popup_comp', None)
++        if not popup:
++            return
++        
++        margin_x = 20
++        margin_y = 20
++        left_pos = float(margin_x)
++        top_pos = float(margin_y + popup.height)
++        
++        if popup.visible:
++            popup.hide()
++        else:
++            popup.show_over(left_pos, top_pos)
++
++
++class ToggleProgressBarCommand(Command):
++    """Toggle progress bar visibility."""
++    
++    def execute(self, window: Any) -> None:
++        progress_bar = getattr(window, 'progress_bar_comp', None)
++        if progress_bar:
++            progress_bar.toggle_visibility()
++
++
++class ToggleSessionInfoCommand(Command):
++    """Toggle session info banner visibility."""
++    
++    def execute(self, window: Any) -> None:
++        session_info = getattr(window, 'session_info_comp', None)
++        if session_info:
++            session_info.toggle_visibility()
+diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
+index f44af73..4d7db55 100644
+--- a/src/interfaces/race_replay.py
++++ b/src/interfaces/race_replay.py
+@@ -11,20 +11,21 @@ from src.ui_components import (
+     RaceProgressBarComponent,
+     RaceControlsComponent,
+     ControlsPopupComponent,
+     SessionInfoComponent,
+     extract_race_events,
+     build_track_from_example_lap,
+     draw_finish_line
+ )
+ from src.tyre_degradation_integration import TyreDegradationIntegrator
+ from src.services.stream import TelemetryStreamServer
++from src.commands import InputHandler
+ 
+ 
+ SCREEN_WIDTH = 1280
+ SCREEN_HEIGHT = 720
+ SCREEN_TITLE = "F1 Race Replay"
+ PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+ 
+ class F1RaceReplayWindow(arcade.Window):
+     def __init__(self, frames, track_statuses, example_lap, drivers, title,
+                  playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
+@@ -129,20 +130,22 @@ class F1RaceReplayWindow(arcade.Window):
+                 year=session_info.get('year'),
+                 round_num=session_info.get('round'),
+                 date=session_info.get('date', ''),
+                 total_laps=total_laps
+             )
+ 
+         self.is_rewinding = False
+         self.is_forwarding = False
+         self.was_paused_before_hold = False
+         
++        self._input_handler = InputHandler()
++        
+         # Extract race events for the progress bar
+         race_events = extract_race_events(frames, track_statuses, total_laps or 0)
+         self.progress_bar_comp.set_race_data(
+             total_frames=len(frames),
+             total_laps=total_laps or 0,
+             events=race_events
+         )
+ 
+         # Build track geometry (Raw World Coordinates)
+         (self.plot_x_ref, self.plot_y_ref,
+@@ -642,110 +645,27 @@ class F1RaceReplayWindow(arcade.Window):
+ 
+         self.frame_index += delta_time * FPS * self.playback_speed
+         
+         if self.frame_index >= self.n_frames:
+             self.frame_index = float(self.n_frames - 1)
+             
+         # Broadcast telemetry state during playback
+         self._broadcast_telemetry_state()
+ 
+     def on_key_press(self, symbol: int, modifiers: int):
+-        # Allow ESC to close window at any time
+-        if symbol == arcade.key.ESCAPE:
+-            arcade.close_window()
+-            return
+-        if symbol == arcade.key.SPACE:
+-            self.paused = not self.paused
+-            self._broadcast_telemetry_state()
+-            self.race_controls_comp.flash_button('play_pause')
+-        elif symbol == arcade.key.RIGHT:
+-            self.was_paused_before_hold = self.paused
+-            self.is_forwarding = True
+-            self.paused = True
+-        elif symbol == arcade.key.LEFT:
+-            self.was_paused_before_hold = self.paused
+-            self.is_rewinding = True
+-            self.paused = True
+-        elif symbol == arcade.key.UP:
+-            if self.playback_speed < PLAYBACK_SPEEDS[-1]:
+-                # Increase to next higher speed
+-                for spd in PLAYBACK_SPEEDS:
+-                    if spd > self.playback_speed:
+-                        self.playback_speed = spd
+-                        self._broadcast_telemetry_state()
+-                        break
+-            self.race_controls_comp.flash_button('speed_increase')
+-        elif symbol == arcade.key.DOWN:
+-            if self.playback_speed > PLAYBACK_SPEEDS[0]:
+-                # Decrease to next lower speed
+-                for spd in reversed(PLAYBACK_SPEEDS):
+-                    if spd < self.playback_speed:
+-                        self.playback_speed = spd
+-                        self._broadcast_telemetry_state()
+-                        break
+-            self.race_controls_comp.flash_button('speed_decrease')
+-        elif symbol == arcade.key.KEY_1:
+-            self.playback_speed = 0.5
+-            self._broadcast_telemetry_state()
+-            self.race_controls_comp.flash_button('speed_decrease')
+-        elif symbol == arcade.key.KEY_2:
+-            self.playback_speed = 1.0
+-            self._broadcast_telemetry_state()
+-            self.race_controls_comp.flash_button('speed_decrease')
+-        elif symbol == arcade.key.KEY_3:
+-            self.playback_speed = 2.0
+-            self._broadcast_telemetry_state()
+-            self.race_controls_comp.flash_button('speed_increase')
+-        elif symbol == arcade.key.KEY_4:
+-            self.playback_speed = 4.0
+-            self._broadcast_telemetry_state()
+-            self.race_controls_comp.flash_button('speed_increase')
+-        elif symbol == arcade.key.R:
+-            self.frame_index = 0.0
+-            self.playback_speed = 1.0
+-            self._broadcast_telemetry_state()
+-            # Clear degradation cache on restart
+-            if self.degradation_integrator:
+-                self.degradation_integrator.clear_cache()
+-            self.race_controls_comp.flash_button('rewind')
+-        elif symbol == arcade.key.D:
+-            self.toggle_drs_zones = not self.toggle_drs_zones
+-        elif symbol == arcade.key.L:
+-            self.show_driver_labels = not self.show_driver_labels
+-        elif symbol == arcade.key.H:
+-            # Toggle Controls popup with 'H' key — show anchored to bottom-left with 20px margin
+-            margin_x = 20
+-            margin_y = 20
+-            left_pos = float(margin_x)
+-            top_pos = float(margin_y + self.controls_popup_comp.height)
+-            if self.controls_popup_comp.visible:
+-                self.controls_popup_comp.hide()
+-            else:
+-                self.controls_popup_comp.show_over(left_pos, top_pos)
+-        elif symbol == arcade.key.B:
+-            self.progress_bar_comp.toggle_visibility() # toggle progress bar visibility
+-        elif symbol == arcade.key.I:
+-            self.session_info_comp.toggle_visibility() # toggle session info banner
++        self._input_handler.handle_key_press(self, symbol, modifiers)
+ 
+     def on_key_release(self, symbol: int, modifiers: int):
+-        if symbol == arcade.key.RIGHT:
+-            self.is_forwarding = False
+-            self.paused = self.was_paused_before_hold
+-        elif symbol == arcade.key.LEFT:
+-            self.is_rewinding = False
+-            self.paused = self.was_paused_before_hold
++        self._input_handler.handle_key_release(self, symbol, modifiers)
+ 
+     def on_mouse_release(self, x: float, y: float, button: int, modifiers: int):
+-        if self.is_forwarding or self.is_rewinding:
+-            self.is_forwarding = False
+-            self.is_rewinding = False
+-            self.paused = self.was_paused_before_hold
++        self._input_handler.handle_mouse_release_seeking(self, x, y, button, modifiers)
+ 
+     def on_mouse_press(self, x: float, y: float, button: int, modifiers: int):
+         # forward to components; stop at first that handled it
+         if self.controls_popup_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.race_controls_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.progress_bar_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.leaderboard_comp.on_mouse_press(self, x, y, button, modifiers):
+diff --git a/src/ui_components.py b/src/ui_components.py
+index 9a40b47..c7bce4b 100644
+--- a/src/ui_components.py
++++ b/src/ui_components.py
+@@ -2,20 +2,21 @@ import arcade
+ from typing import List, Literal, Tuple, Optional
+ from typing import Sequence, Optional, Tuple
+ from src.lib.time import format_time
+ import numpy as np
+ import pandas as pd
+ import os
+ from src.tyre_degradation_integration import (
+     format_tyre_health_bar, 
+     format_degradation_text
+ )
++from src.commands import RaceControlsCommandAdapter
+ 
+ def _format_wind_direction(degrees: Optional[float]) -> str:
+   if degrees is None:
+       return "N/A"
+   deg_norm = degrees % 360
+   dirs = [
+       "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+       "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+   ]
+   idx = int((deg_norm / 22.5) + 0.5) % len(dirs)
+@@ -1625,33 +1626,33 @@ class RaceProgressBarComponent(BaseComponent):
+         return False
+ 
+ # Feature: control race playback (play/pause, speed control, rewind/fast-forward)
+ class RaceControlsComponent(BaseComponent):
+     """
+     A visual component with playback control buttons:
+     - Rewind button (left)
+     - Play/Pause button (center)
+     - Forward button (right)
+     """
+-    
+-    PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+ 
+     def __init__(self, center_x: int = 100, center_y: int = 60, button_size: int = 40, visible=True):
+         self.center_x = center_x
+         self.center_y = center_y
+         self.button_size = button_size
+         self.button_spacing = 70
+         self.speed_container_offset = 200
+         self._hide_speed_text = False
+         self._control_textures = {}
+         self._visible = visible
+         
++        self._command_adapter = RaceControlsCommandAdapter()
++        
+         # Button rectangles for hit testing
+         self.rewind_rect = None
+         self.play_pause_rect = None
+         self.forward_rect = None
+         self.speed_increase_rect = None
+         self.speed_decrease_rect = None
+         
+         # Hover state
+         self.hover_button = None  # 'rewind/forward', 'play/pause', 'speed_increase', 'speed_decrease'
+         # Flash feedback state for keyboard shortcuts
+@@ -1862,56 +1863,33 @@ class RaceControlsComponent(BaseComponent):
+             self.hover_button = 'speed_increase'
+         elif self._point_in_rect(x, y, self.speed_decrease_rect):
+             self.hover_button = 'speed_decrease'
+         else:
+             self.hover_button = None
+         return False
+     
+     def on_mouse_press(self, window, x: float, y: float, button: int, modifiers: int):
+         """Handle button clicks."""
+         if self._point_in_rect(x, y, self.rewind_rect):
+-            # Update: Support hold-to-rewind
+-            if hasattr(window, 'is_rewinding'):
+-                window.was_paused_before_hold = window.paused
+-                window.is_rewinding = True
+-                window.paused = True
+-            elif hasattr(window, 'frame_index'):
+-                window.frame_index = int(max(0, window.frame_index - 10))
++            self._command_adapter.execute_start_rewind(window)
+             return True
+         elif self._point_in_rect(x, y, self.play_pause_rect):
+-            if hasattr(window, 'paused'):
+-                window.paused = not window.paused
++            self._command_adapter.execute_play_pause(window)
+             return True
+         elif self._point_in_rect(x, y, self.forward_rect):
+-            # Update: Support hold-to-forward
+-            if hasattr(window, 'is_forwarding'):
+-                window.was_paused_before_hold = window.paused
+-                window.is_forwarding = True
+-                window.paused = True
+-            elif hasattr(window, 'frame_index') and hasattr(window, 'n_frames'):
+-                window.frame_index = int(min(window.n_frames - 1, window.frame_index + 10))
++            self._command_adapter.execute_start_forward(window)
+             return True
+         elif self._point_in_rect(x, y, self.speed_increase_rect):
+-            if hasattr(window, 'playback_speed'):
+-                # FIX: Use index lookup to increment speed.
+-                if window.playback_speed < max(self.PLAYBACK_SPEEDS):
+-                    current_index = self.PLAYBACK_SPEEDS.index(window.playback_speed)
+-                    window.playback_speed = self.PLAYBACK_SPEEDS[min(current_index + 1, len(self.PLAYBACK_SPEEDS) - 1)]
+-                    self.flash_button('speed_increase')
++            self._command_adapter.execute_increase_speed(window)
+             return True
+         elif self._point_in_rect(x, y, self.speed_decrease_rect):
+-            if hasattr(window, 'playback_speed'):
+-                # FIX: Use index lookup to decrement speed safely within defined PLAYBACK_SPEEDS.
+-                if window.playback_speed > min(self.PLAYBACK_SPEEDS):
+-                    current_index = self.PLAYBACK_SPEEDS.index(window.playback_speed)
+-                    window.playback_speed = self.PLAYBACK_SPEEDS[max(0, current_index - 1)]
+-                    self.flash_button('speed_decrease')
++            self._command_adapter.execute_decrease_speed(window)
+             return True
+         return False
+     
+     def _point_in_rect(self, x: float, y: float, rect: tuple[float, float, float, float] | None) -> bool:
+         """Check if point is inside rectangle."""
+         if rect is None:
+             return False
+         left, bottom, right, top = rect
+         return left <= x <= right and bottom <= y <= top
+ 
+diff --git a/tests/test_commands.py b/tests/test_commands.py
+new file mode 100644
+index 0000000..6be104b
+--- /dev/null
++++ b/tests/test_commands.py
+@@ -0,0 +1,170 @@
++import sys
++import os
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++class MockArcade:
++    class key:
++        ESCAPE = 65307
++        SPACE = 32
++        RIGHT = 65363
++        LEFT = 65361
++        UP = 65362
++        DOWN = 65364
++        KEY_1 = 49
++        KEY_2 = 50
++        KEY_3 = 51
++        KEY_4 = 52
++        R = 114
++        D = 100
++        L = 108
++        H = 104
++        B = 98
++        I = 105
++    
++    @staticmethod
++    def close_window():
++        pass
++
++sys.modules['arcade'] = MockArcade()
++
++from src.commands import (
++    Command,
++    PlayPauseCommand,
++    StartRewindCommand,
++    StopRewindCommand,
++    StartForwardCommand,
++    StopForwardCommand,
++    IncreaseSpeedCommand,
++    DecreaseSpeedCommand,
++    SetSpeedCommand,
++    RestartCommand,
++    ToggleDrsZonesCommand,
++    InputHandler,
++    RaceControlsCommandAdapter,
++)
++
++
++class MockWindow:
++    def __init__(self):
++        self.paused = False
++        self.is_rewinding = False
++        self.is_forwarding = False
++        self.was_paused_before_hold = False
++        self.playback_speed = 1.0
++        self.frame_index = 100.0
++        self.toggle_drs_zones = True
++        self.show_driver_labels = False
++        self.race_controls_comp = MockRaceControls()
++        self.degradation_integrator = None
++    
++    def _broadcast_telemetry_state(self):
++        pass
++
++
++class MockRaceControls:
++    def __init__(self):
++        self.flashed_buttons = []
++    
++    def flash_button(self, name):
++        self.flashed_buttons.append(name)
++
++
++def test_play_pause_command():
++    window = MockWindow()
++    command = PlayPauseCommand()
++    
++    assert window.paused == False
++    command.execute(window)
++    assert window.paused == True
++    command.execute(window)
++    assert window.paused == False
++
++
++def test_rewind_commands():
++    window = MockWindow()
++    
++    start = StartRewindCommand()
++    stop = StopRewindCommand()
++    
++    start.execute(window)
++    assert window.is_rewinding == True
++    assert window.paused == True
++    
++    stop.execute(window)
++    assert window.is_rewinding == False
++
++
++def test_speed_commands():
++    window = MockWindow()
++    
++    increase = IncreaseSpeedCommand()
++    decrease = DecreaseSpeedCommand()
++    
++    increase.execute(window)
++    assert window.playback_speed == 2.0
++    
++    increase.execute(window)
++    assert window.playback_speed == 4.0
++    
++    decrease.execute(window)
++    assert window.playback_speed == 2.0
++
++
++def test_set_speed_command():
++    window = MockWindow()
++    
++    command = SetSpeedCommand(4.0)
++    command.execute(window)
++    assert window.playback_speed == 4.0
++
++
++def test_restart_command():
++    window = MockWindow()
++    
++    command = RestartCommand()
++    command.execute(window)
++    
++    assert window.frame_index == 0.0
++    assert window.playback_speed == 1.0
++
++
++def test_toggle_drs_zones():
++    window = MockWindow()
++    
++    command = ToggleDrsZonesCommand()
++    
++    assert window.toggle_drs_zones == True
++    command.execute(window)
++    assert window.toggle_drs_zones == False
++
++
++def test_input_handler():
++    handler = InputHandler()
++    window = MockWindow()
++    
++    handler.handle_key_press(window, MockArcade.key.SPACE, 0)
++    assert window.paused == True
++
++
++def test_command_adapter():
++    adapter = RaceControlsCommandAdapter()
++    window = MockWindow()
++    
++    adapter.execute_play_pause(window)
++    assert window.paused == True
++    
++    adapter.execute_start_rewind(window)
++    assert window.is_rewinding == True
++
++
++if __name__ == "__main__":
++    test_play_pause_command()
++    test_rewind_commands()
++    test_speed_commands()
++    test_set_speed_command()
++    test_restart_command()
++    test_toggle_drs_zones()
++    test_input_handler()
++    test_command_adapter()
++    print("All tests passed!")
