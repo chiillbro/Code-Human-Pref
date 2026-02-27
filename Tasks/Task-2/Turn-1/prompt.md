@@ -1,0 +1,1 @@
+Hey, I want you to add a session info banner to the race reply view, so basically, what I mean is, to add a ui component that shows session metadata, right now, this info only shows in the window title which is very easy to miss, so, can you please implement this with best practices

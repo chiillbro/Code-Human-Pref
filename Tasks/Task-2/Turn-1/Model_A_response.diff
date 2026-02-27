@@ -1,0 +1,442 @@
+diff --git a/main.py b/main.py
+index c45d6cb..bd38f78 100644
+--- a/main.py
++++ b/main.py
+@@ -77,23 +77,24 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
+     run_arcade_replay(
+       frames=race_telemetry['frames'],
+       track_statuses=race_telemetry['track_statuses'],
+       example_lap=example_lap,
+       drivers=drivers,
+       playback_speed=playback_speed,
+       driver_colors=race_telemetry['driver_colors'],
+       title=f"{session.event['EventName']} - {'Sprint' if session_type == 'S' else 'Race'}",
+       total_laps=race_telemetry['total_laps'],
+       circuit_rotation=circuit_rotation,
+-      visible_hud=visible_hud
+-      ,ready_file=ready_file,
+-      session=session
++      visible_hud=visible_hud,
++      ready_file=ready_file,
++      session=session,
++      session_type=session_type,
+     )
+ 
+ if __name__ == "__main__":
+ 
+   if "--gui" in sys.argv:
+     app = QApplication(sys.argv)
+     win = RaceSelectionWindow()
+     win.show()
+     sys.exit(app.exec())
+ 
+diff --git a/src/arcade_replay.py b/src/arcade_replay.py
+index 905321e..8c486ad 100644
+--- a/src/arcade_replay.py
++++ b/src/arcade_replay.py
+@@ -1,30 +1,31 @@
+ import os
+ import arcade
+ from src.interfaces.race_replay import F1RaceReplayWindow
+ 
+ def run_arcade_replay(frames, track_statuses, example_lap, drivers, title,
+                       playback_speed=1.0, driver_colors=None, circuit_rotation=0.0, total_laps=None,
+-                      visible_hud=True, ready_file=None, session=None):
++                      visible_hud=True, ready_file=None, session=None, session_type='R'):
+     window = F1RaceReplayWindow(
+     frames=frames,
+     track_statuses=track_statuses,
+     example_lap=example_lap,
+     drivers=drivers,
+     title=title,
+     playback_speed=playback_speed,
+     driver_colors=driver_colors,
+     circuit_rotation=circuit_rotation,
+     left_ui_margin=340,
+     right_ui_margin=260,
+     total_laps=total_laps,
+     visible_hud=visible_hud,
+-    session=session  
++    session=session,
++    session_type=session_type,
+     )
+     # Signal readiness to parent process (if requested) after window created
+     if ready_file:
+         try:
+             with open(ready_file, 'w') as f:
+                 f.write('ready')
+         except Exception:
+             pass
+     arcade.run()
+\ No newline at end of file
+diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
+index 6c3f4bc..ea12f8f 100644
+--- a/src/interfaces/race_replay.py
++++ b/src/interfaces/race_replay.py
+@@ -3,39 +3,45 @@ import arcade
+ import numpy as np
+ from src.f1_data import FPS
+ from src.ui_components import (
+     LeaderboardComponent, 
+     WeatherComponent, 
+     LegendComponent, 
+     DriverInfoComponent, 
+     RaceProgressBarComponent,
+     RaceControlsComponent,
+     ControlsPopupComponent,
++    SessionInfoBannerComponent,
++    SessionInfo,
+     extract_race_events,
+     build_track_from_example_lap,
+     draw_finish_line
+ )
+ from src.tyre_degradation_integration import TyreDegradationIntegrator
+ 
+ 
+ SCREEN_WIDTH = 1280
+ SCREEN_HEIGHT = 720
+ SCREEN_TITLE = "F1 Race Replay"
+ PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+ 
+ class F1RaceReplayWindow(arcade.Window):
+     def __init__(self, frames, track_statuses, example_lap, drivers, title,
+              playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
+-             left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True, session=None):
++             left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True, session=None,
++             session_type='R'):
+         # Set resizable to True so the user can adjust mid-sim
+         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
+         self.maximize()
++        
++        # Store session type for banner
++        self._session_type = session_type
+ 
+         self.frames = frames
+         self.track_statuses = track_statuses
+         self.n_frames = len(frames)
+         self.drivers = list(drivers)
+         self.playback_speed = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.index(playback_speed)] if playback_speed in PLAYBACK_SPEEDS else 1.0
+         self.driver_colors = driver_colors or {}
+         self.frame_index = 0.0  # use float for fractional-frame accumulation
+         self.paused = False
+         self.total_laps = total_laps
+@@ -54,20 +60,33 @@ class F1RaceReplayWindow(arcade.Window):
+         # UI components
+         leaderboard_x = max(20, self.width - self.right_ui_margin + 12)
+         self.leaderboard_comp = LeaderboardComponent(x=leaderboard_x, width=240, visible=visible_hud)
+         self.weather_comp = WeatherComponent(left=20, top_offset=170, visible=visible_hud)
+         self.legend_comp = LegendComponent(x=max(12, self.left_ui_margin - 320), visible=visible_hud)
+         self.driver_info_comp = DriverInfoComponent(left=20, width=300)
+         self.controls_popup_comp = ControlsPopupComponent()
+ 
+         self.controls_popup_comp.set_size(340, 230) # width/height of the popup box
+         self.controls_popup_comp.set_font_sizes(header_font_size=16, body_font_size=13) # adjust font sizes
++        
++        # Session info banner component
++        session_info = None
++        if session is not None:
++            try:
++                session_info = SessionInfo.from_fastf1_session(session, self._session_type)
++            except Exception as e:
++                print(f"Could not extract session info: {e}")
++        self.session_info_banner = SessionInfoBannerComponent(
++            session_info=session_info,
++            top_margin=10,
++        )
++        
+         self.degradation_integrator = None
+         if session is not None:
+             try:
+                 print("Initializing tyre degradation model...")
+                 self.degradation_integrator = TyreDegradationIntegrator(session=session)
+                 
+                 # This computes curves once at startup (1-2 seconds)
+                 init_success = self.degradation_integrator.initialize_from_session()
+                 
+                 if init_success:
+@@ -255,21 +274,21 @@ class F1RaceReplayWindow(arcade.Window):
+         # Update the polyline screen coordinates based on new scale
+         self.screen_inner_points = [self.world_to_screen(x, y) for x, y in self.world_inner_points]
+         self.screen_outer_points = [self.world_to_screen(x, y) for x, y in self.world_outer_points]
+ 
+     def on_resize(self, width, height):
+         """Called automatically by Arcade when window is resized."""
+         super().on_resize(width, height)
+         self.update_scaling(width, height)
+         # notify components
+         self.leaderboard_comp.x = max(20, self.width - self.right_ui_margin + 12)
+-        for c in (self.leaderboard_comp, self.weather_comp, self.legend_comp, self.driver_info_comp, self.progress_bar_comp, self.race_controls_comp):
++        for c in (self.leaderboard_comp, self.weather_comp, self.legend_comp, self.driver_info_comp, self.progress_bar_comp, self.race_controls_comp, self.session_info_banner):
+             c.on_resize(self)
+         
+         # update persistent text positions
+         self.lap_text.x = 20
+         self.lap_text.y = self.height - 40
+         self.time_text.x = 20
+         self.time_text.y = self.height - 80
+         self.status_text.x = 20
+         self.status_text.y = self.height - 120
+ 
+@@ -451,20 +470,23 @@ class F1RaceReplayWindow(arcade.Window):
+         for code, pos in frame["drivers"].items():
+             color = self.driver_colors.get(code, arcade.color.WHITE)
+             progress_m = driver_progress.get(code, float(pos.get("dist", 0.0)))
+             driver_list.append((code, color, pos, progress_m))
+         driver_list.sort(key=lambda x: x[3], reverse=True)
+         self.leaderboard_comp.set_entries(driver_list)
+         self.leaderboard_comp.draw(self)
+         # expose rects for existing hit test compatibility if needed
+         self.leaderboard_rects = self.leaderboard_comp.rects
+ 
++        # Session info banner - Top Center
++        self.session_info_banner.draw(self)
++
+         # Controls Legend - Bottom Left (keeps small offset from left UI edge)
+         self.legend_comp.draw(self)
+         
+         # Selected driver info component
+         self.driver_info_comp.draw(self)
+         
+         # Race Progress Bar with event markers (DNF, flags, leader changes)
+         self.progress_bar_comp.draw(self)
+         
+         # Race playback control buttons
+diff --git a/src/ui_components.py b/src/ui_components.py
+index 605c7c5..f8ed8d2 100644
+--- a/src/ui_components.py
++++ b/src/ui_components.py
+@@ -1,37 +1,234 @@
++from __future__ import annotations
+ import arcade
+ from typing import List, Literal, Tuple, Optional
+ from typing import Sequence, Optional, Tuple
+ from src.lib.time import format_time
+ import numpy as np
+ import os
+ from src.tyre_degradation_integration import (
+     format_tyre_health_bar, 
+     format_degradation_text
+ )
+ 
++
++class SessionInfo:
++    """Session metadata container for the banner component."""
++    
++    def __init__(
++        self,
++        event_name: str,
++        session_type: str,
++        year: int,
++        round_number: int,
++        country: Optional[str] = None,
++        circuit_name: Optional[str] = None,
++    ):
++        self.event_name = event_name
++        self.session_type = session_type
++        self.year = year
++        self.round_number = round_number
++        self.country = country
++        self.circuit_name = circuit_name
++    
++    @property
++    def session_type_display(self) -> str:
++        """Human-readable session type."""
++        type_map = {
++            'R': 'Race',
++            'S': 'Sprint',
++            'Q': 'Qualifying',
++            'SQ': 'Sprint Qualifying',
++            'FP1': 'Practice 1',
++            'FP2': 'Practice 2',
++            'FP3': 'Practice 3',
++        }
++        return type_map.get(self.session_type, self.session_type)
++    
++    @classmethod
++    def from_fastf1_session(cls, session, session_type: str) -> 'SessionInfo':
++        """Create SessionInfo from a fastf1 session object."""
++        event = session.event
++        year = 2024
++        event_date = event.get('EventDate', None)
++        if event_date is not None and hasattr(event_date, 'year'):
++            year = int(event_date.year)
++        
++        return cls(
++            event_name=event.get('EventName', 'Unknown Event'),
++            session_type=session_type,
++            year=year,
++            round_number=int(event.get('RoundNumber', 0)),
++            country=event.get('Country'),
++            circuit_name=event.get('Location'),
++        )
++
++
+ def _format_wind_direction(degrees: Optional[float]) -> str:
+   if degrees is None:
+       return "N/A"
+   deg_norm = degrees % 360
+   dirs = [
+       "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+       "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+   ]
+   idx = int((deg_norm / 22.5) + 0.5) % len(dirs)
+   return dirs[idx]
+ 
+ class BaseComponent:
+     def on_resize(self, window): pass
+     def draw(self, window): pass
+     def on_mouse_press(self, window, x: float, y: float, button: int, modifiers: int) -> bool: return False
+ 
++
++class SessionInfoBannerComponent(BaseComponent):
++    """
++    A banner component that displays session metadata at the top of the screen.
++    Shows event name, session type, year, and round number prominently.
++    """
++    
++    COLORS = {
++        "background": (20, 20, 20, 220),
++        "border": (200, 0, 0),
++        "title": (255, 255, 255),
++        "subtitle": (180, 180, 180),
++        "accent": (255, 24, 1),  # F1 red
++    }
++    
++    def __init__(
++        self,
++        session_info: Optional[SessionInfo] = None,
++        top_margin: int = 10,
++        title_font_size: int = 20,
++        subtitle_font_size: int = 12,
++        padding: int = 12,
++        min_width: int = 300,
++    ):
++        self.session_info = session_info
++        self.top_margin = top_margin
++        self.title_font_size = title_font_size
++        self.subtitle_font_size = subtitle_font_size
++        self.padding = padding
++        self.min_width = min_width
++        
++        self._visible = session_info is not None
++        self._center_x: Optional[float] = None
++        self._cached_title: Optional[arcade.Text] = None
++        self._cached_subtitle: Optional[arcade.Text] = None
++    
++    @property
++    def visible(self) -> bool:
++        return self._visible
++    
++    @visible.setter
++    def visible(self, value: bool):
++        self._visible = value
++    
++    def toggle_visibility(self) -> bool:
++        self._visible = not self._visible
++        return self._visible
++    
++    def set_session_info(self, session_info: Optional[SessionInfo]):
++        self.session_info = session_info
++        self._visible = session_info is not None
++        self._cached_title = None
++        self._cached_subtitle = None
++    
++    def _format_title_line(self) -> str:
++        if not self.session_info:
++            return ""
++        return f"{self.session_info.event_name} — {self.session_info.session_type_display}"
++    
++    def _format_subtitle_line(self) -> str:
++        if not self.session_info:
++            return ""
++        parts = [str(self.session_info.year), f"Round {self.session_info.round_number}"]
++        if self.session_info.country:
++            parts.append(self.session_info.country)
++        return " · ".join(parts)
++    
++    def on_resize(self, window):
++        self._center_x = window.width // 2
++        self._cached_title = None
++        self._cached_subtitle = None
++    
++    def draw(self, window):
++        if not self._visible or not self.session_info:
++            return
++        
++        if self._center_x is None:
++            self._center_x = window.width // 2
++        
++        title_text = self._format_title_line()
++        subtitle_text = self._format_subtitle_line()
++        
++        if self._cached_title is None:
++            self._cached_title = arcade.Text(
++                title_text,
++                self._center_x, 0,
++                self.COLORS["title"],
++                self.title_font_size,
++                anchor_x="center",
++                anchor_y="top",
++                bold=True,
++            )
++        else:
++            self._cached_title.text = title_text
++            self._cached_title.x = self._center_x
++        
++        if self._cached_subtitle is None:
++            self._cached_subtitle = arcade.Text(
++                subtitle_text,
++                self._center_x, 0,
++                self.COLORS["subtitle"],
++                self.subtitle_font_size,
++                anchor_x="center",
++                anchor_y="top",
++            )
++        else:
++            self._cached_subtitle.text = subtitle_text
++            self._cached_subtitle.x = self._center_x
++        
++        title_height = self.title_font_size + 4
++        subtitle_height = self.subtitle_font_size + 4
++        total_text_height = title_height + subtitle_height
++        banner_height = total_text_height + self.padding * 2
++        
++        title_width = self._cached_title.content_width
++        subtitle_width = self._cached_subtitle.content_width
++        content_width = max(title_width, subtitle_width)
++        banner_width = max(self.min_width, content_width + self.padding * 2)
++        
++        banner_top = window.height - self.top_margin
++        banner_center_y = banner_top - banner_height / 2
++        
++        # Draw background
++        bg_rect = arcade.XYWH(self._center_x, banner_center_y, banner_width, banner_height)
++        arcade.draw_rect_filled(bg_rect, self.COLORS["background"])
++        
++        # Draw accent line at top
++        accent_y = banner_top
++        arcade.draw_line(
++            self._center_x - banner_width / 2, accent_y,
++            self._center_x + banner_width / 2, accent_y,
++            self.COLORS["accent"], 3
++        )
++        
++        # Draw title
++        self._cached_title.y = banner_top - self.padding
++        self._cached_title.draw()
++        
++        # Draw subtitle
++        self._cached_subtitle.y = banner_top - self.padding - title_height
++        self._cached_subtitle.draw()
++
++
+ class LegendComponent(BaseComponent):
+     def __init__(self, x: int = 20, y: int = 220, visible=True): # Increased y to 220 to fit all lines
+         self.x = x
+         self.y = y
+         self._control_icons_textures = {}
+         self._visible = visible
+         # Load control icons from images/icons folder (all files)
+         icons_folder = os.path.join("images", "controls")
+         if os.path.exists(icons_folder):
+             for filename in os.listdir(icons_folder):

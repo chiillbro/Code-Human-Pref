@@ -1,0 +1,542 @@
+diff --git a/main.py b/main.py
+index c45d6cb..bd38f78 100644
+--- a/main.py
++++ b/main.py
+@@ -77,23 +77,24 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
+     run_arcade_replay(
+       frames=race_telemetry['frames'],
+       track_statuses=race_telemetry['track_statuses'],
+       example_lap=example_lap,
+       drivers=drivers,
+       playback_speed=playback_speed,
+       driver_colors=race_telemetry['driver_colors'],
+       title=f"{session.event['EventName']} - {'Sprint' if session_type == 'S' else 'Race'}",
+       total_laps=race_telemetry['total_laps'],
+       circuit_rotation=circuit_rotation,
+-      visible_hud=visible_hud
+-      ,ready_file=ready_file,
+-      session=session
++      visible_hud=visible_hud,
++      ready_file=ready_file,
++      session=session,
++      session_type=session_type,
+     )
+ 
+ if __name__ == "__main__":
+ 
+   if "--gui" in sys.argv:
+     app = QApplication(sys.argv)
+     win = RaceSelectionWindow()
+     win.show()
+     sys.exit(app.exec())
+ 
+diff --git a/src/arcade_replay.py b/src/arcade_replay.py
+index 905321e..83de399 100644
+--- a/src/arcade_replay.py
++++ b/src/arcade_replay.py
+@@ -1,30 +1,31 @@
+ import os
+ import arcade
+ from src.interfaces.race_replay import F1RaceReplayWindow
+ 
+ def run_arcade_replay(frames, track_statuses, example_lap, drivers, title,
+                       playback_speed=1.0, driver_colors=None, circuit_rotation=0.0, total_laps=None,
+-                      visible_hud=True, ready_file=None, session=None):
++                      visible_hud=True, ready_file=None, session=None, session_type=None):
+     window = F1RaceReplayWindow(
+     frames=frames,
+     track_statuses=track_statuses,
+     example_lap=example_lap,
+     drivers=drivers,
+     title=title,
+     playback_speed=playback_speed,
+     driver_colors=driver_colors,
+     circuit_rotation=circuit_rotation,
+     left_ui_margin=340,
+     right_ui_margin=260,
+     total_laps=total_laps,
+     visible_hud=visible_hud,
+-    session=session  
++    session=session,
++    session_type=session_type,
+     )
+     # Signal readiness to parent process (if requested) after window created
+     if ready_file:
+         try:
+             with open(ready_file, 'w') as f:
+                 f.write('ready')
+         except Exception:
+             pass
+     arcade.run()
+\ No newline at end of file
+diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
+index 6c3f4bc..f1db603 100644
+--- a/src/interfaces/race_replay.py
++++ b/src/interfaces/race_replay.py
+@@ -1,38 +1,41 @@
+ import os
+ import arcade
+ import numpy as np
+ from src.f1_data import FPS
+ from src.ui_components import (
+-    LeaderboardComponent, 
+-    WeatherComponent, 
+-    LegendComponent, 
+-    DriverInfoComponent, 
++    LeaderboardComponent,
++    WeatherComponent,
++    LegendComponent,
++    DriverInfoComponent,
+     RaceProgressBarComponent,
+     RaceControlsComponent,
+     ControlsPopupComponent,
++    SessionInfoBannerComponent,
+     extract_race_events,
+     build_track_from_example_lap,
++    build_session_info,
+     draw_finish_line
+ )
+ from src.tyre_degradation_integration import TyreDegradationIntegrator
+ 
+ 
+ SCREEN_WIDTH = 1280
+ SCREEN_HEIGHT = 720
+ SCREEN_TITLE = "F1 Race Replay"
+ PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+ 
+ class F1RaceReplayWindow(arcade.Window):
+     def __init__(self, frames, track_statuses, example_lap, drivers, title,
+              playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
+-             left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True, session=None):
++             left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
++             session=None, session_type=None):
+         # Set resizable to True so the user can adjust mid-sim
+         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
+         self.maximize()
+ 
+         self.frames = frames
+         self.track_statuses = track_statuses
+         self.n_frames = len(frames)
+         self.drivers = list(drivers)
+         self.playback_speed = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.index(playback_speed)] if playback_speed in PLAYBACK_SPEEDS else 1.0
+         self.driver_colors = driver_colors or {}
+@@ -54,20 +57,36 @@ class F1RaceReplayWindow(arcade.Window):
+         # UI components
+         leaderboard_x = max(20, self.width - self.right_ui_margin + 12)
+         self.leaderboard_comp = LeaderboardComponent(x=leaderboard_x, width=240, visible=visible_hud)
+         self.weather_comp = WeatherComponent(left=20, top_offset=170, visible=visible_hud)
+         self.legend_comp = LegendComponent(x=max(12, self.left_ui_margin - 320), visible=visible_hud)
+         self.driver_info_comp = DriverInfoComponent(left=20, width=300)
+         self.controls_popup_comp = ControlsPopupComponent()
+ 
+         self.controls_popup_comp.set_size(340, 230) # width/height of the popup box
+         self.controls_popup_comp.set_font_sizes(header_font_size=16, body_font_size=13) # adjust font sizes
++
++        # Session Info Banner — surfaces event / round / circuit / date at the
++        # top-centre of the track view so users can tell at a glance which
++        # session they are watching (previously only shown in the title bar).
++        # Metadata is extracted once here into a plain dict so the component
++        # stays decoupled from fastf1 and we never query ``session.event``
++        # during the render loop.
++        self.session_info_comp = SessionInfoBannerComponent(
++            left_margin=left_ui_margin,
++            right_margin=right_ui_margin,
++            visible=visible_hud,
++        )
++        self.session_info_comp.set_info(
++            build_session_info(session, session_type=session_type, fallback_title=title)
++        )
++
+         self.degradation_integrator = None
+         if session is not None:
+             try:
+                 print("Initializing tyre degradation model...")
+                 self.degradation_integrator = TyreDegradationIntegrator(session=session)
+                 
+                 # This computes curves once at startup (1-2 seconds)
+                 init_success = self.degradation_integrator.initialize_from_session()
+                 
+                 if init_success:
+@@ -255,21 +274,21 @@ class F1RaceReplayWindow(arcade.Window):
+         # Update the polyline screen coordinates based on new scale
+         self.screen_inner_points = [self.world_to_screen(x, y) for x, y in self.world_inner_points]
+         self.screen_outer_points = [self.world_to_screen(x, y) for x, y in self.world_outer_points]
+ 
+     def on_resize(self, width, height):
+         """Called automatically by Arcade when window is resized."""
+         super().on_resize(width, height)
+         self.update_scaling(width, height)
+         # notify components
+         self.leaderboard_comp.x = max(20, self.width - self.right_ui_margin + 12)
+-        for c in (self.leaderboard_comp, self.weather_comp, self.legend_comp, self.driver_info_comp, self.progress_bar_comp, self.race_controls_comp):
++        for c in (self.leaderboard_comp, self.weather_comp, self.legend_comp, self.driver_info_comp, self.progress_bar_comp, self.race_controls_comp, self.session_info_comp):
+             c.on_resize(self)
+         
+         # update persistent text positions
+         self.lap_text.x = 20
+         self.lap_text.y = self.height - 40
+         self.time_text.x = 20
+         self.time_text.y = self.height - 80
+         self.status_text.x = 20
+         self.status_text.y = self.height - 120
+ 
+@@ -432,20 +451,24 @@ class F1RaceReplayWindow(arcade.Window):
+                 self.status_text.color = arcade.color.ORANGE
+             elif current_track_status == "4":
+                 self.status_text.text = "SAFETY CAR"
+                 self.status_text.color = arcade.color.BROWN
+ 
+             self.lap_text.draw()
+             self.time_text.draw()
+             if self.status_text.text:
+                 self.status_text.draw()
+ 
++        # Session Info banner (top-centre, above the track) — draw before
++        # other overlays so popups / tooltips can still render on top of it.
++        self.session_info_comp.draw(self)
++
+         # Weather component (set info then draw)
+         weather_info = frame.get("weather") if frame else None
+         self.weather_comp.set_info(weather_info)
+         self.weather_comp.draw(self)
+         # optionally expose weather_bottom for driver info layout
+         self.weather_bottom = self.height - 170 - 130 if (weather_info or self.has_weather) else None
+ 
+         # Draw leaderboard via component
+         driver_list = []
+         for code, pos in frame["drivers"].items():
+diff --git a/src/ui_components.py b/src/ui_components.py
+index 605c7c5..1c650c1 100644
+--- a/src/ui_components.py
++++ b/src/ui_components.py
+@@ -134,20 +134,330 @@ class LegendComponent(BaseComponent):
+             # Draw the text line
+             self._text.text = line
+             self._text.x = self.x + (60 if icon_keys else 0)
+             base_y = self.y - (i * 25)
+             
+             if i == 0:
+                 base_y -= getattr(self, "controls_text_offset", 0)
+             self._text.y = base_y
+             self._text.draw()
+ 
++class SessionInfoBannerComponent(BaseComponent):
++    """
++    A top-center banner that surfaces session metadata (event name, round,
++    circuit, country, session type, date) so users can see at-a-glance which
++    session they are watching — previously this was only shown in the window
++    title bar, which is easy to miss.
++
++    Design notes / best practices applied:
++      - Inherits ``BaseComponent`` and follows the same visibility-toggle
++        pattern used by the other HUD components so it respects ``--no-hud``.
++      - Uses ``set_info()`` to accept a plain ``dict`` — the component is
++        decoupled from ``fastf1`` so it can be tested in isolation and the
++        window never holds on to the heavy ``session`` object just to render
++        a string.
++      - Pre-allocates ``arcade.Text`` objects once and mutates them each
++        frame (the same performance optimisation already applied to the
++        lap/time HUD text — see ``roadmap.md`` "Reducing Lag").
++      - Recomputes its anchor position in ``on_resize()`` so it stays centred
++        above the track between the left and right UI margins on any window
++        size.
++      - Content is pre-formatted once in ``set_info()`` (not every frame)
++        and the draw path is a no-op when no info has been provided.
++    """
++
++    # Colour palette kept subtle so the banner provides context without
++    # competing visually with live race data (leaderboard, flags, etc.).
++    COLORS = {
++        "background": (25, 25, 25, 200),
++        "border": (90, 90, 90),
++        "title": (255, 255, 255),
++        "detail": (185, 185, 185),
++    }
++
++    def __init__(self,
++                 left_margin: int = 340,
++                 right_margin: int = 260,
++                 top_offset: int = 10,
++                 height: int = 52,
++                 padding_x: int = 16,
++                 visible: bool = True):
++        """
++        Args:
++            left_margin: Pixels reserved on the left for the existing HUD
++                column — the banner centres itself in the remaining space.
++            right_margin: Pixels reserved on the right for the leaderboard.
++            top_offset: Gap between the top of the window and the banner.
++            height: Total height of the banner box (clamped to fit two rows
++                of text — title + detail line).
++            padding_x: Horizontal padding inside the banner box.
++            visible: Initial visibility; wired to the HUD visibility flag.
++        """
++        self.left_margin = left_margin
++        self.right_margin = right_margin
++        self.top_offset = top_offset
++        self.height = max(40, height)
++        self.padding_x = padding_x
++        self._visible: bool = visible
++
++        # Session metadata — ``None`` until ``set_info()`` is called.
++        self._info: Optional[dict] = None
++        # Pre-formatted strings — computed once in ``set_info()`` so the
++        # draw loop only mutates Text positions (fast path).
++        self._title_str: str = ""
++        self._detail_str: str = ""
++
++        # Cached layout — recalculated on resize.
++        self._center_x: float = 0.0
++        self._center_y: float = 0.0
++        self._bar_width: float = 0.0
++
++        # Persistent Text objects — allocate once, reuse every frame.
++        # The title is slightly larger and bold so the event name stands out;
++        # the detail row packs round / circuit / country / date on one line.
++        self._title_text = arcade.Text(
++            "", 0, 0, self.COLORS["title"], 16,
++            anchor_x="center", anchor_y="center", bold=True,
++        )
++        self._detail_text = arcade.Text(
++            "", 0, 0, self.COLORS["detail"], 12,
++            anchor_x="center", anchor_y="center",
++        )
++
++    # --- Visibility API (mirrors WeatherComponent / LeaderboardComponent) ---
++
++    @property
++    def visible(self) -> bool:
++        return self._visible
++
++    @visible.setter
++    def visible(self, value: bool):
++        self._visible = value
++
++    def toggle_visibility(self) -> bool:
++        """Toggle visibility and return the new state."""
++        self._visible = not self._visible
++        return self._visible
++
++    def set_visible(self):
++        """Force the banner to show (matches the existing HUD API)."""
++        self._visible = True
++
++    # --- Data injection -----------------------------------------------------
++
++    def set_info(self, info: Optional[dict]):
++        """
++        Accepts a plain dict of session metadata and pre-formats the two
++        banner lines. Keys are all optional and defensively stringified —
++        missing values are simply omitted rather than rendered as ``None``.
++
++        Expected keys (all optional):
++            - ``event_name``:  e.g. "British Grand Prix"
++            - ``session_name``: e.g. "Race", "Sprint", "Qualifying"
++            - ``round_number``: e.g. 12
++            - ``year``: e.g. 2025
++            - ``location``: e.g. "Silverstone"
++            - ``country``: e.g. "United Kingdom"
++            - ``date``: e.g. "2025-07-06" (pre-formatted string preferred)
++        """
++        self._info = info
++
++        if not info:
++            # Fall back to an empty banner — ``draw()`` will no-op.
++            self._title_str = ""
++            self._detail_str = ""
++            return
++
++        def _present(key):
++            v = info.get(key)
++            # Guard against pandas ``NaT`` / ``nan`` sneaking in from the
++            # event Series — the string ``"nan"``/``"NaT"`` should not be
++            # shown to the user.
++            if v is None:
++                return None
++            s = str(v).strip()
++            if not s or s.lower() in ("nan", "nat", "none"):
++                return None
++            return s
++
++        event_name = _present("event_name") or ""
++        session_name = _present("session_name")
++
++        # Title line: "<Event Name> — <Session>"
++        if event_name and session_name:
++            self._title_str = f"{event_name} — {session_name}"
++        else:
++            # Whichever is available, or the window title as a last resort.
++            self._title_str = event_name or session_name or (_present("title") or "")
++
++        # Detail line — join only the pieces that actually exist so the
++        # banner gracefully adapts to older fastf1 schemas / missing data.
++        detail_parts = []
++        year = _present("year")
++        rnd = _present("round_number")
++        if year and rnd:
++            detail_parts.append(f"Round {rnd} · {year}")
++        elif rnd:
++            detail_parts.append(f"Round {rnd}")
++        elif year:
++            detail_parts.append(year)
++
++        location = _present("location")
++        country = _present("country")
++        if location and country and location != country:
++            detail_parts.append(f"{location}, {country}")
++        elif location or country:
++            detail_parts.append(location or country)
++
++        date_str = _present("date")
++        if date_str:
++            detail_parts.append(date_str)
++
++        self._detail_str = "   •   ".join(detail_parts)
++
++    # --- Layout -------------------------------------------------------------
++
++    def _calculate_layout(self, window):
++        """Centre the banner horizontally above the track, inside the
++        reserved UI margins, and pin it to the top of the window."""
++        inner_w = max(1.0, window.width - self.left_margin - self.right_margin)
++        # Keep a sensible minimum so the text doesn't get squashed on tiny
++        # windows, and cap the width so it doesn't stretch wall-to-wall
++        # on ultra-wide monitors.
++        self._bar_width = max(240.0, min(inner_w - 20.0, 720.0))
++        self._center_x = self.left_margin + inner_w / 2.0
++        self._center_y = window.height - self.top_offset - self.height / 2.0
++
++    def on_resize(self, window):
++        self._calculate_layout(window)
++
++    # --- Draw ---------------------------------------------------------------
++
++    def draw(self, window):
++        # Skip entirely when hidden or when no info has been provided —
++        # the banner is purely contextual so there is nothing to show.
++        if not self._visible or not self._title_str:
++            return
++
++        # Recompute layout lazily — cheap, and covers the case where the
++        # window was created at a different size before ``on_resize()`` fired.
++        self._calculate_layout(window)
++
++        # 1. Subtle rounded-look panel so the text is readable over the
++        #    background texture / track lines.
++        bg_rect = arcade.XYWH(self._center_x, self._center_y, self._bar_width, self.height)
++        arcade.draw_rect_filled(bg_rect, self.COLORS["background"])
++        arcade.draw_rect_outline(bg_rect, self.COLORS["border"], 1)
++
++        # 2. Two-row text layout — title on top, details below.
++        #    The two rows are evenly spaced within the banner box.
++        top_row_y = self._center_y + self.height * 0.22
++        bottom_row_y = self._center_y - self.height * 0.22
++
++        self._title_text.text = self._title_str
++        self._title_text.x = self._center_x
++        self._title_text.y = top_row_y if self._detail_str else self._center_y
++        self._title_text.draw()
++
++        if self._detail_str:
++            self._detail_text.text = self._detail_str
++            self._detail_text.x = self._center_x
++            self._detail_text.y = bottom_row_y
++            self._detail_text.draw()
++
++
++def build_session_info(session, session_type: Optional[str] = None,
++                       fallback_title: Optional[str] = None) -> dict:
++    """
++    Extract a plain dict of session metadata from a ``fastf1`` ``Session``
++    object for ``SessionInfoBannerComponent.set_info()``.
++
++    This helper keeps the UI layer free of any ``fastf1`` coupling — the
++    component only ever sees a simple dict — and centralises all the
++    defensive ``getattr`` / ``KeyError`` handling in one place.
++
++    Args:
++        session: A loaded ``fastf1.Session`` (or ``None``).
++        session_type: The short session code ('R', 'S', 'Q', 'SQ'). Used to
++            derive a human-readable session name when ``session.name`` is
++            unavailable (older fastf1 versions).
++        fallback_title: The existing window title string — used as a last
++            resort when no structured metadata can be extracted.
++
++    Returns:
++        A dict with keys: ``event_name``, ``session_name``, ``round_number``,
++        ``year``, ``location``, ``country``, ``date``, ``title``.
++        All keys are always present (values may be ``None``).
++    """
++    info = {
++        "event_name": None,
++        "session_name": None,
++        "round_number": None,
++        "year": None,
++        "location": None,
++        "country": None,
++        "date": None,
++        "title": fallback_title,
++    }
++
++    if session is None:
++        return info
++
++    # Human-readable session name: prefer the session's own ``.name``
++    # attribute (fastf1 3.x) but fall back to mapping the short code.
++    _SESSION_TYPE_NAMES = {
++        "R": "Race",
++        "S": "Sprint",
++        "Q": "Qualifying",
++        "SQ": "Sprint Qualifying",
++        "FP1": "Practice 1",
++        "FP2": "Practice 2",
++        "FP3": "Practice 3",
++    }
++    info["session_name"] = (
++        getattr(session, "name", None)
++        or _SESSION_TYPE_NAMES.get(str(session_type or "").upper())
++    )
++
++    # Event metadata lives on ``session.event`` — a pandas Series whose
++    # available keys vary slightly between fastf1 versions, so every lookup
++    # is individually guarded.
++    event = getattr(session, "event", None)
++
++    def _safe_get(key):
++        try:
++            return event[key]
++        except Exception:
++            return None
++
++    if event is not None:
++        info["event_name"] = _safe_get("EventName")
++        info["round_number"] = _safe_get("RoundNumber")
++        info["location"] = _safe_get("Location")
++        info["country"] = _safe_get("Country")
++
++        # Extract year + formatted date from EventDate if present.
++        ev_date = _safe_get("EventDate")
++        if ev_date is not None:
++            try:
++                # pandas.Timestamp / datetime -> "06 Jul 2025"
++                info["year"] = ev_date.year
++                info["date"] = ev_date.strftime("%d %b %Y")
++            except Exception:
++                # Fall back to whatever string representation is available.
++                date_str = str(ev_date)
++                if date_str and date_str.lower() not in ("nat", "nan"):
++                    info["date"] = date_str
++
++    return info
++
++
+ class WeatherComponent(BaseComponent):
+     def __init__(self, left=20, width=280, height=130, top_offset=170, visible=True):
+         self.left = left
+         self.width = width
+         self.height = height
+         self.top_offset = top_offset
+         self.info = None
+         self._weather_icon_textures = {}
+         self._visible: bool = visible
+         # Load weather icons from images/weather folder (all files)
