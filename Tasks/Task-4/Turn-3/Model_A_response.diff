@@ -1,0 +1,437 @@
+diff --git a/data/classes.json b/data/classes.json
+new file mode 100644
+index 00000000..4254abe8
+--- /dev/null
++++ b/data/classes.json
+@@ -0,0 +1,46 @@
++{
++    "innkeeper": {
++        "constitution": 0,
++        "move": 0,
++        "stats_up": {
++            "hp": [1, 2, 2, 2, 3],
++            "strength": [0, 0, 1],
++            "defense": [0, 1, 1],
++            "resistance": [0, 1]
++        },
++        "skills": []
++    },
++    "warrior": {
++        "constitution": 5,
++        "move": 0,
++        "stats_up": {
++            "hp": [1, 1, 2, 2, 2, 3, 4],
++            "strength": [0, 1, 1, 2],
++            "defense": [0, 1, 1, 2, 2, 3],
++            "resistance": [0, 1]
++        },
++        "skills": []
++    },
++    "ranger": {
++        "constitution": 2,
++        "move": 0,
++        "stats_up": {
++            "hp": [1, 2, 2, 2, 3, 3, 4],
++            "strength": [0, 1, 1],
++            "defense": [0, 1, 1, 2],
++            "resistance": [0, 1]
++        },
++        "skills": ["covered"]
++    },
++    "spy": {
++        "constitution": 0,
++        "move": 0,
++        "stats_up": {
++            "hp": [1, 2, 2, 2, 3, 4],
++            "strength": [0, 1],
++            "defense": [0, 1, 1, 2, 2],
++            "resistance": [0, 1, 2]
++        },
++        "skills": ["lock_picking", "double_attack"]
++    }
++}
+diff --git a/data/classes.xml b/data/classes.xml
+deleted file mode 100644
+index 0a67d87c..00000000
+--- a/data/classes.xml
++++ /dev/null
+@@ -1,91 +0,0 @@
+-<classes>
+-    <innkeeper>
+-        <stats_up>
+-            <hp>
+-                1, 2, 2, 2, 3
+-            </hp>
+-            <strength>
+-                0, 0, 1
+-            </strength>
+-            <defense>
+-                0, 1, 1
+-            </defense>
+-            <resistance>
+-                0, 1
+-            </resistance>
+-        </stats_up>
+-    </innkeeper>
+-    <warrior>
+-        <constitution>
+-            5
+-        </constitution>
+-        <stats_up>
+-            <hp>
+-                1, 1, 2, 2, 2, 3, 4
+-            </hp>
+-            <strength>
+-                0, 1, 1, 2
+-            </strength>
+-            <defense>
+-                0, 1, 1, 2, 2, 3
+-            </defense>
+-            <resistance>
+-                0, 1
+-            </resistance>
+-        </stats_up>
+-    </warrior>
+-    <ranger>
+-        <constitution>
+-            2
+-        </constitution>
+-        <stats_up>
+-            <hp>
+-                1, 2, 2, 2, 3, 3, 4
+-            </hp>
+-            <strength>
+-                0, 1, 1
+-            </strength>
+-            <defense>
+-                0, 1, 1, 2
+-            </defense>
+-            <resistance>
+-                0, 1
+-            </resistance>
+-        </stats_up>
+-        <skills>
+-            <skill>
+-                <name>
+-                    covered
+-                </name>
+-            </skill>
+-        </skills>
+-    </ranger>
+-    <spy>
+-        <stats_up>
+-            <hp>
+-                1, 2, 2, 2, 3, 4
+-            </hp>
+-            <strength>
+-                0, 1
+-            </strength>
+-            <defense>
+-                0, 1, 1, 2, 2
+-            </defense>
+-            <resistance>
+-                0, 1, 2
+-            </resistance>
+-        </stats_up>
+-        <skills>
+-          <skill>
+-              <name>
+-                  lock_picking
+-              </name>
+-          </skill>
+-            <skill>
+-              <name>
+-                  double_attack
+-              </name>
+-          </skill>
+-        </skills>
+-    </spy>
+-</classes>
+\ No newline at end of file
+diff --git a/imgs/dungeon_crawl/player/gloves/glove_short_green.png - Raccourci.lnk b/imgs/dungeon_crawl/player/gloves/glove_short_green.png-Raccourci.lnk
+similarity index 100%
+rename from imgs/dungeon_crawl/player/gloves/glove_short_green.png - Raccourci.lnk
+rename to imgs/dungeon_crawl/player/gloves/glove_short_green.png-Raccourci.lnk
+diff --git a/main.py b/main.py
+index 34309f8a..a3e57d0e 100644
+--- a/main.py
++++ b/main.py
+@@ -49,20 +49,21 @@ if __name__ == "__main__":
+     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+         # running main.py in a pyinstaller bundle
+         os.chdir(sys._MEIPASS)
+ 
+     from src.constants import (BLACK, FRAME_RATE, MAIN_WIN_HEIGHT,
+                                MAIN_WIN_WIDTH)
+     from src.game_entities.character import Character
+     from src.game_entities.movable import Movable
+     from src.gui import constant_sprites, fonts
+     from src.services import load_from_xml_manager as loader
++    from src.services import load_from_json_manager as json_loader
+     from src.services.language import *
+     from src.services.language import STR_GAME_TITLE
+ 
+     pygame.init()
+     pygame.mixer.init()
+     pygamepopup.init()
+ 
+     fonts.init_fonts()
+ 
+     # Configure pygame-popup manager : set default assets to be used
+@@ -85,21 +86,21 @@ if __name__ == "__main__":
+ 
+         try:
+             windll.user32.SetProcessDPIAware()
+         except AttributeError:
+             pass
+ 
+     Movable.init_constant_sprites()
+     constant_sprites.init_constant_sprites()
+ 
+     races = loader.load_races()
+-    classes = loader.load_classes()
++    classes = json_loader.load_classes()
+     Character.init_data(races, classes)
+ 
+     scene_manager = SceneManager(main_screen)
+ 
+     pygame.mixer.music.load(os.path.join("sound_fx", "soundtrack.ogg"))
+     pygame.mixer.music.play(-1)
+ 
+     # Lets the game start!
+     quit_action = main_loop(scene_manager, main_screen, pygame.time.Clock())
+ 
+diff --git a/src/services/load_from_json_manager.py b/src/services/load_from_json_manager.py
+new file mode 100644
+index 00000000..6c1b2f6b
+--- /dev/null
++++ b/src/services/load_from_json_manager.py
+@@ -0,0 +1,43 @@
++from __future__ import annotations
++
++import json
++from collections.abc import Sequence
++
++from src.services.load_from_xml_manager import get_skill_data
++
++CLASSES_DATA_PATH = "data/classes.json"
++
++
++def load_classes() -> dict[str, dict[str, any]]:
++    """
++    Load classes data from JSON file.
++
++    :return: Dictionary containing class data
++    """
++    with open(CLASSES_DATA_PATH, "r", encoding="utf-8") as classes_file:
++        classes_json = json.load(classes_file)
++
++    classes = {}
++    for class_name, class_data in classes_json.items():
++        classes[class_name] = {
++            "constitution": class_data.get("constitution", 0),
++            "move": class_data.get("move", 0),
++            "stats_up": _load_stats_up(class_data["stats_up"]),
++            "skills": [get_skill_data(skill) for skill in class_data.get("skills", [])],
++        }
++    return classes
++
++
++def _load_stats_up(stats_up_data: dict) -> dict[str, Sequence[int]]:
++    """
++    Convert stats_up data from JSON format to internal format.
++
++    :param stats_up_data: Dictionary containing stats_up data from JSON
++    :return: Dictionary with internal stat keys
++    """
++    return {
++        "hp": stats_up_data["hp"],
++        "str": stats_up_data["strength"],
++        "def": stats_up_data["defense"],
++        "res": stats_up_data["resistance"],
++    }
+diff --git a/src/services/load_from_xml_manager.py b/src/services/load_from_xml_manager.py
+index c1089f6d..e3f3f6e8 100644
+--- a/src/services/load_from_xml_manager.py
++++ b/src/services/load_from_xml_manager.py
+@@ -29,21 +29,20 @@ from src.game_entities.spellbook import Spellbook
+ from src.game_entities.weapon import Weapon
+ from src.gui.position import Position
+ from src.services.language import *
+ from src.services.global_foes import link_foe_to_mission
+ 
+ foes_data = {}
+ fountains_data = {}
+ skills_data = {}
+ 
+ RACES_DATA_PATH = "data/races.xml"
+-CLASSES_DATA_PATH = "data/classes.xml"
+ 
+ 
+ def load_races() -> dict[str, dict[str, any]]:
+     """
+ 
+     :return:
+     """
+     races = {}
+     races_file = etree.parse(RACES_DATA_PATH).getroot()
+     for race_element in races_file.findall("*"):
+@@ -57,44 +56,20 @@ def load_races() -> dict[str, dict[str, any]]:
+             int(race_element.find("move").text.strip()) if move is not None else 0
+         )
+         race["skills"] = [
+             get_skill_data(skill.text.strip())
+             for skill in race_element.findall("skills/skill/name")
+         ]
+         races[race_element.tag] = race
+     return races
+ 
+ 
+-def load_classes() -> dict[str, dict[str, any]]:
+-    """
+-
+-    :return:
+-    """
+-    classes = {}
+-    classes_file = etree.parse(CLASSES_DATA_PATH).getroot()
+-    for class_element in classes_file.findall("*"):
+-        class_data = {}
+-        constitution = class_element.find("constitution")
+-        class_data["constitution"] = (
+-            int(constitution.text.strip()) if constitution is not None else 0
+-        )
+-        move = class_element.find("move")
+-        class_data["move"] = int(move.text.strip()) if move is not None else 0
+-        class_data["stats_up"] = load_stats_up(class_element)
+-        class_data["skills"] = [
+-            get_skill_data(skill.text.strip())
+-            for skill in class_element.findall("skills/skill/name")
+-        ]
+-        classes[class_element.tag] = class_data
+-    return classes
+-
+-
+ def load_stat_up(element, stat_name) -> Sequence[int]:
+     """
+ 
+     :param element:
+     :param stat_name:
+     :return:
+     """
+     return [
+         int(value)
+         for value in element.find("stats_up/" + stat_name).text.strip().split(",")
+diff --git a/tests/test_load_from_json_manager.py b/tests/test_load_from_json_manager.py
+new file mode 100644
+index 00000000..d0724bfd
+--- /dev/null
++++ b/tests/test_load_from_json_manager.py
+@@ -0,0 +1,72 @@
++import unittest
++
++from src.services.load_from_json_manager import load_classes
++from tests.tools import minimal_setup_for_game
++
++
++class TestLoadFromJsonManager(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        minimal_setup_for_game()
++
++    def test_load_classes_returns_dict(self):
++        classes = load_classes()
++        self.assertIsInstance(classes, dict)
++
++    def test_load_classes_contains_all_classes(self):
++        classes = load_classes()
++        expected_classes = ["innkeeper", "warrior", "ranger", "spy"]
++        for class_name in expected_classes:
++            self.assertIn(class_name, classes)
++
++    def test_load_classes_innkeeper_data(self):
++        classes = load_classes()
++        innkeeper = classes["innkeeper"]
++        self.assertEqual(0, innkeeper["constitution"])
++        self.assertEqual(0, innkeeper["move"])
++        self.assertEqual([1, 2, 2, 2, 3], innkeeper["stats_up"]["hp"])
++        self.assertEqual([0, 0, 1], innkeeper["stats_up"]["str"])
++        self.assertEqual([0, 1, 1], innkeeper["stats_up"]["def"])
++        self.assertEqual([0, 1], innkeeper["stats_up"]["res"])
++        self.assertEqual([], innkeeper["skills"])
++
++    def test_load_classes_warrior_data(self):
++        classes = load_classes()
++        warrior = classes["warrior"]
++        self.assertEqual(5, warrior["constitution"])
++        self.assertEqual(0, warrior["move"])
++        self.assertEqual([1, 1, 2, 2, 2, 3, 4], warrior["stats_up"]["hp"])
++        self.assertEqual([0, 1, 1, 2], warrior["stats_up"]["str"])
++        self.assertEqual([0, 1, 1, 2, 2, 3], warrior["stats_up"]["def"])
++        self.assertEqual([0, 1], warrior["stats_up"]["res"])
++        self.assertEqual([], warrior["skills"])
++
++    def test_load_classes_ranger_data(self):
++        classes = load_classes()
++        ranger = classes["ranger"]
++        self.assertEqual(2, ranger["constitution"])
++        self.assertEqual(0, ranger["move"])
++        self.assertEqual([1, 2, 2, 2, 3, 3, 4], ranger["stats_up"]["hp"])
++        self.assertEqual([0, 1, 1], ranger["stats_up"]["str"])
++        self.assertEqual([0, 1, 1, 2], ranger["stats_up"]["def"])
++        self.assertEqual([0, 1], ranger["stats_up"]["res"])
++        self.assertEqual(1, len(ranger["skills"]))
++        self.assertEqual("covered", ranger["skills"][0].name)
++
++    def test_load_classes_spy_data(self):
++        classes = load_classes()
++        spy = classes["spy"]
++        self.assertEqual(0, spy["constitution"])
++        self.assertEqual(0, spy["move"])
++        self.assertEqual([1, 2, 2, 2, 3, 4], spy["stats_up"]["hp"])
++        self.assertEqual([0, 1], spy["stats_up"]["str"])
++        self.assertEqual([0, 1, 1, 2, 2], spy["stats_up"]["def"])
++        self.assertEqual([0, 1, 2], spy["stats_up"]["res"])
++        self.assertEqual(2, len(spy["skills"]))
++        skill_names = [skill.name for skill in spy["skills"]]
++        self.assertIn("lock_picking", skill_names)
++        self.assertIn("double_attack", skill_names)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/tools.py b/tests/tools.py
+index 17c0ba5e..726ecdb8 100644
+--- a/tests/tools.py
++++ b/tests/tools.py
+@@ -1,29 +1,30 @@
+ import pygame
+ import pygamepopup
+ 
+ import src.gui.fonts as font
+ import src.services.load_from_xml_manager as loader
++import src.services.load_from_json_manager as json_loader
+ from src.constants import MAIN_WIN_HEIGHT, MAIN_WIN_WIDTH
+ from src.game_entities.character import Character
+ from src.gui.constant_sprites import init_constant_sprites
+ 
+ NB_TESTS_FOR_PROPORTIONS = 1000
+ 
+ already_set_up = False
+ 
+ 
+ def minimal_setup_for_game():
+     global already_set_up
+     if already_set_up:
+         return
+     pygame.init()
+     pygamepopup.init()
+     font.init_fonts()
+     # Window parameters
+     pygame.display.set_mode((MAIN_WIN_WIDTH, MAIN_WIN_HEIGHT))
+     # Load some data
+     races = loader.load_races()
+-    classes = loader.load_classes()
++    classes = json_loader.load_classes()
+     Character.init_data(races, classes)
+     init_constant_sprites()
+     already_set_up = True
