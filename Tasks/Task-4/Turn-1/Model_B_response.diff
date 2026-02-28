@@ -1,0 +1,204 @@
+diff --git a/data/__init__.py b/data/__init__.py
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/data/classes.json b/data/classes.json
+new file mode 100644
+index 00000000..4254abe8
+--- /dev/null
++++ b/data/classes.json
+@@ -0,0 +1,46 @@
++{
++    "innkeeper": {
++        "constitution": 0,
++        "move": 0,
++        "stats_up": {
++            "hp": [1, 2, 2, 2, 3],
++            "strength": [0, 0, 1],
++            "defense": [0, 1, 1],
++            "resistance": [0, 1]
++        },
++        "skills": []
++    },
++    "warrior": {
++        "constitution": 5,
++        "move": 0,
++        "stats_up": {
++            "hp": [1, 1, 2, 2, 2, 3, 4],
++            "strength": [0, 1, 1, 2],
++            "defense": [0, 1, 1, 2, 2, 3],
++            "resistance": [0, 1]
++        },
++        "skills": []
++    },
++    "ranger": {
++        "constitution": 2,
++        "move": 0,
++        "stats_up": {
++            "hp": [1, 2, 2, 2, 3, 3, 4],
++            "strength": [0, 1, 1],
++            "defense": [0, 1, 1, 2],
++            "resistance": [0, 1]
++        },
++        "skills": ["covered"]
++    },
++    "spy": {
++        "constitution": 0,
++        "move": 0,
++        "stats_up": {
++            "hp": [1, 2, 2, 2, 3, 4],
++            "strength": [0, 1],
++            "defense": [0, 1, 1, 2, 2],
++            "resistance": [0, 1, 2]
++        },
++        "skills": ["lock_picking", "double_attack"]
++    }
++}
+diff --git a/imgs/dungeon_crawl/player/gloves/glove_short_green.png - Raccourci.lnk b/imgs/dungeon_crawl/player/gloves/glove_short_green.png-Raccourci.lnk
+similarity index 100%
+rename from imgs/dungeon_crawl/player/gloves/glove_short_green.png - Raccourci.lnk
+rename to imgs/dungeon_crawl/player/gloves/glove_short_green.png-Raccourci.lnk
+diff --git a/main.py b/main.py
+index 34309f8a..e823de7f 100644
+--- a/main.py
++++ b/main.py
+@@ -48,20 +48,21 @@ if __name__ == "__main__":
+ 
+     if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+         # running main.py in a pyinstaller bundle
+         os.chdir(sys._MEIPASS)
+ 
+     from src.constants import (BLACK, FRAME_RATE, MAIN_WIN_HEIGHT,
+                                MAIN_WIN_WIDTH)
+     from src.game_entities.character import Character
+     from src.game_entities.movable import Movable
+     from src.gui import constant_sprites, fonts
++    from src.services import load_from_json_manager as json_loader
+     from src.services import load_from_xml_manager as loader
+     from src.services.language import *
+     from src.services.language import STR_GAME_TITLE
+ 
+     pygame.init()
+     pygame.mixer.init()
+     pygamepopup.init()
+ 
+     fonts.init_fonts()
+ 
+@@ -85,21 +86,21 @@ if __name__ == "__main__":
+ 
+         try:
+             windll.user32.SetProcessDPIAware()
+         except AttributeError:
+             pass
+ 
+     Movable.init_constant_sprites()
+     constant_sprites.init_constant_sprites()
+ 
+     races = loader.load_races()
+-    classes = loader.load_classes()
++    classes = json_loader.load_classes()
+     Character.init_data(races, classes)
+ 
+     scene_manager = SceneManager(main_screen)
+ 
+     pygame.mixer.music.load(os.path.join("sound_fx", "soundtrack.ogg"))
+     pygame.mixer.music.play(-1)
+ 
+     # Lets the game start!
+     quit_action = main_loop(scene_manager, main_screen, pygame.time.Clock())
+ 
+diff --git a/src/services/load_from_json_manager.py b/src/services/load_from_json_manager.py
+new file mode 100644
+index 00000000..f0f5473c
+--- /dev/null
++++ b/src/services/load_from_json_manager.py
+@@ -0,0 +1,54 @@
++"""
++Service module for loading game data from JSON files.
++Provides functionality to load class definitions with their stats and skills.
++"""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Sequence
++from typing import Any
++
++from src.services.load_from_xml_manager import get_skill_data
++
++CLASSES_JSON_PATH = "data/classes.json"
++
++
++def load_classes() -> dict[str, dict[str, Any]]:
++    """
++    Load all character class definitions from the JSON data file.
++
++    Returns:
++        Dictionary mapping class names to their data (constitution, move, stats_up, skills)
++    """
++    with open(CLASSES_JSON_PATH, "r", encoding="utf-8") as classes_file:
++        classes_raw = json.load(classes_file)
++
++    classes = {}
++    for class_name, class_data in classes_raw.items():
++        classes[class_name] = {
++            "constitution": class_data.get("constitution", 0),
++            "move": class_data.get("move", 0),
++            "stats_up": _load_stats_up(class_data["stats_up"]),
++            "skills": [get_skill_data(skill_name) for skill_name in class_data.get("skills", [])],
++        }
++    return classes
++
++
++def _load_stats_up(stats_up_data: dict[str, list[int]]) -> dict[str, Sequence[int]]:
++    """
++    Transform stats_up data from JSON format to internal format.
++    Maps JSON keys (defense, resistance, strength) to internal keys (def, res, str).
++
++    Arguments:
++        stats_up_data -- dictionary containing stat progression arrays
++
++    Returns:
++        Dictionary with internal stat keys mapping to progression arrays
++    """
++    return {
++        "hp": stats_up_data["hp"],
++        "def": stats_up_data["defense"],
++        "res": stats_up_data["resistance"],
++        "str": stats_up_data["strength"],
++    }
+diff --git a/tests/tools.py b/tests/tools.py
+index 17c0ba5e..a8d5d9ba 100644
+--- a/tests/tools.py
++++ b/tests/tools.py
+@@ -1,14 +1,15 @@
+ import pygame
+ import pygamepopup
+ 
+ import src.gui.fonts as font
++import src.services.load_from_json_manager as json_loader
+ import src.services.load_from_xml_manager as loader
+ from src.constants import MAIN_WIN_HEIGHT, MAIN_WIN_WIDTH
+ from src.game_entities.character import Character
+ from src.gui.constant_sprites import init_constant_sprites
+ 
+ NB_TESTS_FOR_PROPORTIONS = 1000
+ 
+ already_set_up = False
+ 
+ 
+@@ -16,14 +17,14 @@ def minimal_setup_for_game():
+     global already_set_up
+     if already_set_up:
+         return
+     pygame.init()
+     pygamepopup.init()
+     font.init_fonts()
+     # Window parameters
+     pygame.display.set_mode((MAIN_WIN_WIDTH, MAIN_WIN_HEIGHT))
+     # Load some data
+     races = loader.load_races()
+-    classes = loader.load_classes()
++    classes = json_loader.load_classes()
+     Character.init_data(races, classes)
+     init_constant_sprites()
+     already_set_up = True
