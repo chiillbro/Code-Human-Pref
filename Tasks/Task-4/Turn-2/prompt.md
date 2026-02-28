@@ -1,0 +1,1 @@
+Good start, only few things to clean up. First remove the old load_classes() function and CLASSES_DATA_PATH constant from load_from_xml_manager.py since they are not used anymore now, also delete the old data/classes.xml file entirely because we are now fully moved to json. the unrelated file name change  (glove_short_green.png lnk file) should not be touched
