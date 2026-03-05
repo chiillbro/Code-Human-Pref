@@ -47,3 +47,35 @@ Aligns with project goal of improving user experience
 Maintains clean, readable code structure
 Additional Notes
 This feature enhances the session information display mentioned in community discussions, providing users with always-visible context about what race they're watching. The design is intentionally minimal to maintain the clean aesthetic of the application while adding significant value.
+
+---
+
+## Copilot Analysis
+
+### Scope Validation: ✅ GOOD
+
+- Single feature, 4 files, aligns with roadmap UX improvements
+- Not trivial (new component class + data extraction + integration + keyboard toggle + responsive sizing)
+- Not too broad (focused on one feature)
+
+### Gold-Standard Solution Notes
+
+- Replaces `session=session` with `session_info=session_info` — breaks tyre degradation as side effect
+- Removes `tyre_degradation_integration` import from ui_components.py but leaves usage at lines 747/776 — would cause NameError
+- New `SessionInfoComponent` follows `BaseComponent` pattern correctly
+- Uses emoji in banner text (encoding may be problematic)
+- Toggle via `[I]` key, responsive width `min(900, window.width - 40)`
+
+### Key Watch Items for Model Responses
+
+- Models should NOT break tyre degradation — pass both `session_info` and keep `session`
+- Must follow existing `BaseComponent` pattern
+- Integration in `on_draw()` and `[I]` key in `on_key_press()`
+- No unnecessary markdown/summary file commits
+- No test suite exists, but pure utility functions could be unit tested
+
+### Draft Initial Prompt
+
+```
+Hey, I want to add a Session Info Banner to the race replay view, basically a UI component that shows session metadata like the event name, circuit, country, year, round number, date and total laps in a banner at the top-center of the screen. Right now this info only shows in the window title which is easy to miss. The banner should be togglable with a keyboard shortcut, follow the existing BaseComponent pattern in ui_components.py, and should not obstruct the existing UI elements like the leaderboard or telemetry panel. Also, extract the session metadata in main.py and pass it through to the component, make sure not to break any existing functionality like the tyre degradation integration
+```
