@@ -1,0 +1,1297 @@
+diff --git a/src/gui/filters/__init__.py b/src/gui/filters/__init__.py
+new file mode 100644
+index 0000000..9c7d174
+--- /dev/null
++++ b/src/gui/filters/__init__.py
+@@ -0,0 +1,12 @@
++from .interfaces import IFilterStrategy, IFilterProvider, IFilterableDataSource
++from .race_name_filter import RaceNameFilterStrategy
++from .filter_manager import FilterManager, FilterManagerFactory
++
++__all__ = [
++    'IFilterStrategy',
++    'IFilterProvider', 
++    'IFilterableDataSource',
++    'RaceNameFilterStrategy',
++    'FilterManager',
++    'FilterManagerFactory',
++]
+diff --git a/src/gui/filters/filter_manager.py b/src/gui/filters/filter_manager.py
+new file mode 100644
+index 0000000..e8633fc
+--- /dev/null
++++ b/src/gui/filters/filter_manager.py
+@@ -0,0 +1,134 @@
++from typing import Any, Optional
++from .interfaces import (
++    IFilterStrategy, 
++    IFilterProvider, 
++    IFilterableDataSource,
++    FilterCriteria,
++    FilterChangeEmitter,
++)
++
++
++class FilterManager(IFilterProvider, IFilterableDataSource):
++    """Central manager for coordinating filters on race data."""
++    
++    def __init__(self, emitter: FilterChangeEmitter = None):
++        self._strategies: dict[str, IFilterStrategy] = {}
++        self._active_filters: dict[str, FilterCriteria] = {}
++        self._items: list[dict] = []
++        self._emitter = emitter or FilterChangeEmitter()
++        self._cached_filter_values: dict[str, list[str]] = {}
++    
++    @property
++    def emitter(self) -> FilterChangeEmitter:
++        return self._emitter
++    
++    def register_strategy(self, strategy: IFilterStrategy) -> None:
++        """Register a filter strategy."""
++        self._strategies[strategy.get_filter_key()] = strategy
++    
++    def unregister_strategy(self, filter_key: str) -> None:
++        """Unregister a filter strategy."""
++        if filter_key in self._strategies:
++            del self._strategies[filter_key]
++            self.clear_filter(filter_key)
++    
++    def set_data(self, items: list[dict]) -> None:
++        """Set the data to be filtered."""
++        self._items = items
++        self._refresh_cached_filter_values()
++    
++    def _refresh_cached_filter_values(self) -> None:
++        """Refresh cached filter values for all registered strategies."""
++        for key, strategy in self._strategies.items():
++            self._cached_filter_values[key] = strategy.extract_filterable_values(self._items)
++    
++    def get_available_filters(self) -> list[str]:
++        """Get list of registered filter keys."""
++        return list(self._strategies.keys())
++    
++    def get_filter_options(self, filter_key: str) -> list[str]:
++        """Get available filter options for a specific filter."""
++        return self._cached_filter_values.get(filter_key, [])
++    
++    def refresh_filters(self, data_source: list[dict]) -> None:
++        """Refresh available filters based on current data."""
++        self.set_data(data_source)
++    
++    def get_all_items(self) -> list[dict]:
++        """Get all unfiltered items."""
++        return self._items
++    
++    def apply_filter(self, strategy: IFilterStrategy, criteria: FilterCriteria) -> list[dict]:
++        """Apply a filter and return filtered items."""
++        self._active_filters[strategy.get_filter_key()] = criteria
++        self._emitter.filter_changed.emit(strategy.get_filter_key(), criteria.value)
++        return self._get_filtered_items()
++    
++    def set_filter(self, filter_key: str, value: Any, display_name: str = "") -> list[dict]:
++        """Set a filter by key and value."""
++        if filter_key not in self._strategies:
++            return self._items
++        
++        strategy = self._strategies[filter_key]
++        criteria = FilterCriteria(
++            field_name=filter_key,
++            value=value,
++            display_name=display_name or str(value)
++        )
++        return self.apply_filter(strategy, criteria)
++    
++    def clear_filter(self, filter_key: str) -> list[dict]:
++        """Clear a specific filter and return items."""
++        if filter_key in self._active_filters:
++            del self._active_filters[filter_key]
++            self._emitter.filter_cleared.emit(filter_key)
++        return self._get_filtered_items()
++    
++    def clear_all_filters(self) -> list[dict]:
++        """Clear all filters and return unfiltered items."""
++        self._active_filters.clear()
++        self._emitter.filters_reset.emit()
++        return self._items
++    
++    def _get_filtered_items(self) -> list[dict]:
++        """Apply all active filters and return results."""
++        if not self._active_filters:
++            return self._items
++        
++        result = self._items
++        
++        for filter_key, criteria in self._active_filters.items():
++            strategy = self._strategies.get(filter_key)
++            if strategy:
++                result = [item for item in result if strategy.matches(item, criteria)]
++        
++        return result
++    
++    def get_active_filter(self, filter_key: str) -> Optional[FilterCriteria]:
++        """Get the active filter criteria for a key."""
++        return self._active_filters.get(filter_key)
++    
++    def is_filter_active(self, filter_key: str) -> bool:
++        """Check if a filter is currently active."""
++        return filter_key in self._active_filters
++
++
++class FilterManagerFactory:
++    """Factory for creating pre-configured FilterManager instances."""
++    
++    @staticmethod
++    def create_race_filter_manager() -> FilterManager:
++        """Create a FilterManager configured for race filtering."""
++        from .race_name_filter import RaceNameFilterStrategy
++        
++        manager = FilterManager()
++        manager.register_strategy(RaceNameFilterStrategy())
++        return manager
++    
++    @staticmethod
++    def create_with_strategies(*strategies: IFilterStrategy) -> FilterManager:
++        """Create a FilterManager with custom strategies."""
++        manager = FilterManager()
++        for strategy in strategies:
++            manager.register_strategy(strategy)
++        return manager
+diff --git a/src/gui/filters/filter_widgets.py b/src/gui/filters/filter_widgets.py
+new file mode 100644
+index 0000000..4fac876
+--- /dev/null
++++ b/src/gui/filters/filter_widgets.py
+@@ -0,0 +1,161 @@
++from PySide6.QtWidgets import (
++    QWidget, QHBoxLayout, QVBoxLayout, QLabel, QComboBox, QPushButton
++)
++from PySide6.QtCore import Signal, Qt
++from typing import Optional
++
++from .interfaces import FilterChangeEmitter
++from .filter_manager import FilterManager
++
++
++class FilterComboBoxWidget(QWidget):
++    """A combo box widget for filter selection."""
++    
++    selection_changed = Signal(str)  # Emits selected value
++    cleared = Signal()
++    
++    def __init__(
++        self, 
++        label_text: str,
++        placeholder: str = "All",
++        parent: QWidget = None
++    ):
++        super().__init__(parent)
++        self._placeholder = placeholder
++        self._setup_ui(label_text)
++    
++    def _setup_ui(self, label_text: str) -> None:
++        layout = QHBoxLayout(self)
++        layout.setContentsMargins(0, 0, 0, 0)
++        
++        self._label = QLabel(label_text)
++        self._combo = QComboBox()
++        self._combo.setMinimumWidth(200)
++        self._combo.addItem(self._placeholder)
++        self._combo.currentTextChanged.connect(self._on_selection_changed)
++        
++        self._clear_btn = QPushButton("✕")
++        self._clear_btn.setFixedSize(24, 24)
++        self._clear_btn.setCursor(Qt.PointingHandCursor)
++        self._clear_btn.setToolTip("Clear filter")
++        self._clear_btn.clicked.connect(self._on_clear_clicked)
++        self._clear_btn.hide()
++        
++        layout.addWidget(self._label)
++        layout.addWidget(self._combo)
++        layout.addWidget(self._clear_btn)
++        layout.addStretch()
++    
++    def set_options(self, options: list[str]) -> None:
++        """Set the available filter options."""
++        current = self._combo.currentText()
++        self._combo.blockSignals(True)
++        self._combo.clear()
++        self._combo.addItem(self._placeholder)
++        for opt in options:
++            self._combo.addItem(opt)
++        
++        idx = self._combo.findText(current)
++        if idx >= 0:
++            self._combo.setCurrentIndex(idx)
++        else:
++            self._combo.setCurrentIndex(0)
++        
++        self._combo.blockSignals(False)
++    
++    def get_selected_value(self) -> Optional[str]:
++        """Get the currently selected filter value, or None if placeholder."""
++        text = self._combo.currentText()
++        return None if text == self._placeholder else text
++    
++    def set_selected_value(self, value: str) -> None:
++        """Set the selected value programmatically."""
++        idx = self._combo.findText(value)
++        if idx >= 0:
++            self._combo.setCurrentIndex(idx)
++    
++    def clear_selection(self) -> None:
++        """Reset to placeholder."""
++        self._combo.setCurrentIndex(0)
++        self._clear_btn.hide()
++    
++    def _on_selection_changed(self, text: str) -> None:
++        if text == self._placeholder:
++            self._clear_btn.hide()
++            self.cleared.emit()
++        else:
++            self._clear_btn.show()
++            self.selection_changed.emit(text)
++    
++    def _on_clear_clicked(self) -> None:
++        self.clear_selection()
++
++
++class RaceNameFilterWidget(FilterComboBoxWidget):
++    """Specialized filter widget for Grand Prix name filtering."""
++    
++    FILTER_KEY = "race_name"
++    
++    def __init__(self, parent: QWidget = None):
++        super().__init__(
++            label_text="Filter by GP:",
++            placeholder="All Grand Prix",
++            parent=parent
++        )
++    
++    def bind_to_manager(self, manager: FilterManager) -> None:
++        """Bind this widget to a FilterManager."""
++        self._manager = manager
++        
++        options = manager.get_filter_options(self.FILTER_KEY)
++        self.set_options(options)
++        
++        self.selection_changed.connect(self._on_filter_selected)
++        self.cleared.connect(self._on_filter_cleared)
++        
++        manager.emitter.filters_reset.connect(self.clear_selection)
++    
++    def _on_filter_selected(self, value: str) -> None:
++        if hasattr(self, '_manager'):
++            self._manager.set_filter(self.FILTER_KEY, value, value)
++    
++    def _on_filter_cleared(self) -> None:
++        if hasattr(self, '_manager'):
++            self._manager.clear_filter(self.FILTER_KEY)
++    
++    def refresh_options(self, manager: FilterManager) -> None:
++        """Refresh the available options from the manager."""
++        options = manager.get_filter_options(self.FILTER_KEY)
++        self.set_options(options)
++
++
++class FilterPanelWidget(QWidget):
++    """Container widget for multiple filters."""
++    
++    filters_changed = Signal()
++    
++    def __init__(self, parent: QWidget = None):
++        super().__init__(parent)
++        self._filter_widgets: dict[str, FilterComboBoxWidget] = {}
++        self._setup_ui()
++    
++    def _setup_ui(self) -> None:
++        self._layout = QHBoxLayout(self)
++        self._layout.setContentsMargins(0, 5, 0, 5)
++    
++    def add_filter_widget(self, key: str, widget: FilterComboBoxWidget) -> None:
++        """Add a filter widget to the panel."""
++        self._filter_widgets[key] = widget
++        self._layout.addWidget(widget)
++        
++        widget.selection_changed.connect(lambda: self.filters_changed.emit())
++        widget.cleared.connect(lambda: self.filters_changed.emit())
++    
++    def get_filter_widget(self, key: str) -> Optional[FilterComboBoxWidget]:
++        """Get a filter widget by key."""
++        return self._filter_widgets.get(key)
++    
++    def clear_all(self) -> None:
++        """Clear all filter widgets."""
++        for widget in self._filter_widgets.values():
++            widget.clear_selection()
+diff --git a/src/gui/filters/interfaces.py b/src/gui/filters/interfaces.py
+new file mode 100644
+index 0000000..70ee257
+--- /dev/null
++++ b/src/gui/filters/interfaces.py
+@@ -0,0 +1,86 @@
++from abc import ABC, abstractmethod
++from typing import Any, Callable, Generic, TypeVar, Protocol
++from dataclasses import dataclass
++from PySide6.QtCore import Signal, QObject
++
++T = TypeVar('T')
++
++
++@dataclass
++class FilterCriteria:
++    field_name: str
++    value: Any
++    display_name: str = ""
++
++
++class IFilterStrategy(ABC):
++    """Interface for filter strategies that determine how filtering logic is applied."""
++    
++    @abstractmethod
++    def matches(self, item: dict, criteria: FilterCriteria) -> bool:
++        """Check if an item matches the filter criteria."""
++        pass
++    
++    @abstractmethod
++    def get_filter_key(self) -> str:
++        """Return the unique key for this filter strategy."""
++        pass
++    
++    @abstractmethod
++    def extract_filterable_values(self, items: list[dict]) -> list[str]:
++        """Extract unique filterable values from a list of items."""
++        pass
++
++
++class IFilterProvider(ABC):
++    """Interface for components that provide filter options."""
++    
++    @abstractmethod
++    def get_available_filters(self) -> list[str]:
++        """Get list of available filter values."""
++        pass
++    
++    @abstractmethod
++    def refresh_filters(self, data_source: list[dict]) -> None:
++        """Refresh available filters based on current data."""
++        pass
++
++
++class IFilterableDataSource(ABC):
++    """Interface for data sources that can be filtered."""
++    
++    @abstractmethod
++    def get_all_items(self) -> list[dict]:
++        """Get all unfiltered items."""
++        pass
++    
++    @abstractmethod
++    def apply_filter(self, strategy: IFilterStrategy, criteria: FilterCriteria) -> list[dict]:
++        """Apply a filter and return filtered items."""
++        pass
++    
++    @abstractmethod
++    def clear_filter(self, filter_key: str) -> list[dict]:
++        """Clear a specific filter and return items."""
++        pass
++
++
++class IFilterObserver(ABC):
++    """Interface for observers that react to filter changes."""
++    
++    @abstractmethod
++    def on_filter_changed(self, filter_key: str, new_value: Any) -> None:
++        """Called when a filter value changes."""
++        pass
++    
++    @abstractmethod
++    def on_filter_cleared(self, filter_key: str) -> None:
++        """Called when a filter is cleared."""
++        pass
++
++
++class FilterChangeEmitter(QObject):
++    """Qt signal emitter for filter changes."""
++    filter_changed = Signal(str, object)  # filter_key, new_value
++    filter_cleared = Signal(str)  # filter_key
++    filters_reset = Signal()
+diff --git a/src/gui/filters/race_name_filter.py b/src/gui/filters/race_name_filter.py
+new file mode 100644
+index 0000000..db59e38
+--- /dev/null
++++ b/src/gui/filters/race_name_filter.py
+@@ -0,0 +1,109 @@
++import re
++from typing import Any
++from .interfaces import IFilterStrategy, FilterCriteria
++
++
++class RaceNameNormalizer:
++    """Handles normalization of Grand Prix names for consistent matching."""
++    
++    COMMON_SUFFIXES = [
++        "Grand Prix",
++        "GP",
++    ]
++    
++    COMMON_PREFIXES = [
++        "Formula 1",
++        "F1",
++    ]
++    
++    NAME_MAPPINGS = {
++        "emilia romagna": "emilia-romagna",
++        "emilia-romagna": "emilia-romagna",
++        "las vegas": "las-vegas",
++        "saudi arabian": "saudi-arabia",
++        "saudi arabia": "saudi-arabia",
++        "abu dhabi": "abu-dhabi",
++        "united states": "usa",
++        "us": "usa",
++        "american": "usa",
++        "great britain": "british",
++        "british": "british",
++        "gb": "british",
++        "uk": "british",
++    }
++    
++    @classmethod
++    def normalize(cls, name: str) -> str:
++        if not name:
++            return ""
++        
++        normalized = name.lower().strip()
++        
++        for prefix in cls.COMMON_PREFIXES:
++            if normalized.startswith(prefix.lower()):
++                normalized = normalized[len(prefix):].strip()
++        
++        for suffix in cls.COMMON_SUFFIXES:
++            if normalized.endswith(suffix.lower()):
++                normalized = normalized[:-len(suffix)].strip()
++        
++        for key, value in cls.NAME_MAPPINGS.items():
++            if key in normalized:
++                normalized = normalized.replace(key, value)
++        
++        normalized = re.sub(r'\s+', '-', normalized)
++        normalized = re.sub(r'[^a-z0-9-]', '', normalized)
++        normalized = re.sub(r'-+', '-', normalized)
++        normalized = normalized.strip('-')
++        
++        return normalized
++    
++    @classmethod
++    def extract_core_name(cls, event_name: str) -> str:
++        """Extract the core GP name from a full event name."""
++        normalized = cls.normalize(event_name)
++        return normalized if normalized else event_name
++
++
++class RaceNameFilterStrategy(IFilterStrategy):
++    """Filter strategy for filtering events by race/Grand Prix name."""
++    
++    FILTER_KEY = "race_name"
++    
++    def __init__(self, normalizer: RaceNameNormalizer = None):
++        self._normalizer = normalizer or RaceNameNormalizer()
++    
++    def matches(self, item: dict, criteria: FilterCriteria) -> bool:
++        if not criteria.value:
++            return True
++        
++        event_name = item.get("event_name", "")
++        normalized_event = self._normalizer.normalize(event_name)
++        normalized_criteria = self._normalizer.normalize(str(criteria.value))
++        
++        return normalized_criteria in normalized_event or normalized_event in normalized_criteria
++    
++    def get_filter_key(self) -> str:
++        return self.FILTER_KEY
++    
++    def extract_filterable_values(self, items: list[dict]) -> list[str]:
++        seen_normalized = {}
++        
++        for item in items:
++            event_name = item.get("event_name", "")
++            if not event_name:
++                continue
++            
++            normalized = self._normalizer.extract_core_name(event_name)
++            
++            if normalized not in seen_normalized:
++                seen_normalized[normalized] = event_name
++        
++        display_names = list(seen_normalized.values())
++        display_names.sort()
++        
++        return display_names
++    
++    def get_canonical_name(self, event_name: str) -> str:
++        """Get the canonical/normalized form of a GP name."""
++        return self._normalizer.extract_core_name(event_name)
+diff --git a/src/gui/race_selection.py b/src/gui/race_selection.py
+index 8d6d2b8..d9dd9d5 100644
+--- a/src/gui/race_selection.py
++++ b/src/gui/race_selection.py
+@@ -1,222 +1,374 @@
+ from PySide6.QtWidgets import (
+     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+-    QLabel, QComboBox, QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox, QInputDialog
++    QLabel, QComboBox, QPushButton, QTreeWidget, QTreeWidgetItem, QMessageBox, QInputDialog,
++    QCheckBox, QFrame
+ )
+ from PySide6.QtWidgets import QProgressDialog
+ from PySide6.QtCore import QThread, Signal, Qt, QTimer
+ from PySide6.QtGui import QPixmap, QFont
+ import sys
+ import os
+ import subprocess
+ import tempfile
+ import uuid
+ from src.f1_data import get_race_weekends_by_year, load_session
+ from src.gui.settings_dialog import SettingsDialog
++from src.gui.filters import FilterManagerFactory, RaceNameFilterStrategy
++from src.gui.filters.filter_widgets import RaceNameFilterWidget, FilterPanelWidget
++from src.gui.services import RaceDataServiceFactory
+ 
+ 
+-# Worker thread to fetch schedule without blocking UI
+ class FetchScheduleWorker(QThread):
+     result = Signal(object)
+     error = Signal(str)
+ 
+     def __init__(self, year, parent=None):
+         super().__init__(parent)
+         self.year = year
+ 
+     def run(self):
+         try:
+-            # enable cache if available in project
+-            try:
+-                from src.f1_data import enable_cache
+-                enable_cache()
+-            except Exception:
+-                pass
++            from src.f1_data import enable_cache
++            enable_cache()
++        except Exception:
++            pass
++        try:
+             events = get_race_weekends_by_year(self.year)
++            for event in events:
++                event["year"] = self.year
+             self.result.emit(events)
+         except Exception as e:
+             self.error.emit(str(e))
+ 
++
++class FetchMultiYearWorker(QThread):
++    result = Signal(object)
++    progress = Signal(int, int)
++    error = Signal(str)
++
++    def __init__(self, years, parent=None):
++        super().__init__(parent)
++        self.years = years
++
++    def run(self):
++        try:
++            from src.f1_data import enable_cache
++            enable_cache()
++        except Exception:
++            pass
++        try:
++            all_events = []
++            total = len(self.years)
++            for idx, year in enumerate(self.years):
++                events = get_race_weekends_by_year(year)
++                for event in events:
++                    event["year"] = year
++                all_events.extend(events)
++                self.progress.emit(idx + 1, total)
++            self.result.emit(all_events)
++        except Exception as e:
++            self.error.emit(str(e))
++
++
+ class RaceSelectionWindow(QMainWindow):
+     def __init__(self):
+         super().__init__()
+         self.worker = None
+         self.loading_session = False
+         self.selected_session_title = None
++        self._all_events_cache: list[dict] = []
++        self._multi_year_mode = False
++
++        self._filter_manager = FilterManagerFactory.create_race_filter_manager()
++        self._data_service = RaceDataServiceFactory.get_shared_instance()
+ 
+         self.setWindowTitle("F1 Race Replay - Session Selection")
+         self._setup_ui()
+         self.resize(1000, 700)
+         self.setMinimumSize(800, 600)
+         self.setWindowState(self.windowState())
+ 
+     def _setup_ui(self):
+         central_widget = QWidget()
+         self.setCentralWidget(central_widget)
+ 
+         main_layout = QVBoxLayout()
+         central_widget.setLayout(main_layout)
+ 
+-        # Header (title)
++        # Header
+         header_layout = QHBoxLayout()
+         header_label = QLabel("F1 Race Replay 🏎️")
+         font = header_label.font()
+         settings_btn = QPushButton("⚙ Settings")
+         settings_btn.setCursor(Qt.PointingHandCursor)
+         settings_btn.setFixedHeight(32)
+         settings_btn.clicked.connect(self.open_settings)
+         font.setPointSize(18)
+         font.setBold(True)
+         header_label.setFont(font)
+         header_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+         
+         header_layout.addWidget(header_label)
+         header_layout.addStretch()
+         header_layout.addWidget(settings_btn)
+         main_layout.addLayout(header_layout)
+ 
+-        # Year selection
++        # Year selection row
+         year_layout = QHBoxLayout()
+         year_label = QLabel("Select Year:")
+         self.year_combo = QComboBox()
+-        current_year = 2025  # Update as needed
++        current_year = 2025
+         for year in range(2010, current_year + 1):
+             self.year_combo.addItem(str(year))
+         self.year_combo.setCurrentText(str(current_year))
+-        self.year_combo.currentTextChanged.connect(self.load_schedule)
++        self.year_combo.currentTextChanged.connect(self._on_year_changed)
+ 
+         year_layout.addWidget(year_label)
+         year_layout.addWidget(self.year_combo)
++        
++        # Multi-year comparison toggle
++        self.multi_year_checkbox = QCheckBox("Compare across years")
++        self.multi_year_checkbox.setToolTip(
++            "Enable to load multiple years and filter by Grand Prix name for historical comparison"
++        )
++        self.multi_year_checkbox.stateChanged.connect(self._on_multi_year_toggled)
++        year_layout.addWidget(self.multi_year_checkbox)
++        
++        year_layout.addStretch()
+         main_layout.addLayout(year_layout)
+ 
+-        # Main content: left = schedule, right = session list
++        # Filter panel
++        self._filter_panel = FilterPanelWidget()
++        self._race_name_filter_widget = RaceNameFilterWidget()
++        self._filter_panel.add_filter_widget("race_name", self._race_name_filter_widget)
++        self._filter_panel.hide()
++        main_layout.addWidget(self._filter_panel)
++
++        # Separator
++        separator = QFrame()
++        separator.setFrameShape(QFrame.HLine)
++        separator.setFrameShadow(QFrame.Sunken)
++        main_layout.addWidget(separator)
++
++        # Main content
+         content_layout = QHBoxLayout()
+ 
+-        # Schedule tree (left)
++        # Schedule tree
+         self.schedule_tree = QTreeWidget()
+-        self.schedule_tree.setHeaderLabels(["Round", "Event", "Country", "Start Date"])
++        self.schedule_tree.setHeaderLabels(["Year", "Round", "Event", "Country", "Start Date"])
+         self.schedule_tree.setRootIsDecorated(False)
+         content_layout.addWidget(self.schedule_tree, 3)
++        self.schedule_tree.setColumnWidth(0, 60)
+         self.schedule_tree.setColumnWidth(2, 180)
+ 
+-        # Session panel (right)
++        # Session panel
+         self.session_panel = QWidget()
+         self.session_panel_layout = QVBoxLayout()
+         self.session_panel.setLayout(self.session_panel_layout)
+         self.session_panel_layout.setAlignment(Qt.AlignTop)
+         header_lbl = QLabel("Sessions")
+         hdr_font = header_lbl.font()
+         hdr_font.setPointSize(14)
+         hdr_font.setBold(True)
+         header_lbl.setFont(hdr_font)
+         self.session_panel_layout.addWidget(header_lbl)
+ 
+-        # placeholder spacer
+         self.session_list_container = QWidget()
+         self.session_list_layout = QVBoxLayout()
+         self.session_list_container.setLayout(self.session_list_layout)
+         self.session_panel_layout.addWidget(self.session_list_container)
+ 
+         content_layout.addWidget(self.session_panel, 1)
+ 
+         main_layout.addLayout(content_layout)
+ 
+-        # connect click handler
+         self.schedule_tree.itemClicked.connect(self.on_race_clicked)
+ 
+-        # Load initial schedule
+-        # hide sessions panel until a weekend is selected
+         self.session_panel.hide()
++        self._update_tree_headers()
+         self.load_schedule(str(current_year))
+         
++    def _update_tree_headers(self):
++        """Update tree headers based on mode."""
++        if self._multi_year_mode:
++            self.schedule_tree.setHeaderLabels(["Year", "Round", "Event", "Country", "Start Date"])
++            self.schedule_tree.setColumnWidth(0, 60)
++        else:
++            self.schedule_tree.setHeaderLabels(["Round", "Event", "Country", "Start Date"])
++        
++    def _on_year_changed(self, year: str):
++        if not self._multi_year_mode:
++            self.load_schedule(year)
++    
++    def _on_multi_year_toggled(self, state: int):
++        self._multi_year_mode = state == Qt.Checked
++        
++        if self._multi_year_mode:
++            self._filter_panel.show()
++            self.year_combo.setEnabled(False)
++            self._load_multi_year_data()
++        else:
++            self._filter_panel.hide()
++            self.year_combo.setEnabled(True)
++            self._filter_manager.clear_all_filters()
++            self._update_tree_headers()
++            self.load_schedule(self.year_combo.currentText())
++    
++    def _load_multi_year_data(self):
++        """Load data for all years for comparison mode."""
++        if self.loading_session:
++            return
++        
++        self.loading_session = True
++        self.schedule_tree.clear()
++        self.session_panel.hide()
++        
++        current_year = int(self.year_combo.currentText())
++        years = list(range(2018, current_year + 1))
++        
++        self._multi_year_worker = FetchMultiYearWorker(years)
++        self._multi_year_worker.result.connect(self._on_multi_year_loaded)
++        self._multi_year_worker.error.connect(self.show_error)
++        self._multi_year_worker.start()
++    
++    def _on_multi_year_loaded(self, events: list[dict]):
++        """Handle multi-year data loaded."""
++        self._all_events_cache = events
++        self._filter_manager.set_data(events)
++        self._race_name_filter_widget.bind_to_manager(self._filter_manager)
++        
++        self._filter_manager.emitter.filter_changed.connect(self._on_filter_applied)
++        self._filter_manager.emitter.filter_cleared.connect(self._on_filter_cleared)
++        
++        self._update_tree_headers()
++        self._populate_schedule_multi_year(events)
++        self.loading_session = False
++    
++    def _on_filter_applied(self, filter_key: str, value):
++        """Handle filter being applied."""
++        filtered = self._filter_manager._get_filtered_items()
++        self._populate_schedule_multi_year(filtered)
++    
++    def _on_filter_cleared(self, filter_key: str):
++        """Handle filter being cleared."""
++        self._populate_schedule_multi_year(self._all_events_cache)
++    
++    def _populate_schedule_multi_year(self, events: list[dict]):
++        """Populate the schedule tree with multi-year events."""
++        self.schedule_tree.clear()
++        
++        sorted_events = sorted(events, key=lambda e: (e.get("year", 0), e.get("round_number", 0)), reverse=True)
++        
++        for event in sorted_events:
++            year_str = str(event.get("year", ""))
++            round_str = str(event.get("round_number", ""))
++            name = str(event.get("event_name", ""))
++            country = str(event.get("country", ""))
++            date = str(event.get("date", ""))
++
++            event_item = QTreeWidgetItem([year_str, round_str, name, country, date])
++            event_item.setData(0, Qt.UserRole, event)
++            self.schedule_tree.addTopLevelItem(event_item)
++
++        try:
++            for i in range(5):
++                self.schedule_tree.resizeColumnToContents(i)
++        except Exception:
++            pass
++
+     def load_schedule(self, year):
+         if self.loading_session:
+             return
++        if self._multi_year_mode:
++            return
++            
+         self.loading_session = True
+         self.schedule_tree.clear()
+-        # hide sessions panel while loading / when nothing selected
+         try:
+             self.session_panel.hide()
+         except Exception:
+             pass
+         self.worker = FetchScheduleWorker(int(year))
+         self.worker.result.connect(self.populate_schedule)
+         self.worker.error.connect(self.show_error)
+         self.worker.start()
++        
+     def populate_schedule(self, events):
++        self.schedule_tree.clear()
++        
+         for event in events:
+-            # Ensure all columns are strings (QTreeWidgetItem expects text)
+-            round_str = str(event.get("round_number", ""))
+-            name = str(event.get("event_name", ""))
+-            country = str(event.get("country", ""))
+-            date = str(event.get("date", ""))
+-
+-            event_item = QTreeWidgetItem([round_str, name, country, date])
++            if self._multi_year_mode:
++                year_str = str(event.get("year", ""))
++                round_str = str(event.get("round_number", ""))
++                name = str(event.get("event_name", ""))
++                country = str(event.get("country", ""))
++                date = str(event.get("date", ""))
++                event_item = QTreeWidgetItem([year_str, round_str, name, country, date])
++            else:
++                round_str = str(event.get("round_number", ""))
++                name = str(event.get("event_name", ""))
++                country = str(event.get("country", ""))
++                date = str(event.get("date", ""))
++                event_item = QTreeWidgetItem([round_str, name, country, date])
++            
+             event_item.setData(0, Qt.UserRole, event)
+             self.schedule_tree.addTopLevelItem(event_item)
+ 
+-        # Make sure the round column is wide enough to be visible
+         try:
+             self.schedule_tree.resizeColumnToContents(0)
+             self.schedule_tree.resizeColumnToContents(1)
++            if self._multi_year_mode:
++                self.schedule_tree.resizeColumnToContents(2)
+         except Exception:
+             pass
+ 
+         self.loading_session = False
+ 
+     def on_race_clicked(self, item, column):
+         ev = item.data(0, Qt.UserRole)
+-        # ensure the sessions panel is visible when a race is selected
+         try:
+             self.session_panel.show()
+         except Exception:
+             pass
+-        # determine sessions to show
+         ev_type = (ev.get("type") or "").lower()
+         sessions = ["Qualifying", "Race"]
+         if "sprint" in ev_type:
+             sessions.insert(0, "Sprint Qualifying")
+-            # show sprint-related session
+             sessions.insert(2, "Sprint")
+ 
+-        # clear existing session widgets
+         for i in reversed(range(self.session_list_layout.count())):
+             w = self.session_list_layout.itemAt(i).widget()
+             if w:
+                 w.setParent(None)
+ 
+-        # add buttons for each session (launch playback in separate process)
+         for s in sessions:
+             btn = QPushButton(s)
+             btn.clicked.connect(
+                 lambda _, sname=s, e=ev: self._on_session_button_clicked(e, sname)
+             )
+             self.session_list_layout.addWidget(btn)
+ 
+     def _on_session_button_clicked(self, ev, session_label):
+-        """Launch main.py in a separate process to run the selected session.
+-
+-        Uses the same CLI flags that `main.py` understands: `--qualifying`,
+-        `--sprint-qualifying`, `--sprint`. Runs the command detached so the
+-        Qt UI remains responsive.
+-        """
+-        try:
+-            year = int(self.year_combo.currentText())
+-        except Exception:
+-            year = None
++        if self._multi_year_mode:
++            year = ev.get("year")
++        else:
++            try:
++                year = int(self.year_combo.currentText())
++            except Exception:
++                year = None
+ 
+         try:
+             round_no = int(ev.get("round_number"))
+         except Exception:
+             round_no = None
+ 
+-        # map button labels to CLI flags
+         flag = None
+         if session_label == "Qualifying":
+             flag = "--qualifying"
+         elif session_label == "Sprint Qualifying":
+             flag = "--sprint-qualifying"
+         elif session_label == "Sprint":
+             flag = "--sprint"
+ 
+         main_path = os.path.normpath(
+             os.path.join(os.path.dirname(__file__), "..", "..", "main.py")
+@@ -225,31 +377,29 @@ class RaceSelectionWindow(QMainWindow):
+         if year is not None:
+             cmd += ["--year", str(year)]
+         if round_no is not None:
+             cmd += ["--round", str(round_no)]
+         if flag:
+             cmd.append(flag)
+ 
+         if "--telemetry" in sys.argv:
+             cmd += ["--telemetry"]
+ 
+-        # Show a modal loading dialog and load the session in a background thread.
+         dlg = QProgressDialog("Loading session data...", None, 0, 0, self)
+         dlg.setWindowTitle("Loading")
+         dlg.setWindowModality(Qt.ApplicationModal)
+         dlg.setCancelButton(None)
+         dlg.setMinimumDuration(0)
+         dlg.setRange(0, 0)
+         dlg.show()
+         QApplication.processEvents()
+ 
+-        # Map label -> fastf1 session type code
+         session_code = 'R'
+         if session_label == "Qualifying":
+             session_code = 'Q'
+         elif session_label == "Sprint Qualifying":
+             session_code = 'SQ'
+         elif session_label == "Sprint":
+             session_code = 'S'
+ 
+         class FetchSessionWorker(QThread):
+             result = Signal(object)
+@@ -267,78 +417,73 @@ class RaceSelectionWindow(QMainWindow):
+                         from src.f1_data import enable_cache
+                         enable_cache()
+                     except Exception:
+                         pass
+                     sess = load_session(self.year, self.round_no, self.session_type)
+                     self.result.emit(sess)
+                 except Exception as e:
+                     self.error.emit(str(e))
+ 
+         def _on_loaded(session_obj):
+-            # create a unique ready-file path and pass it to the child
+             ready_path = os.path.join(tempfile.gettempdir(), f"f1_ready_{uuid.uuid4().hex}")
+             cmd_with_ready = list(cmd) + ["--ready-file", ready_path]
+ 
+             try:
+                 proc = subprocess.Popen(cmd_with_ready)
+             except Exception as exc:
+                 try:
+                     dlg.close()
+                 except Exception:
+                     pass
+                 QMessageBox.critical(self, "Playback error", f"Failed to start playback:\n{exc}")
+                 return
+ 
+-            # Poll for ready file or child exit
+             timer = QTimer(self)
+ 
+             def _check_ready():
+                 try:
+                     if os.path.exists(ready_path):
+                         try:
+                             dlg.close()
+                         except Exception:
+                             pass
+                         timer.stop()
+                         try:
+                             os.remove(ready_path)
+                         except Exception:
+                             pass
+                         return
+-                    # if process exited early, show error
+                     if proc.poll() is not None:
+                         try:
+                             dlg.close()
+                         except Exception:
+                             pass
+                         timer.stop()
+                         QMessageBox.critical(self, "Playback error", "Playback process exited before signaling readiness")
+                 except Exception:
+-                    # ignore transient file-system errors
+                     pass
+ 
+             timer.timeout.connect(_check_ready)
+             timer.start(200)
+-            # keep references
+             self._play_proc = proc
+             self._ready_timer = timer
+ 
+         def _on_error(msg):
+             try:
+                 dlg.close()
+             except Exception:
+                 pass
+             QMessageBox.critical(self, "Load error", f"Failed to load session data:\n{msg}")
+ 
+         worker = FetchSessionWorker(year, round_no, session_code)
+         worker.result.connect(_on_loaded)
+         worker.error.connect(_on_error)
+-        # Keep a reference so it doesn't get GC'd
+         self._session_worker = worker
+         worker.start()
++        
+     def show_error(self, message):
+         QMessageBox.critical(self, "Error", f"Failed to load schedule: {message}")
+         self.loading_session = False
+ 
+     def open_settings(self):
+         dialog = SettingsDialog(self)
+         dialog.exec()
+diff --git a/src/gui/services/__init__.py b/src/gui/services/__init__.py
+new file mode 100644
+index 0000000..311c84d
+--- /dev/null
++++ b/src/gui/services/__init__.py
+@@ -0,0 +1,13 @@
++from .race_data_service import (
++    IRaceDataProvider,
++    RaceDataService,
++    RaceDataServiceFactory,
++    CachedRaceDataService,
++)
++
++__all__ = [
++    'IRaceDataProvider',
++    'RaceDataService',
++    'RaceDataServiceFactory',
++    'CachedRaceDataService',
++]
+diff --git a/src/gui/services/race_data_service.py b/src/gui/services/race_data_service.py
+new file mode 100644
+index 0000000..fbdfd7c
+--- /dev/null
++++ b/src/gui/services/race_data_service.py
+@@ -0,0 +1,164 @@
++from abc import ABC, abstractmethod
++from typing import Optional
++from dataclasses import dataclass
++from PySide6.QtCore import QThread, Signal, QObject
++
++
++@dataclass
++class RaceEvent:
++    year: int
++    round_number: int
++    event_name: str
++    country: str
++    date: str
++    event_type: str
++    
++    def to_dict(self) -> dict:
++        return {
++            "year": self.year,
++            "round_number": self.round_number,
++            "event_name": self.event_name,
++            "country": self.country,
++            "date": self.date,
++            "type": self.event_type,
++        }
++    
++    @classmethod
++    def from_dict(cls, data: dict, year: int) -> 'RaceEvent':
++        return cls(
++            year=year,
++            round_number=data.get("round_number", 0),
++            event_name=data.get("event_name", ""),
++            country=data.get("country", ""),
++            date=data.get("date", ""),
++            event_type=data.get("type", ""),
++        )
++
++
++class IRaceDataProvider(ABC):
++    """Interface for race data providers."""
++    
++    @abstractmethod
++    def get_events_by_year(self, year: int) -> list[dict]:
++        """Get all events for a specific year."""
++        pass
++    
++    @abstractmethod
++    def get_events_by_years(self, years: list[int]) -> list[dict]:
++        """Get events for multiple years."""
++        pass
++
++
++class RaceDataService(IRaceDataProvider):
++    """Service for fetching race data from FastF1."""
++    
++    def __init__(self):
++        self._cache: dict[int, list[dict]] = {}
++    
++    def get_events_by_year(self, year: int) -> list[dict]:
++        if year in self._cache:
++            return self._cache[year]
++        
++        from src.f1_data import get_race_weekends_by_year
++        events = get_race_weekends_by_year(year)
++        
++        for event in events:
++            event["year"] = year
++        
++        self._cache[year] = events
++        return events
++    
++    def get_events_by_years(self, years: list[int]) -> list[dict]:
++        all_events = []
++        for year in years:
++            events = self.get_events_by_year(year)
++            all_events.extend(events)
++        return all_events
++    
++    def clear_cache(self, year: Optional[int] = None) -> None:
++        if year:
++            self._cache.pop(year, None)
++        else:
++            self._cache.clear()
++
++
++class CachedRaceDataService(IRaceDataProvider):
++    """Decorator that adds caching to any IRaceDataProvider."""
++    
++    def __init__(self, delegate: IRaceDataProvider):
++        self._delegate = delegate
++        self._year_cache: dict[int, list[dict]] = {}
++    
++    def get_events_by_year(self, year: int) -> list[dict]:
++        if year not in self._year_cache:
++            self._year_cache[year] = self._delegate.get_events_by_year(year)
++        return self._year_cache[year]
++    
++    def get_events_by_years(self, years: list[int]) -> list[dict]:
++        all_events = []
++        for year in years:
++            all_events.extend(self.get_events_by_year(year))
++        return all_events
++    
++    def invalidate_cache(self, year: Optional[int] = None) -> None:
++        if year:
++            self._year_cache.pop(year, None)
++        else:
++            self._year_cache.clear()
++
++
++class FetchMultiYearWorker(QThread):
++    """Worker thread for fetching data across multiple years."""
++    
++    result = Signal(list)
++    progress = Signal(int, int)  # current, total
++    error = Signal(str)
++    
++    def __init__(self, years: list[int], service: IRaceDataProvider, parent=None):
++        super().__init__(parent)
++        self.years = years
++        self.service = service
++    
++    def run(self):
++        try:
++            from src.f1_data import enable_cache
++            enable_cache()
++        except Exception:
++            pass
++        
++        try:
++            all_events = []
++            total = len(self.years)
++            
++            for idx, year in enumerate(self.years):
++                events = self.service.get_events_by_year(year)
++                all_events.extend(events)
++                self.progress.emit(idx + 1, total)
++            
++            self.result.emit(all_events)
++        except Exception as e:
++            self.error.emit(str(e))
++
++
++class RaceDataServiceFactory:
++    """Factory for creating RaceDataService instances."""
++    
++    _instance: Optional[RaceDataService] = None
++    
++    @classmethod
++    def get_shared_instance(cls) -> RaceDataService:
++        """Get a shared singleton instance of RaceDataService."""
++        if cls._instance is None:
++            cls._instance = RaceDataService()
++        return cls._instance
++    
++    @classmethod
++    def create(cls) -> RaceDataService:
++        """Create a new RaceDataService instance."""
++        return RaceDataService()
++    
++    @classmethod
++    def create_cached(cls, base_service: Optional[IRaceDataProvider] = None) -> CachedRaceDataService:
++        """Create a cached service wrapper."""
++        delegate = base_service or cls.get_shared_instance()
++        return CachedRaceDataService(delegate)
+diff --git a/tests/test_race_name_filter.py b/tests/test_race_name_filter.py
+new file mode 100644
+index 0000000..3071d7e
+--- /dev/null
++++ b/tests/test_race_name_filter.py
+@@ -0,0 +1,34 @@
++import unittest
++import sys
++import os
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
++
++from src.gui.filters.race_name_filter import RaceNameFilterStrategy, RaceNameNormalizer
++from src.gui.filters.interfaces import FilterCriteria
++
++
++class TestRaceNameFilter(unittest.TestCase):
++    
++    def setUp(self):
++        self.strategy = RaceNameFilterStrategy()
++        self.sample_events = [
++            {"event_name": "Monaco Grand Prix", "year": 2023},
++            {"event_name": "Monaco Grand Prix", "year": 2022},
++            {"event_name": "British Grand Prix", "year": 2023},
++            {"event_name": "Abu Dhabi Grand Prix", "year": 2023},
++            {"event_name": "Las Vegas Grand Prix", "year": 2023},
++        ]
++    
++    def test_matches_exact_name(self):
++        criteria = FilterCriteria(field_name="race_name", value="Monaco Grand Prix")
++        item = {"event_name": "Monaco Grand Prix"}
++        self.assertTrue(self.strategy.matches(item, criteria))
++    
++    def test_extract_unique_gp_names(self):
++        values = self.strategy.extract_filterable_values(self.sample_events)
++        self.assertEqual(len(values), 4)
++
++
++if __name__ == '__main__':
++    unittest.main()
