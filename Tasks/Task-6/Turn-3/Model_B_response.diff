@@ -1,0 +1,408 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 8b2813a..77d7a88 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,16 +1,21 @@
+ Changelog
+ =========
+ 
+ main
+ ----
+ 
++* Fix stub generation for nested classes. Previously, nested classes could render
++  with invalid Python syntax like ``class Outer.Inner:``. Now they render correctly
++  with proper nesting and indentation. Added ``class_stubs`` parameter to ``ClassStub``
++  and updated ``render()`` to support nested class hierarchies.
++
+ * Add ``RewriteMostSpecificCommonBase`` type rewriter to replace union of derived classes with common
+   base class (not enabled by default.) Merge of #311, fixes #298. Thanks Christoph Hansknecht.
+ 
+ * Drop support for Python 3.7 and 3.8.
+ 
+ 
+ 23.3.0
+ ------
+ 
+ * Add ``--pep_563`` flag to ``apply`` command. Thanks Sagar Badiyani.
+diff --git a/monkeytype/stubs.py b/monkeytype/stubs.py
+index 9c1d3eb..fc48fab 100644
+--- a/monkeytype/stubs.py
++++ b/monkeytype/stubs.py
+@@ -534,51 +534,82 @@ class FunctionStub(Stub):
+         return "FunctionStub(%s, %s, %s, %s, %s)" % (
+             repr(self.name),
+             repr(self.signature),
+             repr(self.kind),
+             repr(self.strip_modules),
+             self.is_async,
+         )
+ 
+ 
+ class ClassStub(Stub):
++    """Represents a class in a stub file.
++
++    Supports nested classes via the class_stubs parameter. When rendered, nested
++    classes are indented inside their parent class to produce valid Python syntax:
++
++        class Outer:
++            class Inner:
++                def method(self) -> None: ...
++
++    The nesting structure is built by _build_module_stub() which walks the qualname
++    path (e.g., "Outer.Inner.method") and creates/traverses ClassStub.class_stubs
++    dictionaries accordingly.
++    """
++
+     def __init__(
+         self,
+         name: str,
+         function_stubs: Optional[Iterable[FunctionStub]] = None,
+         attribute_stubs: Optional[Iterable[AttributeStub]] = None,
++        class_stubs: Optional[Iterable["ClassStub"]] = None,
+     ) -> None:
+         self.name = name
+         self.function_stubs: Dict[str, FunctionStub] = {}
+         self.attribute_stubs = attribute_stubs or []
++        # Nested class stubs, keyed by class name
++        self.class_stubs: Dict[str, "ClassStub"] = {}
++        if class_stubs is not None:
++            self.class_stubs = {stub.name: stub for stub in class_stubs}
+         if function_stubs is not None:
+             self.function_stubs = {stub.name: stub for stub in function_stubs}
+ 
+-    def render(self) -> str:
++    def render(self, prefix: str = "") -> str:
++        """Render this class stub with proper indentation.
++
++        Args:
++            prefix: Indentation prefix for this class (empty string for top-level).
++
++        Returns:
++            The rendered class definition with all members properly indented.
++        """
++        nested_prefix = prefix + "    "
+         parts = [
+-            f"class {self.name}:",
++            f"{prefix}class {self.name}:",
+             *[
+-                stub.render(prefix="    ")
++                stub.render(prefix=nested_prefix)
+                 for stub in sorted(self.attribute_stubs, key=lambda stub: stub.name)
+             ],
+             *[
+-                stub.render(prefix="    ")
++                stub.render(prefix=nested_prefix)
+                 for _, stub in sorted(self.function_stubs.items())
+             ],
++            # Render nested classes with increased indentation
++            *[stub.render(prefix=nested_prefix) for stub in self.class_stubs.values()],
+         ]
+         return "\n".join(parts)
+ 
+     def __repr__(self) -> str:
+-        return "ClassStub(%s, %s, %s)" % (
++        return "ClassStub(%s, %s, %s, %s)" % (
+             repr(self.name),
+             tuple(self.function_stubs.values()),
+             tuple(self.attribute_stubs),
++            tuple(self.class_stubs),
+         )
+ 
+ 
+ class ReplaceTypedDictsWithStubs(TypeRewriter):
+     """Replace TypedDicts in a generic type with class stubs and store all the stubs."""
+ 
+     def __init__(self, class_name_hint: str) -> None:
+         self._class_name_hint = class_name_hint
+         self.stubs: List[ClassStub] = []
+ 
+@@ -831,55 +862,80 @@ def get_updated_definition(
+     arg_types = {name: rewriter.rewrite(typ) for name, typ in arg_types.items()}
+     if return_type is not None:
+         return_type = rewriter.rewrite(return_type)
+     if yield_type is not None:
+         yield_type = rewriter.rewrite(yield_type)
+     return FunctionDefinition.from_callable_and_traced_types(
+         func, arg_types, return_type, yield_type, existing_annotation_strategy
+     )
+ 
+ 
+-def build_module_stubs(entries: Iterable[FunctionDefinition]) -> Dict[str, ModuleStub]:
+-    """Given an iterable of function definitions, build the corresponding stubs"""
+-    mod_stubs: Dict[str, ModuleStub] = {}
++def _build_module_stub(entries: Iterable[FunctionDefinition]) -> ModuleStub:
++    """Given an iterable of function definitions for one module, build the module stub.
++
++    This function handles nested classes by parsing the qualname of each function.
++    For example, a function with qualname "Outer.Inner.method" will:
++    1. Create/find ClassStub "Outer" in mod_stub.class_stubs
++    2. Create/find ClassStub "Inner" in Outer's class_stubs
++    3. Add the FunctionStub "method" to Inner's function_stubs
++
++    This produces properly nested output like:
++        class Outer:
++            class Inner:
++                def method(self) -> None: ...
++    """
++    mod_stub = ModuleStub()
+     for entry in entries:
+-        path = entry.qualname.split(".")
+-        name = path.pop()
+-        class_path = path
+-        # TODO: Handle nested classes
+-        klass = None
+-        if len(class_path) > 0:
+-            klass = ".".join(class_path)
+-        if entry.module not in mod_stubs:
+-            mod_stubs[entry.module] = ModuleStub()
+-        mod_stub = mod_stubs[entry.module]
+         imports = get_imports_for_signature(entry.signature)
+-        # Import TypedDict, if needed.
+         if entry.typed_dict_class_stubs:
+             imports["mypy_extensions"].add("TypedDict")
++        # Don't import from the module we're generating stubs for
++        imports.pop(entry.module, None)
++        mod_stub.imports_stub.imports.merge(imports)
++
++        # Split qualname into class path and function name.
++        # e.g., "Outer.Inner.method" -> class_path=["Outer", "Inner"], name="method"
++        path = entry.qualname.split(".")
++        class_path, name = path[:-1], path[-1]
++
++        # Traverse/create the nested class hierarchy.
++        # Both ModuleStub and ClassStub have class_stubs dict, so we can walk
++        # down the tree uniformly. fn_container ends up pointing to the ClassStub
++        # (or ModuleStub for module-level functions) that should contain this function.
++        fn_container = mod_stub
++        while len(class_path) > 0:
++            outer_class, *inner_classes = class_path
++
++            if outer_class not in fn_container.class_stubs:
++                fn_container.class_stubs[outer_class] = ClassStub(outer_class)
++
++            fn_container = fn_container.class_stubs[outer_class]
++            class_path = inner_classes
++
+         func_stub = FunctionStub(
+             name, entry.signature, entry.kind, list(imports.keys()), entry.is_async
+         )
+-        # Don't need to import anything from the same module
+-        imports.pop(entry.module, None)
+-        mod_stub.imports_stub.imports.merge(imports)
+-        if klass is not None:
+-            if klass not in mod_stub.class_stubs:
+-                mod_stub.class_stubs[klass] = ClassStub(klass)
+-            class_stub = mod_stub.class_stubs[klass]
+-            class_stub.function_stubs[func_stub.name] = func_stub
+-        else:
+-            mod_stub.function_stubs[func_stub.name] = func_stub
++        fn_container.function_stubs[func_stub.name] = func_stub
+ 
+         mod_stub.typed_dict_class_stubs.extend(entry.typed_dict_class_stubs)
++    return mod_stub
++
++
++def build_module_stubs(entries: Iterable[FunctionDefinition]) -> Dict[str, ModuleStub]:
++    """Given an iterable of function definitions, build the corresponding stubs"""
++    entry_groups: Dict[str, List[FunctionDefinition]] = collections.defaultdict(list)
++    for entry in entries:
++        entry_groups[entry.module].append(entry)
+ 
+-    return mod_stubs
++    return {
++        module: _build_module_stub(entries) for module, entries in entry_groups.items()
++    }
+ 
+ 
+ def build_module_stubs_from_traces(
+     traces: Iterable[CallTrace],
+     max_typed_dict_size: int,
+     existing_annotation_strategy: ExistingAnnotationStrategy = ExistingAnnotationStrategy.REPLICATE,
+     rewriter: Optional[TypeRewriter] = None,
+ ) -> Dict[str, ModuleStub]:
+     """Given an iterable of call traces, build the corresponding stubs."""
+     index: DefaultDict[Callable[..., Any], Set[CallTrace]] = collections.defaultdict(
+diff --git a/tests/test_stubs.py b/tests/test_stubs.py
+index e7fa80e..c6229b0 100644
+--- a/tests/test_stubs.py
++++ b/tests/test_stubs.py
+@@ -359,20 +359,76 @@ class TestClassStub:
+                                    AttributeStub('bar', str),
+                                 ])
+         expected = '\n'.join([
+             'class Test:',
+             '    bar: str',
+             '    foo: int',
+             '    @classmethod',
+             '    def a_class_method(cls, foo: Any) -> Optional[frame]: ...',
+             '    def an_instance_method(self, foo: Any, bar: Any) -> Optional[frame]: ...',
+         ])
++
++    def test_render_nested_class(self):
++        cm_stub = _func_stub_from_callable(Dummy.a_class_method.__func__)
++        im_stub = _func_stub_from_callable(Dummy.an_instance_method)
++
++        # innermost class
++        nested_nested_class_stub = ClassStub(
++            'TestNestedNested',
++            function_stubs=(cm_stub, im_stub),
++            attribute_stubs=[
++                AttributeStub('foo', int),
++                AttributeStub('bar', str),
++            ],
++        )
++
++        # intermediate class
++        nested_class_stub = ClassStub(
++            'TestNested',
++            function_stubs=(cm_stub, im_stub),
++            attribute_stubs=[
++                AttributeStub('foo', int),
++                AttributeStub('bar', str),
++            ],
++            class_stubs=[nested_nested_class_stub],
++        )
++
++        # outermost class
++        class_stub = ClassStub(
++            'Test',
++            function_stubs=(cm_stub, im_stub),
++            attribute_stubs=[
++                AttributeStub('foo', int),
++                AttributeStub('bar', str),
++            ],
++            class_stubs=[nested_class_stub],
++        )
++        expected = '\n'.join([
++            'class Test:',
++            '    bar: str',
++            '    foo: int',
++            '    @classmethod',
++            '    def a_class_method(cls, foo: Any) -> Optional[frame]: ...',
++            '    def an_instance_method(self, foo: Any, bar: Any) -> Optional[frame]: ...',
++            '    class TestNested:',
++            '        bar: str',
++            '        foo: int',
++            '        @classmethod',
++            '        def a_class_method(cls, foo: Any) -> Optional[frame]: ...',
++            '        def an_instance_method(self, foo: Any, bar: Any) -> Optional[frame]: ...',
++            '        class TestNestedNested:',
++            '            bar: str',
++            '            foo: int',
++            '            @classmethod',
++            '            def a_class_method(cls, foo: Any) -> Optional[frame]: ...',
++            '            def an_instance_method(self, foo: Any, bar: Any) -> Optional[frame]: ...',
++        ])
+         assert class_stub.render() == expected
+ 
+ 
+ class TestReplaceTypedDictsWithStubs:
+     SIMPLE_TYPED_DICT_STUB: ClassStub = ClassStub(
+         name='FooBarTypedDict__RENAME_ME__(TypedDict)',
+         function_stubs=[],
+         attribute_stubs=[
+             AttributeStub(name='a', typ=int),
+             AttributeStub(name='b', typ=str),
+@@ -854,20 +910,69 @@ class TestBuildModuleStubs:
+             },
+             make_typed_dict(required_fields={'c': int}),
+             None,
+             existing_annotation_strategy=ExistingAnnotationStrategy.IGNORE
+         )
+         entries = [function]
+         expected = module_stub_for_method_with_typed_dict
+         self.maxDiff = None
+         assert build_module_stubs(entries) == expected
+ 
++    def test_build_module_stubs_with_nested_classes(self):
++        entries = [
++            FunctionDefinition.from_callable(Dummy.a_static_method),
++            FunctionDefinition.from_callable(Dummy.a_class_method.__func__),
++            FunctionDefinition.from_callable(Dummy.an_instance_method),
++            FunctionDefinition.from_callable(simple_add),
++            FunctionDefinition.from_callable(Dummy.Nested1.an_instance_method),
++            FunctionDefinition.from_callable(Dummy.Nested1.Nested2.an_instance_method),
++        ]
++
++        to_strip = ['typing']
++
++        nested2_stub = ClassStub(
++            'Nested2',
++            function_stubs=[
++                _func_stub_from_callable(
++                    Dummy.Nested1.Nested2.an_instance_method, to_strip
++                ),
++            ],
++        )
++
++        nested_stub = ClassStub(
++            'Nested1',
++            function_stubs=[
++                _func_stub_from_callable(Dummy.Nested1.an_instance_method, to_strip)
++            ],
++            class_stubs=[nested2_stub],
++        )
++
++        simple_add_stub = _func_stub_from_callable(simple_add)
++        dummy_stub = ClassStub(
++            'Dummy',
++            function_stubs=[
++                _func_stub_from_callable(Dummy.a_class_method.__func__, to_strip),
++                _func_stub_from_callable(Dummy.an_instance_method, to_strip),
++                _func_stub_from_callable(Dummy.a_static_method, to_strip),
++            ],
++            class_stubs=[nested_stub],
++        )
++        imports = {'typing': {'Any', 'Optional'}}
++        expected = {
++            'tests.test_stubs': ModuleStub(function_stubs=[simple_add_stub]),
++            'tests.util': ModuleStub(
++                class_stubs=[dummy_stub], imports_stub=ImportBlockStub(imports)
++            ),
++        }
++        self.maxDiff = None
++        assert build_module_stubs(entries) == expected
++
+ 
+ def untyped_helper(x, y):
+     pass
+ 
+ 
+ class TestStubIndexBuilder:
+     def test_ignore_non_matching_functions(self):
+         b = StubIndexBuilder('foo.bar', max_typed_dict_size=0)
+         b.log(CallTrace(untyped_helper, {'x': int, 'y': str}))
+         assert len(b.index) == 0
+diff --git a/tests/util.py b/tests/util.py
+index 7cca51c..0710795 100644
+--- a/tests/util.py
++++ b/tests/util.py
+@@ -51,20 +51,28 @@ class Dummy:
+ 
+     @a_settable_property.setter
+     def a_settable_property(self, unused) -> Optional[FrameType]:
+         return inspect.currentframe()
+ 
+     if cached_property:
+         @cached_property
+         def a_cached_property(self) -> Optional[FrameType]:
+             return inspect.currentframe()
+ 
++    class Nested1:
++        def an_instance_method(self, foo: str) -> Optional[FrameType]:
++            return inspect.currentframe()
++
++        class Nested2:
++            def an_instance_method(self, bar: str) -> Optional[FrameType]:
++                return inspect.currentframe()
++
+ 
+ class Outer:
+     class Inner:
+         def f(self) -> None:
+             pass
+ 
+ 
+ def transform_path(path: str) -> str:
+     """Transform tests/test_foo.py to monkeytype.foo"""
+     path = 'monkeytype/' + path[len('tests/'):]
