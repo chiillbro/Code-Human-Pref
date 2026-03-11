@@ -1,0 +1,818 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index 0d1070b..bd5ed92 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,16 +1,20 @@
+ Changelog
+ =========
+ 
+ master
+ ------
+ 
++* Generate stubs for TypedDicts nested within generic types. Disable
++  TypedDicts completely when the max size is zero. Thanks Pradeep Kumar
++  Srinivasan. Fixes #159.
++
+ 
+ 19.11.2
+ -------
+ 
+ * Disable TypedDict generation by default for now, since it breaks `--apply`.
+ 
+ 
+ 19.11.1
+ -------
+ 
+@@ -40,21 +44,21 @@ master
+   with a generic "invalid value" message. See
+   https://bugs.python.org/issue30220. Thanks Daniel G Holmes for the report.
+   Merge of #142, fixes #141.
+ 
+ * Typing support for collections.defaultdict. Thanks Dinesh Kesavan. Merge of #152.
+ 
+ 
+ 19.5.0
+ ------
+ 
+-* Mark ``monkeytype`` package as typed per PEP 561. Thanks Vasily Zakharov for 
++* Mark ``monkeytype`` package as typed per PEP 561. Thanks Vasily Zakharov for
+   the report.
+ * Add ``-v`` option; don't display individual traces that fail to decode unless
+   it is given.
+ 
+ 
+ 19.1.1
+ ------
+ 
+ * Pass ``--incremental`` to retype when applying stubs, so it doesn't choke on
+   partial stubs (which can result from e.g. failures to decode some traces).
+diff --git a/monkeytype/stubs.py b/monkeytype/stubs.py
+index 11d3c0d..82c0eeb 100644
+--- a/monkeytype/stubs.py
++++ b/monkeytype/stubs.py
+@@ -496,36 +496,73 @@ class ClassStub(Stub):
+             *[stub.render(prefix='    ')
+               for _, stub in sorted(self.function_stubs.items())],
+         ]
+         return "\n".join(parts)
+ 
+     def __repr__(self) -> str:
+         return 'ClassStub(%s, %s, %s)' % (repr(self.name),
+                                           tuple(self.function_stubs.values()),
+                                           tuple(self.attribute_stubs))
+ 
+-    @staticmethod
+-    def stubs_from_typed_dict(type_dict: type, class_name: str) -> List['ClassStub']:
+-        """Return a list of class stubs for all TypedDicts found within `type_dict`."""
+-        assert is_anonymous_typed_dict(type_dict)
+-        class_stubs = []
++
++class ReplaceTypedDictsWithStubs(TypeRewriter):
++    """Replace TypedDicts in a generic type with class stubs and store all the stubs."""
++
++    def __init__(self, class_name_hint: str) -> None:
++        self._class_name_hint = class_name_hint
++        self.stubs: List[ClassStub] = []
++
++    def _rewrite_container(self, cls: type, container: type) -> type:
++        """Rewrite while using the index of the inner type as a class name hint.
++
++        Otherwise, Tuple[TypedDict(...), TypedDict(...)] would give the same
++        name for both the generated classes."""
++        if container.__module__ != "typing":
++            return container
++        args = getattr(container, '__args__', None)
++        if args is None:
++            return container
++        elif args == ((),):  # special case of empty tuple `Tuple[()]`
++            elems: Tuple[Any, ...] = ()
++        else:
++            # Avoid adding a suffix for the first one so that
++            # single-element containers don't have a numeric suffix.
++            elems, stub_lists = zip(*[
++                self.rewrite_and_get_stubs(
++                    elem,
++                    class_name_hint=self._class_name_hint + (
++                        '' if index == 0 else str(index + 1)))
++                for index, elem in enumerate(args)])
++            for stubs in stub_lists:
++                self.stubs.extend(stubs)
++        # Value of type "type" is not indexable.
++        return cls[elems]  # type: ignore
++
++    def rewrite_TypedDict(self, typed_dict: type) -> type:
++        if not is_anonymous_typed_dict(typed_dict):
++            return super().rewrite_TypedDict(typed_dict)
++        class_name = get_typed_dict_class_name(self._class_name_hint)
+         attribute_stubs = []
+-        for name, typ in type_dict.__annotations__.items():
+-            if is_anonymous_typed_dict(typ):
+-                _class_name = get_typed_dict_class_name(name)
+-                class_stubs.extend(ClassStub.stubs_from_typed_dict(typ, _class_name))
+-                typ = make_forward_ref(_class_name)
+-            attribute_stubs.append(AttributeStub(name, typ))
+-        class_stubs.append(ClassStub(name=f'{class_name}(TypedDict)',
+-                                     function_stubs=[],
+-                                     attribute_stubs=attribute_stubs))
+-        return class_stubs
++        for name, typ in typed_dict.__annotations__.items():
++            rewritten_type, stubs = self.rewrite_and_get_stubs(typ, class_name_hint=name)
++            attribute_stubs.append(AttributeStub(name, rewritten_type))
++            self.stubs.extend(stubs)
++        self.stubs.append(ClassStub(name=f'{class_name}(TypedDict)',
++                                    function_stubs=[],
++                                    attribute_stubs=attribute_stubs))
++        return make_forward_ref(class_name)
++
++    @staticmethod
++    def rewrite_and_get_stubs(typ: type, class_name_hint: str) -> Tuple[type, List[ClassStub]]:
++        rewriter = ReplaceTypedDictsWithStubs(class_name_hint)
++        rewritten_type = rewriter.rewrite(typ)
++        return rewritten_type, rewriter.stubs
+ 
+ 
+ class ModuleStub(Stub):
+     def __init__(
+             self,
+             function_stubs: Iterable[FunctionStub] = None,
+             class_stubs: Iterable[ClassStub] = None,
+             imports_stub: ImportBlockStub = None,
+             typed_dict_class_stubs: Iterable[ClassStub] = None,
+     ) -> None:
+@@ -597,37 +634,35 @@ class FunctionDefinition:
+         cls,
+         func: Callable,
+         arg_types: Dict[str, type],
+         return_type: Optional[type],
+         yield_type: Optional[type],
+         existing_annotation_strategy: ExistingAnnotationStrategy = ExistingAnnotationStrategy.REPLICATE,
+     ) -> 'FunctionDefinition':
+         typed_dict_class_stubs: List[ClassStub] = []
+         new_arg_types = {}
+         for name, typ in arg_types.items():
+-            if is_anonymous_typed_dict(typ):
+-                class_name = get_typed_dict_class_name(name)
+-                typed_dict_class_stubs.extend(ClassStub.stubs_from_typed_dict(typ, class_name))
+-                typ = make_forward_ref(class_name)
+-            new_arg_types[name] = typ
++            rewritten_type, stubs = ReplaceTypedDictsWithStubs.rewrite_and_get_stubs(typ, class_name_hint=name)
++            new_arg_types[name] = rewritten_type
++            typed_dict_class_stubs.extend(stubs)
+ 
+-        if return_type and is_anonymous_typed_dict(return_type):
++        if return_type:
+             # Replace the dot in a qualified name.
+-            class_name = get_typed_dict_class_name(func.__qualname__.replace('.', '_'))
+-            typed_dict_class_stubs.extend(ClassStub.stubs_from_typed_dict(return_type, class_name))
+-            return_type = make_forward_ref(class_name)
++            class_name_hint = func.__qualname__.replace('.', '_')
++            return_type, stubs = ReplaceTypedDictsWithStubs.rewrite_and_get_stubs(return_type, class_name_hint)
++            typed_dict_class_stubs.extend(stubs)
+ 
+-        if yield_type and is_anonymous_typed_dict(yield_type):
++        if yield_type:
+             # Replace the dot in a qualified name.
+-            class_name = get_typed_dict_class_name(func.__qualname__.replace('.', '_') + 'Yield')
+-            typed_dict_class_stubs.extend(ClassStub.stubs_from_typed_dict(yield_type, class_name))
+-            yield_type = make_forward_ref(class_name)
++            class_name_hint = func.__qualname__.replace('.', '_') + 'Yield'
++            yield_type, stubs = ReplaceTypedDictsWithStubs.rewrite_and_get_stubs(yield_type, class_name_hint)
++            typed_dict_class_stubs.extend(stubs)
+ 
+         function = FunctionDefinition.from_callable(func)
+         signature = function.signature
+         signature = update_signature_args(signature, new_arg_types,
+                                           function.has_self, existing_annotation_strategy)
+         signature = update_signature_return(signature, return_type,
+                                             yield_type, existing_annotation_strategy)
+         return FunctionDefinition(function.module, function.qualname,
+                                   function.kind, signature,
+                                   function.is_async, typed_dict_class_stubs)
+diff --git a/monkeytype/typing.py b/monkeytype/typing.py
+index 34248cc..e1f1503 100644
+--- a/monkeytype/typing.py
++++ b/monkeytype/typing.py
+@@ -109,55 +109,60 @@ def make_generator(yield_typ, send_typ, return_typ):
+ 
+ _BUILTIN_CALLABLE_TYPES = (
+     types.FunctionType,
+     types.LambdaType,
+     types.MethodType,
+     types.BuiltinMethodType,
+     types.BuiltinFunctionType,
+ )
+ 
+ 
+-def get_dict_type(dct, max_typed_dict_size=None):
++def get_dict_type(dct, max_typed_dict_size):
+     """Return a TypedDict for `dct` if all the keys are strings.
+     Else, default to the union of the keys and of the values."""
++    if len(dct) == 0:
++        # Special-case this because returning an empty TypedDict is
++        # unintuitive, especially when you've "disabled" TypedDict generation
++        # by setting `max_typed_dict_size` to 0.
++        return Dict[Any, Any]
+     if (all(isinstance(k, str) for k in dct.keys())
+             and (max_typed_dict_size is None or len(dct) <= max_typed_dict_size)):
+-        return TypedDict(DUMMY_TYPED_DICT_NAME, {k: get_type(v) for k, v in dct.items()})
++        return TypedDict(DUMMY_TYPED_DICT_NAME, {k: get_type(v, max_typed_dict_size) for k, v in dct.items()})
+     else:
+-        key_type = shrink_types(get_type(k) for k in dct.keys())
+-        val_type = shrink_types(get_type(v) for v in dct.values())
++        key_type = shrink_types(get_type(k, max_typed_dict_size) for k in dct.keys())
++        val_type = shrink_types(get_type(v, max_typed_dict_size) for v in dct.values())
+         return Dict[key_type, val_type]
+ 
+ 
+-def get_type(obj, max_typed_dict_size=None):
++def get_type(obj, max_typed_dict_size):
+     """Return the static type that would be used in a type hint"""
+     if isinstance(obj, type):
+         return Type[obj]
+     elif isinstance(obj, _BUILTIN_CALLABLE_TYPES):
+         return Callable
+     elif isinstance(obj, types.GeneratorType):
+         return Iterator[Any]
+     typ = type(obj)
+     if typ is list:
+-        elem_type = shrink_types(get_type(e) for e in obj)
++        elem_type = shrink_types(get_type(e, max_typed_dict_size) for e in obj)
+         return List[elem_type]
+     elif typ is set:
+-        elem_type = shrink_types(get_type(e) for e in obj)
++        elem_type = shrink_types(get_type(e, max_typed_dict_size) for e in obj)
+         return Set[elem_type]
+     elif typ is dict:
+         return get_dict_type(obj, max_typed_dict_size)
+     elif typ is defaultdict:
+-        key_type = shrink_types(get_type(k) for k in obj.keys())
+-        val_type = shrink_types(get_type(v) for v in obj.values())
++        key_type = shrink_types(get_type(k, max_typed_dict_size) for k in obj.keys())
++        val_type = shrink_types(get_type(v, max_typed_dict_size) for v in obj.values())
+         return DefaultDict[key_type, val_type]
+     elif typ is tuple:
+-        return Tuple[tuple(get_type(e) for e in obj)]
++        return Tuple[tuple(get_type(e, max_typed_dict_size) for e in obj)]
+     return typ
+ 
+ 
+ NoneType = type(None)
+ NotImplementedType = type(NotImplemented)
+ mappingproxy = type(range.__dict__)
+ 
+ 
+ class TypeRewriter:
+     """TypeRewriter provides a visitor for rewriting parts of types"""
+@@ -179,32 +184,40 @@ class TypeRewriter:
+ 
+     def rewrite_List(self, lst):
+         return self._rewrite_container(List, lst)
+ 
+     def rewrite_Set(self, st):
+         return self._rewrite_container(Set, st)
+ 
+     def rewrite_Tuple(self, tup):
+         return self._rewrite_container(Tuple, tup)
+ 
++    def rewrite_TypedDict(self, typed_dict):
++        return TypedDict(typed_dict.__name__,
++                         {name: self.rewrite(typ)
++                          for name, typ in typed_dict.__annotations__.items()},
++                         total=typed_dict.__total__)
++
+     def rewrite_Union(self, union):
+         return self._rewrite_container(Union, union)
+ 
+     def generic_rewrite(self, typ):
+         """Fallback method when there isn't a type-specific rewrite method"""
+         return typ
+ 
+     def rewrite(self, typ):
+         if is_any(typ):
+             typname = 'Any'
+         elif is_union(typ):
+             typname = 'Union'
++        elif is_typed_dict(typ):
++            typname = 'TypedDict'
+         elif is_generic(typ):
+             typname = name_of_generic(typ)
+         else:
+             typname = getattr(typ, '__name__', None)
+         rewriter = getattr(
+             self, 'rewrite_' + typname, None) if typname else None
+         if rewriter:
+             return rewriter(typ)
+         return self.generic_rewrite(typ)
+ 
+diff --git a/monkeytype/typing.pyi b/monkeytype/typing.pyi
+index 1d80d2c..97be9cb 100644
+--- a/monkeytype/typing.pyi
++++ b/monkeytype/typing.pyi
+@@ -27,21 +27,21 @@ DUMMY_TYPED_DICT_NAME: str = ...
+ 
+ def is_typed_dict(typ: type) -> bool: ...
+ 
+ 
+ def is_anonymous_typed_dict(typ: type) -> bool: ...
+ 
+ 
+ def shrink_types(types: Iterable[type]) -> type: ...
+ 
+ 
+-def get_dict_type(dct: Any) -> type: ...
++def get_dict_type(dct: Any, max_typed_dict_size: Optional[int]) -> type: ...
+ 
+ 
+ def get_type(obj: Any, max_typed_dict_size: Optional[int]) -> type: ...
+ 
+ 
+ def get_type_str(t: type) -> str: ...
+ 
+ 
+ def make_iterator(typ: type) -> type: ...
+ 
+@@ -52,20 +52,22 @@ def make_generator(yield_typ: type, send_typ: type, return_typ: type) -> type:
+ 
+ class TypeRewriter:
+     def rewrite_Dict(self, dct: Dict) -> type: ...
+ 
+     def rewrite_List(self, lst: List) -> type: ...
+ 
+     def rewrite_Set(self, st: Set) -> type: ...
+ 
+     def rewrite_Union(self, union: _Union) -> type:  ...
+ 
++    def rewrite_TypedDict(self, typed_dict: type) -> type: ...
++
+     def rewrite_Tuple(self, tup: Tuple) -> type: ...
+ 
+     def generic_rewrite(self, typ: type) -> type: ...
+ 
+     def rewrite(self, typ: type) -> type: ...
+ 
+ 
+ class RemoveEmptyContainers(TypeRewriter):
+     ...
+ 
+diff --git a/tests/test_stubs.py b/tests/test_stubs.py
+index 5edfc20..3dae040 100644
+--- a/tests/test_stubs.py
++++ b/tests/test_stubs.py
+@@ -30,20 +30,21 @@ from monkeytype.compat import make_forward_ref, repr_forward_ref
+ from monkeytype.stubs import (
+     AttributeStub,
+     ClassStub,
+     ExistingAnnotationStrategy,
+     FunctionDefinition,
+     FunctionStub,
+     FunctionKind,
+     ImportBlockStub,
+     ImportMap,
+     ModuleStub,
++    ReplaceTypedDictsWithStubs,
+     StubIndexBuilder,
+     build_module_stubs,
+     get_imports_for_annotation,
+     render_signature,
+     shrink_traced_types,
+     update_signature_args,
+     update_signature_return,
+ )
+ from monkeytype.tracing import CallTrace
+ from monkeytype.typing import NoneType, DUMMY_TYPED_DICT_NAME
+@@ -321,34 +322,120 @@ class TestClassStub:
+         expected = '\n'.join([
+             'class Test:',
+             '    bar: str',
+             '    foo: int',
+             '    @classmethod',
+             '    def a_class_method(cls, foo: Any) -> Optional[frame]: ...',
+             '    def an_instance_method(self, foo: Any, bar: Any) -> Optional[frame]: ...',
+         ])
+         assert class_stub.render() == expected
+ 
++
++class TestReplaceTypedDictsWithStubs:
++    SIMPLE_TYPED_DICT_STUB: ClassStub = ClassStub(
++        name='FooBarTypedDict(TypedDict)',
++        function_stubs=[],
++        attribute_stubs=[
++            AttributeStub(name='a', typ=int),
++            AttributeStub(name='b', typ=str),
++        ])
++    SIMPLE_TYPED_DICT_STUB2: ClassStub = ClassStub(
++        name='FooBar2TypedDict(TypedDict)',
++        function_stubs=[],
++        attribute_stubs=[
++            AttributeStub(name='a', typ=int),
++            AttributeStub(name='b', typ=str),
++        ])
++
+     @pytest.mark.parametrize(
+         'typ, expected',
+         [
++            (int, (int, [])),
++            (List[int], (List[int], [])),
++            (Set[int], (Set[int], [])),
++            (Dict[str, int], (Dict[str, int], [])),
++            (Tuple[str, int], (Tuple[str, int], [])),
++            (List[List[Dict[str, int]]], (List[List[Dict[str, int]]], []),),
++            (List[List[Dict[str, int]]], (List[List[Dict[str, int]]], []),),
++            (
++                List[List[TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': str})]],
++                (List[List[make_forward_ref('FooBarTypedDict')]], [SIMPLE_TYPED_DICT_STUB]),
++            ),
++            (
++                Dict[str, TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': str})],
++                (Dict[str, make_forward_ref('FooBar2TypedDict')], [SIMPLE_TYPED_DICT_STUB2]),
++            ),
++            (
++                Set[TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': str})],
++                (Set[make_forward_ref('FooBarTypedDict')], [SIMPLE_TYPED_DICT_STUB]),
++            ),
++            (
++                Tuple[int, TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': str})],
++                (Tuple[int, make_forward_ref('FooBar2TypedDict')], [SIMPLE_TYPED_DICT_STUB2]),
++            ),
+             (
+                 TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': str}),
+-                [ClassStub(name='FooBar(TypedDict)', function_stubs=[], attribute_stubs=[
+-                    AttributeStub(name='a', typ=int),
+-                    AttributeStub(name='b', typ=str),
+-                ])],
++                (make_forward_ref('FooBarTypedDict'), [SIMPLE_TYPED_DICT_STUB]),
++            ),
++            (
++                TypedDict('GenuineTypedDict', {'a': int, 'b': str}),
++                (TypedDict('GenuineTypedDict', {'a': int, 'b': str}), []),
++            ),
++            (
++                TypedDict(
++                    DUMMY_TYPED_DICT_NAME, {
++                        'a': int,
++                        'b': TypedDict(DUMMY_TYPED_DICT_NAME, {
++                            'a': int,
++                            'b': str
++                        })
++                    }),
++                (make_forward_ref('FooBarTypedDict'), [
++                    ClassStub(
++                        name='BTypedDict(TypedDict)',
++                        function_stubs=[],
++                        attribute_stubs=[
++                            AttributeStub(name='a', typ=int),
++                            AttributeStub(name='b', typ=str),
++                        ]),
++                    ClassStub(
++                        name='FooBarTypedDict(TypedDict)',
++                        function_stubs=[],
++                        attribute_stubs=[
++                            AttributeStub(name='a', typ=int),
++                            AttributeStub(name='b', typ=make_forward_ref('BTypedDict')),
++                        ])
++                ]),
++            ),
++            (
++                Tuple[TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int}),
++                      TypedDict(DUMMY_TYPED_DICT_NAME, {'b': str})],
++                (Tuple[make_forward_ref('FooBarTypedDict'), make_forward_ref('FooBar2TypedDict')],
++                 [ClassStub(
++                     name='FooBarTypedDict(TypedDict)',
++                     function_stubs=[],
++                     attribute_stubs=[
++                         AttributeStub(name='a', typ=int),
++                     ]),
++                  ClassStub(
++                      name='FooBar2TypedDict(TypedDict)',
++                      function_stubs=[],
++                      attribute_stubs=[
++                          AttributeStub(name='b', typ=str),
++                      ])]),
+             ),
+         ],
+     )
+-    def test_stubs_from_typed_dict(self, typ, expected):
+-        assert ClassStub.stubs_from_typed_dict(typ, class_name='FooBar') == expected
++    def test_replace_typed_dict_with_stubs(self, typ, expected):
++        rewritten_type, stubs = ReplaceTypedDictsWithStubs.rewrite_and_get_stubs(typ, class_name_hint='foo_bar')
++        actual = rewritten_type, stubs
++        assert actual == expected
+ 
+ 
+ typed_dict_import_map = ImportMap()
+ typed_dict_import_map['mypy_extensions'] = {'TypedDict'}
+ module_stub_for_method_with_typed_dict = {
+     'tests.util': ModuleStub(
+         function_stubs=(),
+         class_stubs=[
+             ClassStub(
+                 name='Dummy',
+@@ -479,20 +566,47 @@ class TestModuleStub:
+             'class ZTypedDict(TypedDict):',
+             '    a: int',
+             '    b: str',
+             '',
+             '',
+             'class Dummy:',
+             '    def an_instance_method(self, foo: \'FooTypedDict\', bar: int) -> int: ...'])
+         self.maxDiff = None
+         assert build_module_stubs(entries)['tests.util'].render() == expected
+ 
++    def test_render_return_typed_dict(self):
++        function = FunctionDefinition.from_callable_and_traced_types(
++            Dummy.an_instance_method,
++            {
++                'foo': int,
++                'bar': int,
++            },
++            TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': str}),
++            yield_type=None,
++            existing_annotation_strategy=ExistingAnnotationStrategy.IGNORE
++        )
++        entries = [function]
++        expected = '\n'.join([
++            'from mypy_extensions import TypedDict',
++            '',
++            '',
++            'class DummyAnInstanceMethodTypedDict(TypedDict):',
++            '    a: int',
++            '    b: str',
++            '',
++            '',
++            'class Dummy:',
++            '    def an_instance_method(self, foo: int, bar: int) -> \'DummyAnInstanceMethodTypedDict\': ...',
++        ])
++        self.maxDiff = None
++        assert build_module_stubs(entries)['tests.util'].render() == expected
++
+     def test_render_yield_typed_dict(self):
+         function = FunctionDefinition.from_callable_and_traced_types(
+             Dummy.an_instance_method,
+             {
+                 'foo': int,
+                 'bar': int,
+             },
+             int,
+             yield_type=TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': str}),
+             existing_annotation_strategy=ExistingAnnotationStrategy.IGNORE
+@@ -512,20 +626,46 @@ class TestModuleStub:
+             '    def an_instance_method(',
+             '        self,',
+             '        foo: int,',
+             '        bar: int',
+             f'    ) -> Generator[{repr_forward_ref()}'
+             + '(\'DummyAnInstanceMethodYieldTypedDict\'), None, int]: ...',
+         ])
+         self.maxDiff = None
+         assert build_module_stubs(entries)['tests.util'].render() == expected
+ 
++    def test_render_typed_dict_in_list(self):
++        function = FunctionDefinition.from_callable_and_traced_types(
++            Dummy.an_instance_method,
++            {
++                'foo': List[TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int})],
++                'bar': int,
++            },
++            int,
++            None,
++            existing_annotation_strategy=ExistingAnnotationStrategy.IGNORE,
++        )
++        entries = [function]
++        expected = '\n'.join([
++            'from mypy_extensions import TypedDict',
++            'from typing import List',
++            '',
++            '',
++            'class FooTypedDict(TypedDict):',
++            '    a: int',
++            '',
++            '',
++            'class Dummy:',
++            f'    def an_instance_method(self, foo: List[{make_forward_ref("FooTypedDict")}], bar: int) -> int: ...'])
++        self.maxDiff = None
++        assert build_module_stubs(entries)['tests.util'].render() == expected
++
+ 
+ class TestBuildModuleStubs:
+     def test_build_module_stubs(self):
+         entries = [
+             FunctionDefinition.from_callable(Dummy.a_static_method),
+             FunctionDefinition.from_callable(Dummy.a_class_method.__func__),
+             FunctionDefinition.from_callable(Dummy.an_instance_method),
+             FunctionDefinition.from_callable(simple_add),
+         ]
+         simple_add_stub = _func_stub_from_callable(simple_add)
+diff --git a/tests/test_typing.py b/tests/test_typing.py
+index c7764bb..441f82b 100644
+--- a/tests/test_typing.py
++++ b/tests/test_typing.py
+@@ -14,31 +14,34 @@ from typing import (
+     Optional,
+     Set,
+     Tuple as typing_Tuple,
+     Type,
+     Union,
+     Generator,
+ )
+ 
+ import pytest
+ 
++from monkeytype.compat import name_of_generic
++
+ from monkeytype.typing import (
+     NoneType,
+     RemoveEmptyContainers,
+     RewriteConfigDict,
+     RewriteLargeUnion,
+     get_type,
+     is_typed_dict,
+     shrink_types,
+     shrink_typed_dict_types,
+     typed_dict_to_dict,
+     RewriteGenerator,
++    TypeRewriter,
+     DUMMY_TYPED_DICT_NAME,
+ )
+ 
+ from mypy_extensions import TypedDict
+ 
+ from .util import Dummy
+ 
+ 
+ class TestShrinkType:
+     @pytest.mark.parametrize(
+@@ -204,20 +207,26 @@ def get_default_dict(key, value):
+     m[key] += value
+     return m
+ 
+ 
+ def get_nested_default_dict(key, value):
+     m = defaultdict(lambda: defaultdict(lambda: 1))
+     m[key][key] += value
+     return m
+ 
+ 
++def get_default_dict_with_dict(key, value):
++    m = defaultdict(lambda: {'a': 1, 'b': 2})
++    m[key]['a'] = value
++    return m
++
++
+ class TestGetType:
+ 
+     @pytest.mark.parametrize(
+         'value, expected_type',
+         [
+             (1, int),
+             ('foo', str),
+             (Dummy, Type[Dummy]),
+             (1.1, float),
+             (('a', 1, True), typing_Tuple[str, int, bool]),
+@@ -230,52 +239,134 @@ class TestGetType:
+             (tuple(), typing_Tuple[()]),
+             (helper, Callable),
+             (lambda x: x, Callable),
+             (Dummy().an_instance_method, Callable),
+             (len, Callable),
+             (generator(), Iterator[Any]),
+         ],
+     )
+     def test_builtin_types(self, value, expected_type):
+         """Return the appropriate type for builtins"""
+-        assert get_type(value) == expected_type
++        assert get_type(value, max_typed_dict_size=None) == expected_type
++        assert get_type(value, max_typed_dict_size=0) == expected_type
+ 
+     @pytest.mark.parametrize(
+-        'value, max_typed_dict_size, expected_dict_type',
++        'value, expected_when_max_size_is_zero, expected_when_max_size_is_none',
+         [
+-            ({}, None, TypedDict(DUMMY_TYPED_DICT_NAME, {})),
+-            ({'a': 1, 'b': 2}, None, TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': int})),
+-            ({'a': 1, 'b': 2}, 2, TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': int})),
+-            ({'a': 1, 'b': 2}, 1, Dict[str, int]),
+-            ({'a': 1, 2: 'b'}, None, Dict[Union[str, int], Union[str, int]]),
+-            (get_default_dict(key=1, value=1), None, DefaultDict[int, int]),
+-            (get_nested_default_dict(key=1, value=1.0), None, DefaultDict[int, DefaultDict[int, float]]),
++            ({}, Dict[Any, Any], Dict[Any, Any]),
++            ({'a': 1, 'b': 2}, Dict[str, int], TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': int})),
++            ({'a': 1, 2: 'b'}, Dict[Union[str, int], Union[str, int]], Dict[Union[str, int], Union[str, int]]),
++            (get_default_dict(key=1, value=1), DefaultDict[int, int], DefaultDict[int, int]),
++            (get_nested_default_dict(key=1, value=1.0),
++             DefaultDict[int, DefaultDict[int, float]],
++             DefaultDict[int, DefaultDict[int, float]]),
++            ({
++                'foo': {
++                    'a': 1,
++                    'b': "hello"
++                }
++            },
++             Dict[str, Dict[str, Union[str, int]]],
++             TypedDict(
++                 DUMMY_TYPED_DICT_NAME, {
++                     'foo': TypedDict(DUMMY_TYPED_DICT_NAME, {
++                         'a': int,
++                         'b': str
++                     }),
++                 })),
+         ],
+     )
+-    def test_dict_type(self, value, max_typed_dict_size, expected_dict_type):
++    def test_dict_type(self, value, expected_when_max_size_is_zero, expected_when_max_size_is_none):
+         """Return the appropriate type for dictionaries."""
+-        assert get_type(value, max_typed_dict_size) == expected_dict_type
++        assert get_type(value, max_typed_dict_size=0) == expected_when_max_size_is_zero
++        assert get_type(value, max_typed_dict_size=None) == expected_when_max_size_is_none
++
++    @pytest.mark.parametrize(
++        'value, expected_when_max_size_is_zero, expected_when_max_size_is_none',
++        [
++            (get_default_dict_with_dict(key=1, value=3),
++             DefaultDict[int, Dict[str, int]],
++             DefaultDict[int, TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': int})]),
++            ([{'a': 1, 'b': 2}], List[Dict[str, int]], List[TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': int})]),
++            (({'a': 1, 'b': 2},),
++             typing_Tuple[Dict[str, int]],
++             typing_Tuple[TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': int})]),
++
++        ],
++    )
++    def test_dict_nested_within_generic(self, value, expected_when_max_size_is_zero, expected_when_max_size_is_none):
++        """Return the appropriate type for dictionaries."""
++        actual_when_zero = get_type(value, max_typed_dict_size=0)
++        actual_when_none = get_type(value, max_typed_dict_size=None)
++
++        def are_generic_types_equal(actual, expected) -> bool:
++            """Compare manually because the module name causes errors in 3.6.
++            List[tests.test_typing.FooTypedDict] != List[monkeytype.typing.FooTypedDict]."""
++            return name_of_generic(actual) == name_of_generic(expected) and actual.__args__ == expected.__args__
++
++        assert (are_generic_types_equal(actual_when_zero, expected_when_max_size_is_zero))
++        assert (are_generic_types_equal(actual_when_none, expected_when_max_size_is_none))
++
++    @pytest.mark.parametrize(
++        'value, max_typed_dict_size, expected',
++        [
++            ({'a': 1, 'b': 2}, 1, Dict[str, int]),
++            ({
++                'foo': {
++                    'a': 1,
++                    'b': "hello"
++                }
++            }, 1,
++             TypedDict(
++                 DUMMY_TYPED_DICT_NAME, {
++                     'foo': Dict[str, Union[str, int]],
++                 })),
++        ]
++    )
++    def test_dict_type_with_other_max_sizes(self, value, max_typed_dict_size, expected):
++        assert get_type(value, max_typed_dict_size) == expected
+ 
+     def test_instance_type(self):
+         """Return appropriate type for an instance of a user defined class"""
+-        assert get_type(Dummy()) == Dummy
++        assert get_type(Dummy(), max_typed_dict_size=None) == Dummy
+ 
+     def test_class_type(self):
+         """Return the correct type for classes"""
+-        assert get_type(Dummy) == Type[Dummy]
++        assert get_type(Dummy, max_typed_dict_size=None) == Type[Dummy]
+ 
+ 
+ class Tuple:
+     """A name conflict that is not generic."""
+     pass
+ 
+ 
++class RewriteListToInt(TypeRewriter):
++    """Dummy rewriter for testing."""
++    def rewrite_List(self, lst):
++        return int
++
++
++class TestTypeRewriter:
++    @pytest.mark.parametrize(
++        'typ, expected',
++        [
++            (List[str], int),
++            (TypedDict('Foo', {'a': List[str], 'b': int}), TypedDict('Foo', {'a': int, 'b': int})),
++            (TypedDict('Foo', {'a': List[str], 'b': int}, total=False),
++             TypedDict('Foo', {'a': int, 'b': int}, total=False)),
++        ],
++    )
++    def test_rewrite_TypedDict(self, typ, expected):
++        rewritten = RewriteListToInt().rewrite(typ)
++        assert rewritten == expected
++
++
+ class TestRemoveEmptyContainers:
+     @pytest.mark.parametrize(
+         'typ, expected',
+         [
+             (Union[Set[Any], Set[int]], Set[int]),
+             (Union[Dict[Any, Any], Dict[int, int]], Dict[int, int]),
+             (
+                 Union[Set[Any], Set[int], Dict[int, str]],
+                 Union[Set[int], Dict[int, str]],
+             ),
