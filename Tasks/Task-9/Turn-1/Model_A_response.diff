@@ -1,0 +1,995 @@
+diff --git a/monkeytype/cli.py b/monkeytype/cli.py
+index 9e3a477..6b21319 100644
+--- a/monkeytype/cli.py
++++ b/monkeytype/cli.py
+@@ -15,20 +15,21 @@ import sys
+ from pathlib import Path
+ from typing import IO, TYPE_CHECKING, List, Optional, Tuple
+ 
+ from libcst import parse_module
+ from libcst.codemod import CodemodContext
+ from libcst.codemod.visitors import ApplyTypeAnnotationsVisitor
+ 
+ from monkeytype import trace
+ from monkeytype.config import Config
+ from monkeytype.exceptions import MonkeyTypeError
++from monkeytype.pep563 import apply_pep563_transform
+ from monkeytype.stubs import (
+     ExistingAnnotationStrategy,
+     Stub,
+     build_module_stubs_from_traces,
+ )
+ from monkeytype.tracing import CallTrace
+ from monkeytype.typing import NoOpRewriter
+ from monkeytype.util import get_name_in_module
+ 
+ if TYPE_CHECKING:
+@@ -133,53 +134,59 @@ def get_stub(
+     if args.sample_count:
+         display_sample_count(traces, stderr)
+     return stubs.get(module, None)
+ 
+ 
+ class HandlerError(Exception):
+     pass
+ 
+ 
+ def apply_stub_using_libcst(
+-    stub: str, source: str, overwrite_existing_annotations: bool
++    stub: str, source: str, overwrite_existing_annotations: bool, pep563: bool = False
+ ) -> str:
+     try:
+         stub_module = parse_module(stub)
+         source_module = parse_module(source)
+         context = CodemodContext()
+         ApplyTypeAnnotationsVisitor.store_stub_in_context(
+             context,
+             stub_module,
+             overwrite_existing_annotations,
+         )
+         transformer = ApplyTypeAnnotationsVisitor(context)
+         transformed_source_module = transformer.transform_module(source_module)
++
++        if pep563:
++            transformed_source_module = apply_pep563_transform(
++                source_module, transformed_source_module
++            )
+     except Exception as exception:
+         raise HandlerError(f"Failed applying stub with libcst:\n{exception}")
+     return transformed_source_module.code
+ 
+ 
+ def apply_stub_handler(
+     args: argparse.Namespace, stdout: IO[str], stderr: IO[str]
+ ) -> None:
+     stub = get_stub(args, stdout, stderr)
+     if stub is None:
+         complain_about_no_traces(args, stderr)
+         return
+     module = args.module_path[0]
+     mod = importlib.import_module(module)
+     source_path = Path(inspect.getfile(mod))
+     source_with_types = apply_stub_using_libcst(
+         stub=stub.render(),
+         source=source_path.read_text(),
+         overwrite_existing_annotations=args.existing_annotation_strategy
+         == ExistingAnnotationStrategy.IGNORE,
++        pep563=args.pep563,
+     )
+     source_path.write_text(source_with_types)
+     print(source_with_types, file=stdout)
+ 
+ 
+ def get_diff(
+     args: argparse.Namespace, stdout: IO[str], stderr: IO[str]
+ ) -> Optional[str]:
+     args.existing_annotation_strategy = ExistingAnnotationStrategy.REPLICATE
+     stub = get_stub(args, stdout, stderr)
+@@ -329,20 +336,30 @@ qualname format.""",
+         help="Print to stderr the numbers of traces stubs are based on",
+     )
+     apply_parser.add_argument(
+         "--ignore-existing-annotations",
+         action="store_const",
+         dest="existing_annotation_strategy",
+         default=ExistingAnnotationStrategy.REPLICATE,
+         const=ExistingAnnotationStrategy.IGNORE,
+         help="Ignore existing annotations when applying stubs from traces.",
+     )
++    apply_parser.add_argument(
++        "--pep563",
++        action="store_true",
++        default=False,
++        help=(
++            "Use PEP 563 postponed annotation evaluation to avoid circular imports. "
++            "Adds `from __future__ import annotations` and moves newly added type "
++            "imports into `if TYPE_CHECKING:` block."
++        ),
++    )
+     apply_parser.set_defaults(handler=apply_stub_handler)
+ 
+     stub_parser = subparsers.add_parser(
+         "stub", help="Generate a stub", description="Generate a stub"
+     )
+     stub_parser.add_argument(
+         "module_path",
+         type=module_path,
+         help="""A string of the form <module>[:<qualname>] (e.g.
+ my.module:Class.method). This specifies the set of functions/methods for which
+diff --git a/monkeytype/pep563.py b/monkeytype/pep563.py
+new file mode 100644
+index 0000000..e359c82
+--- /dev/null
++++ b/monkeytype/pep563.py
+@@ -0,0 +1,346 @@
++# Copyright (c) 2017-present, Facebook, Inc.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++"""PEP 563 support for MonkeyType.
++
++This module provides transformations to support PEP 563 (Postponed Evaluation
++of Annotations) when applying type annotations. This helps avoid circular
++import issues by:
++
++1. Adding `from __future__ import annotations` to enable postponed evaluation
++2. Moving newly added type imports into `if TYPE_CHECKING:` blocks so they
++   are only evaluated during static type checking, not at runtime
++"""
++from typing import List, Set, Tuple, Union
++
++import libcst as cst
++
++
++class ImportCollector(cst.CSTVisitor):
++    """Collects all `from X import Y` style imports from a module."""
++
++    def __init__(self) -> None:
++        self.imports: Set[Tuple[str, str]] = set()
++
++    def _get_module_name(self, node: cst.BaseExpression) -> str:
++        if isinstance(node, cst.Name):
++            return node.value
++        elif isinstance(node, cst.Attribute):
++            return self._get_module_name(node.value) + "." + node.attr.value
++        return ""
++
++    def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
++        if isinstance(node.names, cst.ImportStar):
++            return
++
++        module_parts: List[str] = []
++        for _ in node.relative:
++            module_parts.append(".")
++
++        if node.module:
++            module_parts.append(self._get_module_name(node.module))
++
++        module = "".join(module_parts)
++
++        for alias in node.names:
++            if isinstance(alias.name, cst.Name):
++                self.imports.add((module, alias.name.value))
++
++
++def collect_imports(module: cst.Module) -> Set[Tuple[str, str]]:
++    """Collect all (module, name) imports from a module."""
++    wrapper = cst.MetadataWrapper(module)
++    collector = ImportCollector()
++    wrapper.visit(collector)
++    return collector.imports
++
++
++class Pep563Transformer(cst.CSTTransformer):
++    """
++    Transforms a module to use PEP 563 postponed annotations.
++
++    This transformer:
++    1. Adds `from __future__ import annotations` at the top of the file
++    2. Moves newly added imports into an `if TYPE_CHECKING:` block
++
++    This enables type annotations to reference types that would otherwise
++    cause circular imports, since the imports are only evaluated during
++    static type checking and not at runtime.
++    """
++
++    def __init__(self, new_imports: Set[Tuple[str, str]]) -> None:
++        super().__init__()
++        self.new_imports = new_imports
++        self._imports_to_move: List[cst.SimpleStatementLine] = []
++        self._has_future_annotations = False
++        self._has_type_checking_import = False
++        self._has_type_checking_block = False
++        self._in_type_checking_block = False
++        self._added_to_existing_block = False
++
++    def _get_module_name(self, node: cst.BaseExpression) -> str:
++        if isinstance(node, cst.Name):
++            return node.value
++        elif isinstance(node, cst.Attribute):
++            return self._get_module_name(node.value) + "." + node.attr.value
++        return ""
++
++    def _is_future_annotations_import(self, node: cst.ImportFrom) -> bool:
++        if not node.module:
++            return False
++        module_name = self._get_module_name(node.module)
++        if module_name != "__future__":
++            return False
++        if isinstance(node.names, cst.ImportStar):
++            return False
++        for alias in node.names:
++            if isinstance(alias.name, cst.Name) and alias.name.value == "annotations":
++                return True
++        return False
++
++    def _is_type_checking_import(self, node: cst.ImportFrom) -> bool:
++        if not node.module:
++            return False
++        module_name = self._get_module_name(node.module)
++        if module_name != "typing":
++            return False
++        if isinstance(node.names, cst.ImportStar):
++            return False
++        for alias in node.names:
++            if isinstance(alias.name, cst.Name) and alias.name.value == "TYPE_CHECKING":
++                return True
++        return False
++
++    def _is_type_checking_block(self, node: cst.If) -> bool:
++        return isinstance(node.test, cst.Name) and node.test.value == "TYPE_CHECKING"
++
++    def _get_import_names_to_keep(
++        self, node: cst.ImportFrom
++    ) -> List[cst.ImportAlias]:
++        if isinstance(node.names, cst.ImportStar):
++            return []
++
++        module_parts: List[str] = []
++        for _ in node.relative:
++            module_parts.append(".")
++        if node.module:
++            module_parts.append(self._get_module_name(node.module))
++        module = "".join(module_parts)
++
++        keep = []
++        for alias in node.names:
++            if isinstance(alias.name, cst.Name):
++                if (module, alias.name.value) not in self.new_imports:
++                    keep.append(alias)
++        return keep
++
++    def _get_import_names_to_move(
++        self, node: cst.ImportFrom
++    ) -> List[cst.ImportAlias]:
++        if isinstance(node.names, cst.ImportStar):
++            return []
++
++        module_parts: List[str] = []
++        for _ in node.relative:
++            module_parts.append(".")
++        if node.module:
++            module_parts.append(self._get_module_name(node.module))
++        module = "".join(module_parts)
++
++        move = []
++        for alias in node.names:
++            if isinstance(alias.name, cst.Name):
++                if (module, alias.name.value) in self.new_imports:
++                    move.append(alias)
++        return move
++
++    def _make_import_names(
++        self, aliases: List[cst.ImportAlias]
++    ) -> List[cst.ImportAlias]:
++        if len(aliases) == 1:
++            return [aliases[0].with_changes(comma=cst.MaybeSentinel.DEFAULT)]
++        result = [
++            a.with_changes(
++                comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
++            )
++            for a in aliases[:-1]
++        ]
++        result.append(aliases[-1].with_changes(comma=cst.MaybeSentinel.DEFAULT))
++        return result
++
++    def visit_ImportFrom(self, node: cst.ImportFrom) -> bool:
++        if self._is_future_annotations_import(node):
++            self._has_future_annotations = True
++        if self._is_type_checking_import(node):
++            self._has_type_checking_import = True
++        return True
++
++    def visit_If(self, node: cst.If) -> bool:
++        if self._is_type_checking_block(node):
++            self._has_type_checking_block = True
++            self._in_type_checking_block = True
++        return True
++
++    def leave_If(
++        self, original_node: cst.If, updated_node: cst.If
++    ) -> Union[cst.If, cst.RemovalSentinel]:
++        if self._is_type_checking_block(original_node):
++            self._in_type_checking_block = False
++            # Mark that we have an existing block - we'll add imports in leave_Module
++            self._added_to_existing_block = True
++        return updated_node
++
++    def leave_SimpleStatementLine(
++        self,
++        original_node: cst.SimpleStatementLine,
++        updated_node: cst.SimpleStatementLine,
++    ) -> Union[cst.SimpleStatementLine, cst.RemovalSentinel]:
++        if self._in_type_checking_block:
++            return updated_node
++
++        if len(updated_node.body) == 1 and isinstance(
++            updated_node.body[0], cst.ImportFrom
++        ):
++            import_node = updated_node.body[0]
++            to_keep = self._get_import_names_to_keep(import_node)
++            to_move = self._get_import_names_to_move(import_node)
++
++            if to_move:
++                moved_import = import_node.with_changes(
++                    names=self._make_import_names(to_move)
++                )
++                self._imports_to_move.append(
++                    cst.SimpleStatementLine(body=[moved_import])
++                )
++
++                if not to_keep:
++                    return cst.RemovalSentinel.REMOVE
++                else:
++                    new_import = import_node.with_changes(
++                        names=self._make_import_names(to_keep)
++                    )
++                    return updated_node.with_changes(body=[new_import])
++
++        return updated_node
++
++    def leave_Module(
++        self, original_node: cst.Module, updated_node: cst.Module
++    ) -> cst.Module:
++        if not self._imports_to_move:
++            return updated_node
++
++        new_body: List[cst.BaseStatement] = []
++
++        if not self._has_future_annotations:
++            future_import = cst.SimpleStatementLine(
++                body=[
++                    cst.ImportFrom(
++                        module=cst.Name("__future__"),
++                        names=[cst.ImportAlias(name=cst.Name("annotations"))],
++                    )
++                ]
++            )
++            new_body.append(future_import)
++
++        type_checking_block_added = False
++        found_first_non_import = False
++
++        for stmt in updated_node.body:
++            # Check if this is the existing TYPE_CHECKING block
++            if (
++                self._added_to_existing_block
++                and isinstance(stmt, cst.If)
++                and self._is_type_checking_block(stmt)
++            ):
++                # Add our imports to the existing block
++                if isinstance(stmt.body, cst.IndentedBlock):
++                    all_imports = list(stmt.body.body) + self._imports_to_move
++                    new_block_body = stmt.body.with_changes(body=all_imports)
++                    stmt = stmt.with_changes(body=new_block_body)
++                type_checking_block_added = True
++                new_body.append(stmt)
++                continue
++
++            is_import = isinstance(stmt, cst.SimpleStatementLine) and (
++                len(stmt.body) == 1
++                and isinstance(stmt.body[0], (cst.Import, cst.ImportFrom))
++            )
++
++            if (
++                not is_import
++                and not found_first_non_import
++                and not self._added_to_existing_block
++            ):
++                found_first_non_import = True
++
++                if not self._has_type_checking_import:
++                    tc_import = cst.SimpleStatementLine(
++                        body=[
++                            cst.ImportFrom(
++                                module=cst.Name("typing"),
++                                names=[cst.ImportAlias(name=cst.Name("TYPE_CHECKING"))],
++                            )
++                        ],
++                        leading_lines=[cst.EmptyLine()],
++                    )
++                    new_body.append(tc_import)
++
++                tc_block = cst.If(
++                    test=cst.Name("TYPE_CHECKING"),
++                    body=cst.IndentedBlock(body=self._imports_to_move),
++                    leading_lines=[cst.EmptyLine()],
++                )
++                new_body.append(tc_block)
++                type_checking_block_added = True
++
++            new_body.append(stmt)
++
++        if not type_checking_block_added and self._imports_to_move:
++            if not self._has_type_checking_import:
++                tc_import = cst.SimpleStatementLine(
++                    body=[
++                        cst.ImportFrom(
++                            module=cst.Name("typing"),
++                            names=[cst.ImportAlias(name=cst.Name("TYPE_CHECKING"))],
++                        )
++                    ],
++                    leading_lines=[cst.EmptyLine()],
++                )
++                new_body.append(tc_import)
++
++            tc_block = cst.If(
++                test=cst.Name("TYPE_CHECKING"),
++                body=cst.IndentedBlock(body=self._imports_to_move),
++                leading_lines=[cst.EmptyLine()],
++            )
++            new_body.append(tc_block)
++
++        return updated_node.with_changes(body=new_body)
++
++
++def apply_pep563_transform(
++    source_module: cst.Module, annotated_module: cst.Module
++) -> cst.Module:
++    """
++    Apply PEP 563 transformation to a module after type annotations have been applied.
++
++    Args:
++        source_module: The original source module before annotations were applied.
++        annotated_module: The module after annotations have been applied.
++
++    Returns:
++        The transformed module with:
++        - `from __future__ import annotations` added
++        - Newly added type imports moved into `if TYPE_CHECKING:` block
++    """
++    existing_imports = collect_imports(source_module)
++    imports_after = collect_imports(annotated_module)
++    new_imports = imports_after - existing_imports
++
++    if not new_imports:
++        return annotated_module
++
++    transformer = Pep563Transformer(new_imports)
++    return annotated_module.visit(transformer)
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 27be5cb..bcc3718 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -443,10 +443,86 @@ def test_apply_stub_using_libcst__overwrite_existing_annotations():
+         from typing import List
+ 
+         def has_annotations(x: List[int]) -> bool:
+           return 1 in x
+     """
+     assert cli.apply_stub_using_libcst(
+         textwrap.dedent(stub),
+         textwrap.dedent(source),
+         overwrite_existing_annotations=True,
+     ) == textwrap.dedent(expected)
++
++
++def test_apply_stub_using_libcst__pep563():
++    """Test that --pep563 adds future annotations and TYPE_CHECKING block."""
++    source = """
++        def my_test_function(a, b):
++          return True
++    """
++    stub = """
++        from mymodule import MyClass
++        def my_test_function(a: MyClass, b: int) -> bool: ...
++    """
++    result = cli.apply_stub_using_libcst(
++        textwrap.dedent(stub),
++        textwrap.dedent(source),
++        overwrite_existing_annotations=False,
++        pep563=True,
++    )
++    assert "from __future__ import annotations" in result
++    assert "if TYPE_CHECKING:" in result
++    assert "from mymodule import MyClass" in result
++    assert "def my_test_function(a: MyClass, b: int) -> bool:" in result
++
++
++def test_apply_stub_using_libcst__pep563_with_existing_imports():
++    """Test that --pep563 preserves existing imports outside TYPE_CHECKING."""
++    source = """
++        from existing import SomeClass
++
++        def my_test_function(a, b):
++          return True
++    """
++    stub = """
++        from existing import SomeClass
++        from newmodule import NewClass
++        def my_test_function(a: SomeClass, b: NewClass) -> bool: ...
++    """
++    result = cli.apply_stub_using_libcst(
++        textwrap.dedent(stub),
++        textwrap.dedent(source),
++        overwrite_existing_annotations=False,
++        pep563=True,
++    )
++    assert "from __future__ import annotations" in result
++    assert "if TYPE_CHECKING:" in result
++    assert "from newmodule import NewClass" in result
++    # SomeClass should remain outside TYPE_CHECKING
++    lines = result.split('\n')
++    type_checking_started = False
++    some_class_in_type_checking = False
++    for line in lines:
++        if 'if TYPE_CHECKING:' in line:
++            type_checking_started = True
++        if type_checking_started and 'from existing import SomeClass' in line:
++            some_class_in_type_checking = True
++    assert not some_class_in_type_checking, "Existing imports should stay outside TYPE_CHECKING"
++
++
++def test_apply_stub_using_libcst__pep563_no_new_imports():
++    """Test that --pep563 with no new type imports doesn't add TYPE_CHECKING."""
++    source = """
++        def my_test_function(a, b):
++          return True
++    """
++    stub = """
++        def my_test_function(a: int, b: str) -> bool: ...
++    """
++    result = cli.apply_stub_using_libcst(
++        textwrap.dedent(stub),
++        textwrap.dedent(source),
++        overwrite_existing_annotations=False,
++        pep563=True,
++    )
++    # No TYPE_CHECKING block needed since int and str are builtins
++    assert "if TYPE_CHECKING:" not in result
++    assert "def my_test_function(a: int, b: str) -> bool:" in result
+diff --git a/tests/test_pep563.py b/tests/test_pep563.py
+new file mode 100644
+index 0000000..ca1f597
+--- /dev/null
++++ b/tests/test_pep563.py
+@@ -0,0 +1,428 @@
++# Copyright (c) 2017-present, Facebook, Inc.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++import textwrap
++
++import libcst as cst
++import pytest
++from libcst.codemod import CodemodContext
++from libcst.codemod.visitors import ApplyTypeAnnotationsVisitor
++
++from monkeytype.pep563 import (
++    ImportCollector,
++    Pep563Transformer,
++    apply_pep563_transform,
++    collect_imports,
++)
++
++
++class TestImportCollector:
++    def test_collects_simple_import(self):
++        source = "from foo import Bar"
++        module = cst.parse_module(source)
++        imports = collect_imports(module)
++        assert imports == {("foo", "Bar")}
++
++    def test_collects_multiple_imports_same_module(self):
++        source = "from foo import Bar, Baz"
++        module = cst.parse_module(source)
++        imports = collect_imports(module)
++        assert imports == {("foo", "Bar"), ("foo", "Baz")}
++
++    def test_collects_dotted_module_import(self):
++        source = "from foo.bar.baz import Qux"
++        module = cst.parse_module(source)
++        imports = collect_imports(module)
++        assert imports == {("foo.bar.baz", "Qux")}
++
++    def test_collects_multiple_import_statements(self):
++        source = textwrap.dedent("""
++            from foo import Bar
++            from baz import Qux
++        """)
++        module = cst.parse_module(source)
++        imports = collect_imports(module)
++        assert imports == {("foo", "Bar"), ("baz", "Qux")}
++
++    def test_ignores_star_import(self):
++        source = "from foo import *"
++        module = cst.parse_module(source)
++        imports = collect_imports(module)
++        assert imports == set()
++
++    def test_collects_relative_import(self):
++        source = "from . import foo"
++        module = cst.parse_module(source)
++        imports = collect_imports(module)
++        assert imports == {(".", "foo")}
++
++    def test_collects_relative_import_with_module(self):
++        source = "from .foo import Bar"
++        module = cst.parse_module(source)
++        imports = collect_imports(module)
++        assert imports == {(".foo", "Bar")}
++
++
++class TestPep563Transformer:
++    def test_adds_future_annotations(self):
++        source = textwrap.dedent("""
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        # Need to add an import first to trigger transformation
++        module_with_import = cst.parse_module(
++            "from foo import Bar\n\ndef func(x):\n    pass\n"
++        )
++        result = module_with_import.visit(transformer)
++        assert "from __future__ import annotations" in result.code
++
++    def test_does_not_duplicate_future_annotations(self):
++        source = textwrap.dedent("""
++            from __future__ import annotations
++            from foo import Bar
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        assert result.code.count("from __future__ import annotations") == 1
++
++    def test_moves_new_imports_to_type_checking(self):
++        source = textwrap.dedent("""
++            from foo import Bar
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        assert "if TYPE_CHECKING:" in result.code
++        assert "from typing import TYPE_CHECKING" in result.code
++
++    def test_keeps_non_new_imports_outside_type_checking(self):
++        source = textwrap.dedent("""
++            from existing import SomeClass
++            from foo import Bar
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        assert "from existing import SomeClass" in result.code
++        lines = result.code.split("\n")
++        for i, line in enumerate(lines):
++            if "from existing import SomeClass" in line:
++                # Check it's NOT inside TYPE_CHECKING block
++                assert "if TYPE_CHECKING:" not in "".join(lines[max(0, i - 3) : i])
++                break
++
++    def test_splits_import_statement_when_partial_move(self):
++        source = textwrap.dedent("""
++            from foo import Bar, Baz
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        # Bar should be in TYPE_CHECKING, Baz should stay
++        assert "if TYPE_CHECKING:" in result.code
++        assert "from foo import Baz" in result.code
++
++    def test_adds_type_checking_import_when_needed(self):
++        source = textwrap.dedent("""
++            from foo import Bar
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        assert "from typing import TYPE_CHECKING" in result.code
++
++    def test_reuses_existing_type_checking_import(self):
++        source = textwrap.dedent("""
++            from typing import TYPE_CHECKING
++            from foo import Bar
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        assert result.code.count("TYPE_CHECKING") == 2  # import and if statement
++
++    def test_appends_to_existing_type_checking_block(self):
++        source = textwrap.dedent("""
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from other import OtherClass
++
++            from foo import Bar
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        # Should have both imports in the TYPE_CHECKING block
++        assert "from other import OtherClass" in result.code
++        assert "from foo import Bar" in result.code
++        # Should only have one TYPE_CHECKING block
++        assert result.code.count("if TYPE_CHECKING:") == 1
++
++    def test_no_transform_when_no_new_imports(self):
++        source = textwrap.dedent("""
++            from existing import SomeClass
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer(set())
++        result = module.visit(transformer)
++        assert result.code == source
++
++
++class TestApplyPep563Transform:
++    def _apply_stub_and_transform(self, source: str, stub: str) -> str:
++        source_module = cst.parse_module(source)
++        stub_module = cst.parse_module(stub)
++        context = CodemodContext()
++        ApplyTypeAnnotationsVisitor.store_stub_in_context(context, stub_module, False)
++        transformer = ApplyTypeAnnotationsVisitor(context)
++        annotated_module = transformer.transform_module(source_module)
++        result = apply_pep563_transform(source_module, annotated_module)
++        return result.code
++
++    def test_simple_annotation_application(self):
++        source = textwrap.dedent("""
++            def func(x):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            from mymodule import MyClass
++            def func(x: MyClass) -> None: ...
++        """)
++        result = self._apply_stub_and_transform(source, stub)
++        assert "from __future__ import annotations" in result
++        assert "if TYPE_CHECKING:" in result
++        assert "from mymodule import MyClass" in result
++        assert "def func(x: MyClass) -> None:" in result
++
++    def test_preserves_existing_imports(self):
++        source = textwrap.dedent("""
++            from existing import SomeClass
++
++            def func(x, y):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            from existing import SomeClass
++            from mymodule import MyClass
++            def func(x: SomeClass, y: MyClass) -> None: ...
++        """)
++        result = self._apply_stub_and_transform(source, stub)
++        # SomeClass should NOT be in TYPE_CHECKING block
++        lines = result.split("\n")
++        in_type_checking = False
++        some_class_location = None
++        for i, line in enumerate(lines):
++            if "if TYPE_CHECKING:" in line:
++                in_type_checking = True
++            if "from existing import SomeClass" in line:
++                some_class_location = "type_checking" if in_type_checking else "outside"
++        assert some_class_location == "outside"
++
++    def test_multiple_new_imports(self):
++        source = textwrap.dedent("""
++            def func(a, b):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            from module1 import Class1
++            from module2 import Class2
++            def func(a: Class1, b: Class2) -> None: ...
++        """)
++        result = self._apply_stub_and_transform(source, stub)
++        assert "from __future__ import annotations" in result
++        assert "if TYPE_CHECKING:" in result
++        assert "from module1 import Class1" in result
++        assert "from module2 import Class2" in result
++
++    def test_no_transform_when_no_new_imports(self):
++        source = textwrap.dedent("""
++            def func(x):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            def func(x: int) -> None: ...
++        """)
++        result = self._apply_stub_and_transform(source, stub)
++        assert "TYPE_CHECKING" not in result
++        assert "from __future__ import annotations" not in result
++
++    def test_with_existing_future_import(self):
++        source = textwrap.dedent("""
++            from __future__ import annotations
++
++            def func(x):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            from mymodule import MyClass
++            def func(x: MyClass) -> None: ...
++        """)
++        result = self._apply_stub_and_transform(source, stub)
++        # Should not duplicate future import
++        assert result.count("from __future__ import annotations") == 1
++
++    def test_with_existing_type_checking_block(self):
++        source = textwrap.dedent("""
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from other import OtherClass
++
++            def func(x):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            from mymodule import MyClass
++            def func(x: MyClass) -> None: ...
++        """)
++        result = self._apply_stub_and_transform(source, stub)
++        # Should add to existing block
++        assert result.count("if TYPE_CHECKING:") == 1
++        assert "from other import OtherClass" in result
++        assert "from mymodule import MyClass" in result
++
++    def test_dotted_module_import(self):
++        source = textwrap.dedent("""
++            def func(x):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            from foo.bar.baz import Qux
++            def func(x: Qux) -> None: ...
++        """)
++        result = self._apply_stub_and_transform(source, stub)
++        assert "from foo.bar.baz import Qux" in result
++        assert "if TYPE_CHECKING:" in result
++
++
++class TestCliIntegration:
++    def test_apply_stub_using_libcst_with_pep563(self):
++        from monkeytype.cli import apply_stub_using_libcst
++
++        source = textwrap.dedent("""
++            def func(x):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            from mymodule import MyClass
++            def func(x: MyClass) -> None: ...
++        """)
++        result = apply_stub_using_libcst(stub, source, False, pep563=True)
++        assert "from __future__ import annotations" in result
++        assert "if TYPE_CHECKING:" in result
++        assert "from mymodule import MyClass" in result
++
++    def test_apply_stub_using_libcst_without_pep563(self):
++        from monkeytype.cli import apply_stub_using_libcst
++
++        source = textwrap.dedent("""
++            def func(x):
++                pass
++        """)
++        stub = textwrap.dedent("""
++            from mymodule import MyClass
++            def func(x: MyClass) -> None: ...
++        """)
++        result = apply_stub_using_libcst(stub, source, False, pep563=False)
++        assert "from __future__ import annotations" not in result
++        assert "if TYPE_CHECKING:" not in result
++        assert "from mymodule import MyClass" in result
++
++
++class TestEdgeCases:
++    def test_empty_module(self):
++        source = ""
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer(set())
++        result = module.visit(transformer)
++        assert result.code == source
++
++    def test_module_with_only_imports(self):
++        source = textwrap.dedent("""
++            from foo import Bar
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        assert "from __future__ import annotations" in result.code
++        assert "if TYPE_CHECKING:" in result.code
++
++    def test_complex_import_statement(self):
++        source = textwrap.dedent("""
++            from foo import (
++                Bar,
++                Baz,
++                Qux,
++            )
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar"), ("foo", "Baz")})
++        result = module.visit(transformer)
++        # Qux should stay outside, Bar and Baz should move
++        assert "if TYPE_CHECKING:" in result.code
++        # This is a simplification - the actual implementation might format differently
++        assert "Qux" in result.code
++
++    def test_aliased_import_not_moved(self):
++        # Aliased imports are not currently tracked, but the import statement
++        # should still work correctly
++        source = textwrap.dedent("""
++            from foo import Bar as MyBar
++            from baz import Qux
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("baz", "Qux")})
++        result = module.visit(transformer)
++        assert "from foo import Bar as MyBar" in result.code
++
++    def test_typing_import_coexists(self):
++        source = textwrap.dedent("""
++            from typing import List, Optional
++            from foo import Bar
++
++            def func(x):
++                pass
++        """)
++        module = cst.parse_module(source)
++        transformer = Pep563Transformer({("foo", "Bar")})
++        result = module.visit(transformer)
++        # Should preserve existing typing imports
++        assert "from typing import List, Optional" in result.code or (
++            "List" in result.code and "Optional" in result.code
++        )
