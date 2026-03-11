@@ -1,0 +1,328 @@
+diff --git a/monkeytype/stubs.py b/monkeytype/stubs.py
+index 11d3c0d..b7a6d53 100644
+--- a/monkeytype/stubs.py
++++ b/monkeytype/stubs.py
+@@ -26,25 +26,98 @@ from typing import (
+     Union,
+ )
+ 
+ from monkeytype.compat import (
+     is_any,
+     is_union,
+     is_generic,
+     qualname_of_generic,
+     is_forward_ref,
+     make_forward_ref,
++    name_of_generic,
+ )
+ from monkeytype.typing import is_anonymous_typed_dict
+ from monkeytype.util import pascal_case
+ 
+ 
++def _reconstruct_generic(typ: Any, new_args: Tuple) -> Any:
++    """Reconstruct a generic type with new type arguments.
++
++    Uses copy_with if available (Python 3.7+) to properly preserve
++    typing module generics like List, Dict, etc.
++    """
++    copy_with = getattr(typ, 'copy_with', None)
++    if copy_with is not None:
++        return copy_with(new_args)
++
++    # Fallback for older Python versions or non-standard generics
++    origin = getattr(typ, '__origin__', None)
++    if origin is None:
++        return typ
++    if len(new_args) == 1:
++        return origin[new_args[0]]
++    return origin[new_args]
++
++
++def extract_and_replace_typeddicts(
++    typ: Any,
++    name_prefix: str,
++    typed_dict_class_stubs: List['ClassStub'],
++    counter: Optional[List[int]] = None,
++) -> Any:
++    """Recursively extract TypedDicts from a type and replace them with forward references.
++
++    This handles TypedDicts nested within generic containers like List[TypedDict],
++    Dict[str, TypedDict], etc.
++
++    Args:
++        typ: The type to process
++        name_prefix: Prefix for generating TypedDict class names
++        typed_dict_class_stubs: List to append generated ClassStub instances to
++        counter: Mutable counter for generating unique names for nested TypedDicts
++
++    Returns:
++        The type with all anonymous TypedDicts replaced with forward references
++    """
++    if counter is None:
++        counter = [0]
++
++    if is_anonymous_typed_dict(typ):
++        class_name = get_typed_dict_class_name(name_prefix)
++        typed_dict_class_stubs.extend(ClassStub.stubs_from_typed_dict(typ, class_name))
++        return make_forward_ref(class_name)
++
++    if is_generic(typ) and not is_any(typ):
++        args = getattr(typ, '__args__', None)
++        if args:
++            new_args = []
++            for i, arg in enumerate(args):
++                if is_anonymous_typed_dict(arg):
++                    counter[0] += 1
++                    nested_name = f"{name_prefix}_{counter[0]}"
++                    new_arg = extract_and_replace_typeddicts(
++                        arg, nested_name, typed_dict_class_stubs, counter
++                    )
++                elif is_generic(arg) and not is_any(arg):
++                    new_arg = extract_and_replace_typeddicts(
++                        arg, name_prefix, typed_dict_class_stubs, counter
++                    )
++                else:
++                    new_arg = arg
++                new_args.append(new_arg)
++
++            if new_args != list(args):
++                return _reconstruct_generic(typ, tuple(new_args))
++
++    return typ
++
++
+ try:
+     from django.utils.functional import cached_property  # type: ignore
+ except ImportError:
+     cached_property = None
+ 
+ 
+ from monkeytype.tracing import (
+     CallTrace,
+     CallTraceLogger,
+ )
+@@ -295,20 +368,34 @@ def _get_optional_elem(anno: Any) -> Any:
+ 
+ def render_annotation(anno: Any) -> str:
+     """Convert an annotation into its stub representation."""
+     if _is_optional(anno):
+         elem_type = _get_optional_elem(anno)
+         rendered = 'Optional[' + render_annotation(elem_type) + ']'
+     elif hasattr(anno, '__supertype__'):
+         rendered = anno.__name__
+     elif is_forward_ref(anno):
+         rendered = repr(anno.__forward_arg__)
++    elif is_generic(anno) and not is_any(anno):
++        # Handle generic types like List[...], Dict[...], etc. by rendering
++        # each type argument recursively. This ensures ForwardRefs inside
++        # generic containers are rendered properly.
++        args = getattr(anno, '__args__', None)
++        if args:
++            if is_union(anno):
++                name = 'Union'
++            else:
++                name = name_of_generic(anno)
++            rendered_args = ', '.join(render_annotation(arg) for arg in args)
++            rendered = f'{name}[{rendered_args}]'
++        else:
++            rendered = repr(anno).replace('typing.', '')
+     elif getattr(anno, '__module__', None) == 'typing':
+         rendered = repr(anno).replace('typing.', '')
+     elif isinstance(anno, NoneType):
+         rendered = 'None'
+     elif isinstance(anno, type):
+         if anno.__module__ in ('builtins',):
+             rendered = anno.__qualname__
+         else:
+             rendered = anno.__module__ + '.' + anno.__qualname__
+     elif isinstance(anno, str):
+@@ -498,29 +585,32 @@ class ClassStub(Stub):
+         ]
+         return "\n".join(parts)
+ 
+     def __repr__(self) -> str:
+         return 'ClassStub(%s, %s, %s)' % (repr(self.name),
+                                           tuple(self.function_stubs.values()),
+                                           tuple(self.attribute_stubs))
+ 
+     @staticmethod
+     def stubs_from_typed_dict(type_dict: type, class_name: str) -> List['ClassStub']:
+-        """Return a list of class stubs for all TypedDicts found within `type_dict`."""
++        """Return a list of class stubs for all TypedDicts found within `type_dict`.
++
++        This handles TypedDicts nested directly within the dict's fields as well as
++        TypedDicts nested inside generic containers like List[TypedDict].
++        """
+         assert is_anonymous_typed_dict(type_dict)
+-        class_stubs = []
++        class_stubs: List['ClassStub'] = []
+         attribute_stubs = []
+         for name, typ in type_dict.__annotations__.items():
+-            if is_anonymous_typed_dict(typ):
+-                _class_name = get_typed_dict_class_name(name)
+-                class_stubs.extend(ClassStub.stubs_from_typed_dict(typ, _class_name))
+-                typ = make_forward_ref(_class_name)
++            # Use extract_and_replace_typeddicts to handle both direct TypedDicts
++            # and TypedDicts nested within generic containers
++            typ = extract_and_replace_typeddicts(typ, name, class_stubs)
+             attribute_stubs.append(AttributeStub(name, typ))
+         class_stubs.append(ClassStub(name=f'{class_name}(TypedDict)',
+                                      function_stubs=[],
+                                      attribute_stubs=attribute_stubs))
+         return class_stubs
+ 
+ 
+ class ModuleStub(Stub):
+     def __init__(
+             self,
+@@ -597,37 +687,38 @@ class FunctionDefinition:
+         cls,
+         func: Callable,
+         arg_types: Dict[str, type],
+         return_type: Optional[type],
+         yield_type: Optional[type],
+         existing_annotation_strategy: ExistingAnnotationStrategy = ExistingAnnotationStrategy.REPLICATE,
+     ) -> 'FunctionDefinition':
+         typed_dict_class_stubs: List[ClassStub] = []
+         new_arg_types = {}
+         for name, typ in arg_types.items():
+-            if is_anonymous_typed_dict(typ):
+-                class_name = get_typed_dict_class_name(name)
+-                typed_dict_class_stubs.extend(ClassStub.stubs_from_typed_dict(typ, class_name))
+-                typ = make_forward_ref(class_name)
++            # Use extract_and_replace_typeddicts to handle both direct TypedDicts
++            # and TypedDicts nested within generic containers like List[TypedDict]
++            typ = extract_and_replace_typeddicts(typ, name, typed_dict_class_stubs)
+             new_arg_types[name] = typ
+ 
+-        if return_type and is_anonymous_typed_dict(return_type):
+-            # Replace the dot in a qualified name.
+-            class_name = get_typed_dict_class_name(func.__qualname__.replace('.', '_'))
+-            typed_dict_class_stubs.extend(ClassStub.stubs_from_typed_dict(return_type, class_name))
+-            return_type = make_forward_ref(class_name)
+-
+-        if yield_type and is_anonymous_typed_dict(yield_type):
+-            # Replace the dot in a qualified name.
+-            class_name = get_typed_dict_class_name(func.__qualname__.replace('.', '_') + 'Yield')
+-            typed_dict_class_stubs.extend(ClassStub.stubs_from_typed_dict(yield_type, class_name))
+-            yield_type = make_forward_ref(class_name)
++        if return_type:
++            # Replace the dot in a qualified name for the return type name
++            return_name = func.__qualname__.replace('.', '_')
++            return_type = extract_and_replace_typeddicts(
++                return_type, return_name, typed_dict_class_stubs
++            )
++
++        if yield_type:
++            # Replace the dot in a qualified name for the yield type name
++            yield_name = func.__qualname__.replace('.', '_') + 'Yield'
++            yield_type = extract_and_replace_typeddicts(
++                yield_type, yield_name, typed_dict_class_stubs
++            )
+ 
+         function = FunctionDefinition.from_callable(func)
+         signature = function.signature
+         signature = update_signature_args(signature, new_arg_types,
+                                           function.has_self, existing_annotation_strategy)
+         signature = update_signature_return(signature, return_type,
+                                             yield_type, existing_annotation_strategy)
+         return FunctionDefinition(function.module, function.qualname,
+                                   function.kind, signature,
+                                   function.is_async, typed_dict_class_stubs)
+diff --git a/monkeytype/typing.py b/monkeytype/typing.py
+index 34248cc..9399167 100644
+--- a/monkeytype/typing.py
++++ b/monkeytype/typing.py
+@@ -110,25 +110,29 @@ def make_generator(yield_typ, send_typ, return_typ):
+ _BUILTIN_CALLABLE_TYPES = (
+     types.FunctionType,
+     types.LambdaType,
+     types.MethodType,
+     types.BuiltinMethodType,
+     types.BuiltinFunctionType,
+ )
+ 
+ 
+ def get_dict_type(dct, max_typed_dict_size=None):
+-    """Return a TypedDict for `dct` if all the keys are strings.
++    """Return a TypedDict for `dct` if all the keys are strings and dict is non-empty.
++    Empty dicts return Dict[Any, Any] since an empty TypedDict is not intuitive.
+     Else, default to the union of the keys and of the values."""
+-    if (all(isinstance(k, str) for k in dct.keys())
++    if (len(dct) > 0
++            and all(isinstance(k, str) for k in dct.keys())
+             and (max_typed_dict_size is None or len(dct) <= max_typed_dict_size)):
+         return TypedDict(DUMMY_TYPED_DICT_NAME, {k: get_type(v) for k, v in dct.items()})
++    elif len(dct) == 0:
++        return Dict[Any, Any]
+     else:
+         key_type = shrink_types(get_type(k) for k in dct.keys())
+         val_type = shrink_types(get_type(v) for v in dct.values())
+         return Dict[key_type, val_type]
+ 
+ 
+ def get_type(obj, max_typed_dict_size=None):
+     """Return the static type that would be used in a type hint"""
+     if isinstance(obj, type):
+         return Type[obj]
+diff --git a/tests/test_stubs.py b/tests/test_stubs.py
+index 5edfc20..f18831f 100644
+--- a/tests/test_stubs.py
++++ b/tests/test_stubs.py
+@@ -502,26 +502,22 @@ class TestModuleStub:
+             'from mypy_extensions import TypedDict',
+             'from typing import Generator',
+             '',
+             '',
+             'class DummyAnInstanceMethodYieldTypedDict(TypedDict):',
+             '    a: int',
+             '    b: str',
+             '',
+             '',
+             'class Dummy:',
+-            '    def an_instance_method(',
+-            '        self,',
+-            '        foo: int,',
+-            '        bar: int',
+-            f'    ) -> Generator[{repr_forward_ref()}'
+-            + '(\'DummyAnInstanceMethodYieldTypedDict\'), None, int]: ...',
++            '    def an_instance_method(self, foo: int, bar: int) '
++            + '-> Generator[\'DummyAnInstanceMethodYieldTypedDict\', None, int]: ...',
+         ])
+         self.maxDiff = None
+         assert build_module_stubs(entries)['tests.util'].render() == expected
+ 
+ 
+ class TestBuildModuleStubs:
+     def test_build_module_stubs(self):
+         entries = [
+             FunctionDefinition.from_callable(Dummy.a_static_method),
+             FunctionDefinition.from_callable(Dummy.a_class_method.__func__),
+diff --git a/tests/test_typing.py b/tests/test_typing.py
+index c7764bb..1f0b003 100644
+--- a/tests/test_typing.py
++++ b/tests/test_typing.py
+@@ -235,21 +235,22 @@ class TestGetType:
+             (generator(), Iterator[Any]),
+         ],
+     )
+     def test_builtin_types(self, value, expected_type):
+         """Return the appropriate type for builtins"""
+         assert get_type(value) == expected_type
+ 
+     @pytest.mark.parametrize(
+         'value, max_typed_dict_size, expected_dict_type',
+         [
+-            ({}, None, TypedDict(DUMMY_TYPED_DICT_NAME, {})),
++            # Empty dicts return Dict[Any, Any] since empty TypedDicts are not intuitive
++            ({}, None, Dict[Any, Any]),
+             ({'a': 1, 'b': 2}, None, TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': int})),
+             ({'a': 1, 'b': 2}, 2, TypedDict(DUMMY_TYPED_DICT_NAME, {'a': int, 'b': int})),
+             ({'a': 1, 'b': 2}, 1, Dict[str, int]),
+             ({'a': 1, 2: 'b'}, None, Dict[Union[str, int], Union[str, int]]),
+             (get_default_dict(key=1, value=1), None, DefaultDict[int, int]),
+             (get_nested_default_dict(key=1, value=1.0), None, DefaultDict[int, DefaultDict[int, float]]),
+         ],
+     )
+     def test_dict_type(self, value, max_typed_dict_size, expected_dict_type):
+         """Return the appropriate type for dictionaries."""
