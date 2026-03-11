@@ -1,0 +1,1006 @@
+diff --git a/monkeytype/stubs.py b/monkeytype/stubs.py
+index 2723fb5..14c7cbf 100644
+--- a/monkeytype/stubs.py
++++ b/monkeytype/stubs.py
+@@ -1,17 +1,18 @@
+ # Copyright (c) 2017-present, Facebook, Inc.
+ # All rights reserved.
+ #
+ # This source code is licensed under the BSD-style license found in the
+ # LICENSE file in the root directory of this source tree.
+ import asyncio
+ import collections
++import dataclasses
+ import enum
+ import inspect
+ import logging
+ import re
+ from abc import ABCMeta, abstractmethod
+ from typing import (
+     Any,
+     Callable,
+     DefaultDict,
+     Dict,
+@@ -42,20 +43,38 @@ from monkeytype.typing import (
+     field_annotations,
+     make_generator,
+     make_iterator,
+     shrink_types,
+ )
+ from monkeytype.util import get_name_in_module, pascal_case
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class RenderContext:
++    """Context for rendering stubs with import alias resolution.
++
++    Attributes:
++        import_aliases: Mapping from (module, name) tuples to their aliased names.
++            Used to resolve conflicting imports from different modules that share
++            the same symbol name (e.g., xml.dom.minidom.Element vs
++            xml.etree.ElementTree.Element).
++    """
++    import_aliases: Dict[Tuple[str, str], str] = dataclasses.field(default_factory=dict)
++
++    @classmethod
++    def empty(cls) -> "RenderContext":
++        """Create an empty render context with no aliases."""
++        return cls()
++
++
+ class FunctionKind(enum.Enum):
+     MODULE = 0
+     CLASS = 1
+     INSTANCE = 2
+     STATIC = 3
+     # Properties are really instance methods, but this is fine for now...
+     PROPERTY = 4
+     DJANGO_CACHED_PROPERTY = 5
+ 
+     @classmethod
+@@ -93,20 +112,81 @@ class ExistingAnnotationStrategy(enum.Enum):
+ class ImportMap(DefaultDict[Any, Any]):
+     """A mapping of module name to the set of names to be imported."""
+ 
+     def __init__(self) -> None:
+         super().__init__(set)
+ 
+     def merge(self, other: "ImportMap") -> None:
+         for module, names in other.items():
+             self[module].update(names)
+ 
++    def get_conflicting_names(self) -> Dict[str, List[str]]:
++        """Find names that are imported from multiple modules.
++
++        Returns a dict mapping each conflicting name to the list of modules
++        that export it.
++        """
++        name_to_modules: Dict[str, List[str]] = {}
++        for module, names in self.items():
++            for name in names:
++                if name not in name_to_modules:
++                    name_to_modules[name] = []
++                name_to_modules[name].append(module)
++        return {name: modules for name, modules in name_to_modules.items() if len(modules) > 1}
++
++    def generate_alias_map(self) -> Dict[Tuple[str, str], str]:
++        """Generate aliases for conflicting names.
++
++        Returns a dict mapping (module, name) tuples to their alias.
++        For non-conflicting names, no entry is added (they don't need aliases).
++        Ensures all generated aliases are unique by adding numerical suffixes if needed.
++        """
++        conflicts = self.get_conflicting_names()
++        alias_map: Dict[Tuple[str, str], str] = {}
++        used_aliases: Set[str] = set()
++
++        for name, modules in conflicts.items():
++            for module in sorted(modules):
++                base_alias = _generate_base_alias_for_import(module, name)
++                alias = _make_unique_alias(base_alias, used_aliases)
++                used_aliases.add(alias)
++                alias_map[(module, name)] = alias
++
++        return alias_map
++
++
++def _generate_base_alias_for_import(module: str, name: str) -> str:
++    """Generate a base alias for an import to avoid conflicts.
++
++    For example:
++        xml.dom.minidom.Element -> MinidomElement
++        xml.etree.ElementTree.Element -> ElementTreeElement
++        module.a.Parent.Child -> AParentChild (nested classes)
++    """
++    parts = module.split(".")
++    if len(parts) >= 2:
++        qualifier = pascal_case(parts[-1])
++    else:
++        qualifier = pascal_case(module)
++    clean_name = name.replace(".", "")
++    return f"{qualifier}{clean_name}"
++
++
++def _make_unique_alias(base_alias: str, used_aliases: Set[str]) -> str:
++    """Ensure alias is unique by adding numerical suffix if needed."""
++    if base_alias not in used_aliases:
++        return base_alias
++    counter = 2
++    while f"{base_alias}{counter}" in used_aliases:
++        counter += 1
++    return f"{base_alias}{counter}"
++
+ 
+ def _get_import_for_qualname(qualname: str) -> str:
+     # Nested classes are annotated using the path from the root class
+     # (e.g. Parent.Child, where Child is defined inside Parent)
+     return qualname.split(".")[0]
+ 
+ 
+ def get_imports_for_annotation(anno: Any) -> ImportMap:
+     """Return the imports (module, name) needed for the type in the annotation"""
+     imports = ImportMap()
+@@ -256,32 +336,51 @@ class Stub(metaclass=ABCMeta):
+         return NotImplemented
+ 
+     @abstractmethod
+     def render(self) -> str:
+         pass
+ 
+ 
+ class ImportBlockStub(Stub):
+     def __init__(self, imports: Optional[ImportMap] = None) -> None:
+         self.imports = imports if imports else ImportMap()
++        self._alias_map: Optional[Dict[Tuple[str, str], str]] = None
++
++    @property
++    def alias_map(self) -> Dict[Tuple[str, str], str]:
++        """Lazy-computed alias map for conflicting imports."""
++        if self._alias_map is None:
++            self._alias_map = self.imports.generate_alias_map()
++        return self._alias_map
+ 
+     def render(self) -> str:
+         imports = []
++        alias_map = self.alias_map
+         for module in sorted(self.imports.keys()):
+             names = sorted(self.imports[module])
+-            if module == "_io":
+-                module = module[1:]
+-            if len(names) == 1:
+-                imports.append("from %s import %s" % (module, names[0]))
++            render_module = module
++            if render_module == "_io":
++                render_module = render_module[1:]
++
++            import_parts = []
++            for name in names:
++                alias = alias_map.get((module, name))
++                if alias:
++                    import_parts.append(f"{name} as {alias}")
++                else:
++                    import_parts.append(name)
++
++            if len(import_parts) == 1:
++                imports.append("from %s import %s" % (render_module, import_parts[0]))
+             else:
+-                stanza = ["from %s import (" % (module,)]
+-                stanza.extend(["    %s," % (name,) for name in names])
++                stanza = ["from %s import (" % (render_module,)]
++                stanza.extend(["    %s," % (part,) for part in import_parts])
+                 stanza.append(")")
+                 imports.append("\n".join(stanza))
+         return "\n".join(imports)
+ 
+     def __repr__(self) -> str:
+         return "ImportBlockStub(%s)" % (repr(self.imports),)
+ 
+ 
+ def _is_optional(anno: Any) -> bool:
+     """Is the supplied annotation an instance of the 'virtual' Optional type?
+@@ -297,50 +396,78 @@ def _get_optional_elem(anno: Any) -> Any:
+         raise TypeError("Supplied annotation isn't an optional")
+     elems = tuple(e for e in anno.__args__ if e is not NoneType)
+     if len(elems) == 1:
+         return elems[0]
+     return Union[elems]
+ 
+ 
+ class RenderAnnotation(GenericTypeRewriter[str]):
+     """Render annotation recursively."""
+ 
++    def __init__(
++        self,
++        context: Optional[RenderContext] = None,
++        strip_modules: Optional[Iterable[str]] = None,
++    ) -> None:
++        self.context = context or RenderContext.empty()
++        self.strip_modules = set(strip_modules) if strip_modules else set()
++
+     def make_anonymous_typed_dict(
+         self, required_fields: Dict[str, str], optional_fields: Dict[str, str]
+     ) -> str:
+         raise Exception(
+             "Should not receive an anonymous TypedDict in RenderAnnotation,"
+             f" but was called with required_fields={required_fields}, optional_fields={optional_fields}."
+         )
+ 
+     def make_builtin_typed_dict(
+         self, name: str, annotations: Dict[str, str], total: bool
+     ) -> str:
+         raise Exception(
+             "Should not receive a TypedDict type in RenderAnnotation,"
+             f" but was called with name={name}, annotations={annotations}, total={total}."
+         )
+ 
++    def _render_type_with_module(self, typ: type) -> str:
++        """Render a type, applying alias resolution or module stripping as appropriate."""
++        module = typ.__module__
++        qualname = typ.__qualname__
++
++        if module in ("builtins",):
++            return qualname
++
++        root_name = qualname.split(".")[0]
++        alias_key = (module, root_name)
++
++        if alias_key in self.context.import_aliases:
++            alias = self.context.import_aliases[alias_key]
++            if "." in qualname:
++                suffix = qualname[len(root_name):]
++                return alias + suffix
++            return alias
++
++        if module in self.strip_modules:
++            return qualname
++
++        return module + "." + qualname
++
+     def generic_rewrite(self, typ: Any) -> str:
+         if hasattr(typ, "__supertype__"):
+             rendered = str(typ.__name__)
+         elif is_forward_ref(typ):
+             rendered = repr(typ.__forward_arg__)
+         elif isinstance(typ, NoneType) or typ is NoneType:
+             rendered = "None"
+         elif is_generic(typ):
+             rendered = repr(typ)
+         elif isinstance(typ, type):
+-            if typ.__module__ in ("builtins",):
+-                rendered = typ.__qualname__
+-            else:
+-                rendered = typ.__module__ + "." + typ.__qualname__
++            rendered = self._render_type_with_module(typ)
+         elif isinstance(typ, str):
+             rendered = typ
+         else:
+             rendered = repr(typ)
+         return rendered
+ 
+     def rewrite_container_type(self, container_type: Any) -> str:
+         return repr(container_type)
+ 
+     def rewrite_malformed_container(self, container: Any) -> str:
+@@ -370,70 +497,82 @@ class RenderAnnotation(GenericTypeRewriter[str]):
+ 
+     def rewrite(self, typ: type) -> str:
+         rendered = super().rewrite(typ)
+         if getattr(typ, "__module__", None) == "typing":
+             rendered = rendered.replace("typing.", "")
+         # Temporary hacky workaround for #76 to fix remaining NoneType hints by search-replace
+         rendered = rendered.replace("NoneType", "None")
+         return rendered
+ 
+ 
+-def render_annotation(anno: Any) -> str:
++def render_annotation(
++    anno: Any,
++    context: Optional[RenderContext] = None,
++    strip_modules: Optional[Iterable[str]] = None,
++) -> str:
+     """Convert an annotation into its stub representation."""
+-    return RenderAnnotation().rewrite(anno)
++    return RenderAnnotation(context, strip_modules).rewrite(anno)
+ 
+ 
+-def render_parameter(param: inspect.Parameter) -> str:
++def render_parameter(
++    param: inspect.Parameter,
++    context: Optional[RenderContext] = None,
++    strip_modules: Optional[Iterable[str]] = None,
++) -> str:
+     """Convert a parameter into its stub representation.
+ 
+     NB: This is copied almost entirely from https://github.com/python/cpython/blob/3.6/Lib/inspect.py
+     with the modification that it calls our own rendering functions for annotations.
+ 
+     TODO: push a patch upstream so we don't have to do this on Python 3.x.
+     """
+     kind = param.kind
+     formatted = param.name
+ 
+     # Add annotation and default value
+     if param.annotation is not inspect.Parameter.empty:
+         anno = param.annotation
+         if not _is_optional(anno) and param.default is None:
+             anno = Optional[anno]
+-        rendered = render_annotation(anno)
++        rendered = render_annotation(anno, context, strip_modules)
+         formatted = "{}: {}".format(formatted, rendered)
+ 
+     if param.default is not inspect.Parameter.empty:
+         formatted = "{} = ...".format(formatted)
+ 
+     if kind == inspect.Parameter.VAR_POSITIONAL:
+         formatted = "*" + formatted
+     elif kind == inspect.Parameter.VAR_KEYWORD:
+         formatted = "**" + formatted
+ 
+     return formatted
+ 
+ 
+ def render_signature(
+-    sig: inspect.Signature, max_line_len: Optional[int] = None, prefix: str = ""
++    sig: inspect.Signature,
++    max_line_len: Optional[int] = None,
++    prefix: str = "",
++    context: Optional[RenderContext] = None,
++    strip_modules: Optional[Iterable[str]] = None,
+ ) -> str:
+     """Convert a signature into its stub representation.
+ 
+     NB: This is copied almost entirely from https://github.com/python/cpython/blob/3.6/Lib/inspect.py
+     with the modification that it calls our own rendering functions for annotations.
+ 
+     TODO: push a patch upstream so we don't have to do this on Python 3.x.
+     """
+     formatted_params = []
+     render_pos_only_separator = False
+     render_kw_only_separator = True
+     for param in sig.parameters.values():
+-        formatted = render_parameter(param)
++        formatted = render_parameter(param, context, strip_modules)
+         kind = param.kind
+ 
+         if kind == inspect.Parameter.POSITIONAL_ONLY:
+             render_pos_only_separator = True
+         elif render_pos_only_separator:
+             # It's not a positional-only parameter, and the flag
+             # is set to 'True' (there were pos-only params before.)
+             formatted_params.append("/")
+             render_pos_only_separator = False
+ 
+@@ -452,21 +591,21 @@ def render_signature(
+ 
+         formatted_params.append(formatted)
+ 
+         if render_pos_only_separator:
+             # There were only positional-only parameters, hence the
+             # flag was not reset to 'False'
+             formatted_params.append("/")
+ 
+     rendered_return = ""
+     if sig.return_annotation is not inspect.Signature.empty:
+-        anno = render_annotation(sig.return_annotation)
++        anno = render_annotation(sig.return_annotation, context, strip_modules)
+         rendered_return = " -> {}".format(anno)
+ 
+     # first try render it into one single line, if it doesn't exceed
+     # the limit then just use it
+     rendered_single_line = "({})".format(", ".join(formatted_params)) + rendered_return
+     if max_line_len is None or len(rendered_single_line) <= max_line_len:
+         return rendered_single_line
+ 
+     # add prefix to all lines except the first one
+     rendered_multi_lines = ["("]
+@@ -481,52 +620,63 @@ def render_signature(
+ 
+ class AttributeStub(Stub):
+     def __init__(
+         self,
+         name: str,
+         typ: type,
+     ) -> None:
+         self.name = name
+         self.typ = typ
+ 
+-    def render(self, prefix: str = "") -> str:
+-        return f"{prefix}{self.name}: {render_annotation(self.typ)}"
++    def render(
++        self,
++        prefix: str = "",
++        context: Optional[RenderContext] = None,
++    ) -> str:
++        rendered_type = render_annotation(self.typ, context)
++        return f"{prefix}{self.name}: {rendered_type}"
+ 
+     def __repr__(self) -> str:
+         return f"AttributeStub({self.name}, {self.typ})"
+ 
+ 
+ class FunctionStub(Stub):
+     def __init__(
+         self,
+         name: str,
+         signature: inspect.Signature,
+         kind: FunctionKind,
+         strip_modules: Optional[Iterable[str]] = None,
+         is_async: bool = False,
+     ) -> None:
+         self.name = name
+         self.signature = signature
+         self.kind = kind
+-        self.strip_modules = strip_modules or []
++        self.strip_modules = list(strip_modules) if strip_modules else []
+         self.is_async = is_async
+ 
+-    def render(self, prefix: str = "") -> str:
++    def render(
++        self,
++        prefix: str = "",
++        context: Optional[RenderContext] = None,
++    ) -> str:
+         s = prefix
+         if self.is_async:
+             s += "async "
+         s += "def " + self.name
+-        s += render_signature(self.signature, 120 - len(s), prefix) + ": ..."
+-        # Yes, this is a horrible hack, but inspect.py gives us no way to
+-        # specify the function that should be used to format annotations.
+-        for module in self.strip_modules:
+-            s = s.replace(module + ".", "")
++        s += render_signature(
++            self.signature,
++            120 - len(s),
++            prefix,
++            context,
++            self.strip_modules,
++        ) + ": ..."
+         if self.kind == FunctionKind.CLASS:
+             s = prefix + "@classmethod\n" + s
+         elif self.kind == FunctionKind.STATIC:
+             s = prefix + "@staticmethod\n" + s
+         elif self.kind == FunctionKind.PROPERTY:
+             s = prefix + "@property\n" + s
+         elif self.kind == FunctionKind.DJANGO_CACHED_PROPERTY:
+             s = prefix + "@cached_property\n" + s
+         return s
+ 
+@@ -546,29 +696,32 @@ class ClassStub(Stub):
+         name: str,
+         function_stubs: Optional[Iterable[FunctionStub]] = None,
+         attribute_stubs: Optional[Iterable[AttributeStub]] = None,
+     ) -> None:
+         self.name = name
+         self.function_stubs: Dict[str, FunctionStub] = {}
+         self.attribute_stubs = attribute_stubs or []
+         if function_stubs is not None:
+             self.function_stubs = {stub.name: stub for stub in function_stubs}
+ 
+-    def render(self) -> str:
++    def render(
++        self,
++        context: Optional[RenderContext] = None,
++    ) -> str:
+         parts = [
+             f"class {self.name}:",
+             *[
+-                stub.render(prefix="    ")
++                stub.render(prefix="    ", context=context)
+                 for stub in sorted(self.attribute_stubs, key=lambda stub: stub.name)
+             ],
+             *[
+-                stub.render(prefix="    ")
++                stub.render(prefix="    ", context=context)
+                 for _, stub in sorted(self.function_stubs.items())
+             ],
+         ]
+         return "\n".join(parts)
+ 
+     def __repr__(self) -> str:
+         return "ClassStub(%s, %s, %s)" % (
+             repr(self.name),
+             tuple(self.function_stubs.values()),
+             tuple(self.attribute_stubs),
+@@ -679,32 +832,34 @@ class ModuleStub(Stub):
+         if function_stubs is not None:
+             self.function_stubs = {stub.name: stub for stub in function_stubs}
+         self.class_stubs: Dict[str, ClassStub] = {}
+         if class_stubs is not None:
+             self.class_stubs = {stub.name: stub for stub in class_stubs}
+         self.imports_stub = imports_stub if imports_stub else ImportBlockStub()
+         self.typed_dict_class_stubs: List[ClassStub] = []
+         if typed_dict_class_stubs is not None:
+             self.typed_dict_class_stubs = list(typed_dict_class_stubs)
+ 
+-    def render(self) -> str:
++    def render(self, context: Optional[RenderContext] = None) -> str:
+         parts = []
++        if context is None:
++            context = RenderContext(import_aliases=self.imports_stub.alias_map)
+         if self.imports_stub.imports:
+             parts.append(self.imports_stub.render())
+         for typed_dict_class_stub in sorted(
+             self.typed_dict_class_stubs, key=lambda s: s.name
+         ):
+-            parts.append(typed_dict_class_stub.render())
++            parts.append(typed_dict_class_stub.render(context=context))
+         for func_stub in sorted(self.function_stubs.values(), key=lambda s: s.name):
+-            parts.append(func_stub.render())
++            parts.append(func_stub.render(context=context))
+         for class_stub in sorted(self.class_stubs.values(), key=lambda s: s.name):
+-            parts.append(class_stub.render())
++            parts.append(class_stub.render(context=context))
+         return "\n\n\n".join(parts)
+ 
+     def __repr__(self) -> str:
+         return "ModuleStub(%s, %s, %s, %s)" % (
+             tuple(self.function_stubs.values()),
+             tuple(self.class_stubs.values()),
+             repr(self.imports_stub),
+             tuple(self.typed_dict_class_stubs),
+         )
+ 
+diff --git a/tests/test_stubs.py b/tests/test_stubs.py
+index 5e51734..b0d45a7 100644
+--- a/tests/test_stubs.py
++++ b/tests/test_stubs.py
+@@ -33,20 +33,21 @@ from monkeytype.compat import cached_property, make_forward_ref
+ from monkeytype.stubs import (
+     AttributeStub,
+     ClassStub,
+     ExistingAnnotationStrategy,
+     FunctionDefinition,
+     FunctionStub,
+     FunctionKind,
+     ImportBlockStub,
+     ImportMap,
+     ModuleStub,
++    RenderContext,
+     ReplaceTypedDictsWithStubs,
+     StubIndexBuilder,
+     build_module_stubs,
+     get_imports_for_annotation,
+     get_imports_for_signature,
+     render_annotation,
+     render_signature,
+     shrink_traced_types,
+     update_signature_args,
+     update_signature_return,
+@@ -67,20 +68,94 @@ class TestImportMap:
+         a['module.b'] = {'ClassE', 'ClassF'}
+         b = ImportMap()
+         b['module.a'] = {'ClassB', 'ClassC'}
+         b['module.c'] = {'ClassX', 'ClassY'}
+         expected = ImportMap()
+         for mod in ('module.a', 'module.b', 'module.c'):
+             expected[mod] = a[mod] | b[mod]
+         a.merge(b)
+         assert a == expected
+ 
++    def test_get_conflicting_names_no_conflicts(self):
++        imports = ImportMap()
++        imports['module.a'] = {'ClassA'}
++        imports['module.b'] = {'ClassB'}
++        assert imports.get_conflicting_names() == {}
++
++    def test_get_conflicting_names_with_conflicts(self):
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        conflicts = imports.get_conflicting_names()
++        assert 'Element' in conflicts
++        assert set(conflicts['Element']) == {'xml.dom.minidom', 'xml.etree.ElementTree'}
++
++    def test_generate_alias_map_no_conflicts(self):
++        imports = ImportMap()
++        imports['module.a'] = {'ClassA'}
++        imports['module.b'] = {'ClassB'}
++        assert imports.generate_alias_map() == {}
++
++    def test_generate_alias_map_with_conflicts(self):
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        alias_map = imports.generate_alias_map()
++        assert ('xml.dom.minidom', 'Element') in alias_map
++        assert ('xml.etree.ElementTree', 'Element') in alias_map
++        assert alias_map[('xml.dom.minidom', 'Element')] == 'MinidomElement'
++        assert alias_map[('xml.etree.ElementTree', 'Element')] == 'ElementTreeElement'
++
++    def test_generate_alias_map_multiple_conflicts(self):
++        imports = ImportMap()
++        imports['module.a'] = {'Element', 'Parser'}
++        imports['module.b'] = {'Element', 'Parser'}
++        alias_map = imports.generate_alias_map()
++        assert len(alias_map) == 4
++        assert alias_map[('module.a', 'Element')] == 'AElement'
++        assert alias_map[('module.b', 'Element')] == 'BElement'
++        assert alias_map[('module.a', 'Parser')] == 'AParser'
++        assert alias_map[('module.b', 'Parser')] == 'BParser'
++
++    def test_generate_alias_map_nested_class(self):
++        """Nested class names with dots should be converted to valid identifiers"""
++        imports = ImportMap()
++        imports['module.a'] = {'Parent.Child'}
++        imports['module.b'] = {'Parent.Child'}
++        alias_map = imports.generate_alias_map()
++        assert alias_map[('module.a', 'Parent.Child')] == 'AParentChild'
++        assert alias_map[('module.b', 'Parent.Child')] == 'BParentChild'
++
++    def test_generate_alias_map_same_last_component(self):
++        """When two modules have the same last component, aliases get numerical suffixes"""
++        imports = ImportMap()
++        imports['a.minidom'] = {'Element'}
++        imports['b.minidom'] = {'Element'}
++        alias_map = imports.generate_alias_map()
++        aliases = set(alias_map.values())
++        assert len(aliases) == 2
++        assert 'MinidomElement' in aliases
++        assert 'MinidomElement2' in aliases
++
++    def test_generate_alias_map_three_way_conflict(self):
++        """When three modules have same last component, aliases get sequential suffixes"""
++        imports = ImportMap()
++        imports['a.parser'] = {'Node'}
++        imports['b.parser'] = {'Node'}
++        imports['c.parser'] = {'Node'}
++        alias_map = imports.generate_alias_map()
++        aliases = set(alias_map.values())
++        assert len(aliases) == 3
++        assert 'ParserNode' in aliases
++        assert 'ParserNode2' in aliases
++        assert 'ParserNode3' in aliases
++
+ 
+ class TestImportBlockStub:
+     def test_single_import(self):
+         """Single imports should be on one line"""
+         imports = ImportMap()
+         imports['a.module'] = {'AClass'}
+         imports['another.module'] = {'AnotherClass'}
+         stub = ImportBlockStub(imports)
+         expected = "\n".join([
+             'from a.module import AClass',
+@@ -118,20 +193,61 @@ class TestImportBlockStub:
+         imports['_io'] = {'BytesIO', 'FileIO'}
+         stub = ImportBlockStub(imports)
+         expected = "\n".join([
+             'from io import (',
+             '    BytesIO,',
+             '    FileIO,',
+             ')',
+         ])
+         assert stub.render() == expected
+ 
++    def test_conflicting_imports_single(self):
++        """Conflicting imports should use aliases"""
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        stub = ImportBlockStub(imports)
++        expected = "\n".join([
++            'from xml.dom.minidom import Element as MinidomElement',
++            'from xml.etree.ElementTree import Element as ElementTreeElement',
++        ])
++        assert stub.render() == expected
++
++    def test_conflicting_imports_multiple(self):
++        """Multiple conflicting imports from same module should use aliases"""
++        imports = ImportMap()
++        imports['module.a'] = {'Element', 'Parser', 'UniqueA'}
++        imports['module.b'] = {'Element', 'Parser'}
++        stub = ImportBlockStub(imports)
++        expected = "\n".join([
++            'from module.a import (',
++            '    Element as AElement,',
++            '    Parser as AParser,',
++            '    UniqueA,',
++            ')',
++            'from module.b import (',
++            '    Element as BElement,',
++            '    Parser as BParser,',
++            ')',
++        ])
++        assert stub.render() == expected
++
++    def test_alias_map_property(self):
++        """alias_map property should return the alias mapping"""
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        stub = ImportBlockStub(imports)
++        alias_map = stub.alias_map
++        assert ('xml.dom.minidom', 'Element') in alias_map
++        assert ('xml.etree.ElementTree', 'Element') in alias_map
++
+ 
+ def simple_add(a: int, b: int) -> int:
+     return a + b
+ 
+ 
+ def strip_modules_helper(d1: Dummy, d2: Dummy) -> None:
+     pass
+ 
+ 
+ def has_optional_param(x: Optional[int] = None) -> None:
+@@ -173,20 +289,28 @@ class TestAttributeStub:
+     @pytest.mark.parametrize(
+         'stub, expected',
+         [
+             (AttributeStub(name='foo', typ=int), '    foo: int'),
+             (AttributeStub(name='foo', typ=make_forward_ref('Foo')), '    foo: \'Foo\''),
+         ],
+     )
+     def test_simple_attribute(self, stub, expected):
+         assert stub.render('    ') == expected
+ 
++    def test_render_with_context(self):
++        """AttributeStub should use RenderContext to replace conflicting types"""
++        from xml.dom.minidom import Element as MinidomElement
++        stub = AttributeStub(name='elem', typ=MinidomElement)
++        context = RenderContext(import_aliases={('xml.dom.minidom', 'Element'): 'MinidomElement'})
++        rendered = stub.render(prefix='    ', context=context)
++        assert rendered == '    elem: MinidomElement'
++
+ 
+ class TestRenderAnnotation:
+     @pytest.mark.parametrize(
+         'annotation, expected',
+         [
+             (make_forward_ref('Foo'), '\'Foo\''),
+             (List[make_forward_ref('Foo')], 'List[\'Foo\']'),
+             (List[List[make_forward_ref('Foo')]], 'List[List[\'Foo\']]'),
+             (Optional[int], 'Optional[int]'),
+             (List[Optional[int]], 'List[Optional[int]]'),
+@@ -335,20 +459,59 @@ class TestFunctionStub:
+         assert stub.render() == expected
+ 
+     @pytest.mark.xfail(reason='We get Generator[ForwardRef(), ...].')
+     def test_forward_ref_annotation_within_generator(self):
+         stub = FunctionStub('foo',
+                             inspect.signature(has_forward_ref_within_generator),
+                             FunctionKind.MODULE)
+         expected = "def foo() -> Generator['TestFunctionStub', None, int]: ..."
+         assert stub.render() == expected
+ 
++    def test_render_with_context(self):
++        """FunctionStub should use RenderContext to replace conflicting module.name patterns"""
++        from xml.dom.minidom import Element as MinidomElement
++        from xml.etree.ElementTree import Element as ETElement
++
++        def func_with_elements(a: MinidomElement, b: ETElement) -> None:
++            pass
++
++        sig = Signature.from_callable(func_with_elements)
++        stub = FunctionStub('func_with_elements', sig, FunctionKind.MODULE,
++                           strip_modules=['xml.dom.minidom', 'xml.etree.ElementTree'])
++        context = RenderContext(import_aliases={
++            ('xml.dom.minidom', 'Element'): 'MinidomElement',
++            ('xml.etree.ElementTree', 'Element'): 'ElementTreeElement',
++        })
++        rendered = stub.render(context=context)
++        assert 'MinidomElement' in rendered
++        assert 'ElementTreeElement' in rendered
++        assert 'xml.dom.minidom.Element' not in rendered
++        assert 'xml.etree.ElementTree.Element' not in rendered
++
++    def test_render_with_context_and_strip_modules(self):
++        """RenderContext aliases should be applied, with strip_modules for non-aliased types"""
++        from xml.dom.minidom import Element as MinidomElement
++
++        def func_with_element(a: MinidomElement) -> Dummy:
++            pass
++
++        sig = Signature.from_callable(func_with_element)
++        stub = FunctionStub('func', sig, FunctionKind.MODULE,
++                           strip_modules=['xml.dom.minidom', 'tests.util'])
++        context = RenderContext(import_aliases={
++            ('xml.dom.minidom', 'Element'): 'MinidomElement',
++        })
++        rendered = stub.render(context=context)
++        assert 'MinidomElement' in rendered
++        assert 'Dummy' in rendered
++        assert 'tests.util' not in rendered
++
+ 
+ def _func_stub_from_callable(func: Callable, strip_modules: List[str] = None):
+     kind = FunctionKind.from_callable(func)
+     sig = Signature.from_callable(func)
+     return FunctionStub(func.__name__, sig, kind, strip_modules)
+ 
+ 
+ class TestClassStub:
+     def test_render(self):
+         cm_stub = _func_stub_from_callable(Dummy.a_class_method.__func__)
+@@ -361,20 +524,43 @@ class TestClassStub:
+         expected = '\n'.join([
+             'class Test:',
+             '    bar: str',
+             '    foo: int',
+             '    @classmethod',
+             '    def a_class_method(cls, foo: Any) -> Optional[frame]: ...',
+             '    def an_instance_method(self, foo: Any, bar: Any) -> Optional[frame]: ...',
+         ])
+         assert class_stub.render() == expected
+ 
++    def test_render_with_context(self):
++        """ClassStub should pass RenderContext to its contained stubs"""
++        from xml.dom.minidom import Element as MinidomElement
++        from xml.etree.ElementTree import Element as ETElement
++
++        def method_with_elements(self, a: MinidomElement) -> ETElement:
++            pass
++
++        sig = Signature.from_callable(method_with_elements)
++        func_stub = FunctionStub('method_with_elements', sig, FunctionKind.INSTANCE,
++                                strip_modules=['xml.dom.minidom', 'xml.etree.ElementTree'])
++        attr_stub = AttributeStub('elem', MinidomElement)
++        class_stub = ClassStub('MyClass', function_stubs=[func_stub], attribute_stubs=[attr_stub])
++
++        context = RenderContext(import_aliases={
++            ('xml.dom.minidom', 'Element'): 'MinidomElement',
++            ('xml.etree.ElementTree', 'Element'): 'ElementTreeElement',
++        })
++        rendered = class_stub.render(context=context)
++        assert 'MinidomElement' in rendered
++        assert 'ElementTreeElement' in rendered
++        assert 'xml.dom.minidom.Element' not in rendered
++
+ 
+ class TestReplaceTypedDictsWithStubs:
+     SIMPLE_TYPED_DICT_STUB: ClassStub = ClassStub(
+         name='FooBarTypedDict__RENAME_ME__(TypedDict)',
+         function_stubs=[],
+         attribute_stubs=[
+             AttributeStub(name='a', typ=int),
+             AttributeStub(name='b', typ=str),
+         ])
+     SIMPLE_TYPED_DICT_STUB2: ClassStub = ClassStub(
+@@ -600,20 +786,44 @@ class TestModuleStub:
+             '    def an_instance_method(self, foo: Any, bar: Any) -> Optional[frame]: ...',
+             '',
+             '',
+             'class Test2:',
+             '    @classmethod',
+             '    def a_class_method(foo: Any) -> Optional[frame]: ...',
+             '    def an_instance_method(self, foo: Any, bar: Any) -> Optional[frame]: ...',
+         ])
+         assert mod_stub.render() == expected
+ 
++    def test_render_with_conflicting_imports(self):
++        """ModuleStub should generate aliased imports for conflicting names"""
++        from xml.dom.minidom import Element as MinidomElement
++        from xml.etree.ElementTree import Element as ETElement
++
++        def func_with_elements(a: MinidomElement, b: ETElement) -> None:
++            pass
++
++        sig = Signature.from_callable(func_with_elements)
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        func_stub = FunctionStub('func_with_elements', sig, FunctionKind.MODULE,
++                                strip_modules=['xml.dom.minidom', 'xml.etree.ElementTree'])
++
++        mod_stub = ModuleStub(function_stubs=[func_stub], imports_stub=ImportBlockStub(imports))
++        rendered = mod_stub.render()
++
++        assert 'from xml.dom.minidom import Element as MinidomElement' in rendered
++        assert 'from xml.etree.ElementTree import Element as ElementTreeElement' in rendered
++        assert 'def func_with_elements(a: MinidomElement, b: ElementTreeElement)' in rendered
++        assert 'xml.dom.minidom.Element' not in rendered
++        assert 'xml.etree.ElementTree.Element' not in rendered
++
+     def test_render_nested_typed_dict(self):
+         function = FunctionDefinition.from_callable_and_traced_types(
+             Dummy.an_instance_method,
+             {
+                 'foo': make_typed_dict(required_fields={
+                     # Naming the key 'z' to test a class name
+                     # that comes last in alphabetical order.
+                     'z': make_typed_dict(required_fields={'a': int, 'b': str}),
+                     'b': str,
+                 }),
+@@ -816,20 +1026,99 @@ class TestBuildModuleStubs:
+             make_typed_dict(required_fields={'c': int}),
+             None,
+             existing_annotation_strategy=ExistingAnnotationStrategy.IGNORE
+         )
+         entries = [function]
+         expected = module_stub_for_method_with_typed_dict
+         self.maxDiff = None
+         assert build_module_stubs(entries) == expected
+ 
+ 
++class TestConflictingImportsEndToEnd:
++    """End-to-end tests for handling conflicting imports from different modules."""
++
++    def test_full_pipeline_with_conflicting_xml_elements(self):
++        """Test the full pipeline with xml.dom.minidom.Element and xml.etree.ElementTree.Element."""
++        from xml.dom.minidom import Element as MinidomElement
++        from xml.etree.ElementTree import Element as ETElement
++
++        function = FunctionDefinition.from_callable_and_traced_types(
++            Dummy.an_instance_method,
++            {
++                'foo': MinidomElement,
++                'bar': ETElement,
++            },
++            Union[MinidomElement, ETElement],
++            yield_type=None,
++            existing_annotation_strategy=ExistingAnnotationStrategy.IGNORE
++        )
++        entries = [function]
++        stubs = build_module_stubs(entries)
++        rendered = stubs['tests.util'].render()
++
++        assert 'from xml.dom.minidom import Element as MinidomElement' in rendered
++        assert 'from xml.etree.ElementTree import Element as ElementTreeElement' in rendered
++
++        assert 'foo: MinidomElement' in rendered
++        assert 'bar: ElementTreeElement' in rendered
++        assert 'Union[MinidomElement, ElementTreeElement]' in rendered
++
++        assert 'xml.dom.minidom.Element' not in rendered
++        assert 'xml.etree.ElementTree.Element' not in rendered
++
++    def test_full_pipeline_with_non_conflicting_imports(self):
++        """Test that non-conflicting imports are not aliased."""
++        function = FunctionDefinition.from_callable_and_traced_types(
++            Dummy.an_instance_method,
++            {
++                'foo': Dummy,
++                'bar': int,
++            },
++            str,
++            yield_type=None,
++            existing_annotation_strategy=ExistingAnnotationStrategy.IGNORE
++        )
++        entries = [function]
++        stubs = build_module_stubs(entries)
++        rendered = stubs['tests.util'].render()
++
++        assert 'foo: Dummy' in rendered
++        assert 'bar: int' in rendered
++        assert ' as ' not in rendered
++
++    def test_full_pipeline_with_list_of_conflicting_types(self):
++        """Test conflicting types inside generic containers."""
++        from xml.dom.minidom import Element as MinidomElement
++        from xml.etree.ElementTree import Element as ETElement
++
++        function = FunctionDefinition.from_callable_and_traced_types(
++            Dummy.an_instance_method,
++            {
++                'foo': List[MinidomElement],
++                'bar': List[ETElement],
++            },
++            Dict[str, Union[MinidomElement, ETElement]],
++            yield_type=None,
++            existing_annotation_strategy=ExistingAnnotationStrategy.IGNORE
++        )
++        entries = [function]
++        stubs = build_module_stubs(entries)
++        rendered = stubs['tests.util'].render()
++
++        assert 'from xml.dom.minidom import Element as MinidomElement' in rendered
++        assert 'from xml.etree.ElementTree import Element as ElementTreeElement' in rendered
++
++        assert 'List[MinidomElement]' in rendered
++        assert 'List[ElementTreeElement]' in rendered
++        assert 'Dict[str, Union[MinidomElement, ElementTreeElement]]' in rendered
++
++
+ def untyped_helper(x, y):
+     pass
+ 
+ 
+ class TestStubIndexBuilder:
+     def test_ignore_non_matching_functions(self):
+         b = StubIndexBuilder('foo.bar', max_typed_dict_size=0)
+         b.log(CallTrace(untyped_helper, {'x': int, 'y': str}))
+         assert len(b.index) == 0
+ 
