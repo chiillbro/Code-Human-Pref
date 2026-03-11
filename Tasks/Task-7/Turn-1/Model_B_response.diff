@@ -1,0 +1,407 @@
+diff --git a/monkeytype/stubs.py b/monkeytype/stubs.py
+index 2723fb5..562aacf 100644
+--- a/monkeytype/stubs.py
++++ b/monkeytype/stubs.py
+@@ -93,20 +93,45 @@ class ExistingAnnotationStrategy(enum.Enum):
+ class ImportMap(DefaultDict[Any, Any]):
+     """A mapping of module name to the set of names to be imported."""
+ 
+     def __init__(self) -> None:
+         super().__init__(set)
+ 
+     def merge(self, other: "ImportMap") -> None:
+         for module, names in other.items():
+             self[module].update(names)
+ 
++    def get_conflicting_names(self) -> Dict[str, List[str]]:
++        """Find names that appear in multiple modules.
++
++        Returns a dict mapping each conflicting name to the list of modules
++        that contain it.
++        """
++        name_to_modules: Dict[str, List[str]] = {}
++        for module, names in self.items():
++            for name in names:
++                if name not in name_to_modules:
++                    name_to_modules[name] = []
++                name_to_modules[name].append(module)
++        return {name: modules for name, modules in name_to_modules.items() if len(modules) > 1}
++
++    def get_alias_for_name(self, module: str, name: str) -> Optional[str]:
++        """Generate an alias for a name from a specific module if there's a conflict.
++
++        Returns None if no alias is needed, otherwise returns the alias.
++        """
++        conflicts = self.get_conflicting_names()
++        if name not in conflicts:
++            return None
++        module_suffix = module.replace(".", "_")
++        return f"{module_suffix}_{name}"
++
+ 
+ def _get_import_for_qualname(qualname: str) -> str:
+     # Nested classes are annotated using the path from the root class
+     # (e.g. Parent.Child, where Child is defined inside Parent)
+     return qualname.split(".")[0]
+ 
+ 
+ def get_imports_for_annotation(anno: Any) -> ImportMap:
+     """Return the imports (module, name) needed for the type in the annotation"""
+     imports = ImportMap()
+@@ -259,33 +284,52 @@ class Stub(metaclass=ABCMeta):
+     def render(self) -> str:
+         pass
+ 
+ 
+ class ImportBlockStub(Stub):
+     def __init__(self, imports: Optional[ImportMap] = None) -> None:
+         self.imports = imports if imports else ImportMap()
+ 
+     def render(self) -> str:
+         imports = []
++        conflicts = self.imports.get_conflicting_names()
+         for module in sorted(self.imports.keys()):
+             names = sorted(self.imports[module])
++            render_module = module
+             if module == "_io":
+-                module = module[1:]
+-            if len(names) == 1:
+-                imports.append("from %s import %s" % (module, names[0]))
++                render_module = module[1:]
++            import_parts = []
++            for name in names:
++                alias = self.imports.get_alias_for_name(module, name)
++                if alias:
++                    import_parts.append(f"{name} as {alias}")
++                else:
++                    import_parts.append(name)
++            if len(import_parts) == 1:
++                imports.append("from %s import %s" % (render_module, import_parts[0]))
+             else:
+-                stanza = ["from %s import (" % (module,)]
+-                stanza.extend(["    %s," % (name,) for name in names])
++                stanza = ["from %s import (" % (render_module,)]
++                stanza.extend(["    %s," % (part,) for part in import_parts])
+                 stanza.append(")")
+                 imports.append("\n".join(stanza))
+         return "\n".join(imports)
+ 
++    def get_name_replacements(self) -> Dict[str, str]:
++        """Get a mapping of 'module.name' -> 'alias' for all aliased imports."""
++        replacements = {}
++        for module, names in self.imports.items():
++            for name in names:
++                alias = self.imports.get_alias_for_name(module, name)
++                if alias:
++                    replacements[f"{module}.{name}"] = alias
++        return replacements
++
+     def __repr__(self) -> str:
+         return "ImportBlockStub(%s)" % (repr(self.imports),)
+ 
+ 
+ def _is_optional(anno: Any) -> bool:
+     """Is the supplied annotation an instance of the 'virtual' Optional type?
+ 
+     Optional isn't really a type. It's an alias to Union[T, NoneType]
+     """
+     return is_union(anno) and NoneType in anno.__args__
+@@ -481,51 +525,77 @@ def render_signature(
+ 
+ class AttributeStub(Stub):
+     def __init__(
+         self,
+         name: str,
+         typ: type,
+     ) -> None:
+         self.name = name
+         self.typ = typ
+ 
+-    def render(self, prefix: str = "") -> str:
+-        return f"{prefix}{self.name}: {render_annotation(self.typ)}"
++    def render(
++        self,
++        prefix: str = "",
++        name_replacements: Optional[Dict[str, str]] = None,
++        strip_modules: Optional[List[str]] = None,
++    ) -> str:
++        rendered = render_annotation(self.typ)
++        name_replacements = name_replacements or {}
++        strip_modules = strip_modules or []
++        for full_name in sorted(name_replacements.keys(), key=len, reverse=True):
++            alias = name_replacements[full_name]
++            rendered = rendered.replace(full_name, alias)
++        for module in strip_modules:
++            rendered = rendered.replace(module + ".", "")
++        return f"{prefix}{self.name}: {rendered}"
+ 
+     def __repr__(self) -> str:
+         return f"AttributeStub({self.name}, {self.typ})"
+ 
+ 
+ class FunctionStub(Stub):
+     def __init__(
+         self,
+         name: str,
+         signature: inspect.Signature,
+         kind: FunctionKind,
+         strip_modules: Optional[Iterable[str]] = None,
+         is_async: bool = False,
+     ) -> None:
+         self.name = name
+         self.signature = signature
+         self.kind = kind
+-        self.strip_modules = strip_modules or []
++        self.strip_modules = list(strip_modules) if strip_modules else []
+         self.is_async = is_async
+ 
+-    def render(self, prefix: str = "") -> str:
++    def render(
++        self,
++        prefix: str = "",
++        name_replacements: Optional[Dict[str, str]] = None,
++        strip_modules_override: Optional[List[str]] = None,
++    ) -> str:
+         s = prefix
+         if self.is_async:
+             s += "async "
+         s += "def " + self.name
+         s += render_signature(self.signature, 120 - len(s), prefix) + ": ..."
+         # Yes, this is a horrible hack, but inspect.py gives us no way to
+         # specify the function that should be used to format annotations.
+-        for module in self.strip_modules:
++        name_replacements = name_replacements or {}
++        # First apply name replacements for aliased imports (longer paths first
++        # to avoid partial replacements)
++        for full_name in sorted(name_replacements.keys(), key=len, reverse=True):
++            alias = name_replacements[full_name]
++            s = s.replace(full_name, alias)
++        # Then strip remaining module prefixes
++        modules_to_strip = strip_modules_override if strip_modules_override is not None else self.strip_modules
++        for module in modules_to_strip:
+             s = s.replace(module + ".", "")
+         if self.kind == FunctionKind.CLASS:
+             s = prefix + "@classmethod\n" + s
+         elif self.kind == FunctionKind.STATIC:
+             s = prefix + "@staticmethod\n" + s
+         elif self.kind == FunctionKind.PROPERTY:
+             s = prefix + "@property\n" + s
+         elif self.kind == FunctionKind.DJANGO_CACHED_PROPERTY:
+             s = prefix + "@cached_property\n" + s
+         return s
+@@ -542,33 +612,45 @@ class FunctionStub(Stub):
+ 
+ class ClassStub(Stub):
+     def __init__(
+         self,
+         name: str,
+         function_stubs: Optional[Iterable[FunctionStub]] = None,
+         attribute_stubs: Optional[Iterable[AttributeStub]] = None,
+     ) -> None:
+         self.name = name
+         self.function_stubs: Dict[str, FunctionStub] = {}
+-        self.attribute_stubs = attribute_stubs or []
++        self.attribute_stubs = list(attribute_stubs) if attribute_stubs else []
+         if function_stubs is not None:
+             self.function_stubs = {stub.name: stub for stub in function_stubs}
+ 
+-    def render(self) -> str:
++    def render(
++        self,
++        name_replacements: Optional[Dict[str, str]] = None,
++        strip_modules: Optional[List[str]] = None,
++    ) -> str:
+         parts = [
+             f"class {self.name}:",
+             *[
+-                stub.render(prefix="    ")
++                stub.render(
++                    prefix="    ",
++                    name_replacements=name_replacements,
++                    strip_modules=strip_modules,
++                )
+                 for stub in sorted(self.attribute_stubs, key=lambda stub: stub.name)
+             ],
+             *[
+-                stub.render(prefix="    ")
++                stub.render(
++                    prefix="    ",
++                    name_replacements=name_replacements,
++                    strip_modules_override=strip_modules,
++                )
+                 for _, stub in sorted(self.function_stubs.items())
+             ],
+         ]
+         return "\n".join(parts)
+ 
+     def __repr__(self) -> str:
+         return "ClassStub(%s, %s, %s)" % (
+             repr(self.name),
+             tuple(self.function_stubs.values()),
+             tuple(self.attribute_stubs),
+@@ -683,28 +765,39 @@ class ModuleStub(Stub):
+             self.class_stubs = {stub.name: stub for stub in class_stubs}
+         self.imports_stub = imports_stub if imports_stub else ImportBlockStub()
+         self.typed_dict_class_stubs: List[ClassStub] = []
+         if typed_dict_class_stubs is not None:
+             self.typed_dict_class_stubs = list(typed_dict_class_stubs)
+ 
+     def render(self) -> str:
+         parts = []
+         if self.imports_stub.imports:
+             parts.append(self.imports_stub.render())
++        name_replacements = self.imports_stub.get_name_replacements()
++        strip_modules = list(self.imports_stub.imports.keys())
+         for typed_dict_class_stub in sorted(
+             self.typed_dict_class_stubs, key=lambda s: s.name
+         ):
+-            parts.append(typed_dict_class_stub.render())
++            parts.append(typed_dict_class_stub.render(
++                name_replacements=name_replacements,
++                strip_modules=strip_modules,
++            ))
+         for func_stub in sorted(self.function_stubs.values(), key=lambda s: s.name):
+-            parts.append(func_stub.render())
++            parts.append(func_stub.render(
++                name_replacements=name_replacements,
++                strip_modules_override=strip_modules,
++            ))
+         for class_stub in sorted(self.class_stubs.values(), key=lambda s: s.name):
+-            parts.append(class_stub.render())
++            parts.append(class_stub.render(
++                name_replacements=name_replacements,
++                strip_modules=strip_modules,
++            ))
+         return "\n\n\n".join(parts)
+ 
+     def __repr__(self) -> str:
+         return "ModuleStub(%s, %s, %s, %s)" % (
+             tuple(self.function_stubs.values()),
+             tuple(self.class_stubs.values()),
+             repr(self.imports_stub),
+             tuple(self.typed_dict_class_stubs),
+         )
+ 
+diff --git a/tests/test_stubs.py b/tests/test_stubs.py
+index 5e51734..12ade05 100644
+--- a/tests/test_stubs.py
++++ b/tests/test_stubs.py
+@@ -67,20 +67,47 @@ class TestImportMap:
+         a['module.b'] = {'ClassE', 'ClassF'}
+         b = ImportMap()
+         b['module.a'] = {'ClassB', 'ClassC'}
+         b['module.c'] = {'ClassX', 'ClassY'}
+         expected = ImportMap()
+         for mod in ('module.a', 'module.b', 'module.c'):
+             expected[mod] = a[mod] | b[mod]
+         a.merge(b)
+         assert a == expected
+ 
++    def test_get_conflicting_names_no_conflicts(self):
++        imports = ImportMap()
++        imports['module.a'] = {'ClassA'}
++        imports['module.b'] = {'ClassB'}
++        assert imports.get_conflicting_names() == {}
++
++    def test_get_conflicting_names_with_conflicts(self):
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        conflicts = imports.get_conflicting_names()
++        assert 'Element' in conflicts
++        assert set(conflicts['Element']) == {'xml.dom.minidom', 'xml.etree.ElementTree'}
++
++    def test_get_alias_for_name_no_conflict(self):
++        imports = ImportMap()
++        imports['module.a'] = {'ClassA'}
++        imports['module.b'] = {'ClassB'}
++        assert imports.get_alias_for_name('module.a', 'ClassA') is None
++
++    def test_get_alias_for_name_with_conflict(self):
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        assert imports.get_alias_for_name('xml.dom.minidom', 'Element') == 'xml_dom_minidom_Element'
++        assert imports.get_alias_for_name('xml.etree.ElementTree', 'Element') == 'xml_etree_ElementTree_Element'
++
+ 
+ class TestImportBlockStub:
+     def test_single_import(self):
+         """Single imports should be on one line"""
+         imports = ImportMap()
+         imports['a.module'] = {'AClass'}
+         imports['another.module'] = {'AnotherClass'}
+         stub = ImportBlockStub(imports)
+         expected = "\n".join([
+             'from a.module import AClass',
+@@ -118,20 +145,70 @@ class TestImportBlockStub:
+         imports['_io'] = {'BytesIO', 'FileIO'}
+         stub = ImportBlockStub(imports)
+         expected = "\n".join([
+             'from io import (',
+             '    BytesIO,',
+             '    FileIO,',
+             ')',
+         ])
+         assert stub.render() == expected
+ 
++    def test_conflicting_imports_use_aliases(self):
++        """When same name appears in multiple modules, use aliases"""
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        stub = ImportBlockStub(imports)
++        expected = "\n".join([
++            'from xml.dom.minidom import Element as xml_dom_minidom_Element',
++            'from xml.etree.ElementTree import Element as xml_etree_ElementTree_Element',
++        ])
++        assert stub.render() == expected
++
++    def test_get_name_replacements_with_conflicts(self):
++        """get_name_replacements returns mapping for aliased imports"""
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element'}
++        imports['xml.etree.ElementTree'] = {'Element'}
++        stub = ImportBlockStub(imports)
++        replacements = stub.get_name_replacements()
++        assert replacements == {
++            'xml.dom.minidom.Element': 'xml_dom_minidom_Element',
++            'xml.etree.ElementTree.Element': 'xml_etree_ElementTree_Element',
++        }
++
++    def test_get_name_replacements_no_conflicts(self):
++        """get_name_replacements returns empty dict when no conflicts"""
++        imports = ImportMap()
++        imports['module.a'] = {'ClassA'}
++        imports['module.b'] = {'ClassB'}
++        stub = ImportBlockStub(imports)
++        assert stub.get_name_replacements() == {}
++
++    def test_mixed_conflicting_and_non_conflicting(self):
++        """Handle mix of conflicting and non-conflicting names"""
++        imports = ImportMap()
++        imports['xml.dom.minidom'] = {'Element', 'Document'}
++        imports['xml.etree.ElementTree'] = {'Element', 'TreeBuilder'}
++        stub = ImportBlockStub(imports)
++        expected = "\n".join([
++            'from xml.dom.minidom import (',
++            '    Document,',
++            '    Element as xml_dom_minidom_Element,',
++            ')',
++            'from xml.etree.ElementTree import (',
++            '    Element as xml_etree_ElementTree_Element,',
++            '    TreeBuilder,',
++            ')',
++        ])
++        assert stub.render() == expected
++
+ 
+ def simple_add(a: int, b: int) -> int:
+     return a + b
+ 
+ 
+ def strip_modules_helper(d1: Dummy, d2: Dummy) -> None:
+     pass
+ 
+ 
+ def has_optional_param(x: Optional[int] = None) -> None:
