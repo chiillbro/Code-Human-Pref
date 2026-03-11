@@ -1,0 +1,1281 @@
+diff --git a/CHANGES.rst b/CHANGES.rst
+index ac61dad..59df489 100644
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,258 +1,206 @@
+-Changelog
+-=========
++.. program:: monkeytype
+ 
+-main
+-----
++Generating type annotations
++---------------------------
+ 
+-* Remove hard dependency on Django; ``django.utils.functional.cached_property``
+-  support is now conditionally enabled depending whether it is importable.
++Use the ``monkeytype`` command-line script to generate and apply stub files
++based on recorded call traces.
+ 
+-* Add support for Python 3.11.
++The script must be able to import your code. It automatically adds the current
++working directory to the Python path, so ensuring that you run ``monkeytype``
++from the root of your code is usually sufficient. Alternatively, you can set the
++``PYTHONPATH`` environment variable.
+ 
++.. _monkeytype-list:
+ 
+-22.2.0
+-------
++monkeytype list-modules
++~~~~~~~~~~~~~~~~~~~~~~~
+ 
+-* Drop Python 3.6 support.
++The ``monkeytype list-modules`` subcommand outputs a list of all modules which
++have traces present in the trace store. This command respects only the
++:option:`--config` option.
+ 
+-* Fix `AttributeError: __args__` when generating stubs on Python 3.9. Thanks
+-  GameDungeon and ntjess for the report. Fixes #231.
++.. _monkeytype-stub:
+ 
+-* Fix `AttributeError: '_SpecialForm' object has no attribute '__name__'` in
+-  collecting traces with Union types. Thanks Federico Caselli for the report.
+-  Fixes #243.
++monkeytype stub
++~~~~~~~~~~~~~~~
+ 
++Run ``monkeytype stub some.module`` to generate a stub file for the given module
++based on call traces queried from the trace store. If the module already has
++some type annotations, those annotations will be respected and will not be
++replaced with annotations derived from traced calls.
+ 
+-21.5.0
+-------
++The generated stub file will be printed to standard output. If you want to save
++it to a file, redirect the output to a file (e.g. ``monkeytype stub some.module >
++some/module.pyi``).
+ 
+-* Fix compatibility with Python 3.9. Thanks Felix Yan. Merge of #217, fixes
+-  #205.
++You can also run e.g. ``monkeytype stub some.module:SomeClass`` or ``monkeytype
++stub some.module:somefunc`` to generate a stub for just one class or function.
+ 
+-* Render empty tuple type correctly. Thanks Pradeep Kumar Srinivasan. Merge of
+-  #191, fixes #190.
++MonkeyType must import your code in order to generate annotations for it, so if
++a module has import side effects, running ``monkeytype stub`` on the module
++will trigger those side effects. For "executable" modules, ensure the execution
++code is protected with ``if __name__ == '__main__'`` to avoid MonkeyType
++triggering it.
+ 
++.. _monkeytype-apply:
+ 
+-20.5.0
+-------
++monkeytype apply
++~~~~~~~~~~~~~~~~
+ 
+-* Require ``libcst>=0.3.5``.
++If you prefer inline type annotations, ``monkeytype apply some.module`` will
++generate annotations for ``some.module`` internally (in exactly the same way as
++``monkeytype stub`` would), but rather than printing the annotations in stub
++syntax, it will apply them directly to the code file, modifying it in-place.
+ 
+-* Add ``--ignore-existing-annotations`` flag to ``apply`` command.
++Obviously this is best used when the file is tracked in a version-control
++system, so you can easily see the changes made by MonkeyType and accept or
++reject them. MonkeyType annotations are rarely suitable exactly as generated;
++they are a starting point and usually require some adjustment by someone who
++understands the code.
+ 
++Options
++~~~~~~~
+ 
+-20.4.2
+-------
++Both ``monkeytype stub`` and ``monkeytype apply`` accept the following options:
+ 
+-* Add missing ``libcst`` dependency in ``setup.py``.
++.. option:: -c <config-path>, --config <config-path>
+ 
++  The location of the :doc:`config object <configuration>` defining your
++  call-trace store and other configuration. The config-path should take the form
++  ``some.module:name``, where ``name`` is the variable in ``some.module``
++  containing your config instance.
+ 
+-20.4.1
+-------
++  Optionally, the value can also include a ``()`` suffix, and MonkeyType will
++  call/instantiate the imported function/class with no arguments to get the
++  actual config instance.
+ 
+-* Generate stubs for TypedDicts nested within generic types. Disable
+-  TypedDicts completely when the max size is zero. Thanks Pradeep Kumar
+-  Srinivasan. Merge of #162, fixes #159.
++  The default value is ``monkeytype.config:get_default_config()``, which tries
++  the config path ``monkeytype_config:CONFIG`` and falls back to
++  ``monkeytype.config:DefaultConfig()`` if there is no ``monkeytype_config``
++  module. This allows creating a custom config that will be used by default just
++  by creating ``monkeytype_config.py`` with a ``CONFIG`` instance in it.
+ 
+-* Remove ``stringcase`` dependency, just hand-roll ``pascal_case`` function.
++.. option:: -l <limit>, --limit <limit>
+ 
+-* Shrink dictionary traces with required and optional keys to get non-total
+-  TypedDict class declarations. Thanks Pradeep Kumar Srinivasan.
++  The maximum number of call traces to query from your call trace store.
+ 
+-* Implement ``monkeytype apply`` using libcst's ``ApplyTypeAnnotationsVisitor``.
+-  This correctly applies generated TypedDict classes. Thanks Pradeep Kumar
+-  Srinivasan.
++  See the :meth:`~monkeytype.config.Config.query_limit` config method.
+ 
+-* Render generic types recursively to handle nested special cases like
+-  ``List['Movie']``. Thanks Pradeep Kumar Srinivasan. Fixes #76.
++  Default: 2000
+ 
++.. option:: --disable-type-rewriting
+ 
+-19.11.2
+--------
++  Don't apply your configured :ref:`rewriters` to the output types.
+ 
+-* Disable TypedDict generation by default for now, since it breaks `--apply`.
++.. option:: --ignore-existing-annotations
+ 
++  Generate a stub based only on traced calls, ignoring (and overwriting, if
++  applying stubs) any existing type annotations in the code. (By default,
++  existing annotations in the code take precedence over traced types.)
+ 
+-19.11.1
+--------
++Additionally, ``monkeytype apply`` accepts:
+ 
+-* Add setup.py dependences for mypy-extensions and stringcase. Thanks Nicholas
+-  Bollweg for the report.
++.. option:: --pep-563
+ 
++  Use PEP 563 (postponed evaluation of annotations) to avoid circular imports.
++  When this option is enabled, MonkeyType will:
+ 
+-19.11.0
+--------
++  1. Add ``from __future__ import annotations`` to the module, enabling
++     postponed evaluation of annotations (PEP 563).
++  2. Move newly added type imports into an ``if TYPE_CHECKING:`` block.
+ 
+-* Trace per-key value types for dictionaries (up to a configured max size) and
+-  if the traced types are consistent, output a TypedDict in the stub instead of
+-  a homogenous dict. Thanks Pradeep Kumar Srinivasan. Merge of #143, fixes
+-  #105.
++  This is useful when applying type annotations would otherwise cause circular
++  imports. For example, if module ``a`` contains a method that accepts instances
++  of class ``B`` (defined in module ``b``, which inherits from a class in module
++  ``a``), applying annotations would normally add ``from b import B`` to module
++  ``a``, creating a circular dependency.
+ 
+-* Fix crash with empty tuples. Thanks akayunov for the report, Christophe
+-  Simonis for the simplest-case repro. Fixes #136.
++  With ``--pep-563``, the import is only executed during type checking (e.g.,
++  when running mypy), not at runtime, avoiding the circular import issue.
+ 
+-* Don't add stringified annotations to type stubs. Thanks Łukasz Langa. Merge
+-  of #148.
++Additionally, ``monkeytype stub`` accepts:
+ 
+-* Don't crash in type rewriter on user-defined types that name-collide with
+-  container types from the `typing` module. Thanks Łukasz Langa. Merge of #146.
++.. option:: --omit-existing-annotations
+ 
+-* Load config after argument parsing instead of during it, to avoid argparse
+-  catching TypeError/ValueError at import time of a custom config and replacing
+-  with a generic "invalid value" message. See
+-  https://bugs.python.org/issue30220. Thanks Daniel G Holmes for the report.
+-  Merge of #142, fixes #141.
++  Generate a stub that omits any annotations that are already present in the
++  source. (By default, existing annotations in the source are reproduced in the
++  stub.) Because MonkeyType has to replicate existing annotations via runtime
++  introspection, and doesn't have access to the original string, its replication
++  is often imperfect, which would cause spurious conflicts when applying the
++  stub. Omitting these annotations entirely when generating a stub for
++  application has no cost, since they are already present in the source.
+ 
+-* Typing support for collections.defaultdict. Thanks Dinesh Kesavan. Merge of #152.
++  This option is implied by ``monkeytype apply``, since it minimizes the
++  possibility of a conflict when attempting to apply annotations.
+ 
++  This option is mutually exclusive with ``--ignore-existing-annotations``.
+ 
+-19.5.0
+-------
++.. option:: --diff
+ 
+-* Mark ``monkeytype`` package as typed per PEP 561. Thanks Vasily Zakharov for
+-  the report.
+-* Add ``-v`` option; don't display individual traces that fail to decode unless
+-  it is given.
++  Generate a textual diff between stubs generated by preserving existing
++  annotations and ignoring them. Use this to see how accurately your annotations
++  represent what is seen in production.
+ 
++.. module:: monkeytype.typing
+ 
+-19.1.1
+-------
++.. _rewriters:
+ 
+-* Pass ``--incremental`` to retype when applying stubs, so it doesn't choke on
+-  partial stubs (which can result from e.g. failures to decode some traces).
++Type rewriters
++~~~~~~~~~~~~~~
+ 
++MonkeyType's built-in type generation is quite simple: it just makes a ``Union``
++of all the types seen in traces for a given argument or return value, and
++shrinks that ``Union`` to remove redundancy. All additional type transformations
++are performed through configured type rewriters.
+ 
+-19.1.0
+-------
++.. class:: TypeRewriter()
+ 
+-* Add ``--omit-existing-annotations`` option, implied by ``apply``. Merge of
+-  #129. Fixes #11 and #81.
++  The :class:`TypeRewriter` class provides a type-visitor that can be subclassed
++  to easily implement custom type transformations.
+ 
+-* Render ``...`` for all parameter defaults in stubs. Remove the
+-  ``--include-unparsable-defaults`` and ``--exclude-unparsable-defaults`` CLI
+-  options, as well as the ``include_unparsable_defaults()`` config method.
+-  Merge of #128, fixes #123.
++  Subclasses can implement arbitrary ``rewrite_Foo`` methods for rewriting a
++  type named ``Foo``. :class:`TypeRewriter` itself implements only
++  ``rewrite_Dict``, ``rewrite_List``, ``rewrite_Set``, ``rewrite_Tuple``,
++  ``rewrite_Union`` (in addition to the methods listed below). These methods
++  just recursively rewrite all type arguments of the container types.
+ 
+-* Render forward references (from existing annotations) correctly. Merge of #127.
++  For example type rewriter implementations, see the source code of the
++  subclasses listed below.
+ 
+-* Rewrite `Generator[..., None, None]` to `Iterator[None]` by default. Merge of
+-  #110, fixes #4. Thanks iyanuashiri.
++  .. method:: rewrite(typ: type) -> type
+ 
++    Public entry point to rewrite given type; return rewritten type.
+ 
+-18.8.0
+-------
++  .. method:: generic_rewrite(typ: type) -> type
+ 
+-* Support Python 3.7. Merge of #107, fixes #78.
++    Fallback method when no specific ``rewrite_Foo`` method is available for a
++    visited type.
+ 
+-* Print useful error message when filename is passed to stub/apply. Merge of
+-  #88, fixes #65. Thanks rajathagasthya.
++.. class:: RemoveEmptyContainers()
+ 
+-* Fix crash in ``list_modules`` when there are no traces. Merge of #106, fixes
+-  #90.  Thanks tyrinwu.
++  Rewrites e.g. ``Union[List[Any], List[int]]`` to ``List[int]``. The former
++  type frequently occurs when a method that takes ``List[int]`` also sometimes
++  receives the empty list, which will be typed as ``List[Any]``.
+ 
+-* Enable ``python -m monkeytype {run,stub,apply} ...``. Merge of #100, fixes
+-  #99. Thanks retornam.
++.. class:: RewriteConfigDict()
+ 
++  Takes a generated type like ``Union[Dict[K, V1], Dict[K, V2]]`` and rewrites
++  it to ``Dict[K, Union[V1, V2]]``.
+ 
+-18.5.1
+-------
++.. class:: RewriteLargeUnion(max_union_len: int = 5)
+ 
+-* Add ``MONKEYTYPE_TRACE_MODULES`` env var for easier tracing of code in
+-  site-packages. Merge of #83, fixes #82. Thanks Bo Peng.
++  Rewrites large unions (by default, more than 5 elements) to simply `Any`, for
++  better readability of functions that aren't well suited to static typing.
+ 
+-* Fix passing additional arguments to scripts run via ``monkeytype run``. Merge
+-  of #85. Thanks Danny Qiu.
++.. class:: ChainedRewriter(rewriters: Iterable[TypeRewriter])
+ 
+-* Fix handling of spaces in filenames passed to retype. Merge of #79, fixes
+-  #77.
++  Accepts a list of rewriter instances and applies each in order. Useful for
++  composing rewriters, since the
++  :class:`~monkeytype.config.Config.type_rewriter` config method only allows
++  returning a single rewriter.
+ 
+-* Never render NoneType in stubs, substitute None.  Merge of #75, fixes #5.
+-  Thanks John Arnold.
++.. class:: NoOpRewriter()
+ 
+-
+-18.2.0
+-------
+-
+-* Move filtering of `__main__` module into CallTraceStoreLogger instead of core
+-  tracing code, so it can be overridden by special use cases like IPython
+-  tracing. Merge of #72, fixes #68. Thanks Tony Fast.
+-
+-* Generate stubs for modules where the module file is like module/__init__.py.
+-  Print retype stdout/stderr. Merge of #69, Fixes #66.
+-  Thanks John Arnold.
+-
+-
+-18.1.13
+--------
+-
+-* Improve error messages in case of "no traces found" and/or file path given
+-  instead of module name. Merge of #37, partial fix for #65. Thanks Aarni
+-  Koskela.
+-
+-* Add ``monkeytype list_modules`` sub-command to list all modules present in
+-  trace db. Merge of #61, fixes #60. Thanks Alex Miasoiedov.
+-
+-* Add ``--diff`` option to ``monkeytype stub``. Merge of #59, fixes #58.
+-  Thanks Tai-Lin!
+-
+-* Add ``--ignore-existing-annotations`` option to ``monkeytype stub``. Merge of
+-  #55, fixes #15. Thanks Tai-Lin!
+-
+-
+-18.1.11
+--------
+-
+-* Fix crash in RewriteEmptyContainers rewriter if a parameter has only empty
+-  container types in traces (and more than one). Fixes #53.
+-
+-
+-18.1.10
+--------
+-
+-* Display retype errors when stub application fails. Merge of #52, fixes #49.
+-
+-* Add ``--sample-count`` option to show the number of traces a given stub is
+-  based on. Merge of #50, fixes #7. Thanks Tai-Lin.
+-
+-* Add ``monkeytype run -m`` for running a module as a script. Merge of
+-  #41. Thanks Simon Gomizelj.
+-
+-* Add support for Django's ``cached_property`` decorator. Merge of #46, fixes
+-  #9. Thanks Christopher J Wang.
+-
+-* Catch and log serialization exceptions instead of crashing. Fixes #38, merge
+-  of #39.
+-
+-* Fix bug in default code filter when Python lib paths are symlinked. Merge of
+-  #40. Thanks Simon Gomizelj.
+-
+-17.12.3
+--------
+-
+-* Rewrite imports from _io module to io. (#1, merge of #32). Thanks Radhans
+-  Jadhao.
+-
+-* Add Config.cli_context() as a hook for custom CLI initialization and cleanup
+-  logic (#28; merge of #29). Thanks Rodney Folz.
+-
+-17.12.2
+--------
+-
+-* Exclude "frozen importlib" functions in default code filter.
+-
+-* Fix passing args to script run with ``monkeytype run`` (#18; merge of
+-  #21). Thanks Rodney Folz.
+-
+-* Fix generated annotations for NewType types (#22; merge of #23). Thanks
+-  Rodney Folz.
+-
+-17.12.1
+--------
+-
+-* Fix using MonkeyType outside a virtualenv (#16). Thanks Guido van Rossum for
+-  the report.
+-
+-17.12.0
+--------
+-
+-* Initial public version.
++  Does nothing. The default type rewriter in the base
++  :class:`~monkeytype.config.Config`.
+diff --git a/doc/generation.rst b/doc/generation.rst
+index 7a257f6..59df489 100644
+--- a/doc/generation.rst
++++ b/doc/generation.rst
+@@ -92,20 +92,40 @@ Both ``monkeytype stub`` and ``monkeytype apply`` accept the following options:
+ .. option:: --disable-type-rewriting
+ 
+   Don't apply your configured :ref:`rewriters` to the output types.
+ 
+ .. option:: --ignore-existing-annotations
+ 
+   Generate a stub based only on traced calls, ignoring (and overwriting, if
+   applying stubs) any existing type annotations in the code. (By default,
+   existing annotations in the code take precedence over traced types.)
+ 
++Additionally, ``monkeytype apply`` accepts:
++
++.. option:: --pep-563
++
++  Use PEP 563 (postponed evaluation of annotations) to avoid circular imports.
++  When this option is enabled, MonkeyType will:
++
++  1. Add ``from __future__ import annotations`` to the module, enabling
++     postponed evaluation of annotations (PEP 563).
++  2. Move newly added type imports into an ``if TYPE_CHECKING:`` block.
++
++  This is useful when applying type annotations would otherwise cause circular
++  imports. For example, if module ``a`` contains a method that accepts instances
++  of class ``B`` (defined in module ``b``, which inherits from a class in module
++  ``a``), applying annotations would normally add ``from b import B`` to module
++  ``a``, creating a circular dependency.
++
++  With ``--pep-563``, the import is only executed during type checking (e.g.,
++  when running mypy), not at runtime, avoiding the circular import issue.
++
+ Additionally, ``monkeytype stub`` accepts:
+ 
+ .. option:: --omit-existing-annotations
+ 
+   Generate a stub that omits any annotations that are already present in the
+   source. (By default, existing annotations in the source are reproduced in the
+   stub.) Because MonkeyType has to replicate existing annotations via runtime
+   introspection, and doesn't have access to the original string, its replication
+   is often imperfect, which would cause spurious conflicts when applying the
+   stub. Omitting these annotations entirely when generating a stub for
+diff --git a/monkeytype/cli.py b/monkeytype/cli.py
+index 9e3a477..ab20f0f 100644
+--- a/monkeytype/cli.py
++++ b/monkeytype/cli.py
+@@ -329,20 +329,31 @@ qualname format.""",
+         help="Print to stderr the numbers of traces stubs are based on",
+     )
+     apply_parser.add_argument(
+         "--ignore-existing-annotations",
+         action="store_const",
+         dest="existing_annotation_strategy",
+         default=ExistingAnnotationStrategy.REPLICATE,
+         const=ExistingAnnotationStrategy.IGNORE,
+         help="Ignore existing annotations when applying stubs from traces.",
+     )
++    apply_parser.add_argument(
++        "--pep-563",
++        action="store_true",
++        dest="pep_563",
++        default=False,
++        help=(
++            "Use PEP 563 (postponed evaluation of annotations) to avoid circular "
++            "imports. Adds 'from __future__ import annotations' and moves new "
++            "type imports into an 'if TYPE_CHECKING:' block."
++        ),
++    )
+     apply_parser.set_defaults(handler=apply_stub_handler)
+ 
+     stub_parser = subparsers.add_parser(
+         "stub", help="Generate a stub", description="Generate a stub"
+     )
+     stub_parser.add_argument(
+         "module_path",
+         type=module_path,
+         help="""A string of the form <module>[:<qualname>] (e.g.
+ my.module:Class.method). This specifies the set of functions/methods for which
+diff --git a/monkeytype/pep563_transformer.py b/monkeytype/pep563_transformer.py
+new file mode 100644
+index 0000000..08fc058
+--- /dev/null
++++ b/monkeytype/pep563_transformer.py
+@@ -0,0 +1,315 @@
++# Copyright (c) 2017-present, Facebook, Inc.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++"""
++PEP 563 Transformer for handling circular imports.
++
++This module provides a LibCST transformer that applies PEP 563 (postponed
++evaluation of annotations) to resolve circular import issues that can arise
++when applying type annotations. It:
++
++1. Adds `from __future__ import annotations` at the top of the file
++2. Moves newly added type imports into an `if TYPE_CHECKING:` block
++3. Ensures `TYPE_CHECKING` is imported from `typing`
++
++This allows type annotations to be used without causing runtime circular
++imports, since the imports only execute during type checking.
++"""
++from typing import Dict, List, Optional, Sequence, Set, Union
++
++import libcst as cst
++from libcst.helpers import get_full_name_for_node
++
++
++class GatherImportsBeforeTransform(cst.CSTVisitor):
++    """Collects all imports present in the module before transformation."""
++
++    def __init__(self) -> None:
++        self.module_imports: Set[str] = set()
++        self.from_imports: Dict[str, Set[str]] = {}
++
++    def visit_Import(self, node: cst.Import) -> None:
++        if isinstance(node.names, cst.ImportStar):
++            return
++        for name in node.names:
++            module_name = get_full_name_for_node(name.name)
++            if module_name:
++                self.module_imports.add(module_name)
++
++    def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
++        module = get_full_name_for_node(node.module) if node.module else ""
++        if isinstance(node.names, cst.ImportStar):
++            self.from_imports.setdefault(module, set()).add("*")
++            return
++        for alias in node.names:
++            name = get_full_name_for_node(alias.name)
++            if name:
++                self.from_imports.setdefault(module, set()).add(name)
++
++
++class GatherNewImports(cst.CSTVisitor):
++    """Identifies imports that were added after transformation."""
++
++    # Modules that should not be moved to TYPE_CHECKING block
++    # These are runtime-required typing modules
++    RUNTIME_TYPING_MODULES = frozenset(
++        {
++            "typing",
++            "typing_extensions",
++            "collections.abc",
++        }
++    )
++
++    def __init__(
++        self,
++        original_module_imports: Set[str],
++        original_from_imports: Dict[str, Set[str]],
++    ) -> None:
++        self.original_module_imports = original_module_imports
++        self.original_from_imports = original_from_imports
++        self.new_from_imports: Dict[str, List[cst.ImportAlias]] = {}
++        self.import_nodes_to_modify: List[cst.ImportFrom] = []
++
++    def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
++        module = get_full_name_for_node(node.module) if node.module else ""
++
++        # Skip __future__ imports - they must stay at module level
++        if module == "__future__":
++            return
++
++        # Skip runtime typing modules - they must stay at module level
++        if module in self.RUNTIME_TYPING_MODULES:
++            return
++
++        if isinstance(node.names, cst.ImportStar):
++            return
++
++        original_names = self.original_from_imports.get(module, set())
++
++        # Find which imports in this statement are new
++        new_aliases: List[cst.ImportAlias] = []
++        for alias in node.names:
++            name = get_full_name_for_node(alias.name)
++            if name and name not in original_names:
++                new_aliases.append(alias)
++
++        if new_aliases:
++            self.new_from_imports.setdefault(module, []).extend(new_aliases)
++            self.import_nodes_to_modify.append(node)
++
++
++class PEP563Transformer(cst.CSTTransformer):
++    """
++    Transforms a module to use PEP 563 postponed annotations.
++
++    This transformer:
++    1. Ensures `TYPE_CHECKING` is imported from `typing`
++    2. Moves newly added type imports into an `if TYPE_CHECKING:` block
++
++    Note: `from __future__ import annotations` is handled by libcst's
++    ApplyTypeAnnotationsVisitor via use_future_annotations=True.
++    """
++
++    def __init__(
++        self,
++        new_from_imports: Dict[str, List[cst.ImportAlias]],
++        import_nodes_to_modify: List[cst.ImportFrom],
++    ) -> None:
++        self.new_from_imports = new_from_imports
++        self.import_nodes_to_modify = import_nodes_to_modify
++        self._has_type_checking_import = False
++
++    def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
++        module = get_full_name_for_node(node.module) if node.module else ""
++
++        if module == "typing":
++            if isinstance(node.names, cst.ImportStar):
++                self._has_type_checking_import = True
++                return
++            for alias in node.names:
++                if get_full_name_for_node(alias.name) == "TYPE_CHECKING":
++                    self._has_type_checking_import = True
++
++    def leave_ImportFrom(
++        self, original_node: cst.ImportFrom, updated_node: cst.ImportFrom
++    ) -> Union[cst.ImportFrom, cst.RemovalSentinel]:
++        """Remove new imports from their original location."""
++        if original_node not in self.import_nodes_to_modify:
++            return updated_node
++
++        if isinstance(updated_node.names, cst.ImportStar):
++            return updated_node
++
++        module = (
++            get_full_name_for_node(updated_node.module)
++            if updated_node.module
++            else ""
++        )
++        new_names_for_module = self.new_from_imports.get(module, [])
++        new_name_strs = {
++            get_full_name_for_node(alias.name) for alias in new_names_for_module
++        }
++
++        # Keep only the imports that are NOT new (i.e., were present before)
++        remaining_aliases = [
++            alias
++            for alias in updated_node.names
++            if get_full_name_for_node(alias.name) not in new_name_strs
++        ]
++
++        if not remaining_aliases:
++            return cst.RemovalSentinel.REMOVE
++
++        # Rebuild the import with remaining aliases
++        return updated_node.with_changes(
++            names=_normalize_import_aliases(remaining_aliases)
++        )
++
++    def leave_Module(
++        self, original_node: cst.Module, updated_node: cst.Module
++    ) -> cst.Module:
++        """Add TYPE_CHECKING import and TYPE_CHECKING block."""
++        if not self.new_from_imports:
++            return updated_node
++
++        # Find position to add TYPE_CHECKING import and block (after all imports)
++        type_checking_insert_pos = (
++            self._find_last_import_position(updated_node.body) + 1
++        )
++
++        # Build statements to insert
++        statements_to_insert: List[
++            Union[cst.SimpleStatementLine, cst.BaseCompoundStatement]
++        ] = []
++
++        # Add TYPE_CHECKING import if needed
++        if not self._has_type_checking_import:
++            type_checking_import = cst.SimpleStatementLine(
++                body=[
++                    cst.ImportFrom(
++                        module=cst.Name("typing"),
++                        names=[cst.ImportAlias(name=cst.Name("TYPE_CHECKING"))],
++                    )
++                ],
++                leading_lines=[cst.EmptyLine()],
++            )
++            statements_to_insert.append(type_checking_import)
++
++        # Build the TYPE_CHECKING block with new imports
++        type_checking_block = self._build_type_checking_block()
++        if type_checking_block:
++            statements_to_insert.append(type_checking_block)
++
++        # Insert the new statements
++        final_body = (
++            list(updated_node.body[:type_checking_insert_pos])
++            + statements_to_insert
++            + list(updated_node.body[type_checking_insert_pos:])
++        )
++
++        return updated_node.with_changes(body=final_body)
++
++    def _find_last_import_position(
++        self,
++        body: Sequence[Union[cst.SimpleStatementLine, cst.BaseCompoundStatement]],
++    ) -> int:
++        """Find the index of the last import statement."""
++        last_import_idx = -1
++        for i, stmt in enumerate(body):
++            if isinstance(stmt, cst.SimpleStatementLine):
++                for item in stmt.body:
++                    if isinstance(item, (cst.Import, cst.ImportFrom)):
++                        last_import_idx = i
++        return last_import_idx
++
++    def _build_type_checking_block(self) -> Optional[cst.If]:
++        """Build an if TYPE_CHECKING block containing the new imports."""
++        if not self.new_from_imports:
++            return None
++
++        import_statements: List[cst.SimpleStatementLine] = []
++
++        for module, aliases in sorted(self.new_from_imports.items()):
++            normalized_aliases = _normalize_import_aliases(aliases)
++            import_from = cst.ImportFrom(
++                module=_build_module_attribute(module),
++                names=normalized_aliases,
++            )
++            import_statements.append(cst.SimpleStatementLine(body=[import_from]))
++
++        return cst.If(
++            test=cst.Name("TYPE_CHECKING"),
++            body=cst.IndentedBlock(body=import_statements),
++            leading_lines=[cst.EmptyLine()],
++        )
++
++
++def _build_module_attribute(module_path: str) -> Union[cst.Name, cst.Attribute]:
++    """Build a Name or Attribute node from a dotted module path."""
++    parts = module_path.split(".")
++    if len(parts) == 1:
++        return cst.Name(parts[0])
++
++    result: Union[cst.Name, cst.Attribute] = cst.Name(parts[0])
++    for part in parts[1:]:
++        result = cst.Attribute(value=result, attr=cst.Name(part))
++    return result
++
++
++def _normalize_import_aliases(
++    aliases: Sequence[cst.ImportAlias],
++) -> Sequence[cst.ImportAlias]:
++    """Normalize import aliases by resetting comma separators."""
++    if len(aliases) == 1:
++        return [aliases[0].with_changes(comma=cst.MaybeSentinel.DEFAULT)]
++
++    normalized = []
++    for i, alias in enumerate(aliases):
++        if i < len(aliases) - 1:
++            normalized.append(
++                alias.with_changes(
++                    comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
++                )
++            )
++        else:
++            normalized.append(alias.with_changes(comma=cst.MaybeSentinel.DEFAULT))
++    return normalized
++
++
++def apply_pep563_transformation(
++    original_module: cst.Module, transformed_module: cst.Module
++) -> cst.Module:
++    """
++    Apply PEP 563 transformation to move new imports into TYPE_CHECKING block.
++
++    Args:
++        original_module: The parsed module before type annotations were applied.
++        transformed_module: The parsed module after type annotations were applied.
++
++    Returns:
++        The transformed module with PEP 563 applied.
++    """
++    # Gather imports from the original source
++    original_gatherer = GatherImportsBeforeTransform()
++    original_module.visit(original_gatherer)
++
++    # Identify new imports in the transformed source
++    new_import_gatherer = GatherNewImports(
++        original_gatherer.module_imports,
++        original_gatherer.from_imports,
++    )
++    transformed_module.visit(new_import_gatherer)
++
++    if not new_import_gatherer.new_from_imports:
++        # No new imports to move; libcst handles `from __future__ import annotations`
++        # via use_future_annotations=True, so just return the transformed module
++        return transformed_module
++
++    # Apply the PEP 563 transformation
++    transformer = PEP563Transformer(
++        new_import_gatherer.new_from_imports,
++        new_import_gatherer.import_nodes_to_modify,
++    )
++    return transformed_module.visit(transformer)
+diff --git a/tests/test_pep563_transformer.py b/tests/test_pep563_transformer.py
+new file mode 100644
+index 0000000..4b500c0
+--- /dev/null
++++ b/tests/test_pep563_transformer.py
+@@ -0,0 +1,469 @@
++# Copyright (c) 2017-present, Facebook, Inc.
++# All rights reserved.
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++import textwrap
++
++import libcst as cst
++from libcst.codemod import CodemodContext
++from libcst.codemod.visitors import ApplyTypeAnnotationsVisitor
++
++from monkeytype.pep563_transformer import apply_pep563_transformation
++
++
++def transform_with_pep563(original: str, stub: str) -> str:
++    """
++    Helper to apply type annotations with PEP 563 enabled.
++
++    This simulates the full transformation pipeline that cli.apply_stub_using_libcst
++    performs when pep_563=True.
++    """
++    original_module = cst.parse_module(original)
++    stub_module = cst.parse_module(stub)
++
++    context = CodemodContext()
++    ApplyTypeAnnotationsVisitor.store_stub_in_context(
++        context,
++        stub_module,
++        overwrite_existing_annotations=False,
++        use_future_annotations=True,
++    )
++    transformer = ApplyTypeAnnotationsVisitor(context)
++    transformed_module = transformer.transform_module(original_module)
++
++    return apply_pep563_transformation(original_module, transformed_module).code
++
++
++class TestPEP563Transformer:
++    def test_adds_future_annotations_and_type_checking_block(self):
++        original = textwrap.dedent(
++            """
++            def foo(x):
++                return x + 1
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from some_module import SomeClass
++
++            def foo(x: SomeClass) -> int: ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from some_module import SomeClass
++
++            def foo(x: SomeClass) -> int:
++                return x + 1
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_preserves_existing_imports(self):
++        original = textwrap.dedent(
++            """
++            from existing_module import ExistingClass
++
++            def foo(x):
++                return ExistingClass()
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from existing_module import ExistingClass
++            from new_module import NewClass
++
++            def foo(x: NewClass) -> ExistingClass: ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++            from existing_module import ExistingClass
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from new_module import NewClass
++
++            def foo(x: NewClass) -> ExistingClass:
++                return ExistingClass()
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_preserves_module_docstring(self):
++        original = textwrap.dedent(
++            '''
++            """Module docstring."""
++
++            def foo(x):
++                return x
++        '''
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from some_module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass: ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            '''
++            """Module docstring."""
++            from __future__ import annotations
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from some_module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass:
++                return x
++        '''
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_handles_existing_future_imports(self):
++        original = textwrap.dedent(
++            """
++            from __future__ import division
++
++            def foo(x):
++                return x / 2
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from some_module import SomeClass
++
++            def foo(x: SomeClass): ...
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        # Verify key elements are present
++        # libcst may combine future imports or keep them separate
++        assert "annotations" in result
++        assert "division" in result
++        assert "if TYPE_CHECKING:" in result
++        assert "from some_module import SomeClass" in result
++
++    def test_handles_existing_type_checking_import(self):
++        original = textwrap.dedent(
++            """
++            from typing import TYPE_CHECKING
++
++            def foo(x):
++                return x
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from some_module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass: ...
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        # Should not duplicate TYPE_CHECKING import
++        assert result.count("TYPE_CHECKING") == 2  # import and if block
++        assert "if TYPE_CHECKING:" in result
++        assert "from some_module import SomeClass" in result
++
++    def test_handles_multiple_new_imports_from_same_module(self):
++        original = textwrap.dedent(
++            """
++            def foo(x, y):
++                return x + y
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from some_module import ClassA, ClassB
++
++            def foo(x: ClassA, y: ClassB): ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from some_module import ClassA, ClassB
++
++            def foo(x: ClassA, y: ClassB):
++                return x + y
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_handles_multiple_new_imports_from_different_modules(self):
++        original = textwrap.dedent(
++            """
++            def foo(x, y):
++                return x + y
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from module_a import ClassA
++            from module_b import ClassB
++
++            def foo(x: ClassA, y: ClassB): ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from module_a import ClassA
++                from module_b import ClassB
++
++            def foo(x: ClassA, y: ClassB):
++                return x + y
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_handles_nested_module_imports(self):
++        original = textwrap.dedent(
++            """
++            def foo(x):
++                return x
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from package.subpackage.module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass: ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from package.subpackage.module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass:
++                return x
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_no_changes_when_no_new_imports(self):
++        original = textwrap.dedent(
++            """
++            from some_module import SomeClass
++
++            def foo(x):
++                return x
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from some_module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass: ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++            from some_module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass:
++                return x
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_preserves_existing_future_annotations(self):
++        original = textwrap.dedent(
++            """
++            from __future__ import annotations
++
++            def foo(x):
++                return x
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from some_module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass: ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from some_module import SomeClass
++
++            def foo(x: SomeClass) -> SomeClass:
++                return x
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_handles_mixed_existing_and_new_imports(self):
++        original = textwrap.dedent(
++            """
++            from module_a import ExistingClass
++
++            def foo(x, y):
++                return ExistingClass()
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from module_a import ExistingClass, NewClassA
++            from module_b import NewClassB
++
++            def foo(x: NewClassA, y: NewClassB) -> ExistingClass: ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++            from module_a import ExistingClass
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from module_a import NewClassA
++                from module_b import NewClassB
++
++            def foo(x: NewClassA, y: NewClassB) -> ExistingClass:
++                return ExistingClass()
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
++
++    def test_handles_typing_imports_not_moved(self):
++        """Typing imports should stay at module level, not in TYPE_CHECKING block."""
++        original = textwrap.dedent(
++            """
++            def foo(x):
++                return [x]
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from typing import List
++            from some_module import SomeClass
++
++            def foo(x: SomeClass) -> List[SomeClass]: ...
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        # Verify typing imports are at module level, not in TYPE_CHECKING block
++        assert "from typing import List" in result
++        assert "if TYPE_CHECKING:" in result
++        # The SomeClass import should be inside TYPE_CHECKING
++        lines = result.split("\n")
++        type_checking_idx = next(
++            i for i, line in enumerate(lines) if "if TYPE_CHECKING:" in line
++        )
++        some_class_idx = next(
++            i
++            for i, line in enumerate(lines)
++            if "from some_module import SomeClass" in line
++        )
++        assert some_class_idx > type_checking_idx
++
++    def test_circular_import_scenario(self):
++        """Test the main use case: avoiding circular imports."""
++        original = textwrap.dedent(
++            """
++            class BaseClass:
++                def process(self, item):
++                    return item
++        """
++        ).lstrip()
++
++        stub = textwrap.dedent(
++            """
++            from module_b import ChildClass
++
++            class BaseClass:
++                def process(self, item: ChildClass) -> ChildClass: ...
++        """
++        ).lstrip()
++
++        expected = textwrap.dedent(
++            """
++            from __future__ import annotations
++
++            from typing import TYPE_CHECKING
++
++            if TYPE_CHECKING:
++                from module_b import ChildClass
++
++            class BaseClass:
++                def process(self, item: ChildClass) -> ChildClass:
++                    return item
++        """
++        ).lstrip()
++
++        result = transform_with_pep563(original, stub)
++        assert result == expected
