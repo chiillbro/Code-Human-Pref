@@ -1,0 +1,3240 @@
+diff --git a/main.py b/main.py
+index ff2c64d..e57c44d 100644
+--- a/main.py
++++ b/main.py
+@@ -1,154 +1,317 @@
+ from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, list_rounds, list_sprints
+ from src.arcade_replay import run_arcade_replay
+ 
+ from src.interfaces.qualifying import run_qualifying_replay
+ import sys
+ from src.cli.race_selection import cli_load
+ from src.gui.race_selection import RaceSelectionWindow
+ from PySide6.QtWidgets import QApplication
+ 
+-def main(year=None, round_number=None, playback_speed=1, session_type='R', visible_hud=True, ready_file=None):
+-  print(f"Loading F1 {year} Round {round_number} Session '{session_type}'")
+-  session = load_session(year, round_number, session_type)
+-
+-  print(f"Loaded session: {session.event['EventName']} - {session.event['RoundNumber']} - {session_type}")
+-
+-  # Enable cache for fastf1
+-  enable_cache()
+-
+-  if session_type == 'Q' or session_type == 'SQ':
+-
+-    # Get the drivers who participated and their lap times
+-
+-    qualifying_session_data = get_quali_telemetry(session, session_type=session_type)
+-
+-    # Run the arcade screen showing qualifying results
+ 
+-    title = f"{session.event['EventName']} - {'Sprint Qualifying' if session_type == 'SQ' else 'Qualifying Results'}"
+-    
+-    run_qualifying_replay(
+-      session=session,
+-      data=qualifying_session_data,
+-      title=title,
+-      ready_file=ready_file,
+-    )
+-
+-  else:
+-
+-    # Get the drivers who participated in the race
++def parse_cli_args():
++    """Parse command line arguments with validation."""
++    args = {
++        'cli': '--cli' in sys.argv,
++        'viewer': '--viewer' in sys.argv,
++        'compare': '--compare' in sys.argv,
++        'list_rounds': '--list-rounds' in sys.argv,
++        'list_sprints': '--list-sprints' in sys.argv,
++        'no_hud': '--no-hud' in sys.argv,
++        'year': None,
++        'round': None,
++        'year_b': None,
++        'round_b': None,
++        'session_type': 'R',
++        'session_type_b': 'R',
++        'ready_file': None,
++    }
++    
++    # Parse year
++    if '--year' in sys.argv:
++        try:
++            idx = sys.argv.index('--year') + 1
++            if idx < len(sys.argv):
++                args['year'] = int(sys.argv[idx])
++        except (ValueError, IndexError):
++            print("Warning: Invalid --year value, using default")
++    
++    # Parse round
++    if '--round' in sys.argv:
++        try:
++            idx = sys.argv.index('--round') + 1
++            if idx < len(sys.argv):
++                args['round'] = int(sys.argv[idx])
++        except (ValueError, IndexError):
++            print("Warning: Invalid --round value, using default")
++    
++    # Parse year-b (for comparison)
++    if '--year-b' in sys.argv:
++        try:
++            idx = sys.argv.index('--year-b') + 1
++            if idx < len(sys.argv):
++                args['year_b'] = int(sys.argv[idx])
++        except (ValueError, IndexError):
++            print("Warning: Invalid --year-b value")
++    
++    # Parse round-b (for comparison)
++    if '--round-b' in sys.argv:
++        try:
++            idx = sys.argv.index('--round-b') + 1
++            if idx < len(sys.argv):
++                args['round_b'] = int(sys.argv[idx])
++        except (ValueError, IndexError):
++            print("Warning: Invalid --round-b value")
++    
++    # Parse session types
++    if '--sprint-qualifying' in sys.argv:
++        args['session_type'] = 'SQ'
++    elif '--sprint' in sys.argv:
++        args['session_type'] = 'S'
++    elif '--qualifying' in sys.argv:
++        args['session_type'] = 'Q'
++    
++    # Session type for race B
++    if '--sprint-b' in sys.argv:
++        args['session_type_b'] = 'S'
++    
++    # Ready file for GUI subprocess
++    if '--ready-file' in sys.argv:
++        try:
++            idx = sys.argv.index('--ready-file') + 1
++            if idx < len(sys.argv):
++                args['ready_file'] = sys.argv[idx]
++        except IndexError:
++            pass
++    
++    return args
+ 
+-    race_telemetry = get_race_telemetry(session, session_type=session_type)
+ 
+-    # Get example lap for track layout
+-    # Qualifying lap preferred for DRS zones (fallback to fastest race lap (no DRS data))
+-    example_lap = None
++def main(year=None, round_number=None, playback_speed=1, session_type='R', visible_hud=True, ready_file=None):
++    """Run single race replay."""
++    if year is None or round_number is None:
++        print("Error: Year and round number are required")
++        return
++    
++    print(f"Loading F1 {year} Round {round_number} Session '{session_type}'")
+     
+     try:
+-        print("Attempting to load qualifying session for track layout...")
+-        quali_session = load_session(year, round_number, 'Q')
+-        if quali_session is not None and len(quali_session.laps) > 0:
+-            fastest_quali = quali_session.laps.pick_fastest()
+-            if fastest_quali is not None:
+-                quali_telemetry = fastest_quali.get_telemetry()
+-                if 'DRS' in quali_telemetry.columns:
+-                    example_lap = quali_telemetry
+-                    print(f"Using qualifying lap from driver {fastest_quali['Driver']} for DRS Zones")
++        session = load_session(year, round_number, session_type)
+     except Exception as e:
+-        print(f"Could not load qualifying session: {e}")
+-
+-    # fallback: Use fastest race lap
+-    if example_lap is None:
+-        fastest_lap = session.laps.pick_fastest()
+-        if fastest_lap is not None:
+-            example_lap = fastest_lap.get_telemetry()
+-            print("Using fastest race lap (DRS detection may use speed-based fallback)")
+-        else:
+-            print("Error: No valid laps found in session")
++        print(f"Error loading session: {e}")
++        return
++    
++    if session is None:
++        print("Error: Failed to load session")
++        return
++    
++    print(f"Loaded session: {session.event['EventName']} - {session.event['RoundNumber']} - {session_type}")
++    
++    enable_cache()
++    
++    if session_type == 'Q' or session_type == 'SQ':
++        try:
++            qualifying_session_data = get_quali_telemetry(session, session_type=session_type)
++        except Exception as e:
++            print(f"Error getting qualifying telemetry: {e}")
+             return
++        
++        title = f"{session.event['EventName']} - {'Sprint Qualifying' if session_type == 'SQ' else 'Qualifying Results'}"
++        
++        run_qualifying_replay(
++            session=session,
++            data=qualifying_session_data,
++            title=title,
++            ready_file=ready_file,
++        )
++    else:
++        try:
++            race_telemetry = get_race_telemetry(session, session_type=session_type)
++        except Exception as e:
++            print(f"Error getting race telemetry: {e}")
++            return
++        
++        if race_telemetry is None or not race_telemetry.get('frames'):
++            print("Error: No telemetry data available")
++            return
++        
++        # Get example lap for track layout
++        example_lap = None
++        
++        try:
++            print("Attempting to load qualifying session for track layout...")
++            quali_session = load_session(year, round_number, 'Q')
++            if quali_session is not None and len(quali_session.laps) > 0:
++                fastest_quali = quali_session.laps.pick_fastest()
++                if fastest_quali is not None:
++                    quali_telemetry = fastest_quali.get_telemetry()
++                    if 'DRS' in quali_telemetry.columns:
++                        example_lap = quali_telemetry
++                        print(f"Using qualifying lap from driver {fastest_quali['Driver']} for DRS Zones")
++        except Exception as e:
++            print(f"Could not load qualifying session: {e}")
++        
++        # Fallback: Use fastest race lap
++        if example_lap is None:
++            try:
++                fastest_lap = session.laps.pick_fastest()
++                if fastest_lap is not None:
++                    example_lap = fastest_lap.get_telemetry()
++                    print("Using fastest race lap (DRS detection may use speed-based fallback)")
++                else:
++                    print("Error: No valid laps found in session")
++                    return
++            except Exception as e:
++                print(f"Error getting fastest lap: {e}")
++                return
++        
++        drivers = session.drivers
++        
++        try:
++            circuit_rotation = get_circuit_rotation(session)
++        except Exception as e:
++            print(f"Warning: Could not get circuit rotation: {e}")
++            circuit_rotation = 0.0
++        
++        # Prepare session info for display banner
++        session_info = {
++            'event_name': session.event.get('EventName', ''),
++            'circuit_name': session.event.get('Location', ''),
++            'country': session.event.get('Country', ''),
++            'year': year,
++            'round': round_number,
++            'date': session.event.get('EventDate', '').strftime('%B %d, %Y') if session.event.get('EventDate') else '',
++            'total_laps': race_telemetry['total_laps']
++        }
++        
++        run_arcade_replay(
++            frames=race_telemetry['frames'],
++            track_statuses=race_telemetry['track_statuses'],
++            example_lap=example_lap,
++            drivers=drivers,
++            playback_speed=playback_speed,
++            driver_colors=race_telemetry['driver_colors'],
++            title=f"{session.event['EventName']} - {'Sprint' if session_type == 'S' else 'Race'}",
++            total_laps=race_telemetry['total_laps'],
++            circuit_rotation=circuit_rotation,
++            visible_hud=visible_hud,
++            ready_file=ready_file,
++            session_info=session_info
++        )
+ 
+-    drivers = session.drivers
+-
+-    # Get circuit rotation
+-
+-    circuit_rotation = get_circuit_rotation(session)
+-    
+-    # Prepare session info for display banner
+-    session_info = {
+-        'event_name': session.event.get('EventName', ''),
+-        'circuit_name': session.event.get('Location', ''),  # Circuit location/name
+-        'country': session.event.get('Country', ''),
+-        'year': year,
+-        'round': round_number,
+-        'date': session.event.get('EventDate', '').strftime('%B %d, %Y') if session.event.get('EventDate') else '',
+-        'total_laps': race_telemetry['total_laps']
+-    }
+ 
+-    # Run the arcade replay
++def run_comparison(year_a, round_a, year_b, round_b, session_type_a='R', session_type_b='R', ready_file=None):
++    """Run race comparison mode."""
++    if year_a is None or round_a is None:
++        print("Error: Year and round are required for race A (--year, --round)")
++        return
++    
++    if year_b is None or round_b is None:
++        print("Error: Year and round are required for race B (--year-b, --round-b)")
++        return
++    
++    print(f"Loading comparison: {year_a} R{round_a} vs {year_b} R{round_b}")
++    
++    enable_cache()
++    
++    try:
++        from src.comparison.comparison_data import ComparisonDataLoader
++        from src.comparison.comparison_window import run_comparison_replay
++        
++        loader = ComparisonDataLoader()
++        comparison_data = loader.load_races(
++            year_a=year_a,
++            round_a=round_a,
++            year_b=year_b,
++            round_b=round_b,
++            session_type_a=session_type_a,
++            session_type_b=session_type_b,
++        )
++        
++        if comparison_data is None:
++            errors = loader.load_errors
++            if errors:
++                print("Comparison loading errors:")
++                for err in errors:
++                    print(f"  - {err}")
++            print("Error: Failed to load comparison data")
++            return
++        
++        if not comparison_data.is_loaded:
++            print("Error: Comparison data not fully loaded")
++            return
++        
++        # Signal readiness if ready_file provided
++        if ready_file:
++            try:
++                with open(ready_file, 'w') as f:
++                    f.write('ready')
++            except Exception:
++                pass
++        
++        print("Starting comparison replay...")
++        run_comparison_replay(comparison_data, playback_speed=1.0)
++        
++    except ImportError as e:
++        print(f"Error importing comparison module: {e}")
++        return
++    except Exception as e:
++        print(f"Error during comparison: {e}")
++        import traceback
++        traceback.print_exc()
++        return
+ 
+-    run_arcade_replay(
+-      frames=race_telemetry['frames'],
+-      track_statuses=race_telemetry['track_statuses'],
+-      example_lap=example_lap,
+-      drivers=drivers,
+-      playback_speed=playback_speed,
+-      driver_colors=race_telemetry['driver_colors'],
+-      title=f"{session.event['EventName']} - {'Sprint' if session_type == 'S' else 'Race'}",
+-      total_laps=race_telemetry['total_laps'],
+-      circuit_rotation=circuit_rotation,
+-      visible_hud=visible_hud,
+-      ready_file=ready_file,
+-      session_info=session_info
+-    )
+ 
+ if __name__ == "__main__":
+-
+-  if "--cli" in sys.argv:
+-    # Run the CLI
+-
+-    cli_load()
+-    sys.exit(0)
+-
+-  if "--year" in sys.argv:
+-    year_index = sys.argv.index("--year") + 1
+-    year = int(sys.argv[year_index])
+-  else:
+-    year = 2025  # Default year
+-
+-  if "--round" in sys.argv:
+-    round_index = sys.argv.index("--round") + 1
+-    round_number = int(sys.argv[round_index])
+-  else:
+-    round_number = 12  # Default round number
+-
+-  if "--list-rounds" in sys.argv:
+-    list_rounds(year)
+-  elif "--list-sprints" in sys.argv:
+-    list_sprints(year)
+-  else:
+-    playback_speed = 1
+-
+-  if "--viewer" in sys.argv:
+-  
+-    visible_hud = True
+-    if "--no-hud" in sys.argv:
+-      visible_hud = False
+-
+-    # Session type selection
+-    session_type = 'SQ' if "--sprint-qualifying" in sys.argv else ('S' if "--sprint" in sys.argv else ('Q' if "--qualifying" in sys.argv else 'R'))
+-
+-    # Optional ready-file path used when spawned from the GUI to signal ready state
+-    ready_file = None
+-    if "--ready-file" in sys.argv:
+-      idx = sys.argv.index("--ready-file") + 1
+-      if idx < len(sys.argv):
+-        ready_file = sys.argv[idx]
+-
+-    main(year, round_number, playback_speed, session_type=session_type, visible_hud=visible_hud, ready_file=ready_file)
+-    sys.exit(0)
+-
+-  # Run the GUI
+-
+-  app = QApplication(sys.argv)
+-  win = RaceSelectionWindow()
+-  win.show()
+-  sys.exit(app.exec())
+\ No newline at end of file
++    args = parse_cli_args()
++    
++    # CLI mode
++    if args['cli']:
++        cli_load()
++        sys.exit(0)
++    
++    # List rounds
++    if args['list_rounds']:
++        year = args['year'] if args['year'] else 2025
++        list_rounds(year)
++        sys.exit(0)
++    
++    # List sprints
++    if args['list_sprints']:
++        year = args['year'] if args['year'] else 2025
++        list_sprints(year)
++        sys.exit(0)
++    
++    # Comparison mode
++    if args['compare']:
++        run_comparison(
++            year_a=args['year'],
++            round_a=args['round'],
++            year_b=args['year_b'],
++            round_b=args['round_b'],
++            session_type_a=args['session_type'],
++            session_type_b=args['session_type_b'],
++            ready_file=args['ready_file'],
++        )
++        sys.exit(0)
++    
++    # Viewer mode (single race)
++    if args['viewer']:
++        year = args['year'] if args['year'] else 2025
++        round_number = args['round'] if args['round'] else 12
++        visible_hud = not args['no_hud']
++        
++        main(
++            year=year,
++            round_number=round_number,
++            playback_speed=1,
++            session_type=args['session_type'],
++            visible_hud=visible_hud,
++            ready_file=args['ready_file']
++        )
++        sys.exit(0)
++    
++    # Default: Run the GUI
++    app = QApplication(sys.argv)
++    win = RaceSelectionWindow()
++    win.show()
++    sys.exit(app.exec())
+diff --git a/src/cli/race_selection.py b/src/cli/race_selection.py
+index fe629f8..37722b2 100644
+--- a/src/cli/race_selection.py
++++ b/src/cli/race_selection.py
+@@ -1,47 +1,70 @@
+-from questionary import Style, select, Choice
++from questionary import Style, select, Choice, confirm
+ from rich.console import Console
+ from rich.markdown import Markdown
+ from rich.progress import Progress, SpinnerColumn, TextColumn
+ from src.f1_data import get_race_weekends_by_year
+ import sys
+ import os
+ import subprocess
+ 
++
+ def cli_load():
++    """CLI interface for race selection."""
+     current_year = 2025
+     style = Style([
+         ("pointer", "fg:#e10600 bold"),
+         ("selected", "noinherit fg:#64eb34 bold"),
+         ("highlighted", "fg:#e10600 bold"),
+         ("answer", "fg:#64eb34 bold")
+     ])
+ 
+     console = Console()
+     console.print(Markdown("# F1 Race Replay 🏎️"))
+ 
++    # Main mode selection
++    mode_choices = [
++        Choice(title="Watch Single Race", value="single"),
++        Choice(title="Compare Two Races", value="compare"),
++    ]
++    mode = select("What would you like to do?", choices=mode_choices, qmark="🏁", style=style).ask()
++    
++    if not mode:
++        sys.exit(0)
++    
++    if mode == "compare":
++        _cli_compare_mode(style, console)
++    else:
++        _cli_single_race_mode(style, console)
++
++
++def _cli_single_race_mode(style, console):
++    """CLI flow for single race selection."""
++    current_year = 2025
++    
+     years = [str(year) for year in range(current_year, 2009, -1)]
+     year = select("Choose a year", choices=years, qmark="🗓️ ", style=style).ask()
+     if not year:
+         sys.exit(0)
+     else:
+         year = int(year)
++    
+     with Progress(
+         SpinnerColumn(style="bold red"),
+         TextColumn("[bold]Loading races…"),
+         console=console,
+         transient=True,
+     ) as progress:
+         progress.add_task("load", total=None)
+         data = get_race_weekends_by_year(year)
+ 
+-    rounds = [Choice(title=f"{row['event_name']} ({row['date']})",value=row['round_number']) for row in data]
++    rounds = [Choice(title=f"{row['event_name']} ({row['date']})", value=row['round_number']) for row in data]
+     round_number = select("Choose a round", choices=rounds, qmark="🌏", style=style).ask()
+     if not round_number:
+         sys.exit(0)
+ 
+     sessions = ["Qualifying", "Race"]
+     for row in data:
+         if row['round_number'] == round_number:
+             if row['type'].find('sprint') != -1:
+                 sessions.insert(0, "Sprint Qualifying")
+                 sessions.insert(1, "Sprint")
+@@ -51,28 +74,134 @@ def cli_load():
+         
+     if session in ("Sprint", "Race"):
+         HUD = [Choice(title="Yes", value=True), Choice(title="No", value=False)]
+         hud = select("HUD?", choices=HUD, qmark="🖥️ ", style=style).ask()
+         if hud is None:
+             sys.exit(0)
+     else:
+         hud = True
+ 
+     flag = None
+-    match session:
+-        case "Qualifying":
+-            flag = "--qualifying" 
+-        case "Sprint Qualifying":
+-            flag = "--sprint-qualifying"  
+-        case "Sprint":
+-            flag = "--sprint"     
++    if session == "Qualifying":
++        flag = "--qualifying"
++    elif session == "Sprint Qualifying":
++        flag = "--sprint-qualifying"
++    elif session == "Sprint":
++        flag = "--sprint"
++    
+     main_path = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', 'main.py'))
+     cmd = [sys.executable, main_path, "--viewer"]
+     if year is not None:
+         cmd += ["--year", str(year)]
+     if round_number is not None:
+         cmd += ["--round", str(round_number)]
+     if flag:
+         cmd.append(flag)
+     if not hud:
+         cmd.append("--no-hud")
+     subprocess.run(cmd)
++
++
++def _cli_compare_mode(style, console):
++    """CLI flow for comparing two races."""
++    current_year = 2025
++    
++    console.print("\n[bold cyan]Race A (Primary Race)[/bold cyan]")
++    
++    # Race A selection
++    years = [str(year) for year in range(current_year, 2009, -1)]
++    year_a = select("Choose year for Race A", choices=years, qmark="🗓️ ", style=style).ask()
++    if not year_a:
++        sys.exit(0)
++    year_a = int(year_a)
++    
++    with Progress(
++        SpinnerColumn(style="bold red"),
++        TextColumn("[bold]Loading races…"),
++        console=console,
++        transient=True,
++    ) as progress:
++        progress.add_task("load", total=None)
++        data_a = get_race_weekends_by_year(year_a)
++    
++    rounds_a = [Choice(title=f"{row['event_name']} ({row['date']})", value=row) for row in data_a]
++    event_a = select("Choose Race A", choices=rounds_a, qmark="🌏", style=style).ask()
++    if not event_a:
++        sys.exit(0)
++    round_a = event_a['round_number']
++    
++    # Session type for Race A
++    sessions_a = ["Race"]
++    if 'sprint' in (event_a.get('type') or '').lower():
++        sessions_a.append("Sprint")
++    session_a = select("Session type for Race A", choices=sessions_a, qmark="🏁", style=style).ask()
++    if not session_a:
++        sys.exit(0)
++    session_type_a = 'S' if session_a == "Sprint" else 'R'
++    
++    console.print(f"\n[bold green]Race A: {event_a['event_name']} {year_a} ({session_a})[/bold green]")
++    console.print("\n[bold cyan]Race B (Comparison Race)[/bold cyan]")
++    
++    # Race B selection
++    year_b = select("Choose year for Race B", choices=years, qmark="🗓️ ", style=style).ask()
++    if not year_b:
++        sys.exit(0)
++    year_b = int(year_b)
++    
++    with Progress(
++        SpinnerColumn(style="bold red"),
++        TextColumn("[bold]Loading races…"),
++        console=console,
++        transient=True,
++    ) as progress:
++        progress.add_task("load", total=None)
++        data_b = get_race_weekends_by_year(year_b)
++    
++    rounds_b = [Choice(title=f"{row['event_name']} ({row['date']})", value=row) for row in data_b]
++    event_b = select("Choose Race B", choices=rounds_b, qmark="🌏", style=style).ask()
++    if not event_b:
++        sys.exit(0)
++    round_b = event_b['round_number']
++    
++    # Session type for Race B
++    sessions_b = ["Race"]
++    if 'sprint' in (event_b.get('type') or '').lower():
++        sessions_b.append("Sprint")
++    session_b = select("Session type for Race B", choices=sessions_b, qmark="🏁", style=style).ask()
++    if not session_b:
++        sys.exit(0)
++    session_type_b = 'S' if session_b == "Sprint" else 'R'
++    
++    console.print(f"\n[bold green]Race B: {event_b['event_name']} {year_b} ({session_b})[/bold green]")
++    
++    # Validate not same race
++    if year_a == year_b and round_a == round_b and session_type_a == session_type_b:
++        console.print("\n[bold red]Error: Cannot compare a race with itself![/bold red]")
++        sys.exit(1)
++    
++    # Confirmation
++    console.print(f"\n[bold]Comparing:[/bold]")
++    console.print(f"  A: {event_a['event_name']} {year_a} ({session_a})")
++    console.print(f"  B: {event_b['event_name']} {year_b} ({session_b})")
++    
++    proceed = confirm("Proceed with comparison?", default=True, style=style).ask()
++    if not proceed:
++        sys.exit(0)
++    
++    # Build and run command
++    main_path = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', 'main.py'))
++    cmd = [
++        sys.executable, main_path,
++        "--compare",
++        "--year", str(year_a),
++        "--round", str(round_a),
++        "--year-b", str(year_b),
++        "--round-b", str(round_b),
++    ]
++    
++    if session_type_a == 'S':
++        cmd.append("--sprint")
++    if session_type_b == 'S':
++        cmd.append("--sprint-b")
++    
++    console.print("\n[bold]Starting comparison...[/bold]")
++    subprocess.run(cmd)
+diff --git a/src/comparison/__init__.py b/src/comparison/__init__.py
+new file mode 100644
+index 0000000..679acc7
+--- /dev/null
++++ b/src/comparison/__init__.py
+@@ -0,0 +1,22 @@
++# Race comparison module
++from src.comparison.comparison_data import (
++    ComparisonDataLoader,
++    RaceComparisonData,
++    SyncMode,
++    ViewMode,
++)
++
++__all__ = [
++    'ComparisonDataLoader',
++    'RaceComparisonData',
++    'SyncMode',
++    'ViewMode',
++]
++
++# Conditionally import window if arcade is available
++try:
++    from src.comparison.comparison_window import F1RaceComparisonWindow
++    __all__.append('F1RaceComparisonWindow')
++except ImportError:
++    # arcade not available, window class not exported
++    pass
+diff --git a/src/comparison/comparison_data.py b/src/comparison/comparison_data.py
+new file mode 100644
+index 0000000..847e9c6
+--- /dev/null
++++ b/src/comparison/comparison_data.py
+@@ -0,0 +1,709 @@
++"""
++Race comparison data loading and synchronization module.
++
++Handles loading telemetry for two races and synchronizing their playback
++using various sync modes (lap-based, time-based, distance-based).
++"""
++
++from dataclasses import dataclass, field
++from enum import Enum, auto
++from typing import Optional, Dict, List, Any, Tuple
++import numpy as np
++
++
++class SyncMode(Enum):
++    """Synchronization modes for comparing two races."""
++    LAP_BASED = auto()      # Align by lap number (lap 5 of race A = lap 5 of race B)
++    TIME_BASED = auto()     # Align by race elapsed time
++    DISTANCE_BASED = auto() # Align by track position percentage (0-100%)
++
++
++class ViewMode(Enum):
++    """View modes for race comparison display."""
++    SPLIT = auto()      # Side-by-side tracks with separate leaderboards
++    OVERLAY = auto()    # Single track with ghost cars from race B
++    DIFFERENCE = auto() # Single track color-coded by position deltas
++
++
++@dataclass
++class RaceInfo:
++    """Information about a single race."""
++    year: int
++    round_number: int
++    session_type: str = 'R'
++    event_name: str = ''
++    circuit_name: str = ''
++    country: str = ''
++    date: str = ''
++    total_laps: int = 0
++    
++    def __post_init__(self):
++        if self.year is None or self.year < 1950 or self.year > 2100:
++            raise ValueError(f"Invalid year: {self.year}")
++        if self.round_number is None or self.round_number < 1:
++            raise ValueError(f"Invalid round number: {self.round_number}")
++        if self.session_type not in ('R', 'S', 'Q', 'SQ'):
++            raise ValueError(f"Invalid session type: {self.session_type}")
++
++
++@dataclass
++class RaceComparisonData:
++    """Container for two races' comparison data."""
++    race_a: Dict[str, Any] = field(default_factory=dict)
++    race_b: Dict[str, Any] = field(default_factory=dict)
++    info_a: Optional[RaceInfo] = None
++    info_b: Optional[RaceInfo] = None
++    
++    # Track geometries
++    track_a: Optional[Dict[str, Any]] = None
++    track_b: Optional[Dict[str, Any]] = None
++    example_lap_a: Optional[Any] = None
++    example_lap_b: Optional[Any] = None
++    
++    # Synchronization mappings (built during load)
++    lap_sync_map: Dict[int, Tuple[int, int]] = field(default_factory=dict)
++    time_sync_map: List[Tuple[float, int, int]] = field(default_factory=list)
++    distance_sync_map: List[Tuple[float, int, int]] = field(default_factory=list)
++    
++    @property
++    def is_loaded(self) -> bool:
++        """Check if both races are loaded."""
++        return bool(self.race_a and self.race_b)
++    
++    @property
++    def frames_a(self) -> List[Dict]:
++        """Get frames from race A."""
++        return self.race_a.get('frames', []) if self.race_a else []
++    
++    @property
++    def frames_b(self) -> List[Dict]:
++        """Get frames from race B."""
++        return self.race_b.get('frames', []) if self.race_b else []
++    
++    @property
++    def driver_colors_a(self) -> Dict[str, Tuple[int, int, int]]:
++        """Get driver colors from race A."""
++        return self.race_a.get('driver_colors', {}) if self.race_a else {}
++    
++    @property
++    def driver_colors_b(self) -> Dict[str, Tuple[int, int, int]]:
++        """Get driver colors from race B."""
++        return self.race_b.get('driver_colors', {}) if self.race_b else {}
++    
++    @property
++    def track_statuses_a(self) -> List[Dict]:
++        """Get track statuses from race A."""
++        return self.race_a.get('track_statuses', []) if self.race_a else []
++    
++    @property
++    def track_statuses_b(self) -> List[Dict]:
++        """Get track statuses from race B."""
++        return self.race_b.get('track_statuses', []) if self.race_b else []
++    
++    def get_total_laps(self, race: str = 'a') -> int:
++        """Get total laps for specified race."""
++        data = self.race_a if race.lower() == 'a' else self.race_b
++        return data.get('total_laps', 0) if data else 0
++
++
++class ComparisonDataLoader:
++    """
++    Loads and prepares race comparison data.
++    
++    Handles:
++    - Loading telemetry for two races
++    - Building track geometries
++    - Creating synchronization mappings between races
++    """
++    
++    def __init__(self):
++        self._comparison_data: Optional[RaceComparisonData] = None
++        self._load_errors: List[str] = []
++    
++    @property
++    def comparison_data(self) -> Optional[RaceComparisonData]:
++        return self._comparison_data
++    
++    @property
++    def load_errors(self) -> List[str]:
++        return list(self._load_errors)
++    
++    def load_races(
++        self,
++        year_a: int,
++        round_a: int,
++        year_b: int,
++        round_b: int,
++        session_type_a: str = 'R',
++        session_type_b: str = 'R',
++    ) -> Optional[RaceComparisonData]:
++        """
++        Load two races for comparison.
++        
++        Returns RaceComparisonData if successful, None if loading failed.
++        Errors are available via load_errors property.
++        """
++        self._load_errors.clear()
++        self._comparison_data = None
++        
++        # Validate inputs
++        try:
++            info_a = RaceInfo(
++                year=year_a,
++                round_number=round_a,
++                session_type=session_type_a
++            )
++            info_b = RaceInfo(
++                year=year_b,
++                round_number=round_b,
++                session_type=session_type_b
++            )
++        except ValueError as e:
++            self._load_errors.append(f"Invalid race parameters: {e}")
++            return None
++        
++        # Load race A
++        race_a_data, session_a, example_lap_a = self._load_single_race(
++            info_a, "Race A"
++        )
++        if race_a_data is None:
++            return None
++        
++        # Populate info_a from session
++        if session_a is not None:
++            try:
++                info_a.event_name = session_a.event.get('EventName', '')
++                info_a.circuit_name = session_a.event.get('Location', '')
++                info_a.country = session_a.event.get('Country', '')
++                event_date = session_a.event.get('EventDate')
++                if event_date:
++                    info_a.date = event_date.strftime('%Y-%m-%d')
++                info_a.total_laps = race_a_data.get('total_laps', 0)
++            except Exception as e:
++                self._load_errors.append(f"Warning: Could not extract race A info: {e}")
++        
++        # Load race B
++        race_b_data, session_b, example_lap_b = self._load_single_race(
++            info_b, "Race B"
++        )
++        if race_b_data is None:
++            return None
++        
++        # Populate info_b from session
++        if session_b is not None:
++            try:
++                info_b.event_name = session_b.event.get('EventName', '')
++                info_b.circuit_name = session_b.event.get('Location', '')
++                info_b.country = session_b.event.get('Country', '')
++                event_date = session_b.event.get('EventDate')
++                if event_date:
++                    info_b.date = event_date.strftime('%Y-%m-%d')
++                info_b.total_laps = race_b_data.get('total_laps', 0)
++            except Exception as e:
++                self._load_errors.append(f"Warning: Could not extract race B info: {e}")
++        
++        # Build track geometries
++        track_a = self._build_track_geometry(example_lap_a, "Race A")
++        track_b = self._build_track_geometry(example_lap_b, "Race B")
++        
++        # Create comparison data
++        comparison_data = RaceComparisonData(
++            race_a=race_a_data,
++            race_b=race_b_data,
++            info_a=info_a,
++            info_b=info_b,
++            track_a=track_a,
++            track_b=track_b,
++            example_lap_a=example_lap_a,
++            example_lap_b=example_lap_b,
++        )
++        
++        # Build synchronization mappings
++        self._build_sync_mappings(comparison_data)
++        
++        self._comparison_data = comparison_data
++        return comparison_data
++    
++    def _load_single_race(
++        self,
++        info: RaceInfo,
++        race_label: str
++    ) -> Tuple[Optional[Dict], Optional[Any], Optional[Any]]:
++        """
++        Load a single race's data.
++        
++        Returns (telemetry_data, session_object, example_lap) or (None, None, None) on failure.
++        """
++        try:
++            from src.f1_data import (
++                load_session,
++                get_race_telemetry,
++                enable_cache,
++                get_circuit_rotation,
++            )
++            
++            enable_cache()
++            
++            print(f"Loading {race_label}: {info.year} Round {info.round_number}...")
++            session = load_session(info.year, info.round_number, info.session_type)
++            
++            if session is None:
++                self._load_errors.append(f"Failed to load session for {race_label}")
++                return None, None, None
++            
++            # Get telemetry
++            telemetry = get_race_telemetry(session, session_type=info.session_type)
++            if telemetry is None or not telemetry.get('frames'):
++                self._load_errors.append(f"No telemetry data for {race_label}")
++                return None, None, None
++            
++            # Get circuit rotation
++            try:
++                rotation = get_circuit_rotation(session)
++                telemetry['circuit_rotation'] = rotation
++            except Exception as e:
++                self._load_errors.append(f"Warning: Could not get circuit rotation for {race_label}: {e}")
++                telemetry['circuit_rotation'] = 0.0
++            
++            # Get example lap for track layout
++            example_lap = self._get_example_lap(session, info)
++            
++            return telemetry, session, example_lap
++            
++        except Exception as e:
++            self._load_errors.append(f"Error loading {race_label}: {e}")
++            return None, None, None
++    
++    def _get_example_lap(self, session, info: RaceInfo) -> Optional[Any]:
++        """Get an example lap for track layout (prefer quali lap for DRS zones)."""
++        example_lap = None
++        
++        # Try to get qualifying lap first (has DRS zones)
++        try:
++            from src.f1_data import load_session
++            quali_session = load_session(info.year, info.round_number, 'Q')
++            if quali_session is not None and len(quali_session.laps) > 0:
++                fastest_quali = quali_session.laps.pick_fastest()
++                if fastest_quali is not None:
++                    quali_telemetry = fastest_quali.get_telemetry()
++                    if 'DRS' in quali_telemetry.columns:
++                        example_lap = quali_telemetry
++        except Exception:
++            pass
++        
++        # Fallback to fastest race lap
++        if example_lap is None:
++            try:
++                fastest_lap = session.laps.pick_fastest()
++                if fastest_lap is not None:
++                    example_lap = fastest_lap.get_telemetry()
++            except Exception:
++                pass
++        
++        return example_lap
++    
++    def _build_track_geometry(
++        self,
++        example_lap,
++        race_label: str
++    ) -> Optional[Dict[str, Any]]:
++        """Build track geometry from example lap."""
++        if example_lap is None:
++            self._load_errors.append(f"No example lap for {race_label} track geometry")
++            return None
++        
++        try:
++            from src.ui_components import build_track_from_example_lap
++            
++            result = build_track_from_example_lap(example_lap)
++            if result is None or len(result) < 10:
++                self._load_errors.append(f"Invalid track geometry for {race_label}")
++                return None
++            
++            (plot_x_ref, plot_y_ref, x_inner, y_inner, x_outer, y_outer,
++             x_min, x_max, y_min, y_max, drs_zones) = result
++            
++            return {
++                'plot_x_ref': plot_x_ref,
++                'plot_y_ref': plot_y_ref,
++                'x_inner': x_inner,
++                'y_inner': y_inner,
++                'x_outer': x_outer,
++                'y_outer': y_outer,
++                'x_min': x_min,
++                'x_max': x_max,
++                'y_min': y_min,
++                'y_max': y_max,
++                'drs_zones': drs_zones,
++            }
++        except Exception as e:
++            self._load_errors.append(f"Error building track geometry for {race_label}: {e}")
++            return None
++    
++    def _build_sync_mappings(self, data: RaceComparisonData) -> None:
++        """Build synchronization mappings between the two races."""
++        frames_a = data.frames_a
++        frames_b = data.frames_b
++        
++        if not frames_a or not frames_b:
++            return
++        
++        # Lap-based sync: map lap numbers to frame indices
++        data.lap_sync_map = self._build_lap_sync_map(frames_a, frames_b)
++        
++        # Time-based sync: direct frame mapping by time
++        data.time_sync_map = self._build_time_sync_map(frames_a, frames_b)
++        
++        # Distance-based sync: map by track position percentage
++        data.distance_sync_map = self._build_distance_sync_map(frames_a, frames_b)
++    
++    def _build_lap_sync_map(
++        self,
++        frames_a: List[Dict],
++        frames_b: List[Dict]
++    ) -> Dict[int, Tuple[int, int]]:
++        """
++        Build lap-based synchronization map.
++        
++        Returns dict: lap_number -> (frame_index_a, frame_index_b)
++        where frame indices are the start of each lap.
++        """
++        lap_map = {}
++        
++        # Find lap start frames for race A
++        lap_starts_a = {}
++        prev_lap = 0
++        for i, frame in enumerate(frames_a):
++            lap = frame.get('lap', 1)
++            if lap != prev_lap and lap not in lap_starts_a:
++                lap_starts_a[lap] = i
++            prev_lap = lap
++        
++        # Find lap start frames for race B
++        lap_starts_b = {}
++        prev_lap = 0
++        for i, frame in enumerate(frames_b):
++            lap = frame.get('lap', 1)
++            if lap != prev_lap and lap not in lap_starts_b:
++                lap_starts_b[lap] = i
++            prev_lap = lap
++        
++        # Build combined map
++        all_laps = set(lap_starts_a.keys()) | set(lap_starts_b.keys())
++        for lap in sorted(all_laps):
++            frame_a = lap_starts_a.get(lap, 0)
++            frame_b = lap_starts_b.get(lap, 0)
++            lap_map[lap] = (frame_a, frame_b)
++        
++        return lap_map
++    
++    def _build_time_sync_map(
++        self,
++        frames_a: List[Dict],
++        frames_b: List[Dict]
++    ) -> List[Tuple[float, int, int]]:
++        """
++        Build time-based synchronization map.
++        
++        Returns list of (time, frame_index_a, frame_index_b) tuples.
++        """
++        time_map = []
++        
++        # Get time ranges
++        times_a = [f.get('t', 0.0) for f in frames_a]
++        times_b = [f.get('t', 0.0) for f in frames_b]
++        
++        if not times_a or not times_b:
++            return time_map
++        
++        max_time = max(max(times_a), max(times_b))
++        
++        # Sample at regular intervals (every second)
++        sample_interval = 1.0
++        current_time = 0.0
++        idx_a = 0
++        idx_b = 0
++        
++        while current_time <= max_time:
++            # Find closest frame in race A
++            while idx_a < len(times_a) - 1 and times_a[idx_a + 1] <= current_time:
++                idx_a += 1
++            
++            # Find closest frame in race B
++            while idx_b < len(times_b) - 1 and times_b[idx_b + 1] <= current_time:
++                idx_b += 1
++            
++            time_map.append((current_time, idx_a, idx_b))
++            current_time += sample_interval
++        
++        return time_map
++    
++    def _build_distance_sync_map(
++        self,
++        frames_a: List[Dict],
++        frames_b: List[Dict]
++    ) -> List[Tuple[float, int, int]]:
++        """
++        Build distance-based synchronization map using track position percentage.
++        
++        Returns list of (percentage, frame_index_a, frame_index_b) tuples.
++        """
++        distance_map = []
++        
++        # Sample at 1% intervals
++        for pct in range(0, 101):
++            pct_float = pct / 100.0
++            
++            # Find frame where leader's rel_dist is closest to target percentage
++            frame_a = self._find_frame_by_rel_dist(frames_a, pct_float)
++            frame_b = self._find_frame_by_rel_dist(frames_b, pct_float)
++            
++            distance_map.append((pct_float, frame_a, frame_b))
++        
++        return distance_map
++    
++    def _find_frame_by_rel_dist(
++        self,
++        frames: List[Dict],
++        target_pct: float
++    ) -> int:
++        """Find frame index where leader is closest to target track percentage."""
++        if not frames:
++            return 0
++        
++        best_idx = 0
++        best_diff = float('inf')
++        
++        for i, frame in enumerate(frames):
++            drivers = frame.get('drivers', {})
++            if not drivers:
++                continue
++            
++            # Find leader's rel_dist
++            leader_dist = 0.0
++            for driver_data in drivers.values():
++                rel_dist = driver_data.get('rel_dist', 0.0)
++                if rel_dist > leader_dist:
++                    leader_dist = rel_dist
++            
++            diff = abs(leader_dist - target_pct)
++            if diff < best_diff:
++                best_diff = diff
++                best_idx = i
++        
++        return best_idx
++
++
++class SyncController:
++    """
++    Controls synchronization between two races during playback.
++    
++    Manages frame indices for both races based on the current sync mode.
++    """
++    
++    def __init__(self, comparison_data: RaceComparisonData):
++        self._data = comparison_data
++        self._sync_mode = SyncMode.LAP_BASED
++        self._primary_frame_idx = 0.0  # Frame index for primary race (A)
++        self._secondary_frame_idx = 0.0  # Frame index for secondary race (B)
++    
++    @property
++    def sync_mode(self) -> SyncMode:
++        return self._sync_mode
++    
++    @sync_mode.setter
++    def sync_mode(self, mode: SyncMode) -> None:
++        if not isinstance(mode, SyncMode):
++            raise ValueError(f"Invalid sync mode: {mode}")
++        self._sync_mode = mode
++        # Recalculate secondary frame based on new mode
++        self._update_secondary_frame()
++    
++    @property
++    def frame_index_a(self) -> int:
++        """Current frame index for race A."""
++        return max(0, min(int(self._primary_frame_idx), len(self._data.frames_a) - 1))
++    
++    @property
++    def frame_index_b(self) -> int:
++        """Current frame index for race B."""
++        return max(0, min(int(self._secondary_frame_idx), len(self._data.frames_b) - 1))
++    
++    @property
++    def frame_index_a_float(self) -> float:
++        """Fractional frame index for race A (for smooth playback)."""
++        return self._primary_frame_idx
++    
++    @frame_index_a_float.setter
++    def frame_index_a_float(self, value: float) -> None:
++        max_frame = max(0, len(self._data.frames_a) - 1)
++        self._primary_frame_idx = max(0.0, min(float(value), float(max_frame)))
++        self._update_secondary_frame()
++    
++    def advance(self, delta_frames: float) -> None:
++        """Advance playback by delta_frames."""
++        max_frame = max(0, len(self._data.frames_a) - 1)
++        self._primary_frame_idx = max(0.0, min(
++            self._primary_frame_idx + delta_frames,
++            float(max_frame)
++        ))
++        self._update_secondary_frame()
++    
++    def seek(self, frame_idx: float) -> None:
++        """Seek to specific frame index in primary race."""
++        self.frame_index_a_float = frame_idx
++    
++    def _update_secondary_frame(self) -> None:
++        """Update secondary frame index based on sync mode."""
++        if not self._data.frames_a or not self._data.frames_b:
++            return
++        
++        if self._sync_mode == SyncMode.LAP_BASED:
++            self._sync_by_lap()
++        elif self._sync_mode == SyncMode.TIME_BASED:
++            self._sync_by_time()
++        elif self._sync_mode == SyncMode.DISTANCE_BASED:
++            self._sync_by_distance()
++    
++    def _sync_by_lap(self) -> None:
++        """Synchronize by lap number."""
++        frame_a = self.frame_index_a
++        if frame_a >= len(self._data.frames_a):
++            return
++        
++        current_lap = self._data.frames_a[frame_a].get('lap', 1)
++        
++        # Find corresponding lap start in race B
++        lap_map = self._data.lap_sync_map
++        if current_lap in lap_map:
++            lap_start_a, lap_start_b = lap_map[current_lap]
++            
++            # Calculate offset within current lap
++            offset = frame_a - lap_start_a
++            
++            # Apply same offset to race B
++            self._secondary_frame_idx = float(lap_start_b + offset)
++        else:
++            # Fallback: use time-based sync
++            self._sync_by_time()
++    
++    def _sync_by_time(self) -> None:
++        """Synchronize by race elapsed time."""
++        frame_a = self.frame_index_a
++        if frame_a >= len(self._data.frames_a):
++            return
++        
++        current_time = self._data.frames_a[frame_a].get('t', 0.0)
++        
++        # Find frame in race B with closest time
++        frames_b = self._data.frames_b
++        best_idx = 0
++        best_diff = float('inf')
++        
++        for i, frame in enumerate(frames_b):
++            diff = abs(frame.get('t', 0.0) - current_time)
++            if diff < best_diff:
++                best_diff = diff
++                best_idx = i
++            elif diff > best_diff:
++                break  # Times are monotonic, stop searching
++        
++        self._secondary_frame_idx = float(best_idx)
++    
++    def _sync_by_distance(self) -> None:
++        """Synchronize by track position percentage."""
++        frame_a = self.frame_index_a
++        if frame_a >= len(self._data.frames_a):
++            return
++        
++        # Get leader's rel_dist in race A
++        drivers_a = self._data.frames_a[frame_a].get('drivers', {})
++        leader_dist_a = 0.0
++        for driver_data in drivers_a.values():
++            rel_dist = driver_data.get('rel_dist', 0.0)
++            if rel_dist > leader_dist_a:
++                leader_dist_a = rel_dist
++        
++        # Find frame in race B with similar leader rel_dist
++        frames_b = self._data.frames_b
++        best_idx = 0
++        best_diff = float('inf')
++        
++        for i, frame in enumerate(frames_b):
++            drivers_b = frame.get('drivers', {})
++            leader_dist_b = 0.0
++            for driver_data in drivers_b.values():
++                rel_dist = driver_data.get('rel_dist', 0.0)
++                if rel_dist > leader_dist_b:
++                    leader_dist_b = rel_dist
++            
++            diff = abs(leader_dist_b - leader_dist_a)
++            if diff < best_diff:
++                best_diff = diff
++                best_idx = i
++        
++        self._secondary_frame_idx = float(best_idx)
++
++
++def compute_position_deltas(
++    frame_a: Dict[str, Any],
++    frame_b: Dict[str, Any],
++    driver_colors_a: Dict[str, Tuple[int, int, int]],
++    driver_colors_b: Dict[str, Tuple[int, int, int]],
++) -> Dict[str, Dict[str, Any]]:
++    """
++    Compute position deltas between two frames for difference view.
++    
++    Returns dict of driver_code -> {
++        'position_a': position in race A (or None),
++        'position_b': position in race B (or None),
++        'delta': position difference (positive = worse in B),
++        'color': computed delta color (green=improved, red=worse),
++    }
++    """
++    deltas = {}
++    
++    drivers_a = frame_a.get('drivers', {})
++    drivers_b = frame_b.get('drivers', {})
++    
++    # Build position maps
++    positions_a = {}
++    for code, data in drivers_a.items():
++        positions_a[code] = data.get('position', 0)
++    
++    positions_b = {}
++    for code, data in drivers_b.items():
++        positions_b[code] = data.get('position', 0)
++    
++    # Find all drivers
++    all_drivers = set(positions_a.keys()) | set(positions_b.keys())
++    
++    for code in all_drivers:
++        pos_a = positions_a.get(code)
++        pos_b = positions_b.get(code)
++        
++        if pos_a is not None and pos_b is not None:
++            delta = pos_b - pos_a  # Positive = worse in B
++            # Color: green if improved (negative delta), red if worse
++            if delta < 0:
++                intensity = min(255, 100 + abs(delta) * 30)
++                color = (0, intensity, 0)
++            elif delta > 0:
++                intensity = min(255, 100 + delta * 30)
++                color = (intensity, 0, 0)
++            else:
++                color = (128, 128, 128)  # Gray for no change
++        else:
++            delta = None
++            color = (100, 100, 100)  # Dim for missing
++        
++        deltas[code] = {
++            'position_a': pos_a,
++            'position_b': pos_b,
++            'delta': delta,
++            'color': color,
++            'color_a': driver_colors_a.get(code, (128, 128, 128)),
++            'color_b': driver_colors_b.get(code, (128, 128, 128)),
++        }
++    
++    return deltas
+diff --git a/src/comparison/comparison_window.py b/src/comparison/comparison_window.py
+new file mode 100644
+index 0000000..5d46473
+--- /dev/null
++++ b/src/comparison/comparison_window.py
+@@ -0,0 +1,1259 @@
++"""
++F1 Race Comparison Window.
++
++Displays two races side-by-side or overlaid for comparison.
++Supports multiple view modes and synchronization modes.
++"""
++
++import os
++import arcade
++import numpy as np
++from typing import Optional, Dict, List, Any, Tuple
++
++from src.f1_data import FPS
++from src.comparison.comparison_data import (
++    RaceComparisonData,
++    SyncMode,
++    ViewMode,
++    SyncController,
++    compute_position_deltas,
++)
++from src.ui_components import (
++    LeaderboardComponent,
++    RaceProgressBarComponent,
++    RaceControlsComponent,
++    ControlsPopupComponent,
++    extract_race_events,
++    build_track_from_example_lap,
++    BaseComponent,
++)
++
++
++SCREEN_WIDTH = 1600
++SCREEN_HEIGHT = 900
++SCREEN_TITLE = "F1 Race Comparison"
++PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
++
++
++class ComparisonControlsPopup(BaseComponent):
++    """Controls popup specialized for comparison view."""
++    
++    def __init__(self, width: int = 420, height: int = 380):
++        self.width = width
++        self.height = height
++        self.visible = False
++        self.cx: Optional[float] = None
++        self.cy: Optional[float] = None
++        self._header_text = arcade.Text("", 0, 0, arcade.color.BLACK, 16, anchor_x="left", anchor_y="center")
++        self._body_text = arcade.Text("", 0, 0, arcade.color.LIGHT_GRAY, 13, anchor_x="left", anchor_y="center")
++    
++    def show_over(self, left: float, top: float):
++        self.cx = float(left + self.width / 2)
++        self.cy = float(top - self.height / 2)
++        self.visible = True
++    
++    def hide(self):
++        self.visible = False
++        self.cx = None
++        self.cy = None
++    
++    def draw(self, window):
++        if not self.visible:
++            return
++        
++        cx = self.cx if self.cx is not None else window.width / 2
++        cy = self.cy if self.cy is not None else window.height / 2
++        
++        rect = arcade.XYWH(cx, cy, self.width, self.height)
++        arcade.draw_rect_filled(rect, (0, 0, 0, 255))
++        arcade.draw_rect_outline(rect, arcade.color.GRAY, 2)
++        
++        header_height = 28
++        header_cy = cy + self.height / 2 - header_height / 2
++        arcade.draw_rect_filled(arcade.XYWH(cx, header_cy, self.width, header_height), arcade.color.GRAY)
++        
++        self._header_text.text = "Comparison Controls"
++        self._header_text.bold = True
++        self._header_text.color = arcade.color.BLACK
++        self._header_text.x = cx - self.width / 2 + 12
++        self._header_text.y = header_cy
++        self._header_text.draw()
++        
++        lines = [
++            " ",
++            "[SPACE]   Pause/Resume",
++            "← / →     Seek backward/forward",
++            "↑ / ↓     Speed +/-",
++            "[1-4]     Set speed: 0.5x / 1x / 2x / 4x",
++            "[R]       Restart",
++            " ",
++            "[V]       Cycle View Mode (Split/Overlay/Difference)",
++            "[S]       Cycle Sync Mode (Lap/Time/Distance)",
++            " ",
++            "[L]       Toggle Driver Labels",
++            "[D]       Toggle DRS Zones",
++            "[H]       Toggle Help Popup",
++            "[ESC]     Exit",
++        ]
++        
++        line_spacing = 21
++        y = header_cy - 20
++        for line in lines:
++            self._body_text.text = line
++            self._body_text.bold = False
++            self._body_text.color = arcade.color.LIGHT_GRAY
++            self._body_text.x = cx - self.width / 2 + 16
++            self._body_text.y = y
++            self._body_text.draw()
++            y -= line_spacing
++    
++    def on_mouse_press(self, window, x: float, y: float, button: int, modifiers: int) -> bool:
++        if not self.visible:
++            return False
++        
++        cx = self.cx if self.cx is not None else window.width / 2
++        cy = self.cy if self.cy is not None else window.height / 2
++        left = cx - self.width / 2
++        right = cx + self.width / 2
++        bottom = cy - self.height / 2
++        top = cy + self.height / 2
++        
++        if left <= x <= right and bottom <= y <= top:
++            return True
++        
++        self.hide()
++        return True
++
++
++class F1RaceComparisonWindow(arcade.Window):
++    """
++    Window for comparing two F1 races.
++    
++    Supports three view modes:
++    - SPLIT: Side-by-side tracks with separate leaderboards
++    - OVERLAY: Single track with ghost cars from race B
++    - DIFFERENCE: Single track color-coded by position deltas
++    
++    And three sync modes:
++    - LAP_BASED: Align by lap number
++    - TIME_BASED: Align by race elapsed time
++    - DISTANCE_BASED: Align by track position percentage
++    """
++    
++    def __init__(
++        self,
++        comparison_data: RaceComparisonData,
++        playback_speed: float = 1.0,
++        visible_hud: bool = True,
++    ):
++        super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_TITLE, resizable=True)
++        self.maximize()
++        
++        # Validation
++        if comparison_data is None or not comparison_data.is_loaded:
++            raise ValueError("Comparison data is not loaded or is None")
++        
++        self._data = comparison_data
++        self._sync_controller = SyncController(comparison_data)
++        
++        # State
++        self._view_mode = ViewMode.SPLIT
++        self._playback_speed = self._validate_playback_speed(playback_speed)
++        self._paused = False
++        self._visible_hud = visible_hud
++        self._show_driver_labels = False
++        self._toggle_drs_zones = True
++        
++        # Seeking state
++        self._is_rewinding = False
++        self._is_forwarding = False
++        self._was_paused_before_hold = False
++        
++        # Track geometries (computed once)
++        self._track_a = self._init_track_geometry(
++            comparison_data.example_lap_a,
++            comparison_data.race_a.get('circuit_rotation', 0.0)
++        )
++        self._track_b = self._init_track_geometry(
++            comparison_data.example_lap_b,
++            comparison_data.race_b.get('circuit_rotation', 0.0)
++        )
++        
++        # Screen coordinates (updated on resize)
++        self._screen_inner_a: List[Tuple[float, float]] = []
++        self._screen_outer_a: List[Tuple[float, float]] = []
++        self._screen_inner_b: List[Tuple[float, float]] = []
++        self._screen_outer_b: List[Tuple[float, float]] = []
++        
++        # Scaling parameters
++        self._scale_a = 1.0
++        self._tx_a = 0.0
++        self._ty_a = 0.0
++        self._scale_b = 1.0
++        self._tx_b = 0.0
++        self._ty_b = 0.0
++        
++        # UI components
++        self._init_ui_components()
++        
++        # Background
++        bg_path = os.path.join("resources", "background.png")
++        self._bg_texture = arcade.load_texture(bg_path) if os.path.exists(bg_path) else None
++        
++        arcade.set_background_color(arcade.color.BLACK)
++        
++        # Persistent text objects
++        self._init_text_objects()
++        
++        # Trigger initial layout
++        self._update_layout(self.width, self.height)
++    
++    def _validate_playback_speed(self, speed: float) -> float:
++        """Validate and normalize playback speed."""
++        if speed in PLAYBACK_SPEEDS:
++            return speed
++        # Find closest valid speed
++        closest = min(PLAYBACK_SPEEDS, key=lambda x: abs(x - speed))
++        return closest
++    
++    def _init_track_geometry(
++        self,
++        example_lap,
++        circuit_rotation: float
++    ) -> Optional[Dict[str, Any]]:
++        """Initialize track geometry for a single race."""
++        if example_lap is None:
++            return None
++        
++        try:
++            result = build_track_from_example_lap(example_lap)
++            if result is None or len(result) < 10:
++                return None
++            
++            (plot_x_ref, plot_y_ref, x_inner, y_inner, x_outer, y_outer,
++             x_min, x_max, y_min, y_max, drs_zones) = result
++            
++            # Pre-compute rotation values
++            rot_rad = float(np.deg2rad(circuit_rotation)) if circuit_rotation else 0.0
++            cos_rot = float(np.cos(rot_rad))
++            sin_rot = float(np.sin(rot_rad))
++            
++            # Interpolate points for smoother drawing
++            world_inner = self._interpolate_points(x_inner, y_inner)
++            world_outer = self._interpolate_points(x_outer, y_outer)
++            
++            return {
++                'plot_x_ref': plot_x_ref,
++                'plot_y_ref': plot_y_ref,
++                'x_inner': x_inner,
++                'y_inner': y_inner,
++                'x_outer': x_outer,
++                'y_outer': y_outer,
++                'x_min': x_min,
++                'x_max': x_max,
++                'y_min': y_min,
++                'y_max': y_max,
++                'drs_zones': drs_zones,
++                'rot_rad': rot_rad,
++                'cos_rot': cos_rot,
++                'sin_rot': sin_rot,
++                'world_inner': world_inner,
++                'world_outer': world_outer,
++            }
++        except Exception as e:
++            print(f"Error initializing track geometry: {e}")
++            return None
++    
++    def _interpolate_points(
++        self,
++        xs,
++        ys,
++        interp_points: int = 2000
++    ) -> List[Tuple[float, float]]:
++        """Interpolate points for smoother track drawing."""
++        try:
++            t_old = np.linspace(0, 1, len(xs))
++            t_new = np.linspace(0, 1, interp_points)
++            xs_i = np.interp(t_new, t_old, xs)
++            ys_i = np.interp(t_new, t_old, ys)
++            return list(zip(xs_i, ys_i))
++        except Exception:
++            return []
++    
++    def _init_ui_components(self) -> None:
++        """Initialize UI components."""
++        # Leaderboards (two for split view)
++        self._leaderboard_a = LeaderboardComponent(
++            x=20, width=200, visible=self._visible_hud
++        )
++        self._leaderboard_b = LeaderboardComponent(
++            x=20, width=200, visible=self._visible_hud
++        )
++        
++        # Progress bar
++        self._progress_bar = RaceProgressBarComponent(
++            left_margin=100,
++            right_margin=100,
++            bottom=30,
++            height=24,
++            marker_height=16
++        )
++        
++        # Initialize progress bar with race A events
++        if self._data.frames_a:
++            race_events = extract_race_events(
++                self._data.frames_a,
++                self._data.track_statuses_a,
++                self._data.get_total_laps('a')
++            )
++            self._progress_bar.set_race_data(
++                total_frames=len(self._data.frames_a),
++                total_laps=self._data.get_total_laps('a'),
++                events=race_events
++            )
++        
++        # Controls
++        self._race_controls = RaceControlsComponent(
++            center_x=self.width // 2,
++            center_y=100,
++            visible=self._visible_hud
++        )
++        
++        # Controls popup (specialized for comparison)
++        self._controls_popup = ComparisonControlsPopup()
++    
++    def _init_text_objects(self) -> None:
++        """Initialize persistent text objects."""
++        self._lap_text_a = arcade.Text(
++            "", 20, self.height - 40, arcade.color.WHITE, 18, anchor_y="top"
++        )
++        self._lap_text_b = arcade.Text(
++            "", 20, self.height - 40, arcade.color.WHITE, 18, anchor_y="top"
++        )
++        self._time_text_a = arcade.Text(
++            "", 20, self.height - 65, arcade.color.WHITE, 14, anchor_y="top"
++        )
++        self._time_text_b = arcade.Text(
++            "", 20, self.height - 65, arcade.color.WHITE, 14, anchor_y="top"
++        )
++        self._mode_text = arcade.Text(
++            "", self.width // 2, self.height - 20, arcade.color.CYAN, 14,
++            anchor_x="center", anchor_y="top"
++        )
++        self._sync_text = arcade.Text(
++            "", self.width // 2, self.height - 40, arcade.color.LIGHT_GRAY, 12,
++            anchor_x="center", anchor_y="top"
++        )
++        self._race_label_a = arcade.Text(
++            "", 20, self.height - 20, arcade.color.YELLOW, 16,
++            anchor_y="top", bold=True
++        )
++        self._race_label_b = arcade.Text(
++            "", 20, self.height - 20, arcade.color.CYAN, 16,
++            anchor_y="top", bold=True
++        )
++    
++    def _update_layout(self, width: int, height: int) -> None:
++        """Update layout and scaling for current window size."""
++        if self._view_mode == ViewMode.SPLIT:
++            self._update_split_layout(width, height)
++        else:
++            self._update_single_layout(width, height)
++        
++        # Update UI positions
++        self._update_ui_positions(width, height)
++    
++    def _update_split_layout(self, width: int, height: int) -> None:
++        """Update layout for split view (side-by-side tracks)."""
++        half_width = width // 2
++        margin = 40
++        leaderboard_width = 210
++        
++        # Left half for race A
++        if self._track_a:
++            self._scale_a, self._tx_a, self._ty_a = self._compute_scaling(
++                self._track_a,
++                left=margin,
++                right=half_width - margin,
++                bottom=80,
++                top=height - 100
++            )
++            self._screen_inner_a = [
++                self._world_to_screen_a(x, y)
++                for x, y in self._track_a['world_inner']
++            ]
++            self._screen_outer_a = [
++                self._world_to_screen_a(x, y)
++                for x, y in self._track_a['world_outer']
++            ]
++        
++        # Right half for race B
++        if self._track_b:
++            self._scale_b, self._tx_b, self._ty_b = self._compute_scaling(
++                self._track_b,
++                left=half_width + margin,
++                right=width - margin,
++                bottom=80,
++                top=height - 100
++            )
++            self._screen_inner_b = [
++                self._world_to_screen_b(x, y)
++                for x, y in self._track_b['world_inner']
++            ]
++            self._screen_outer_b = [
++                self._world_to_screen_b(x, y)
++                for x, y in self._track_b['world_outer']
++            ]
++        
++        # Position leaderboards
++        self._leaderboard_a.x = half_width - leaderboard_width - 20
++        self._leaderboard_b.x = width - leaderboard_width - 20
++    
++    def _update_single_layout(self, width: int, height: int) -> None:
++        """Update layout for single view (overlay/difference)."""
++        margin = 100
++        leaderboard_width = 240
++        
++        # Use race A's track for single view
++        if self._track_a:
++            self._scale_a, self._tx_a, self._ty_a = self._compute_scaling(
++                self._track_a,
++                left=margin,
++                right=width - leaderboard_width - margin,
++                bottom=80,
++                top=height - 80
++            )
++            self._screen_inner_a = [
++                self._world_to_screen_a(x, y)
++                for x, y in self._track_a['world_inner']
++            ]
++            self._screen_outer_a = [
++                self._world_to_screen_a(x, y)
++                for x, y in self._track_a['world_outer']
++            ]
++        
++        # Position single leaderboard
++        self._leaderboard_a.x = width - leaderboard_width - 20
++    
++    def _compute_scaling(
++        self,
++        track: Dict[str, Any],
++        left: float,
++        right: float,
++        bottom: float,
++        top: float
++    ) -> Tuple[float, float, float]:
++        """Compute scaling parameters to fit track in given bounds."""
++        if not track:
++            return 1.0, 0.0, 0.0
++        
++        padding = 0.05
++        
++        world_cx = (track['x_min'] + track['x_max']) / 2
++        world_cy = (track['y_min'] + track['y_max']) / 2
++        
++        # Compute rotated bounds
++        cos_rot = track.get('cos_rot', 1.0)
++        sin_rot = track.get('sin_rot', 0.0)
++        
++        def rotate(x, y):
++            tx = x - world_cx
++            ty = y - world_cy
++            rx = tx * cos_rot - ty * sin_rot
++            ry = tx * sin_rot + ty * cos_rot
++            return rx + world_cx, ry + world_cy
++        
++        rotated_xs = []
++        rotated_ys = []
++        for x, y in track['world_inner'] + track['world_outer']:
++            rx, ry = rotate(x, y)
++            rotated_xs.append(rx)
++            rotated_ys.append(ry)
++        
++        if not rotated_xs or not rotated_ys:
++            return 1.0, 0.0, 0.0
++        
++        world_x_min = min(rotated_xs)
++        world_x_max = max(rotated_xs)
++        world_y_min = min(rotated_ys)
++        world_y_max = max(rotated_ys)
++        
++        world_w = max(1.0, world_x_max - world_x_min)
++        world_h = max(1.0, world_y_max - world_y_min)
++        
++        usable_w = (right - left) * (1 - 2 * padding)
++        usable_h = (top - bottom) * (1 - 2 * padding)
++        
++        scale_x = usable_w / world_w
++        scale_y = usable_h / world_h
++        scale = min(scale_x, scale_y)
++        
++        screen_cx = (left + right) / 2
++        screen_cy = (bottom + top) / 2
++        
++        tx = screen_cx - scale * world_cx
++        ty = screen_cy - scale * world_cy
++        
++        return scale, tx, ty
++    
++    def _world_to_screen_a(self, x: float, y: float) -> Tuple[float, float]:
++        """Convert world coordinates to screen for track A."""
++        return self._world_to_screen(x, y, self._track_a, self._scale_a, self._tx_a, self._ty_a)
++    
++    def _world_to_screen_b(self, x: float, y: float) -> Tuple[float, float]:
++        """Convert world coordinates to screen for track B."""
++        return self._world_to_screen(x, y, self._track_b, self._scale_b, self._tx_b, self._ty_b)
++    
++    def _world_to_screen(
++        self,
++        x: float,
++        y: float,
++        track: Optional[Dict],
++        scale: float,
++        tx: float,
++        ty: float
++    ) -> Tuple[float, float]:
++        """Generic world to screen coordinate conversion."""
++        if track is None:
++            return x * scale + tx, y * scale + ty
++        
++        # Apply rotation
++        world_cx = (track['x_min'] + track['x_max']) / 2
++        world_cy = (track['y_min'] + track['y_max']) / 2
++        
++        cos_rot = track.get('cos_rot', 1.0)
++        sin_rot = track.get('sin_rot', 0.0)
++        
++        if sin_rot != 0.0:
++            dx = x - world_cx
++            dy = y - world_cy
++            rx = dx * cos_rot - dy * sin_rot
++            ry = dx * sin_rot + dy * cos_rot
++            x, y = rx + world_cx, ry + world_cy
++        
++        return x * scale + tx, y * scale + ty
++    
++    def _update_ui_positions(self, width: int, height: int) -> None:
++        """Update UI component positions."""
++        # Progress bar
++        self._progress_bar.on_resize(self)
++        
++        # Controls
++        self._race_controls.center_x = width // 2
++        self._race_controls.on_resize(self)
++        
++        # Text positions
++        if self._view_mode == ViewMode.SPLIT:
++            half_width = width // 2
++            self._lap_text_a.x = 20
++            self._time_text_a.x = 20
++            self._race_label_a.x = 20
++            
++            self._lap_text_b.x = half_width + 20
++            self._time_text_b.x = half_width + 20
++            self._race_label_b.x = half_width + 20
++        else:
++            self._lap_text_a.x = 20
++            self._time_text_a.x = 20
++            self._race_label_a.x = 20
++        
++        self._lap_text_a.y = height - 40
++        self._lap_text_b.y = height - 40
++        self._time_text_a.y = height - 65
++        self._time_text_b.y = height - 65
++        self._race_label_a.y = height - 20
++        self._race_label_b.y = height - 20
++        
++        self._mode_text.x = width // 2
++        self._mode_text.y = height - 20
++        self._sync_text.x = width // 2
++        self._sync_text.y = height - 40
++    
++    def on_resize(self, width: int, height: int) -> None:
++        """Handle window resize."""
++        super().on_resize(width, height)
++        self._update_layout(width, height)
++    
++    def on_draw(self) -> None:
++        """Render the comparison view."""
++        self.clear()
++        
++        # Background
++        if self._bg_texture:
++            arcade.draw_lrbt_rectangle_textured(
++                left=0, right=self.width,
++                bottom=0, top=self.height,
++                texture=self._bg_texture
++            )
++        
++        # Draw based on view mode
++        if self._view_mode == ViewMode.SPLIT:
++            self._draw_split_view()
++        elif self._view_mode == ViewMode.OVERLAY:
++            self._draw_overlay_view()
++        elif self._view_mode == ViewMode.DIFFERENCE:
++            self._draw_difference_view()
++        
++        # Draw common UI
++        self._draw_common_ui()
++    
++    def _draw_split_view(self) -> None:
++        """Draw split view with side-by-side tracks."""
++        # Draw divider line
++        arcade.draw_line(
++            self.width // 2, 0,
++            self.width // 2, self.height,
++            arcade.color.DARK_GRAY, 2
++        )
++        
++        # Draw track A (left)
++        self._draw_track(
++            self._screen_inner_a, self._screen_outer_a,
++            self._get_track_color_a()
++        )
++        
++        # Draw track B (right)
++        self._draw_track(
++            self._screen_inner_b, self._screen_outer_b,
++            self._get_track_color_b()
++        )
++        
++        # Draw cars on track A
++        frame_a = self._get_current_frame_a()
++        if frame_a:
++            self._draw_cars(frame_a, self._data.driver_colors_a, 'a')
++        
++        # Draw cars on track B
++        frame_b = self._get_current_frame_b()
++        if frame_b:
++            self._draw_cars(frame_b, self._data.driver_colors_b, 'b')
++        
++        # Draw leaderboards
++        if self._visible_hud:
++            if frame_a:
++                entries_a = self._build_leaderboard_entries(
++                    frame_a, self._data.driver_colors_a
++                )
++                self._leaderboard_a.set_entries(entries_a)
++            self._leaderboard_a.draw(self)
++            
++            if frame_b:
++                entries_b = self._build_leaderboard_entries(
++                    frame_b, self._data.driver_colors_b
++                )
++                self._leaderboard_b.set_entries(entries_b)
++                # Offset leaderboard B position
++                self._leaderboard_b.x = self.width - 220
++            self._leaderboard_b.draw(self)
++        
++        # Draw race labels
++        if self._visible_hud:
++            info_a = self._data.info_a
++            info_b = self._data.info_b
++            
++            label_a = f"A: {info_a.event_name} {info_a.year}" if info_a else "Race A"
++            label_b = f"B: {info_b.event_name} {info_b.year}" if info_b else "Race B"
++            
++            self._race_label_a.text = label_a
++            self._race_label_a.draw()
++            
++            self._race_label_b.text = label_b
++            self._race_label_b.draw()
++            
++            # Draw lap/time info
++            self._draw_race_info(frame_a, self._lap_text_a, self._time_text_a, 'a')
++            self._draw_race_info(frame_b, self._lap_text_b, self._time_text_b, 'b')
++    
++    def _draw_overlay_view(self) -> None:
++        """Draw overlay view with ghost cars from race B on race A's track."""
++        # Draw track A
++        self._draw_track(
++            self._screen_inner_a, self._screen_outer_a,
++            self._get_track_color_a()
++        )
++        
++        frame_a = self._get_current_frame_a()
++        frame_b = self._get_current_frame_b()
++        
++        # Draw ghost cars from race B (semi-transparent)
++        if frame_b:
++            self._draw_ghost_cars(frame_b, self._data.driver_colors_b)
++        
++        # Draw cars from race A (solid)
++        if frame_a:
++            self._draw_cars(frame_a, self._data.driver_colors_a, 'a')
++        
++        # Single leaderboard showing race A
++        if self._visible_hud and frame_a:
++            entries_a = self._build_leaderboard_entries(
++                frame_a, self._data.driver_colors_a
++            )
++            self._leaderboard_a.set_entries(entries_a)
++            self._leaderboard_a.draw(self)
++        
++        # Draw race info
++        if self._visible_hud:
++            info_a = self._data.info_a
++            info_b = self._data.info_b
++            
++            label = f"{info_a.event_name} {info_a.year}" if info_a else "Race A"
++            label += f" vs {info_b.event_name} {info_b.year} (ghost)" if info_b else " vs Race B"
++            
++            self._race_label_a.text = label
++            self._race_label_a.draw()
++            
++            self._draw_race_info(frame_a, self._lap_text_a, self._time_text_a, 'a')
++    
++    def _draw_difference_view(self) -> None:
++        """Draw difference view with position delta coloring."""
++        # Draw track A
++        self._draw_track(
++            self._screen_inner_a, self._screen_outer_a,
++            (100, 100, 100)  # Neutral gray for difference view
++        )
++        
++        frame_a = self._get_current_frame_a()
++        frame_b = self._get_current_frame_b()
++        
++        if frame_a and frame_b:
++            # Compute position deltas
++            deltas = compute_position_deltas(
++                frame_a, frame_b,
++                self._data.driver_colors_a,
++                self._data.driver_colors_b
++            )
++            
++            # Draw cars with delta colors
++            self._draw_delta_cars(frame_a, deltas)
++            
++            # Draw delta legend
++            if self._visible_hud:
++                self._draw_delta_legend()
++        elif frame_a:
++            # Fallback to normal car drawing
++            self._draw_cars(frame_a, self._data.driver_colors_a, 'a')
++        
++        # Leaderboard with delta info
++        if self._visible_hud and frame_a and frame_b:
++            self._draw_delta_leaderboard(frame_a, frame_b)
++        
++        # Race info
++        if self._visible_hud:
++            info_a = self._data.info_a
++            info_b = self._data.info_b
++            
++            label = f"Position Delta: {info_a.event_name} {info_a.year}" if info_a else "Race A"
++            label += f" vs {info_b.event_name} {info_b.year}" if info_b else " vs Race B"
++            
++            self._race_label_a.text = label
++            self._race_label_a.draw()
++    
++    def _draw_track(
++        self,
++        inner_points: List[Tuple[float, float]],
++        outer_points: List[Tuple[float, float]],
++        color: Tuple[int, int, int]
++    ) -> None:
++        """Draw track outline."""
++        if len(inner_points) > 1:
++            arcade.draw_line_strip(inner_points, color, 3)
++        if len(outer_points) > 1:
++            arcade.draw_line_strip(outer_points, color, 3)
++    
++    def _draw_cars(
++        self,
++        frame: Dict[str, Any],
++        driver_colors: Dict[str, Tuple[int, int, int]],
++        track: str
++    ) -> None:
++        """Draw cars on the track."""
++        drivers = frame.get('drivers', {})
++        
++        for code, pos in drivers.items():
++            if track == 'a':
++                sx, sy = self._world_to_screen_a(pos['x'], pos['y'])
++            else:
++                sx, sy = self._world_to_screen_b(pos['x'], pos['y'])
++            
++            color = driver_colors.get(code, arcade.color.WHITE)
++            arcade.draw_circle_filled(sx, sy, 6, color)
++            
++            if self._show_driver_labels:
++                arcade.draw_text(
++                    code, sx + 8, sy,
++                    color, 10, anchor_y="center", bold=True
++                )
++    
++    def _draw_ghost_cars(
++        self,
++        frame: Dict[str, Any],
++        driver_colors: Dict[str, Tuple[int, int, int]]
++    ) -> None:
++        """Draw ghost cars from race B on track A (semi-transparent)."""
++        drivers = frame.get('drivers', {})
++        
++        for code, pos in drivers.items():
++            # Use track A's coordinate system
++            sx, sy = self._world_to_screen_a(pos['x'], pos['y'])
++            
++            base_color = driver_colors.get(code, arcade.color.WHITE)
++            # Make semi-transparent
++            ghost_color = (*base_color[:3], 100)
++            
++            arcade.draw_circle_filled(sx, sy, 5, ghost_color)
++            
++            # Draw hollow ring to distinguish ghost
++            arcade.draw_circle_outline(sx, sy, 6, base_color, 2)
++    
++    def _draw_delta_cars(
++        self,
++        frame_a: Dict[str, Any],
++        deltas: Dict[str, Dict[str, Any]]
++    ) -> None:
++        """Draw cars with delta coloring."""
++        drivers = frame_a.get('drivers', {})
++        
++        for code, pos in drivers.items():
++            sx, sy = self._world_to_screen_a(pos['x'], pos['y'])
++            
++            delta_info = deltas.get(code, {})
++            color = delta_info.get('color', (128, 128, 128))
++            
++            arcade.draw_circle_filled(sx, sy, 6, color)
++            
++            # Show delta number
++            delta = delta_info.get('delta')
++            if delta is not None and delta != 0:
++                delta_text = f"+{delta}" if delta > 0 else str(delta)
++                arcade.draw_text(
++                    delta_text, sx + 8, sy + 4,
++                    color, 9, anchor_y="center", bold=True
++                )
++            
++            if self._show_driver_labels:
++                arcade.draw_text(
++                    code, sx + 8, sy - 8,
++                    arcade.color.WHITE, 10, anchor_y="center"
++                )
++    
++    def _draw_delta_legend(self) -> None:
++        """Draw legend for position delta colors."""
++        legend_x = 20
++        legend_y = 150
++        
++        arcade.draw_text("Position Delta:", legend_x, legend_y, arcade.color.WHITE, 12, bold=True)
++        
++        legend_items = [
++            ((0, 180, 0), "Improved"),
++            ((128, 128, 128), "Same"),
++            ((180, 0, 0), "Worse"),
++        ]
++        
++        for i, (color, label) in enumerate(legend_items):
++            y = legend_y - 20 - i * 18
++            arcade.draw_circle_filled(legend_x + 8, y, 5, color)
++            arcade.draw_text(label, legend_x + 20, y, arcade.color.LIGHT_GRAY, 11, anchor_y="center")
++    
++    def _draw_delta_leaderboard(
++        self,
++        frame_a: Dict[str, Any],
++        frame_b: Dict[str, Any]
++    ) -> None:
++        """Draw leaderboard with position deltas."""
++        deltas = compute_position_deltas(
++            frame_a, frame_b,
++            self._data.driver_colors_a,
++            self._data.driver_colors_b
++        )
++        
++        # Build sorted entries by race A position
++        entries = []
++        drivers_a = frame_a.get('drivers', {})
++        
++        for code, pos in drivers_a.items():
++            delta_info = deltas.get(code, {})
++            color = delta_info.get('color_a', arcade.color.WHITE)
++            progress_m = pos.get('dist', 0.0)
++            entries.append((code, color, pos, progress_m))
++        
++        entries.sort(key=lambda x: x[3], reverse=True)
++        
++        self._leaderboard_a.set_entries(entries)
++        self._leaderboard_a.draw(self)
++    
++    def _build_leaderboard_entries(
++        self,
++        frame: Dict[str, Any],
++        driver_colors: Dict[str, Tuple[int, int, int]]
++    ) -> List[Tuple[str, Tuple[int, int, int], Dict, float]]:
++        """Build leaderboard entries from frame data."""
++        entries = []
++        drivers = frame.get('drivers', {})
++        
++        for code, pos in drivers.items():
++            color = driver_colors.get(code, arcade.color.WHITE)
++            progress_m = pos.get('dist', 0.0)
++            entries.append((code, color, pos, progress_m))
++        
++        entries.sort(key=lambda x: x[3], reverse=True)
++        return entries
++    
++    def _draw_race_info(
++        self,
++        frame: Optional[Dict],
++        lap_text: arcade.Text,
++        time_text: arcade.Text,
++        race: str
++    ) -> None:
++        """Draw lap and time info for a race."""
++        if not frame:
++            return
++        
++        # Get lap from leader
++        drivers = frame.get('drivers', {})
++        leader_lap = 1
++        for driver_data in drivers.values():
++            lap = driver_data.get('lap', 1)
++            if lap > leader_lap:
++                leader_lap = lap
++        
++        total_laps = self._data.get_total_laps(race)
++        lap_str = f"Lap: {leader_lap}"
++        if total_laps > 0:
++            lap_str += f"/{total_laps}"
++        
++        # Time
++        t = frame.get('t', 0.0)
++        hours = int(t // 3600)
++        minutes = int((t % 3600) // 60)
++        seconds = int(t % 60)
++        time_str = f"Time: {hours:02}:{minutes:02}:{seconds:02}"
++        
++        lap_text.text = lap_str
++        lap_text.draw()
++        
++        time_text.text = time_str
++        time_text.draw()
++    
++    def _draw_common_ui(self) -> None:
++        """Draw common UI elements."""
++        if not self._visible_hud:
++            return
++        
++        # Mode and sync indicators
++        view_mode_names = {
++            ViewMode.SPLIT: "Split View",
++            ViewMode.OVERLAY: "Overlay View",
++            ViewMode.DIFFERENCE: "Difference View",
++        }
++        sync_mode_names = {
++            SyncMode.LAP_BASED: "Sync: Lap",
++            SyncMode.TIME_BASED: "Sync: Time",
++            SyncMode.DISTANCE_BASED: "Sync: Distance",
++        }
++        
++        self._mode_text.text = view_mode_names.get(self._view_mode, "")
++        self._mode_text.draw()
++        
++        self._sync_text.text = sync_mode_names.get(self._sync_controller.sync_mode, "")
++        self._sync_text.draw()
++        
++        # Speed indicator
++        speed_text = f"Speed: {self._playback_speed}x"
++        arcade.draw_text(
++            speed_text, self.width - 100, self.height - 20,
++            arcade.color.WHITE, 12, anchor_y="top"
++        )
++        
++        if self._paused:
++            arcade.draw_text(
++                "PAUSED", self.width - 100, self.height - 40,
++                arcade.color.YELLOW, 12, anchor_y="top", bold=True
++            )
++        
++        # Progress bar
++        self._progress_bar.draw(self)
++        
++        # Race controls
++        self._race_controls.draw(self)
++        
++        # Controls popup
++        self._controls_popup.draw(self)
++    
++    def _get_current_frame_a(self) -> Optional[Dict]:
++        """Get current frame for race A."""
++        idx = self._sync_controller.frame_index_a
++        frames = self._data.frames_a
++        if 0 <= idx < len(frames):
++            return frames[idx]
++        return None
++    
++    def _get_current_frame_b(self) -> Optional[Dict]:
++        """Get current frame for race B."""
++        idx = self._sync_controller.frame_index_b
++        frames = self._data.frames_b
++        if 0 <= idx < len(frames):
++            return frames[idx]
++        return None
++    
++    def _get_track_color_a(self) -> Tuple[int, int, int]:
++        """Get track color for race A based on status."""
++        frame = self._get_current_frame_a()
++        return self._get_track_color_from_status(
++            frame, self._data.track_statuses_a
++        )
++    
++    def _get_track_color_b(self) -> Tuple[int, int, int]:
++        """Get track color for race B based on status."""
++        frame = self._get_current_frame_b()
++        return self._get_track_color_from_status(
++            frame, self._data.track_statuses_b
++        )
++    
++    def _get_track_color_from_status(
++        self,
++        frame: Optional[Dict],
++        track_statuses: List[Dict]
++    ) -> Tuple[int, int, int]:
++        """Determine track color from current status."""
++        if not frame:
++            return (150, 150, 150)
++        
++        current_time = frame.get('t', 0.0)
++        
++        for status in track_statuses:
++            start = status.get('start_time', 0.0)
++            end = status.get('end_time')
++            if start <= current_time and (end is None or current_time < end):
++                status_code = status.get('status', '')
++                if status_code == "2":
++                    return (220, 180, 0)   # Yellow
++                elif status_code == "4":
++                    return (180, 100, 30)  # SC
++                elif status_code == "5":
++                    return (200, 30, 30)   # Red
++                elif status_code in ("6", "7"):
++                    return (200, 130, 50)  # VSC
++        
++        return (150, 150, 150)
++    
++    def on_update(self, delta_time: float) -> None:
++        """Update game state."""
++        self._race_controls.on_update(delta_time)
++        
++        # Handle seeking
++        seek_speed = 3.0 * max(1.0, self._playback_speed)
++        if self._is_rewinding:
++            delta_frames = -delta_time * FPS * seek_speed
++            self._sync_controller.advance(delta_frames)
++            self._race_controls.flash_button('rewind')
++        elif self._is_forwarding:
++            delta_frames = delta_time * FPS * seek_speed
++            self._sync_controller.advance(delta_frames)
++            self._race_controls.flash_button('forward')
++        
++        if self._paused:
++            return
++        
++        # Normal playback
++        delta_frames = delta_time * FPS * self._playback_speed
++        self._sync_controller.advance(delta_frames)
++        
++        # Update progress bar position
++        self._progress_bar._current_frame = self._sync_controller.frame_index_a
++    
++    def on_key_press(self, symbol: int, modifiers: int) -> None:
++        """Handle key press events."""
++        if symbol == arcade.key.ESCAPE:
++            arcade.close_window()
++            return
++        
++        if symbol == arcade.key.SPACE:
++            self._paused = not self._paused
++            self._race_controls.flash_button('play_pause')
++        
++        elif symbol == arcade.key.RIGHT:
++            self._was_paused_before_hold = self._paused
++            self._is_forwarding = True
++            self._paused = True
++        
++        elif symbol == arcade.key.LEFT:
++            self._was_paused_before_hold = self._paused
++            self._is_rewinding = True
++            self._paused = True
++        
++        elif symbol == arcade.key.UP:
++            self._increase_speed()
++            self._race_controls.flash_button('speed_increase')
++        
++        elif symbol == arcade.key.DOWN:
++            self._decrease_speed()
++            self._race_controls.flash_button('speed_decrease')
++        
++        elif symbol == arcade.key.KEY_1:
++            self._playback_speed = 0.5
++        elif symbol == arcade.key.KEY_2:
++            self._playback_speed = 1.0
++        elif symbol == arcade.key.KEY_3:
++            self._playback_speed = 2.0
++        elif symbol == arcade.key.KEY_4:
++            self._playback_speed = 4.0
++        
++        elif symbol == arcade.key.R:
++            self._sync_controller.seek(0)
++            self._playback_speed = 1.0
++            self._race_controls.flash_button('rewind')
++        
++        elif symbol == arcade.key.V:
++            # Cycle view mode
++            modes = list(ViewMode)
++            current_idx = modes.index(self._view_mode)
++            self._view_mode = modes[(current_idx + 1) % len(modes)]
++            self._update_layout(self.width, self.height)
++        
++        elif symbol == arcade.key.S:
++            # Cycle sync mode
++            modes = list(SyncMode)
++            current_idx = modes.index(self._sync_controller.sync_mode)
++            self._sync_controller.sync_mode = modes[(current_idx + 1) % len(modes)]
++        
++        elif symbol == arcade.key.L:
++            self._show_driver_labels = not self._show_driver_labels
++        
++        elif symbol == arcade.key.D:
++            self._toggle_drs_zones = not self._toggle_drs_zones
++        
++        elif symbol == arcade.key.H:
++            margin = 20
++            if self._controls_popup.visible:
++                self._controls_popup.hide()
++            else:
++                self._controls_popup.show_over(
++                    float(margin),
++                    float(margin + self._controls_popup.height)
++                )
++    
++    def on_key_release(self, symbol: int, modifiers: int) -> None:
++        """Handle key release events."""
++        if symbol == arcade.key.RIGHT:
++            self._is_forwarding = False
++            self._paused = self._was_paused_before_hold
++        elif symbol == arcade.key.LEFT:
++            self._is_rewinding = False
++            self._paused = self._was_paused_before_hold
++    
++    def on_mouse_press(self, x: float, y: float, button: int, modifiers: int) -> None:
++        """Handle mouse press events."""
++        if self._is_forwarding or self._is_rewinding:
++            self._is_forwarding = False
++            self._is_rewinding = False
++            self._paused = self._was_paused_before_hold
++            return
++        
++        # Forward to UI components
++        if self._controls_popup.on_mouse_press(self, x, y, button, modifiers):
++            return
++        if self._race_controls.on_mouse_press(self, x, y, button, modifiers):
++            return
++        if self._progress_bar.on_mouse_press(self, x, y, button, modifiers):
++            # Seek to clicked position
++            target_frame = self._progress_bar._x_to_frame(x)
++            self._sync_controller.seek(float(target_frame))
++            return
++        if self._leaderboard_a.on_mouse_press(self, x, y, button, modifiers):
++            return
++    
++    def on_mouse_motion(self, x: float, y: float, dx: float, dy: float) -> None:
++        """Handle mouse motion events."""
++        self._progress_bar.on_mouse_motion(self, x, y, dx, dy)
++        self._race_controls.on_mouse_motion(self, x, y, dx, dy)
++    
++    def on_mouse_release(self, x: float, y: float, button: int, modifiers: int) -> None:
++        """Handle mouse release events."""
++        if self._is_forwarding or self._is_rewinding:
++            self._is_forwarding = False
++            self._is_rewinding = False
++            self._paused = self._was_paused_before_hold
++    
++    def _increase_speed(self) -> None:
++        """Increase playback speed."""
++        if self._playback_speed < PLAYBACK_SPEEDS[-1]:
++            for spd in PLAYBACK_SPEEDS:
++                if spd > self._playback_speed:
++                    self._playback_speed = spd
++                    break
++    
++    def _decrease_speed(self) -> None:
++        """Decrease playback speed."""
++        if self._playback_speed > PLAYBACK_SPEEDS[0]:
++            for spd in reversed(PLAYBACK_SPEEDS):
++                if spd < self._playback_speed:
++                    self._playback_speed = spd
++                    break
++    
++    # Properties for compatibility with existing components
++    @property
++    def paused(self) -> bool:
++        return self._paused
++    
++    @paused.setter
++    def paused(self, value: bool) -> None:
++        self._paused = value
++    
++    @property
++    def playback_speed(self) -> float:
++        return self._playback_speed
++    
++    @playback_speed.setter
++    def playback_speed(self, value: float) -> None:
++        self._playback_speed = self._validate_playback_speed(value)
++    
++    @property
++    def frame_index(self) -> float:
++        return self._sync_controller.frame_index_a_float
++    
++    @frame_index.setter
++    def frame_index(self, value: float) -> None:
++        self._sync_controller.seek(value)
++    
++    @property
++    def n_frames(self) -> int:
++        return len(self._data.frames_a)
++    
++    @property
++    def is_rewinding(self) -> bool:
++        return self._is_rewinding
++    
++    @is_rewinding.setter
++    def is_rewinding(self, value: bool) -> None:
++        self._is_rewinding = value
++    
++    @property
++    def is_forwarding(self) -> bool:
++        return self._is_forwarding
++    
++    @is_forwarding.setter
++    def is_forwarding(self, value: bool) -> None:
++        self._is_forwarding = value
++    
++    @property
++    def was_paused_before_hold(self) -> bool:
++        return self._was_paused_before_hold
++    
++    @was_paused_before_hold.setter
++    def was_paused_before_hold(self, value: bool) -> None:
++        self._was_paused_before_hold = value
++
++
++def run_comparison_replay(comparison_data: RaceComparisonData, playback_speed: float = 1.0) -> None:
++    """Run the race comparison replay window."""
++    if comparison_data is None or not comparison_data.is_loaded:
++        print("Error: Comparison data is not loaded")
++        return
++    
++    window = F1RaceComparisonWindow(
++        comparison_data=comparison_data,
++        playback_speed=playback_speed,
++        visible_hud=True,
++    )
++    arcade.run()
+diff --git a/src/gui/comparison_dialog.py b/src/gui/comparison_dialog.py
+new file mode 100644
+index 0000000..8238547
+--- /dev/null
++++ b/src/gui/comparison_dialog.py
+@@ -0,0 +1,463 @@
++"""
++Dual Race Picker Dialog for Race Comparison.
++
++Provides a GUI dialog to select two races for comparison.
++"""
++
++from PySide6.QtWidgets import (
++    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
++    QPushButton, QTreeWidget, QTreeWidgetItem, QGroupBox,
++    QMessageBox, QProgressDialog, QSplitter, QFrame
++)
++from PySide6.QtCore import Qt, QThread, Signal
++from PySide6.QtGui import QFont
++from typing import Optional, Dict, Any, Tuple
++import sys
++import os
++
++
++class FetchScheduleWorker(QThread):
++    """Worker thread for fetching race schedule."""
++    result = Signal(object)
++    error = Signal(str)
++    
++    def __init__(self, year: int, parent=None):
++        super().__init__(parent)
++        self.year = year
++    
++    def run(self):
++        try:
++            from src.f1_data import get_race_weekends_by_year, enable_cache
++            enable_cache()
++            events = get_race_weekends_by_year(self.year)
++            self.result.emit(events)
++        except Exception as e:
++            self.error.emit(str(e))
++
++
++class RaceSelectionPanel(QFrame):
++    """Panel for selecting a single race (year + round + session)."""
++    
++    def __init__(self, label: str, parent=None):
++        super().__init__(parent)
++        self._label = label
++        self._worker: Optional[FetchScheduleWorker] = None
++        self._selected_event: Optional[Dict] = None
++        self._selected_session: str = 'R'
++        self._events: list = []
++        
++        self._setup_ui()
++    
++    def _setup_ui(self):
++        layout = QVBoxLayout(self)
++        layout.setContentsMargins(10, 10, 10, 10)
++        
++        # Title
++        title = QLabel(self._label)
++        title_font = QFont()
++        title_font.setPointSize(14)
++        title_font.setBold(True)
++        title.setFont(title_font)
++        title.setAlignment(Qt.AlignCenter)
++        layout.addWidget(title)
++        
++        # Year selector
++        year_layout = QHBoxLayout()
++        year_label = QLabel("Year:")
++        self._year_combo = QComboBox()
++        current_year = 2025
++        for year in range(current_year, 2009, -1):
++            self._year_combo.addItem(str(year))
++        self._year_combo.setCurrentText(str(current_year))
++        self._year_combo.currentTextChanged.connect(self._on_year_changed)
++        year_layout.addWidget(year_label)
++        year_layout.addWidget(self._year_combo)
++        year_layout.addStretch()
++        layout.addLayout(year_layout)
++        
++        # Race list
++        self._race_tree = QTreeWidget()
++        self._race_tree.setHeaderLabels(["Round", "Event", "Date"])
++        self._race_tree.setRootIsDecorated(False)
++        self._race_tree.itemClicked.connect(self._on_race_selected)
++        self._race_tree.setMinimumHeight(200)
++        layout.addWidget(self._race_tree)
++        
++        # Session selector
++        session_layout = QHBoxLayout()
++        session_label = QLabel("Session:")
++        self._session_combo = QComboBox()
++        self._session_combo.addItems(["Race", "Sprint"])
++        self._session_combo.currentTextChanged.connect(self._on_session_changed)
++        session_layout.addWidget(session_label)
++        session_layout.addWidget(self._session_combo)
++        session_layout.addStretch()
++        layout.addLayout(session_layout)
++        
++        # Selection summary
++        self._summary_label = QLabel("No race selected")
++        self._summary_label.setStyleSheet("color: gray; font-style: italic;")
++        layout.addWidget(self._summary_label)
++        
++        # Load initial schedule
++        self._load_schedule(str(current_year))
++    
++    def _on_year_changed(self, year: str):
++        self._load_schedule(year)
++    
++    def _load_schedule(self, year: str):
++        self._race_tree.clear()
++        self._selected_event = None
++        self._update_summary()
++        
++        try:
++            year_int = int(year)
++        except ValueError:
++            return
++        
++        self._worker = FetchScheduleWorker(year_int)
++        self._worker.result.connect(self._on_schedule_loaded)
++        self._worker.error.connect(self._on_schedule_error)
++        self._worker.start()
++    
++    def _on_schedule_loaded(self, events: list):
++        self._events = events or []
++        for event in self._events:
++            round_str = str(event.get("round_number", ""))
++            name = str(event.get("event_name", ""))
++            date = str(event.get("date", ""))
++            
++            item = QTreeWidgetItem([round_str, name, date])
++            item.setData(0, Qt.UserRole, event)
++            self._race_tree.addTopLevelItem(item)
++        
++        self._race_tree.resizeColumnToContents(0)
++        self._race_tree.resizeColumnToContents(1)
++    
++    def _on_schedule_error(self, error: str):
++        QMessageBox.warning(
++            self,
++            "Load Error",
++            f"Failed to load schedule: {error}"
++        )
++    
++    def _on_race_selected(self, item: QTreeWidgetItem, column: int):
++        self._selected_event = item.data(0, Qt.UserRole)
++        
++        # Update session options based on event type
++        event_type = (self._selected_event.get('type') or '').lower()
++        self._session_combo.clear()
++        if 'sprint' in event_type:
++            self._session_combo.addItems(["Race", "Sprint"])
++        else:
++            self._session_combo.addItems(["Race"])
++        
++        self._update_summary()
++    
++    def _on_session_changed(self, session: str):
++        self._selected_session = 'S' if session == "Sprint" else 'R'
++        self._update_summary()
++    
++    def _update_summary(self):
++        if self._selected_event:
++            year = self._year_combo.currentText()
++            name = self._selected_event.get('event_name', 'Unknown')
++            session = self._session_combo.currentText()
++            self._summary_label.setText(f"Selected: {name} {year} ({session})")
++            self._summary_label.setStyleSheet("color: green; font-weight: bold;")
++        else:
++            self._summary_label.setText("No race selected")
++            self._summary_label.setStyleSheet("color: gray; font-style: italic;")
++    
++    def get_selection(self) -> Optional[Dict[str, Any]]:
++        """Get the current selection as a dictionary."""
++        if not self._selected_event:
++            return None
++        
++        try:
++            year = int(self._year_combo.currentText())
++        except ValueError:
++            return None
++        
++        round_number = self._selected_event.get('round_number')
++        if round_number is None:
++            return None
++        
++        return {
++            'year': year,
++            'round': int(round_number),
++            'session_type': self._selected_session,
++            'event_name': self._selected_event.get('event_name', ''),
++            'country': self._selected_event.get('country', ''),
++        }
++    
++    def is_valid(self) -> bool:
++        """Check if a valid race is selected."""
++        return self._selected_event is not None
++
++
++class RaceComparisonDialog(QDialog):
++    """
++    Dialog for selecting two races to compare.
++    """
++    
++    def __init__(self, parent=None):
++        super().__init__(parent)
++        self._race_a: Optional[Dict] = None
++        self._race_b: Optional[Dict] = None
++        
++        self.setWindowTitle("Compare Races")
++        self.setMinimumSize(900, 600)
++        self._setup_ui()
++    
++    def _setup_ui(self):
++        layout = QVBoxLayout(self)
++        
++        # Header
++        header = QLabel("Select Two Races to Compare")
++        header_font = QFont()
++        header_font.setPointSize(16)
++        header_font.setBold(True)
++        header.setFont(header_font)
++        header.setAlignment(Qt.AlignCenter)
++        layout.addWidget(header)
++        
++        # Instructions
++        instructions = QLabel(
++            "Compare races from the same circuit across different years "
++            "(e.g., Monza 2023 vs 2024) or different circuits (Monaco vs Singapore)."
++        )
++        instructions.setWordWrap(True)
++        instructions.setAlignment(Qt.AlignCenter)
++        instructions.setStyleSheet("color: gray;")
++        layout.addWidget(instructions)
++        
++        # Splitter with two race selection panels
++        splitter = QSplitter(Qt.Horizontal)
++        
++        # Race A panel
++        self._panel_a = RaceSelectionPanel("Race A (Primary)")
++        splitter.addWidget(self._panel_a)
++        
++        # Race B panel
++        self._panel_b = RaceSelectionPanel("Race B (Comparison)")
++        splitter.addWidget(self._panel_b)
++        
++        layout.addWidget(splitter)
++        
++        # Button row
++        button_layout = QHBoxLayout()
++        button_layout.addStretch()
++        
++        self._compare_btn = QPushButton("Compare Races")
++        self._compare_btn.setMinimumSize(150, 40)
++        self._compare_btn.clicked.connect(self._on_compare_clicked)
++        button_layout.addWidget(self._compare_btn)
++        
++        cancel_btn = QPushButton("Cancel")
++        cancel_btn.setMinimumSize(100, 40)
++        cancel_btn.clicked.connect(self.reject)
++        button_layout.addWidget(cancel_btn)
++        
++        button_layout.addStretch()
++        layout.addLayout(button_layout)
++    
++    def _on_compare_clicked(self):
++        """Handle compare button click."""
++        # Validate selections
++        if not self._panel_a.is_valid():
++            QMessageBox.warning(
++                self,
++                "Invalid Selection",
++                "Please select Race A (primary race)."
++            )
++            return
++        
++        if not self._panel_b.is_valid():
++            QMessageBox.warning(
++                self,
++                "Invalid Selection",
++                "Please select Race B (comparison race)."
++            )
++            return
++        
++        self._race_a = self._panel_a.get_selection()
++        self._race_b = self._panel_b.get_selection()
++        
++        # Check for identical selection
++        if (self._race_a and self._race_b and
++            self._race_a['year'] == self._race_b['year'] and
++            self._race_a['round'] == self._race_b['round'] and
++            self._race_a['session_type'] == self._race_b['session_type']):
++            QMessageBox.warning(
++                self,
++                "Invalid Selection",
++                "Race A and Race B cannot be the same race.\n"
++                "Please select different races to compare."
++            )
++            return
++        
++        self.accept()
++    
++    def get_selections(self) -> Tuple[Optional[Dict], Optional[Dict]]:
++        """Get the selected races."""
++        return self._race_a, self._race_b
++
++
++class LoadComparisonWorker(QThread):
++    """Worker thread for loading comparison data."""
++    result = Signal(object)
++    error = Signal(str)
++    progress = Signal(str)
++    
++    def __init__(
++        self,
++        year_a: int,
++        round_a: int,
++        year_b: int,
++        round_b: int,
++        session_a: str = 'R',
++        session_b: str = 'R',
++        parent=None
++    ):
++        super().__init__(parent)
++        self.year_a = year_a
++        self.round_a = round_a
++        self.year_b = year_b
++        self.round_b = round_b
++        self.session_a = session_a
++        self.session_b = session_b
++    
++    def run(self):
++        try:
++            from src.comparison.comparison_data import ComparisonDataLoader
++            
++            self.progress.emit("Loading comparison data...")
++            
++            loader = ComparisonDataLoader()
++            data = loader.load_races(
++                year_a=self.year_a,
++                round_a=self.round_a,
++                year_b=self.year_b,
++                round_b=self.round_b,
++                session_type_a=self.session_a,
++                session_type_b=self.session_b,
++            )
++            
++            if data is None:
++                errors = loader.load_errors
++                error_msg = "\n".join(errors) if errors else "Unknown error"
++                self.error.emit(f"Failed to load comparison data:\n{error_msg}")
++                return
++            
++            self.result.emit(data)
++            
++        except Exception as e:
++            self.error.emit(f"Error loading comparison data: {e}")
++
++
++def show_comparison_dialog(parent=None) -> Optional[Tuple[Dict, Dict]]:
++    """
++    Show the race comparison dialog and return selected races.
++    
++    Returns (race_a, race_b) tuple if user selected races, None if cancelled.
++    """
++    dialog = RaceComparisonDialog(parent)
++    if dialog.exec() == QDialog.Accepted:
++        return dialog.get_selections()
++    return None
++
++
++def load_and_run_comparison(
++    parent,
++    race_a: Dict,
++    race_b: Dict,
++) -> None:
++    """
++    Load comparison data and launch the comparison window.
++    
++    Shows a loading dialog while data is being fetched.
++    """
++    if not race_a or not race_b:
++        QMessageBox.warning(
++            parent,
++            "Invalid Selection",
++            "Both races must be selected."
++        )
++        return
++    
++    # Show loading dialog
++    progress = QProgressDialog("Loading race data...", None, 0, 0, parent)
++    progress.setWindowTitle("Loading Comparison")
++    progress.setWindowModality(Qt.ApplicationModal)
++    progress.setCancelButton(None)
++    progress.setMinimumDuration(0)
++    progress.show()
++    
++    def on_loaded(data):
++        progress.close()
++        
++        if data is None or not data.is_loaded:
++            QMessageBox.critical(
++                parent,
++                "Load Error",
++                "Failed to load comparison data."
++            )
++            return
++        
++        # Launch comparison window in subprocess
++        _launch_comparison_subprocess(race_a, race_b)
++    
++    def on_error(msg):
++        progress.close()
++        QMessageBox.critical(parent, "Load Error", msg)
++    
++    def on_progress(msg):
++        progress.setLabelText(msg)
++    
++    worker = LoadComparisonWorker(
++        year_a=race_a['year'],
++        round_a=race_a['round'],
++        year_b=race_b['year'],
++        round_b=race_b['round'],
++        session_a=race_a.get('session_type', 'R'),
++        session_b=race_b.get('session_type', 'R'),
++    )
++    worker.result.connect(on_loaded)
++    worker.error.connect(on_error)
++    worker.progress.connect(on_progress)
++    
++    # Keep reference to prevent garbage collection
++    parent._comparison_worker = worker
++    worker.start()
++
++
++def _launch_comparison_subprocess(race_a: Dict, race_b: Dict) -> None:
++    """Launch comparison in a subprocess."""
++    import subprocess
++    
++    main_path = os.path.normpath(
++        os.path.join(os.path.dirname(__file__), '..', '..', 'main.py')
++    )
++    
++    cmd = [
++        sys.executable, main_path,
++        "--compare",
++        "--year", str(race_a['year']),
++        "--round", str(race_a['round']),
++        "--year-b", str(race_b['year']),
++        "--round-b", str(race_b['round']),
++    ]
++    
++    session_a = race_a.get('session_type', 'R')
++    session_b = race_b.get('session_type', 'R')
++    
++    if session_a == 'S':
++        cmd.append("--sprint")
++    if session_b == 'S':
++        cmd.append("--sprint-b")
++    
++    try:
++        subprocess.Popen(cmd)
++    except Exception as e:
++        print(f"Error launching comparison: {e}")
+diff --git a/src/gui/race_selection.py b/src/gui/race_selection.py
+index 36cf399..f5b9d4a 100644
+--- a/src/gui/race_selection.py
++++ b/src/gui/race_selection.py
+@@ -4,20 +4,21 @@ from PySide6.QtWidgets import (
+ )
+ from PySide6.QtWidgets import QProgressDialog
+ from PySide6.QtCore import QThread, Signal, Qt, QTimer
+ from PySide6.QtGui import QPixmap, QFont
+ import sys
+ import os
+ import subprocess
+ import tempfile
+ import uuid
+ from src.f1_data import get_race_weekends_by_year, load_session
++from src.gui.comparison_dialog import show_comparison_dialog, load_and_run_comparison
+ 
+ # Worker thread to fetch schedule without blocking UI
+ class FetchScheduleWorker(QThread):
+     result = Signal(object)
+     error = Signal(str)
+ 
+     def __init__(self, year, parent=None):
+         super().__init__(parent)
+         self.year = year
+ 
+@@ -47,31 +48,39 @@ class RaceSelectionWindow(QMainWindow):
+         self.setMinimumSize(800, 600)
+         self.setWindowState(self.windowState())
+ 
+     def _setup_ui(self):
+         central_widget = QWidget()
+         self.setCentralWidget(central_widget)
+ 
+         main_layout = QVBoxLayout()
+         central_widget.setLayout(main_layout)
+ 
+-        # Header (title)
++        # Header (title + compare button)
+         header_layout = QHBoxLayout()
+         header_label = QLabel("F1 Race Replay 🏎️")
+         font = header_label.font()
+         font.setPointSize(18)
+         font.setBold(True)
+         header_label.setFont(font)
+         header_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+         
+         header_layout.addWidget(header_label)
+         header_layout.addStretch()
++        
++        # Compare Races button
++        self.compare_btn = QPushButton("Compare Races")
++        self.compare_btn.setMinimumSize(120, 35)
++        self.compare_btn.setToolTip("Compare two races side by side")
++        self.compare_btn.clicked.connect(self._on_compare_clicked)
++        header_layout.addWidget(self.compare_btn)
++        
+         main_layout.addLayout(header_layout)
+ 
+         # Year selection
+         year_layout = QHBoxLayout()
+         year_label = QLabel("Select Year:")
+         self.year_combo = QComboBox()
+         current_year = 2025  # Update as needed
+         for year in range(2010, current_year + 1):
+             self.year_combo.addItem(str(year))
+         self.year_combo.setCurrentText(str(current_year))
+@@ -317,11 +326,19 @@ class RaceSelectionWindow(QMainWindow):
+ 
+         worker = FetchSessionWorker(year, round_no, session_code)
+         worker.result.connect(_on_loaded)
+         worker.error.connect(_on_error)
+         # Keep a reference so it doesn't get GC'd
+         self._session_worker = worker
+         worker.start()
+     def show_error(self, message):
+         QMessageBox.critical(self, "Error", f"Failed to load schedule: {message}")
+         self.loading_session = False
++    
++    def _on_compare_clicked(self):
++        """Handle Compare Races button click."""
++        result = show_comparison_dialog(self)
++        if result:
++            race_a, race_b = result
++            if race_a and race_b:
++                load_and_run_comparison(self, race_a, race_b)
+         
+\ No newline at end of file
