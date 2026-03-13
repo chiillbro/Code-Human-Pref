@@ -1,1203 +1,878 @@
-diff --git a/src/incident_detection.py b/src/incident_detection.py
+diff --git a/pytest.ini b/pytest.ini
 new file mode 100644
-index 0000000..4202e61
+index 0000000..8cff5f3
 --- /dev/null
-+++ b/src/incident_detection.py
-@@ -0,0 +1,260 @@
-+"""
-+Incident Detection Module
-+
-+Analyzes race telemetry to detect and classify significant race events:
-+- Overtakes (position changes between drivers)
-+- Near-misses (drivers close together at high speed)
-+- Collisions (sudden distance reduction)
-+- Pit stops
-+- DRS usage patterns
-+"""
-+
-+from dataclasses import dataclass
-+from typing import List, Tuple
-+import numpy as np
-+import pandas as pd
-+
-+
-+@dataclass
-+class Incident:
-+    """Represents a single race incident"""
-+    frame_number: int
-+    time_seconds: float
-+    lap_number: int
-+    incident_type: str  # 'overtake', 'near_miss', 'collision', 'pit_stop'
-+    primary_driver: str
-+    secondary_driver: str = None
-+    description: str = ""
-+    severity: int = 1  # 1-5 scale
-+    
-+    def __str__(self):
-+        if self.secondary_driver:
-+            return f"[Lap {int(self.lap_number)}] {self.incident_type.title()}: {self.primary_driver} vs {self.secondary_driver} - {self.description}"
-+        else:
-+            return f"[Lap {int(self.lap_number)}] {self.incident_type.title()}: {self.primary_driver} - {self.description}"
-+
-+
-+class IncidentDetector:
-+    """Detects and classifies race incidents from telemetry data"""
-+    
-+    def __init__(self, frames: List[dict], drivers: pd.DataFrame, track_length: float = 5000):
-+        """
-+        Initialize incident detector
-+        
-+        Args:
-+            frames: List of frame dictionaries from race telemetry
-+            drivers: DataFrame of driver information
-+            track_length: Approximate track length in meters
-+        """
-+        self.frames = frames
-+        self.drivers = drivers
-+        self.track_length = track_length
-+        self.incidents = []
-+        self._driver_positions_history = {}  # Track position changes over time
-+        
-+    def detect_all_incidents(self) -> List[Incident]:
-+        """Run all incident detection methods and return sorted incidents"""
-+        self.incidents = []
-+        
-+        self._detect_overtakes()
-+        self._detect_near_misses()
-+        self._detect_pit_stops()
-+        
-+        # Sort by frame number
-+        self.incidents.sort(key=lambda x: x.frame_number)
-+        return self.incidents
-+    
-+    def _detect_overtakes(self):
-+        """Detect position changes (overtakes and being overtaken)"""
-+        if not self.frames or len(self.frames) < 2:
-+            return
-+        
-+        # Build position history
-+        position_history = {}  # frame_idx -> {driver_code: position}
-+        
-+        for frame_idx, frame in enumerate(self.frames):
-+            if 'driver_positions' not in frame:
-+                continue
-+            
-+            positions = {}
-+            # Build list of (driver_code, progress_score) for ranking
-+            driver_progress_list = []
-+            for driver_code, (x, y, lap, gap) in frame['driver_positions'].items():
-+                # Calculate progress metric: lap * 1000 + (1 - normalized_gap) gives priority to lap count
-+                progress_score = lap * 1000.0 + (1.0 - min(gap, 1.0))
-+                driver_progress_list.append((driver_code, progress_score))
-+            
-+            # Sort by progress score (descending) and assign integer positions
-+            driver_progress_list.sort(key=lambda item: item[1], reverse=True)
-+            for position, (driver_code, _) in enumerate(driver_progress_list, start=1):
-+                positions[driver_code] = position
-+            
-+            position_history[frame_idx] = positions
-+        
-+        # Detect position changes
-+        frame_indices = sorted(position_history.keys())
-+        check_interval = max(1, len(frame_indices) // 100)  # Sample roughly 100 checks across the entire sequence
-+        
-+        for i in range(check_interval, len(frame_indices), check_interval):
-+            prev_frame_idx = frame_indices[i - check_interval]
-+            curr_frame_idx = frame_indices[i]
-+            
-+            prev_positions = position_history.get(prev_frame_idx, {})
-+            curr_positions = position_history.get(curr_frame_idx, {})
-+            
-+            # Find drivers in both frames
-+            common_drivers = set(prev_positions.keys()) & set(curr_positions.keys())
-+            
-+            # Build position rankings
-+            prev_ranking = sorted(common_drivers, 
-+                                 key=lambda d: prev_positions[d], 
-+                                 reverse=True)
-+            curr_ranking = sorted(common_drivers, 
-+                                 key=lambda d: curr_positions[d], 
-+                                 reverse=True)
-+            
-+            # Find position changes
-+            for driver in common_drivers:
-+                prev_pos = prev_ranking.index(driver) if driver in prev_ranking else -1
-+                curr_pos = curr_ranking.index(driver) if driver in curr_ranking else -1
-+                
-+                if prev_pos >= 0 and curr_pos >= 0 and prev_pos > curr_pos:
-+                    # Driver moved up in position
-+                    frame = self.frames[curr_frame_idx]
-+                    driver_positions = frame.get('driver_positions', {})
-+                    
-+                    if driver in driver_positions:
-+                        _, _, lap, _ = driver_positions[driver]
-+                        
-+                        # Find who was overtaken: identify drivers whose position worsened
-+                        overtaken = None
-+                        for other_driver in common_drivers:
-+                            other_prev_pos = prev_ranking.index(other_driver) if other_driver in prev_ranking else -1
-+                            other_curr_pos = curr_ranking.index(other_driver) if other_driver in curr_ranking else -1
-+                            # Driver's position worsened if their rank decreased (lower index = worse in worst-first ranking)
-+                            if other_prev_pos >= 0 and other_curr_pos >= 0 and other_curr_pos < other_prev_pos:
-+                                # Check if this worsening is due to our driver passing
-+                                # Our driver passed if other was ahead (higher index) and now is not (lower or equal index)
-+                                if other_prev_pos > prev_pos and other_curr_pos <= curr_pos:
-+                                    overtaken = other_driver
-+                                    break
-+                        
-+                        # Only record if we found who was overtaken (actual overtake)
-+                        if overtaken and overtaken in driver_positions:
-+                            incident = Incident(
-+                                frame_number=frame.get('frame_number', curr_frame_idx),
-+                                time_seconds=frame.get('time_seconds', 0),
-+                                lap_number=lap,
-+                                incident_type='overtake',
-+                                primary_driver=driver,
-+                                secondary_driver=overtaken,
-+                                description=f"Position gain on track",
-+                                severity=3
-+                            )
-+                            self.incidents.append(incident)
-+    
-+    def _detect_near_misses(self):
-+        """Detect drivers in close proximity at high speed"""
-+        if not self.frames:
-+            return
-+        
-+        for frame_idx, frame in enumerate(self.frames):
-+            driver_positions = frame.get('driver_positions', {})
-+            
-+            if len(driver_positions) < 2:
-+                continue
-+            
-+            # Get all driver positions as list
-+            drivers_list = list(driver_positions.items())
-+            
-+            # Check all pairs
-+            for i in range(len(drivers_list)):
-+                for j in range(i + 1, len(drivers_list)):
-+                    driver1, (x1, y1, lap1, gap1) = drivers_list[i]
-+                    driver2, (x2, y2, lap2, gap2) = drivers_list[j]
-+                    
-+                    # Skip if on different laps
-+                    if abs(lap1 - lap2) > 0.5:
-+                        continue
-+                    
-+                    # Calculate distance between drivers
-+                    distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-+                    
-+                    # Near miss threshold (200 meters)
-+                    if distance < 200 and distance > 0:
-+                        speed1 = frame.get('driver_speeds', {}).get(driver1, 0)
-+                        speed2 = frame.get('driver_speeds', {}).get(driver2, 0)
-+                        
-+                        # Only flag if both at decent speed (not in pits)
-+                        if speed1 > 50 and speed2 > 50:
-+                            incident = Incident(
-+                                frame_number=frame.get('frame_number', frame_idx),
-+                                time_seconds=frame.get('time_seconds', 0),
-+                                lap_number=lap1,
-+                                incident_type='near_miss',
-+                                primary_driver=driver1,
-+                                secondary_driver=driver2,
-+                                description=f"Close proximity (~{int(distance)}m)",
-+                                severity=2
-+                            )
-+                            # Only add if we haven't already recorded this incident
-+                            if not self._incident_exists(incident):
-+                                self.incidents.append(incident)
-+    
-+    def _detect_pit_stops(self):
-+        """Detect pit stop events"""
-+        if not self.frames or len(self.frames) < 10:
-+            return
-+        
-+        # Track speed drops to identify pit stops
-+        window_size = 10
-+        
-+        for frame_idx in range(window_size, len(self.frames)):
-+            frame = self.frames[frame_idx]
-+            driver_speeds = frame.get('driver_speeds', {})
-+            
-+            for driver, speed in driver_speeds.items():
-+                # Check if speed drops significantly
-+                prev_speeds = []
-+                for i in range(1, window_size + 1):
-+                    prev_frame = self.frames[frame_idx - i]
-+                    prev_speeds.append(prev_frame.get('driver_speeds', {}).get(driver, speed))
-+                
-+                avg_prev_speed = np.mean(prev_speeds) if prev_speeds else speed
-+                
-+                # Significant speed drop = pit stop
-+                if avg_prev_speed > 100 and speed < 40 and avg_prev_speed - speed > 50:
-+                    driver_positions = frame.get('driver_positions', {})
-+                    if driver in driver_positions:
-+                        _, _, lap, _ = driver_positions[driver]
-+                        
-+                        incident = Incident(
-+                            frame_number=frame.get('frame_number', frame_idx),
-+                            time_seconds=frame.get('time_seconds', 0),
-+                            lap_number=lap,
-+                            incident_type='pit_stop',
-+                            primary_driver=driver,
-+                            description="Pit stop",
-+                            severity=1
-+                        )
-+                        if not self._incident_exists(incident):
-+                            self.incidents.append(incident)
-+    
-+    def _incident_exists(self, incident: Incident, time_tolerance: float = 5.0) -> bool:
-+        """Check if similar incident already exists"""
-+        for existing in self.incidents:
-+            if (existing.incident_type == incident.incident_type and
-+                existing.primary_driver == incident.primary_driver and
-+                existing.secondary_driver == incident.secondary_driver and
-+                abs(existing.time_seconds - incident.time_seconds) < time_tolerance):
-+                return True
-+        return False
-+    
-+    def get_incidents_for_driver(self, driver_code: str) -> List[Incident]:
-+        """Get all incidents involving a specific driver"""
-+        return [i for i in self.incidents 
-+                if i.primary_driver == driver_code or i.secondary_driver == driver_code]
-+    
-+    def get_incidents_by_type(self, incident_type: str) -> List[Incident]:
-+        """Get all incidents of a specific type"""
-+        return [i for i in self.incidents if i.incident_type == incident_type]
++++ b/pytest.ini
+@@ -0,0 +1,9 @@
++[pytest]
++testpaths = tests
++python_files = test_*.py
++python_classes = Test*
++python_functions = test_*
++addopts = -v --tb=short
++filterwarnings =
++    ignore::DeprecationWarning
++    ignore::PendingDeprecationWarning
+diff --git a/requirements.txt b/requirements.txt
+index 8a90ffa..58ba716 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,9 +1,13 @@
+ fastf1
+ pandas
+ matplotlib
+ numpy
+ arcade
+ pyglet
+ pyside6
+ questionary
+-rich
 \ No newline at end of file
-diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
-index 1e2a1a6..ea190d9 100644
---- a/src/interfaces/race_replay.py
-+++ b/src/interfaces/race_replay.py
-@@ -1,44 +1,63 @@
- import os
- import arcade
- import numpy as np
-+from scipy.spatial import cKDTree
- from src.f1_data import FPS
- from src.ui_components import (
-     LeaderboardComponent, 
-     WeatherComponent, 
-     LegendComponent, 
-     DriverInfoComponent, 
-     RaceProgressBarComponent,
-     RaceControlsComponent,
-     ControlsPopupComponent,
-     SessionInfoComponent,
-     extract_race_events,
-     build_track_from_example_lap,
-     draw_finish_line
- )
- from src.tyre_degradation_integration import TyreDegradationIntegrator
-+from src.incident_detection import IncidentDetector
-+from src.ui_components_incidents import IncidentsPanelComponent
-+from src.services.stream import TelemetryStreamServer
++rich
 +
- 
- 
- SCREEN_WIDTH = 1280
- SCREEN_HEIGHT = 720
- SCREEN_TITLE = "F1 Race Replay"
- PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
- 
- class F1RaceReplayWindow(arcade.Window):
-     def __init__(self, frames, track_statuses, example_lap, drivers, title,
-                  playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
-                  left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
--                 session_info=None, session=None):
-+                 session_info=None, session=None, enable_telemetry=False):
-         # Set resizable to True so the user can adjust mid-sim
-         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
-         self.maximize()
- 
-+        self.telemetry_stream = None
-+        if enable_telemetry:
-+            try:
-+                self.telemetry_stream = TelemetryStreamServer()
-+                self.telemetry_stream.start()
-+                print("Telemetry stream server started on localhost:9999")
-+            except OSError as e:
-+                print(f"Failed to start telemetry server: {e}")
-+                print("Continuing without telemetry streaming...")
-+                self.telemetry_stream = None
-+            except Exception as e:
-+                print(f"Error starting telemetry server: {e}")
-+                self.telemetry_stream = None
-+
-         self.frames = frames
-         self.track_statuses = track_statuses
-         self.n_frames = len(frames)
-         self.drivers = list(drivers)
-         self.playback_speed = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.index(playback_speed)] if playback_speed in PLAYBACK_SPEEDS else 1.0
-         self.driver_colors = driver_colors or {}
-         self.frame_index = 0.0  # use float for fractional-frame accumulation
-         self.paused = False
-         self.total_laps = total_laps
-         self.has_weather = any("weather" in frame for frame in frames) if frames else False
-@@ -109,20 +128,24 @@ class F1RaceReplayWindow(arcade.Window):
-             self.session_info_comp.set_info(
-                 event_name=session_info.get('event_name', ''),
-                 circuit_name=session_info.get('circuit_name', ''),
-                 country=session_info.get('country', ''),
-                 year=session_info.get('year'),
-                 round_num=session_info.get('round'),
-                 date=session_info.get('date', ''),
-                 total_laps=total_laps
-             )
- 
-+        # Initialize incidents detection
-+        self.incidents_panel_comp = IncidentsPanelComponent(left=20, top=450, visible=visible_hud)
-+        self._initialize_incidents()
-+
-         self.is_rewinding = False
-         self.is_forwarding = False
-         self.was_paused_before_hold = False
-         
-         # Extract race events for the progress bar
-         race_events = extract_race_events(frames, track_statuses, total_laps or 0)
-         self.progress_bar_comp.set_race_data(
-             total_frames=len(frames),
-             total_laps=total_laps or 0,
-             events=race_events
-@@ -142,20 +165,23 @@ class F1RaceReplayWindow(arcade.Window):
-         self._ref_ys = np.array([p[1] for p in ref_points])
- 
-         # Calculate normals for the reference line
-         dx = np.gradient(self._ref_xs)
-         dy = np.gradient(self._ref_ys)
-         norm = np.sqrt(dx**2 + dy**2)
-         norm[norm == 0] = 1.0
-         self._ref_nx = -dy / norm
-         self._ref_ny = dx / norm
- 
-+        # Build KD-Tree for fast closest-point lookup
-+        self.track_tree = cKDTree(np.column_stack((self._ref_xs, self._ref_ys)))
-+
-         # Determine track winding using the shoelace formula to ensure normals point outwards.
-         # A positive area indicates counter-clockwise winding (normals point Left=Inside, so we flip).
-         # A negative area indicates clockwise winding (normals point Left=Outside, so we keep).
-         signed_area = np.sum(self._ref_xs[:-1] * self._ref_ys[1:] - self._ref_xs[1:] * self._ref_ys[:-1])
-         signed_area += (self._ref_xs[-1] * self._ref_ys[0] - self._ref_xs[0] * self._ref_ys[-1])
-         if signed_area > 0:
-             self._ref_nx = -self._ref_nx
-             self._ref_ny = -self._ref_ny
- 
-         # cumulative distances along the reference polyline (metres)
-@@ -189,40 +215,107 @@ class F1RaceReplayWindow(arcade.Window):
-         self.status_text = arcade.Text("", 20, self.height - 120, arcade.color.WHITE, 24, bold=True, anchor_y="top")
- 
-         # Trigger initial scaling calculation
-         self.update_scaling(self.width, self.height)
- 
-         # Selection & hit-testing state for leaderboard
-         self.selected_driver = None
-         self.leaderboard_rects = []  # list of tuples: (code, left, bottom, right, top)
-         # store previous leaderboard order for up/down arrows
-         self.last_leaderboard_order = None
-+        
-+        # Broadcast initial telemetry state
-+        self._broadcast_telemetry_state()
-+
-+    def _broadcast_telemetry_state(self):
-+        """Broadcast current telemetry state to connected clients."""
-+        if not hasattr(self, 'telemetry_stream') or not self.telemetry_stream:
-+            return
-+            
-+        current_frame = self.frames[min(int(self.frame_index), len(self.frames) - 1)] if self.frames else None
-+        
-+        # Get current track status
-+        current_track_status = "GREEN"
-+        if current_frame:
-+            current_time = current_frame["t"]
-+            for status in self.track_statuses:
-+                if (current_time >= status["start_time"] and 
-+                    (status["end_time"] is None or current_time <= status["end_time"])):
-+                    current_track_status = status["status"]
-+                    
-+        # Calculate leader info
-+        leader_code = ""
-+        leader_lap = 1
-+        if current_frame and "drivers" in current_frame:
-+            driver_progress = {}
-+            for code, pos in current_frame["drivers"].items():
-+                x, y = pos["x"], pos["y"]
-+                progress_m = self._project_to_reference(x, y)
-+                driver_progress[code] = progress_m
-+                
-+            if driver_progress:
-+                leader_code = max(driver_progress.keys(), key=lambda k: driver_progress[k])
-+                leader_lap = current_frame["drivers"].get(leader_code, {}).get("lap", 1)
-+        
-+        # Format time
-+        t = current_frame["t"] if current_frame else 0
-+        hours = int(t // 3600)
-+        minutes = int((t % 3600) // 60)
-+        seconds = int(t % 60)
-+        time_str = f"{hours:02}:{minutes:02}:{seconds:02}"
-+        
-+        self.telemetry_stream.broadcast({
-+            "frame_index": int(self.frame_index),
-+            "frame": current_frame,
-+            "track_status": current_track_status,
-+            "playback_speed": self.playback_speed,
-+            "is_paused": self.paused,
-+            "total_frames": self.n_frames,
-+            "session_data": {
-+                "time": time_str,
-+                "lap": leader_lap,
-+                "leader": leader_code,
-+                "total_laps": self.total_laps
-+            }
-+        })
-+
-+    def _initialize_incidents(self):
-+        """Initialize incident detection from telemetry data"""
-+        try:
-+            print("Detecting race incidents...")
-+            detector = IncidentDetector(self.frames, self.drivers)
-+            incidents = detector.detect_all_incidents()
-+            self.incidents_panel_comp.set_incidents(incidents)
-+            print(f"✓ Detected {len(incidents)} incidents")
-+        except Exception as e:
-+            print(f"✗ Incident detection failed: {e}")
-+            # Ensure panel is initialized with safe default even on failure
-+            self.incidents_panel_comp.set_incidents([])
- 
-     def _interpolate_points(self, xs, ys, interp_points=2000):
-         t_old = np.linspace(0, 1, len(xs))
-         t_new = np.linspace(0, 1, interp_points)
-         xs_i = np.interp(t_new, t_old, xs)
-         ys_i = np.interp(t_new, t_old, ys)
-         return list(zip(xs_i, ys_i))
- 
-     def _project_to_reference(self, x, y):
-         if self._ref_total_length == 0.0:
-             return 0.0
- 
--        # Vectorized nearest-point to dense polyline points (sufficient for our purposes)
--        dx = self._ref_xs - x
--        dy = self._ref_ys - y
--        d2 = dx * dx + dy * dy
--        idx = int(np.argmin(d2))
-+        # Vectorized nearest-point lookup using KD-Tree (O(log N))
-+        _, idx = self.track_tree.query([x, y])
-+        idx = int(idx)
- 
-         # For a slightly better estimate, optionally project onto the adjacent segment
-         if idx < len(self._ref_xs) - 1:
-+
-             x1, y1 = self._ref_xs[idx], self._ref_ys[idx]
-             x2, y2 = self._ref_xs[idx+1], self._ref_ys[idx+1]
-             vx, vy = x2 - x1, y2 - y1
-             seg_len2 = vx*vx + vy*vy
-             if seg_len2 > 0:
-                 t = ((x - x1) * vx + (y - y1) * vy) / seg_len2
-                 t_clamped = max(0.0, min(1.0, t))
-                 proj_x = x1 + t_clamped * vx
-                 proj_y = y1 + t_clamped * vy
-                 # distance along segment from x1,y1
-@@ -290,21 +383,21 @@ class F1RaceReplayWindow(arcade.Window):
-         # Update the polyline screen coordinates based on new scale
-         self.screen_inner_points = [self.world_to_screen(x, y) for x, y in self.world_inner_points]
-         self.screen_outer_points = [self.world_to_screen(x, y) for x, y in self.world_outer_points]
- 
-     def on_resize(self, width, height):
-         """Called automatically by Arcade when window is resized."""
-         super().on_resize(width, height)
-         self.update_scaling(width, height)
-         # notify components
-         self.leaderboard_comp.x = max(20, self.width - self.right_ui_margin + 12)
--        for c in (self.leaderboard_comp, self.weather_comp, self.legend_comp, self.driver_info_comp, self.progress_bar_comp, self.race_controls_comp):
-+        for c in (self.leaderboard_comp, self.weather_comp, self.legend_comp, self.driver_info_comp, self.progress_bar_comp, self.race_controls_comp, self.incidents_panel_comp):
-             c.on_resize(self)
-         
-         # update persistent text positions
-         self.lap_text.x = 20
-         self.lap_text.y = self.height - 40
-         self.time_text.x = 20
-         self.time_text.y = self.height - 80
-         self.status_text.x = 20
-         self.status_text.y = self.height - 120
- 
-@@ -409,27 +502,27 @@ class F1RaceReplayWindow(arcade.Window):
-         if not selected_drivers and getattr(self, "selected_driver", None):
-             selected_drivers = [self.selected_driver]
- 
-         for i, (code, pos) in enumerate(frame["drivers"].items()):
-             sx, sy = self.world_to_screen(pos["x"], pos["y"])
-             color = self.driver_colors.get(code, arcade.color.WHITE)
-             
-             is_selected = code in selected_drivers
-             
-             if self.show_driver_labels or is_selected:
--                # Find closest point index on reference track
--                r_dx = self._ref_xs - pos["x"]
--                r_dy = self._ref_ys - pos["y"]
--                idx = int(np.argmin(r_dx*r_dx + r_dy*r_dy))
-+                # Find closest point index on reference track (Optimized KD-Tree)
-+                _, idx = self.track_tree.query([pos["x"], pos["y"]])
-+                idx = int(idx)
-                 
-                 # Get normal vector in world space
-                 nx = self._ref_nx[idx]
-+
-                 ny = self._ref_ny[idx]
-                 
-                 # Rotate normal to screen space
-                 if self._rot_rad:
-                     snx = nx * self._cos_rot - ny * self._sin_rot
-                     sny = nx * self._sin_rot + ny * self._cos_rot
-                 else:
-                     snx, sny = nx, ny
-                 
-                 offset_dist = 45 if i % 2 == 0 else 75
-@@ -531,20 +624,23 @@ class F1RaceReplayWindow(arcade.Window):
-         self.leaderboard_comp.draw(self)
-         # expose rects for existing hit test compatibility if needed
-         self.leaderboard_rects = self.leaderboard_comp.rects
- 
-         # Controls Legend - Bottom Left (keeps small offset from left UI edge)
-         self.legend_comp.draw(self)
-         
-         # Selected driver info component
-         self.driver_info_comp.draw(self)
-         
-+        # Incidents panel component
-+        self.incidents_panel_comp.draw(self.width, self.height)
-+        
-         # Race Progress Bar with event markers (DNF, flags, leader changes)
-         self.progress_bar_comp.draw(self)
-         
-         # Race playback control buttons
-         self.race_controls_comp.draw(self)
-         
-         # Session info banner (top of screen)
-         self.session_info_comp.draw(self)
- 
-         # Draw Controls popup box
-@@ -564,68 +660,79 @@ class F1RaceReplayWindow(arcade.Window):
-             self.frame_index = min(self.n_frames - 1, self.frame_index + delta_time * FPS * seek_speed)
-             self.race_controls_comp.flash_button('forward')
- 
-         if self.paused:
-             return
- 
-         self.frame_index += delta_time * FPS * self.playback_speed
-         
-         if self.frame_index >= self.n_frames:
-             self.frame_index = float(self.n_frames - 1)
-+            
-+        # Broadcast telemetry state during playback
-+        self._broadcast_telemetry_state()
- 
-     def on_key_press(self, symbol: int, modifiers: int):
-         # Allow ESC to close window at any time
-         if symbol == arcade.key.ESCAPE:
-             arcade.close_window()
-             return
-         if symbol == arcade.key.SPACE:
-             self.paused = not self.paused
-+            self._broadcast_telemetry_state()
-             self.race_controls_comp.flash_button('play_pause')
-         elif symbol == arcade.key.RIGHT:
-             self.was_paused_before_hold = self.paused
-             self.is_forwarding = True
-             self.paused = True
-         elif symbol == arcade.key.LEFT:
-             self.was_paused_before_hold = self.paused
-             self.is_rewinding = True
-             self.paused = True
-         elif symbol == arcade.key.UP:
-             if self.playback_speed < PLAYBACK_SPEEDS[-1]:
-                 # Increase to next higher speed
-                 for spd in PLAYBACK_SPEEDS:
-                     if spd > self.playback_speed:
-                         self.playback_speed = spd
-+                        self._broadcast_telemetry_state()
-                         break
-             self.race_controls_comp.flash_button('speed_increase')
-         elif symbol == arcade.key.DOWN:
-             if self.playback_speed > PLAYBACK_SPEEDS[0]:
-                 # Decrease to next lower speed
-                 for spd in reversed(PLAYBACK_SPEEDS):
-                     if spd < self.playback_speed:
-                         self.playback_speed = spd
-+                        self._broadcast_telemetry_state()
-                         break
-             self.race_controls_comp.flash_button('speed_decrease')
-         elif symbol == arcade.key.KEY_1:
-             self.playback_speed = 0.5
-+            self._broadcast_telemetry_state()
-             self.race_controls_comp.flash_button('speed_decrease')
-         elif symbol == arcade.key.KEY_2:
-             self.playback_speed = 1.0
-+            self._broadcast_telemetry_state()
-             self.race_controls_comp.flash_button('speed_decrease')
-         elif symbol == arcade.key.KEY_3:
-             self.playback_speed = 2.0
-+            self._broadcast_telemetry_state()
-             self.race_controls_comp.flash_button('speed_increase')
-         elif symbol == arcade.key.KEY_4:
-             self.playback_speed = 4.0
-+            self._broadcast_telemetry_state()
-             self.race_controls_comp.flash_button('speed_increase')
-         elif symbol == arcade.key.R:
-             self.frame_index = 0.0
-             self.playback_speed = 1.0
-+            self._broadcast_telemetry_state()
-             # Clear degradation cache on restart
-             if self.degradation_integrator:
-                 self.degradation_integrator.clear_cache()
-             self.race_controls_comp.flash_button('rewind')
-         elif symbol == arcade.key.D:
-             self.toggle_drs_zones = not self.toggle_drs_zones
-         elif symbol == arcade.key.L:
-             self.show_driver_labels = not self.show_driver_labels
-         elif symbol == arcade.key.H:
-             # Toggle Controls popup with 'H' key — show anchored to bottom-left with 20px margin
-@@ -634,20 +741,38 @@ class F1RaceReplayWindow(arcade.Window):
-             left_pos = float(margin_x)
-             top_pos = float(margin_y + self.controls_popup_comp.height)
-             if self.controls_popup_comp.visible:
-                 self.controls_popup_comp.hide()
-             else:
-                 self.controls_popup_comp.show_over(left_pos, top_pos)
-         elif symbol == arcade.key.B:
-             self.progress_bar_comp.toggle_visibility() # toggle progress bar visibility
-         elif symbol == arcade.key.I:
-             self.session_info_comp.toggle_visibility() # toggle session info banner
-+        elif symbol == arcade.key.C:
-+            # Toggle incidents panel visibility
-+            self.incidents_panel_comp.toggle_visibility()
-+        elif symbol == arcade.key.N:
-+            # Jump to next incident
-+            frame_number = self.incidents_panel_comp.select_next_incident()
-+            if frame_number is not None:
-+                self.frame_index = float(frame_number)
-+                self.paused = True
-+        elif symbol == arcade.key.P:
-+            # Jump to previous incident
-+            frame_number = self.incidents_panel_comp.select_prev_incident()
-+            if frame_number is not None:
-+                self.frame_index = float(frame_number)
-+                self.paused = True
-+        elif symbol == arcade.key.F:
-+            # Cycle incident type filter
-+            self.incidents_panel_comp.toggle_filter()
- 
-     def on_key_release(self, symbol: int, modifiers: int):
-         if symbol == arcade.key.RIGHT:
-             self.is_forwarding = False
-             self.paused = self.was_paused_before_hold
-         elif symbol == arcade.key.LEFT:
-             self.is_rewinding = False
-             self.paused = self.was_paused_before_hold
- 
-     def on_mouse_release(self, x: float, y: float, button: int, modifiers: int):
-@@ -667,11 +792,18 @@ class F1RaceReplayWindow(arcade.Window):
-         if self.leaderboard_comp.on_mouse_press(self, x, y, button, modifiers):
-             return
-         if self.legend_comp.on_mouse_press(self, x, y, button, modifiers):
-             return
-         # default: clear selection if clicked elsewhere
-         self.selected_driver = None
-         
-     def on_mouse_motion(self, x: float, y: float, dx: float, dy: float):
-         """Handle mouse motion for hover effects on progress bar and controls."""
-         self.progress_bar_comp.on_mouse_motion(self, x, y, dx, dy)
--        self.race_controls_comp.on_mouse_motion(self, x, y, dx, dy)
-\ No newline at end of file
-+        self.race_controls_comp.on_mouse_motion(self, x, y, dx, dy)
-+        
-+    def close(self):
-+        """Clean up resources when window closes."""
-+        if hasattr(self, 'telemetry_stream') and self.telemetry_stream:
-+            print("Stopping telemetry stream server...")
-+            self.telemetry_stream.stop()
-+        super().close()
-\ No newline at end of file
-diff --git a/src/ui_components_incidents.py b/src/ui_components_incidents.py
-new file mode 100644
-index 0000000..b136065
---- /dev/null
-+++ b/src/ui_components_incidents.py
-@@ -0,0 +1,209 @@
-+"""
-+Incidents Panel UI Component
-+
-+Displays a list of detected race incidents (overtakes, near misses, pit stops)
-+with the ability to jump to incidents via keyboard navigation.
-+"""
-+
-+import arcade
-+from typing import List, Optional
-+from src.incident_detection import Incident
-+
-+
-+class IncidentsPanelComponent:
-+    """UI component for displaying and navigating race incidents"""
-+    
-+    def __init__(self, left: float = 20, top: float = 600, width: float = 310, visible: bool = True):
-+        """
-+        Initialize incidents panel
-+        
-+        Args:
-+            left: Left edge x-coordinate
-+            top: Top edge y-coordinate  
-+            width: Panel width
-+            visible: Whether panel is initially visible
-+        """
-+        self.left = left
-+        self.top = top
-+        self.width = width
-+        self.visible = visible
-+        
-+        self.incidents: List[Incident] = []
-+        self.filtered_incidents: List[Incident] = []
-+        self.selected_incident_idx = -1
-+        self.scroll_offset = 0  # Track which incident is at top of visible list
-+        self.filter_type = None  # None = all, 'overtake', 'near_miss', 'pit_stop'
-+        
-+        # Visual params
-+        self.font_size = 11
-+        self.header_height = 30
-+        self.item_height = 22
-+        self.panel_height = 180
-+        self.bg_color = (30, 30, 30, 200)
-+        self.border_color = arcade.color.ORANGE
-+        self.text_color = arcade.color.WHITE
-+        self.selected_color = arcade.color.ORANGE
-+        self.accent_colors = {
-+            'overtake': arcade.color.YELLOW,
-+            'near_miss': arcade.color.ORANGE,
-+            'pit_stop': arcade.color.LIGHT_BLUE,
-+        }
-+        
-+    def set_incidents(self, incidents: List[Incident]):
-+        """Update the incidents list"""
-+        self.incidents = incidents
-+        self.filter_incidents()
-+        self.selected_incident_idx = -1
-+        self.scroll_offset = 0  # Reset scroll when incidents change
-+        
-+    def filter_incidents(self):
-+        """Apply current filter to incidents"""
-+        if self.filter_type is None:
-+            self.filtered_incidents = self.incidents
-+        else:
-+            self.filtered_incidents = [i for i in self.incidents if i.incident_type == self.filter_type]
-+    
-+    def toggle_filter(self):
-+        """Cycle through incident type filters"""
-+        filters = [None, 'overtake', 'near_miss', 'pit_stop']
-+        current_idx = filters.index(self.filter_type) if self.filter_type in filters else 0
-+        self.filter_type = filters[(current_idx + 1) % len(filters)]
-+        self.filter_incidents()
-+        self.selected_incident_idx = min(self.selected_incident_idx, len(self.filtered_incidents) - 1)
-+        self.scroll_offset = 0  # Reset scroll when filter changes
-+        
-+    def select_next_incident(self) -> Optional[int]:
-+        """Select next incident, return frame number or None"""
-+        if not self.filtered_incidents:
-+            return None
-+        self.selected_incident_idx = min(self.selected_incident_idx + 1, len(self.filtered_incidents) - 1)
-+        self._update_scroll_offset()
-+        return self.filtered_incidents[self.selected_incident_idx].frame_number
-+    
-+    def select_prev_incident(self) -> Optional[int]:
-+        """Select previous incident, return frame number or None"""
-+        if not self.filtered_incidents:
-+            return None
-+        self.selected_incident_idx = max(self.selected_incident_idx - 1, 0)
-+        self._update_scroll_offset()
-+        return self.filtered_incidents[self.selected_incident_idx].frame_number
-+    
-+    def _update_scroll_offset(self):
-+        """Update scroll offset to keep selected incident visible"""
-+        max_visible = (self.panel_height - self.header_height) // self.item_height
-+        # If selected is before visible window, scroll to show it at top
-+        if self.selected_incident_idx < self.scroll_offset:
-+            self.scroll_offset = self.selected_incident_idx
-+        # If selected is after visible window, scroll to show it at bottom
-+        elif self.selected_incident_idx >= self.scroll_offset + max_visible:
-+            self.scroll_offset = self.selected_incident_idx - max_visible + 1
-+        # Clamp scroll offset to valid range
-+        self.scroll_offset = max(0, min(self.scroll_offset, max(0, len(self.filtered_incidents) - max_visible)))
-+    
-+    def get_selected_incident(self) -> Optional[Incident]:
-+        """Get currently selected incident"""
-+        if 0 <= self.selected_incident_idx < len(self.filtered_incidents):
-+            return self.filtered_incidents[self.selected_incident_idx]
-+        return None
-+    
-+    def toggle_visibility(self):
-+        """Toggle panel visibility"""
-+        self.visible = not self.visible
-+    
-+    def on_resize(self, window):
-+        """Handle window resize - no-op but required for consistency with other components"""
-+        pass
-+    
-+    def draw(self, viewport_width: float, viewport_height: float):
-+        """Draw the incidents panel"""
-+        if not self.visible:
-+            return
-+        
-+        # Draw semi-transparent background
-+        arcade.draw_rectangle_filled(
-+            self.left + self.width // 2,
-+            self.top - self.panel_height // 2,
-+            self.width,
-+            self.panel_height,
-+            self.bg_color
-+        )
-+        
-+        # Draw border
-+        arcade.draw_rectangle_outline(
-+            self.left + self.width // 2,
-+            self.top - self.panel_height // 2,
-+            self.width,
-+            self.panel_height,
-+            self.border_color,
-+            border_width=2
-+        )
-+        
-+        # Draw header
-+        header_text = f"Incidents ({len(self.filtered_incidents)})"
-+        filter_label = f" [{self.filter_type.upper()}]" if self.filter_type else ""
-+        arcade.draw_text(
-+            header_text + filter_label,
-+            self.left + 8,
-+            self.top - 8,
-+            self.text_color,
-+            font_size=self.font_size + 1,
-+            bold=True
-+        )
-+        
-+        # Draw incidents list
-+        start_y = self.top - self.header_height - 5
-+        max_visible = (self.panel_height - self.header_height) // self.item_height
-+        
-+        # Clamp scroll offset to valid range
-+        self.scroll_offset = max(0, min(self.scroll_offset, max(0, len(self.filtered_incidents) - max_visible)))
-+        
-+        for list_idx, incident in enumerate(self.filtered_incidents[self.scroll_offset:self.scroll_offset + max_visible]):
-+            y = start_y - (list_idx * self.item_height)
-+            # Check if this item is selected (compare absolute index)
-+            absolute_idx = self.scroll_offset + list_idx
-+            is_selected = (absolute_idx == self.selected_incident_idx)
-+            
-+            # Highlight selected incident
-+            if is_selected:
-+                arcade.draw_rectangle_filled(
-+                    self.left + self.width // 2,
-+                    y - self.item_height // 2,
-+                    self.width - 4,
-+                    self.item_height - 2,
-+                    (50, 50, 50, 180)
-+                )
-+                arcade.draw_rectangle_outline(
-+                    self.left + self.width // 2,
-+                    y - self.item_height // 2,
-+                    self.width - 4,
-+                    self.item_height - 2,
-+                    self.selected_color,
-+                    border_width=1
-+                )
-+            
-+            # Incident text with color coding
-+            incident_type_color = self.accent_colors.get(incident.incident_type, self.text_color)
-+            
-+            text = f"L{int(incident.lap_number)} "
-+            arcade.draw_text(
-+                text,
-+                self.left + 8,
-+                y - 7,
-+                self.text_color,
-+                font_size=self.font_size
-+            )
-+            
-+            # Type and drivers
-+            detail = f"{incident.incident_type[:4].upper()}"
-+            if incident.secondary_driver:
-+                detail += f": {incident.primary_driver} vs {incident.secondary_driver}"
-+            else:
-+                detail += f": {incident.primary_driver}"
-+            
-+            arcade.draw_text(
-+                detail,
-+                self.left + 35,
-+                y - 7,
-+                incident_type_color,
-+                font_size=self.font_size - 1
-+            )
-\ No newline at end of file
++# Testing
++pytest>=7.0.0
++pytest-cov>=4.0.0
 diff --git a/tests/__init__.py b/tests/__init__.py
 new file mode 100644
-index 0000000..8bdb25a
+index 0000000..3182d32
 --- /dev/null
 +++ b/tests/__init__.py
 @@ -0,0 +1 @@
-+# Test module for F1 Race Replay
-\ No newline at end of file
-diff --git a/tests/test_incidents.py b/tests/test_incidents.py
++# Test package for f1-race-replay
+diff --git a/tests/conftest.py b/tests/conftest.py
 new file mode 100644
-index 0000000..3211306
+index 0000000..8891573
 --- /dev/null
-+++ b/tests/test_incidents.py
-@@ -0,0 +1,254 @@
++++ b/tests/conftest.py
+@@ -0,0 +1,169 @@
 +"""
-+Test suite for Race Incidents & Overtakes Tracker feature
++Pytest configuration and shared fixtures for f1-race-replay tests.
 +
-+Run with: python -m pytest tests/test_incidents.py -v
++This module provides common fixtures and test data used across multiple test modules.
 +"""
-+
 +import pytest
-+import numpy as np
-+from src.incident_detection import Incident, IncidentDetector
 +
 +
-+class TestIncident:
-+    """Test Incident data class"""
++# =============================================================================
++# Time String Test Data Fixtures
++# =============================================================================
++
++@pytest.fixture
++def valid_time_strings():
++    """
++    Collection of valid time string formats with their expected parsed values in seconds.
 +    
-+    def test_incident_creation(self):
-+        """Test basic incident object creation"""
-+        incident = Incident(
-+            frame_number=100,
-+            time_seconds=50.5,
-+            lap_number=5,
-+            incident_type='overtake',
-+            primary_driver='VER',
-+            secondary_driver='LEC',
-+            description='Position gain'
-+        )
-+        assert incident.frame_number == 100
-+        assert incident.primary_driver == 'VER'
-+        assert incident.secondary_driver == 'LEC'
-+        assert 'VER' in str(incident)
-+        assert 'LEC' in str(incident)
-+    
-+    def test_incident_without_secondary_driver(self):
-+        """Test incident with only primary driver (e.g., pit stop)"""
-+        incident = Incident(
-+            frame_number=200,
-+            time_seconds=100.0,
-+            lap_number=10,
-+            incident_type='pit_stop',
-+            primary_driver='HAM',
-+            description='Pit stop'
-+        )
-+        assert incident.secondary_driver is None
-+        assert 'HAM' in str(incident)
-+        assert 'pit_stop' in str(incident).lower()
++    Returns:
++        list of tuples: (input_string, expected_seconds)
++    """
++    return [
++        ("01:26.123", 86.123),           # MM:SS.micro
++        ("01:26", 86.0),                  # MM:SS (no microseconds)
++        ("00:01:26.123000", 86.123),     # HH:MM:SS.micro
++        ("00:01:26:123000", 86.123),     # HH:MM:SS:micro (colon separator)
++        ("00:00.000", 0.0),              # Zero
++        ("00:00", 0.0),                  # Zero without micro
++        ("59:59.999", 3599.999),         # Max MM:SS
++        ("01:00.000", 60.0),             # Exact minute
++        ("00:30.500", 30.5),             # Half minute
++    ]
 +
 +
-+class TestIncidentDetector:
-+    """Test IncidentDetector functionality"""
++@pytest.fixture
++def timedelta_format_strings():
++    """
++    Time strings in pandas Timedelta format.
 +    
-+    def create_mock_frames(self, num_frames=50):
-+        """Create mock frame data for testing"""
-+        frames = []
-+        drivers = ['VER', 'LEC', 'SAI', 'HAM']
-+        
-+        for frame_idx in range(num_frames):
-+            driver_positions = {}
-+            # Simulate VER and LEC getting closer (overtake setup)
-+            if frame_idx < 20:
-+                # LEC ahead
-+                driver_positions['LEC'] = (100, 100, 5, 0.5)
-+                driver_positions['VER'] = (95, 95, 5, 0.0)
-+            else:
-+                # VER gains position
-+                driver_positions['VER'] = (105, 105, 5, 1.0)
-+                driver_positions['LEC'] = (98, 98, 5, 0.5)
-+            
-+            driver_positions['SAI'] = (80, 80, 4, 0.0)
-+            driver_positions['HAM'] = (70, 70, 4, 0.0)
-+            
-+            frame = {
-+                'frame_number': frame_idx,
-+                'time_seconds': float(frame_idx),
-+                'drivers': {code: {'x': x, 'y': y, 'lap': lap, 'dist': gap} 
-+                           for code, (x, y, lap, gap) in driver_positions.items()},
-+                'driver_positions': driver_positions,
-+                'driver_speeds': {code: 250.0 + np.sin(frame_idx / 10) * 50 for code in drivers}
-+            }
-+            frames.append(frame)
-+        
-+        return frames, drivers
++    Note: Current parse_time_string implementation discards the day count,
++    only parsing the time portion after 'days '.
 +    
-+    def test_detector_initialization(self):
-+        """Test incident detector can be initialized"""
-+        frames, drivers = self.create_mock_frames(20)
-+        detector = IncidentDetector(frames, drivers)
-+        assert detector.frames == frames
-+        assert detector.incidents == []
-+    
-+    def test_detect_all_incidents(self):
-+        """Test incident detection runs without error"""
-+        frames, drivers = self.create_mock_frames(50)
-+        detector = IncidentDetector(frames, drivers)
-+        incidents = detector.detect_all_incidents()
-+        
-+        # Should return a list
-+        assert isinstance(incidents, list)
-+        # Should be sorted by frame number
-+        if len(incidents) > 1:
-+            for i in range(len(incidents) - 1):
-+                assert incidents[i].frame_number <= incidents[i + 1].frame_number
-+    
-+    def test_get_incidents_for_driver(self):
-+        """Test filtering incidents by driver"""
-+        frames, drivers = self.create_mock_frames(50)
-+        detector = IncidentDetector(frames, drivers)
-+        detector.detect_all_incidents()
-+        
-+        # Get incidents for specific driver
-+        ver_incidents = detector.get_incidents_for_driver('VER')
-+        assert isinstance(ver_incidents, list)
-+        
-+        # All incidents should involve VER
-+        for incident in ver_incidents:
-+            assert incident.primary_driver == 'VER' or incident.secondary_driver == 'VER'
-+    
-+    def test_get_incidents_by_type(self):
-+        """Test filtering incidents by type"""
-+        frames, drivers = self.create_mock_frames(100)
-+        detector = IncidentDetector(frames, drivers)
-+        detector.detect_all_incidents()
-+        
-+        # Get incidents of specific type
-+        overtakes = detector.get_incidents_by_type('overtake')
-+        pit_stops = detector.get_incidents_by_type('pit_stop')
-+        
-+        assert isinstance(overtakes, list)
-+        assert isinstance(pit_stops, list)
-+        
-+        # All filtered incidents should match type
-+        for incident in overtakes:
-+            assert incident.incident_type == 'overtake'
-+        for incident in pit_stops:
-+            assert incident.incident_type == 'pit_stop'
-+    
-+    def test_pit_stop_detection(self):
-+        """Test pit stop detection from speed drop"""
-+        frames = []
-+        # Create frames with a sudden speed drop
-+        for i in range(50):
-+            frame = {
-+                'frame_number': i,
-+                'time_seconds': float(i),
-+                'drivers': {'VER': {'x': 100 + i, 'y': 100, 'lap': 10, 'dist': 1000}},
-+                'driver_positions': {'VER': (100 + i, 100, 10, 0.0)},
-+                'driver_speeds': {'VER': 300.0 if i < 20 else max(0.0, 300.0 - (i - 20) * 15)}
-+            }
-+            frames.append(frame)
-+        
-+        detector = IncidentDetector(frames, ['VER'])
-+        incidents = detector.detect_all_incidents()
-+        
-+        # Should detect pit stop from speed drop
-+        pit_stops = [i for i in incidents if i.incident_type == 'pit_stop']
-+        assert len(pit_stops) > 0
-+    
-+    def test_incident_deduplication(self):
-+        """Test that duplicate incidents aren't recorded"""
-+        frames, drivers = self.create_mock_frames(100)
-+        detector = IncidentDetector(frames, drivers)
-+        incidents = detector.detect_all_incidents()
-+        
-+        # Check no duplicate pit stops for same driver in close time
-+        pit_stops = [i for i in incidents if i.incident_type == 'pit_stop']
-+        for i, pit1 in enumerate(pit_stops):
-+            for pit2 in pit_stops[i + 1:]:
-+                if pit1.primary_driver == pit2.primary_driver:
-+                    # Different incidents should be > 5 seconds apart
-+                    assert abs(pit1.time_seconds - pit2.time_seconds) >= 5.0
++    Returns:
++        list of tuples: (input_string, expected_seconds)
++    """
++    return [
++        ("0 days 00:01:27.060000", 87.06),
++        ("0 days 00:00:30.123456", 30.123),
++        ("0 days 01:30:00.000000", 5400.0),
++        # Note: 1 days -> returns 0.0 because days are discarded (known limitation)
++        ("1 days 00:00:00.000000", 0.0),
++    ]
 +
 +
-+class TestIncidentsPanelComponent:
-+    """Test incidents UI component"""
++@pytest.fixture
++def invalid_time_strings():
++    """
++    Collection of invalid time strings that should return None when parsed.
 +    
-+    def test_panel_initialization(self):
-+        """Test panel can be created"""
-+        from src.ui_components_incidents import IncidentsPanelComponent
-+        panel = IncidentsPanelComponent(left=20, top=600)
-+        assert panel.visible == True
-+        assert panel.filtered_incidents == []
-+    
-+    def test_set_incidents(self):
-+        """Test setting incidents on panel"""
-+        from src.ui_components_incidents import IncidentsPanelComponent
-+        panel = IncidentsPanelComponent()
-+        
-+        incidents = [
-+            Incident(0, 0.0, 1, 'overtake', 'VER', 'LEC', 'Test'),
-+            Incident(100, 50.0, 5, 'pit_stop', 'HAM'),
-+        ]
-+        
-+        panel.set_incidents(incidents)
-+        assert len(panel.filtered_incidents) == 2
-+    
-+    def test_incident_filtering(self):
-+        """Test incident type filtering"""
-+        from src.ui_components_incidents import IncidentsPanelComponent
-+        panel = IncidentsPanelComponent()
-+        
-+        incidents = [
-+            Incident(0, 0.0, 1, 'overtake', 'VER', 'LEC'),
-+            Incident(100, 50.0, 5, 'pit_stop', 'HAM'),
-+            Incident(200, 100.0, 10, 'overtake', 'SAI', 'RUS'),
-+        ]
-+        
-+        panel.set_incidents(incidents)
-+        assert len(panel.filtered_incidents) == 3
-+        
-+        # Filter to overtakes only
-+        panel.filter_type = 'overtake'
-+        panel.filter_incidents()
-+        assert len(panel.filtered_incidents) == 2
-+        
-+        # All filtered should be overtakes
-+        for incident in panel.filtered_incidents:
-+            assert incident.incident_type == 'overtake'
-+    
-+    def test_incident_navigation(self):
-+        """Test selecting next/previous incidents"""
-+        from src.ui_components_incidents import IncidentsPanelComponent
-+        panel = IncidentsPanelComponent()
-+        
-+        incidents = [
-+            Incident(10, 5.0, 1, 'overtake', 'VER', 'LEC'),
-+            Incident(100, 50.0, 5, 'overtake', 'SAI', 'RUS'),
-+            Incident(200, 100.0, 10, 'overtake', 'ALO', 'STR'),
-+        ]
-+        
-+        panel.set_incidents(incidents)
-+        
-+        # Should return frame numbers
-+        frame = panel.select_next_incident()
-+        assert frame == 10
-+        
-+        frame = panel.select_next_incident()
-+        assert frame == 100
-+        
-+        frame = panel.select_prev_incident()
-+        assert frame == 10
-+    
-+    def test_panel_visibility_toggle(self):
-+        """Test toggling panel visibility"""
-+        from src.ui_components_incidents import IncidentsPanelComponent
-+        panel = IncidentsPanelComponent(visible=True)
-+        assert panel.visible == True
-+        
-+        panel.toggle_visibility()
-+        assert panel.visible == False
-+        
-+        panel.toggle_visibility()
-+        assert panel.visible == True
++    Returns:
++        list of strings
++    """
++    return [
++        "",           # Empty string
++        "   ",        # Whitespace only
++        "invalid",    # Non-time string
++        "abc:def",    # Invalid format
++        ":",          # Just separator
++    ]
 +
 +
-+if __name__ == '__main__':
-+    pytest.main([__file__, '-v'])
-\ No newline at end of file
++# =============================================================================
++# Tyre Compound Test Data Fixtures
++# =============================================================================
++
++@pytest.fixture
++def all_tyre_compounds():
++    """
++    All valid F1 tyre compounds with their integer mappings.
++    
++    Returns:
++        dict: compound_name -> integer_value
++    """
++    return {
++        "SOFT": 0,
++        "MEDIUM": 1,
++        "HARD": 2,
++        "INTERMEDIATE": 3,
++        "WET": 4,
++    }
++
++
++@pytest.fixture
++def tyre_compound_case_variations():
++    """
++    Different case variations of tyre compound names.
++    
++    Returns:
++        list of tuples: (input, expected_int)
++    """
++    return [
++        ("SOFT", 0),
++        ("soft", 0),
++        ("Soft", 0),
++        ("MEDIUM", 1),
++        ("medium", 1),
++        ("Medium", 1),
++        ("HARD", 2),
++        ("hard", 2),
++        ("INTERMEDIATE", 3),
++        ("intermediate", 3),
++        ("WET", 4),
++        ("wet", 4),
++    ]
++
++
++# =============================================================================
++# Wind Direction Test Data Fixtures
++# =============================================================================
++
++@pytest.fixture
++def cardinal_directions():
++    """
++    Cardinal wind directions (N, E, S, W) with their degree values.
++    
++    Returns:
++        list of tuples: (degrees, expected_direction)
++    """
++    return [
++        (0, "N"),
++        (90, "E"),
++        (180, "S"),
++        (270, "W"),
++    ]
++
++
++@pytest.fixture
++def intercardinal_directions():
++    """
++    Intercardinal wind directions (NE, SE, SW, NW) with their degree values.
++    
++    Returns:
++        list of tuples: (degrees, expected_direction)
++    """
++    return [
++        (45, "NE"),
++        (135, "SE"),
++        (225, "SW"),
++        (315, "NW"),
++    ]
++
++
++@pytest.fixture
++def secondary_intercardinal_directions():
++    """
++    Secondary intercardinal directions (16-point compass: NNE, ENE, ESE, etc.).
++    
++    Returns:
++        list of tuples: (degrees, expected_direction)
++    """
++    return [
++        (22.5, "NNE"),
++        (67.5, "ENE"),
++        (112.5, "ESE"),
++        (157.5, "SSE"),
++        (202.5, "SSW"),
++        (247.5, "WSW"),
++        (292.5, "WNW"),
++        (337.5, "NNW"),
++    ]
+diff --git a/tests/test_time.py b/tests/test_time.py
+new file mode 100644
+index 0000000..ee272b7
+--- /dev/null
++++ b/tests/test_time.py
+@@ -0,0 +1,262 @@
++"""
++Unit tests for src/lib/time.py
++
++Tests the format_time() and parse_time_string() functions with comprehensive
++coverage of edge cases, various input formats, and bidirectional consistency.
++"""
++import pytest
++from src.lib.time import format_time, parse_time_string
++
++
++class TestFormatTime:
++    """Tests for the format_time() function that converts seconds to MM:SS.sss format."""
++
++    # =========================================================================
++    # Standard Cases
++    # =========================================================================
++
++    @pytest.mark.parametrize("seconds,expected", [
++        (0, "00:00.000"),
++        (1, "00:01.000"),
++        (59.999, "00:59.999"),
++        (60, "01:00.000"),
++        (61.5, "01:01.500"),
++        (86.123, "01:26.123"),
++        (90.5, "01:30.500"),
++        (119.999, "01:59.999"),
++        (120, "02:00.000"),
++    ])
++    def test_format_time_standard_values(self, seconds, expected):
++        """Test formatting of standard time values."""
++        assert format_time(seconds) == expected
++
++    @pytest.mark.parametrize("seconds,expected", [
++        (600, "10:00.000"),      # 10 minutes
++        (3599.999, "59:59.999"), # Just under 1 hour
++        (3600, "60:00.000"),     # Exactly 1 hour
++        (7200, "120:00.000"),    # 2 hours
++    ])
++    def test_format_time_large_values(self, seconds, expected):
++        """Test formatting handles values over an hour (displays as minutes > 59)."""
++        assert format_time(seconds) == expected
++
++    # =========================================================================
++    # Precision Tests
++    # =========================================================================
++
++    @pytest.mark.parametrize("seconds,expected", [
++        (30.1, "00:30.100"),
++        (30.12, "00:30.120"),
++        (30.123, "00:30.123"),
++        (30.1234, "00:30.123"),   # Truncates/rounds to 3 decimal places
++        (30.1239, "00:30.124"),   # Rounds up
++    ])
++    def test_format_time_precision_handling(self, seconds, expected):
++        """Test that millisecond precision is handled correctly."""
++        assert format_time(seconds) == expected
++
++    # =========================================================================
++    # Edge Cases
++    # =========================================================================
++
++    def test_format_time_with_none_returns_na(self):
++        """Test that None input returns 'N/A'."""
++        assert format_time(None) == "N/A"
++
++    def test_format_time_with_negative_returns_na(self):
++        """Test that negative values return 'N/A'."""
++        assert format_time(-1) == "N/A"
++        assert format_time(-0.001) == "N/A"
++        assert format_time(-100) == "N/A"
++
++    def test_format_time_with_zero_returns_properly(self):
++        """Test that zero is handled correctly."""
++        assert format_time(0) == "00:00.000"
++        assert format_time(0.0) == "00:00.000"
++
++    def test_format_time_very_small_positive(self):
++        """Test very small positive values."""
++        assert format_time(0.001) == "00:00.001"
++        assert format_time(0.0001) == "00:00.000"  # Rounds to 0
++
++
++class TestParseTimeString:
++    """Tests for parse_time_string() that converts time strings to seconds."""
++
++    # =========================================================================
++    # Standard Formats (MM:SS.micro)
++    # =========================================================================
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26.123", 86.123),
++        ("00:30.500", 30.5),
++        ("01:00.000", 60.0),
++        ("00:00.000", 0.0),
++        ("59:59.999", 3599.999),
++    ])
++    def test_parse_mmss_format(self, time_str, expected):
++        """Test parsing of MM:SS.micro format."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, rel=1e-3)
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26", 86.0),
++        ("00:30", 30.0),
++        ("00:00", 0.0),
++    ])
++    def test_parse_mmss_no_micro(self, time_str, expected):
++        """Test parsing of MM:SS format without microseconds."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, rel=1e-3)
++
++    # =========================================================================
++    # HH:MM:SS Formats
++    # =========================================================================
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("00:01:26.123000", 86.123),
++        ("00:00:30.500000", 30.5),
++        ("01:00:00.000000", 3600.0),
++        ("00:00:00.000000", 0.0),
++        ("01:30:45.123456", 5445.123),
++    ])
++    def test_parse_hhmmss_format(self, time_str, expected):
++        """Test parsing of HH:MM:SS.micro format."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, rel=1e-3)
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("00:01:26:123000", 86.123),
++        ("00:00:30:500000", 30.5),
++    ])
++    def test_parse_hhmmss_colon_separator(self, time_str, expected):
++        """Test parsing with colon as microsecond separator."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, rel=1e-3)
++
++    # =========================================================================
++    # Timedelta Format (pandas output)
++    # =========================================================================
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("0 days 00:01:27.060000", 87.06),
++        ("0 days 00:00:30.123456", 30.123),
++        ("0 days 01:30:00.000000", 5400.0),
++        ("0 days 00:00:00.000000", 0.0),
++    ])
++    def test_parse_timedelta_format(self, time_str, expected):
++        """Test parsing of pandas Timedelta string format."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, rel=1e-3)
++
++    def test_parse_multiday_timedelta(self):
++        """Test parsing of multi-day timedelta format.
++        
++        Note: Current implementation only extracts the time portion after 'days',
++        ignoring the day count. This documents the actual behavior.
++        """
++        # Current implementation discards the day portion
++        result = parse_time_string("1 days 00:00:00.000000")
++        # This returns 0.0 because days are discarded - documenting actual behavior
++        assert result == pytest.approx(0.0, rel=1e-3)
++
++    # =========================================================================
++    # Microsecond Precision Variations
++    # =========================================================================
++
++    @pytest.mark.parametrize("time_str,expected", [
++        # Note: Single digit after dot becomes 100000 microseconds, not 0.1 seconds
++        # This is a known quirk of the current implementation
++        ("01:26.123", 86.123),
++        ("01:26.123456", 86.123),    # Full microseconds
++    ])
++    def test_parse_varying_micro_precision(self, time_str, expected):
++        """Test handling of full microsecond precision.
++        
++        Note: Current implementation pads microseconds with zeros on the right.
++        So '01:26.1' becomes 86 seconds + 100000 microseconds = 86.1 seconds.
++        This test focuses on correct cases.
++        """
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, rel=1e-3)
++
++    # =========================================================================
++    # Edge Cases and Invalid Input
++    # =========================================================================
++
++    def test_parse_empty_string_returns_none(self):
++        """Test that empty string returns None."""
++        assert parse_time_string("") is None
++
++    def test_parse_whitespace_only_returns_none(self):
++        """Test that whitespace-only string returns None."""
++        assert parse_time_string("   ") is None
++        assert parse_time_string("\t") is None
++        assert parse_time_string("\n") is None
++
++    def test_parse_none_input_returns_none(self):
++        """Test that None input returns None (after string conversion)."""
++        # Note: The function converts to string first, so "None" is processed
++        assert parse_time_string(None) is None
++
++    @pytest.mark.parametrize("invalid_input", [
++        "invalid",
++        "abc:def",
++        "12",
++        ":",
++        "::",
++        "a:b:c",
++    ])
++    def test_parse_invalid_format_returns_none(self, invalid_input):
++        """Test that invalid formats return None."""
++        assert parse_time_string(invalid_input) is None
++
++    def test_parse_with_leading_trailing_whitespace(self):
++        """Test that leading/trailing whitespace affects parsing.
++        
++        Note: Current implementation splits on space before stripping,
++        so leading whitespace causes the time string to become empty.
++        This documents the actual behavior.
++        """
++        # Leading spaces result in empty string after split
++        assert parse_time_string("  01:26.123  ") is None
++        # No leading space works correctly
++        assert parse_time_string("01:26.123") == pytest.approx(86.123, rel=1e-3)
++
++    # =========================================================================
++    # Consistency Tests
++    # =========================================================================
++
++    @pytest.mark.parametrize("seconds", [
++        0, 1, 30, 60, 86.123, 90.5, 119.999, 600, 3599.999
++    ])
++    def test_format_parse_roundtrip(self, seconds):
++        """Test bidirectional consistency: format -> parse returns original value."""
++        formatted = format_time(seconds)
++        parsed = parse_time_string(formatted)
++        # Allow small floating point differences
++        assert parsed == pytest.approx(seconds, rel=1e-3)
++
++
++class TestParseTimeStringFromFixtures:
++    """Tests using shared fixtures from conftest.py."""
++
++    def test_valid_time_strings(self, valid_time_strings):
++        """Test parsing of valid time strings from fixture."""
++        for time_str, expected in valid_time_strings:
++            result = parse_time_string(time_str)
++            assert result == pytest.approx(expected, rel=1e-3), \
++                f"Failed for input '{time_str}': expected {expected}, got {result}"
++
++    def test_timedelta_formats(self, timedelta_format_strings):
++        """Test parsing of timedelta format strings from fixture."""
++        for time_str, expected in timedelta_format_strings:
++            result = parse_time_string(time_str)
++            assert result == pytest.approx(expected, rel=1e-3), \
++                f"Failed for input '{time_str}': expected {expected}, got {result}"
++
++    def test_invalid_time_strings(self, invalid_time_strings):
++        """Test that invalid time strings return None."""
++        for time_str in invalid_time_strings:
++            assert parse_time_string(time_str) is None, \
++                f"Expected None for invalid input '{time_str}'"
+diff --git a/tests/test_tyres.py b/tests/test_tyres.py
+new file mode 100644
+index 0000000..328db24
+--- /dev/null
++++ b/tests/test_tyres.py
+@@ -0,0 +1,193 @@
++"""
++Unit tests for src/lib/tyres.py
++
++Tests the tyre compound conversion functions with comprehensive coverage
++of all F1 tyre compounds, case insensitivity, and edge cases.
++"""
++import pytest
++from src.lib.tyres import get_tyre_compound_int, get_tyre_compound_str, tyre_compounds_ints
++
++
++class TestGetTyreCompoundInt:
++    """Tests for get_tyre_compound_int() that converts compound names to integers."""
++
++    # =========================================================================
++    # Standard Compounds
++    # =========================================================================
++
++    @pytest.mark.parametrize("compound,expected", [
++        ("SOFT", 0),
++        ("MEDIUM", 1),
++        ("HARD", 2),
++        ("INTERMEDIATE", 3),
++        ("WET", 4),
++    ])
++    def test_standard_compounds_uppercase(self, compound, expected):
++        """Test all standard F1 tyre compounds in uppercase."""
++        assert get_tyre_compound_int(compound) == expected
++
++    # =========================================================================
++    # Case Insensitivity
++    # =========================================================================
++
++    @pytest.mark.parametrize("compound,expected", [
++        ("soft", 0),
++        ("Soft", 0),
++        ("SOFT", 0),
++        ("sOfT", 0),
++        ("medium", 1),
++        ("Medium", 1),
++        ("MEDIUM", 1),
++        ("hard", 2),
++        ("Hard", 2),
++        ("HARD", 2),
++        ("intermediate", 3),
++        ("Intermediate", 3),
++        ("INTERMEDIATE", 3),
++        ("wet", 4),
++        ("Wet", 4),
++        ("WET", 4),
++    ])
++    def test_case_insensitivity(self, compound, expected):
++        """Test that compound names are case insensitive."""
++        assert get_tyre_compound_int(compound) == expected
++
++    # =========================================================================
++    # Edge Cases and Invalid Input
++    # =========================================================================
++
++    @pytest.mark.parametrize("invalid_compound", [
++        "UNKNOWN",
++        "SUPERSOFT",
++        "ULTRASOFT",
++        "HYPERSOFT",
++        "",
++        "S",
++        "M",
++        "H",
++        "I",
++        "W",
++        "SOFTT",
++        " SOFT",
++        "SOFT ",
++        "  ",
++    ])
++    def test_invalid_compound_returns_minus_one(self, invalid_compound):
++        """Test that unknown compounds return -1."""
++        assert get_tyre_compound_int(invalid_compound) == -1
++
++    # =========================================================================
++    # Fixture-Based Tests
++    # =========================================================================
++
++    def test_all_tyre_compounds_fixture(self, all_tyre_compounds):
++        """Test using the all_tyre_compounds fixture."""
++        for compound, expected in all_tyre_compounds.items():
++            assert get_tyre_compound_int(compound) == expected
++
++    def test_case_variations_fixture(self, tyre_compound_case_variations):
++        """Test using the case variations fixture."""
++        for compound, expected in tyre_compound_case_variations:
++            assert get_tyre_compound_int(compound) == expected
++
++
++class TestGetTyreCompoundStr:
++    """Tests for get_tyre_compound_str() that converts integers to compound names."""
++
++    # =========================================================================
++    # Standard Reverse Lookup
++    # =========================================================================
++
++    @pytest.mark.parametrize("compound_int,expected", [
++        (0, "SOFT"),
++        (1, "MEDIUM"),
++        (2, "HARD"),
++        (3, "INTERMEDIATE"),
++        (4, "WET"),
++    ])
++    def test_valid_integers(self, compound_int, expected):
++        """Test reverse lookup for valid integer values."""
++        assert get_tyre_compound_str(compound_int) == expected
++
++    # =========================================================================
++    # Invalid Integers
++    # =========================================================================
++
++    @pytest.mark.parametrize("invalid_int", [
++        -1,
++        -100,
++        5,
++        10,
++        99,
++        1000,
++    ])
++    def test_invalid_integer_returns_unknown(self, invalid_int):
++        """Test that invalid integers return 'UNKNOWN'."""
++        assert get_tyre_compound_str(invalid_int) == "UNKNOWN"
++
++    # =========================================================================
++    # Fixture-Based Tests
++    # =========================================================================
++
++    def test_all_tyre_compounds_reverse(self, all_tyre_compounds):
++        """Test reverse lookup using the fixture."""
++        for compound, int_value in all_tyre_compounds.items():
++            assert get_tyre_compound_str(int_value) == compound
++
++
++class TestTyreCompoundConsistency:
++    """Tests for bidirectional consistency between the conversion functions."""
++
++    @pytest.mark.parametrize("compound", ["SOFT", "MEDIUM", "HARD", "INTERMEDIATE", "WET"])
++    def test_int_to_str_to_int_roundtrip(self, compound):
++        """Test that str -> int -> str returns the original compound."""
++        int_value = get_tyre_compound_int(compound)
++        str_value = get_tyre_compound_str(int_value)
++        assert str_value == compound
++
++    @pytest.mark.parametrize("int_value", [0, 1, 2, 3, 4])
++    def test_str_to_int_to_str_roundtrip(self, int_value):
++        """Test that int -> str -> int returns the original integer."""
++        str_value = get_tyre_compound_str(int_value)
++        int_result = get_tyre_compound_int(str_value)
++        assert int_result == int_value
++
++    def test_dictionary_integrity(self):
++        """Test that the internal mapping dictionary is complete and unique."""
++        # All expected compounds exist
++        expected_compounds = {"SOFT", "MEDIUM", "HARD", "INTERMEDIATE", "WET"}
++        assert set(tyre_compounds_ints.keys()) == expected_compounds
++        
++        # All values are unique
++        values = list(tyre_compounds_ints.values())
++        assert len(values) == len(set(values)), "Duplicate values in tyre_compounds_ints"
++        
++        # Values are 0-4
++        assert set(values) == {0, 1, 2, 3, 4}
++
++
++class TestTyreCompoundEdgeCases:
++    """Additional edge case tests for tyre compound functions."""
++
++    def test_soft_is_fastest_zero(self):
++        """Test that SOFT (fastest dry compound) is 0."""
++        assert get_tyre_compound_int("SOFT") == 0
++
++    def test_wet_is_highest_value(self):
++        """Test that WET has the highest integer value."""
++        all_ints = [get_tyre_compound_int(c) for c in ["SOFT", "MEDIUM", "HARD", "INTERMEDIATE", "WET"]]
++        assert get_tyre_compound_int("WET") == max(all_ints)
++
++    def test_slick_tyres_ordering(self):
++        """Test that slick tyres (SOFT, MEDIUM, HARD) are in correct order."""
++        soft = get_tyre_compound_int("SOFT")
++        medium = get_tyre_compound_int("MEDIUM")
++        hard = get_tyre_compound_int("HARD")
++        assert soft < medium < hard
++
++    def test_rain_tyres_are_higher(self):
++        """Test that rain tyres have higher values than slicks."""
++        hard = get_tyre_compound_int("HARD")
++        inter = get_tyre_compound_int("INTERMEDIATE")
++        wet = get_tyre_compound_int("WET")
++        assert hard < inter < wet
+diff --git a/tests/test_ui_helpers.py b/tests/test_ui_helpers.py
+new file mode 100644
+index 0000000..ed5a879
+--- /dev/null
++++ b/tests/test_ui_helpers.py
+@@ -0,0 +1,188 @@
++"""
++Unit tests for UI helper functions in src/ui_components.py
++
++Tests standalone helper functions that don't require the Arcade framework
++to be running, focusing on _format_wind_direction().
++
++Note: The arcade module is mocked using patch.dict to avoid polluting sys.modules
++and to allow tests to run without arcade installed.
++"""
++import sys
++import pytest
++from unittest.mock import MagicMock, patch
++
++
++# Use patch.dict context manager to safely mock arcade during import
++# This avoids polluting sys.modules for the entire test session
++with patch.dict(sys.modules, {"arcade": MagicMock()}):
++    from src.ui_components import _format_wind_direction
++
++
++class TestFormatWindDirection:
++    """
++    Tests for _format_wind_direction() that converts degrees to compass directions.
++    
++    This function is defined in src/ui_components.py and converts wind direction
++    in degrees to a 16-point compass direction string (N, NNE, NE, ENE, etc.).
++    """
++
++    # =========================================================================
++    # Cardinal Directions (N, E, S, W)
++    # =========================================================================
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (0, "N"),
++        (90, "E"),
++        (180, "S"),
++        (270, "W"),
++    ])
++    def test_cardinal_directions(self, degrees, expected):
++        """Test the four main cardinal directions."""
++        assert _format_wind_direction(degrees) == expected
++
++    # =========================================================================
++    # Intercardinal (Ordinal) Directions (NE, SE, SW, NW)
++    # =========================================================================
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (45, "NE"),
++        (135, "SE"),
++        (225, "SW"),
++        (315, "NW"),
++    ])
++    def test_intercardinal_directions(self, degrees, expected):
++        """Test the four intercardinal directions."""
++        assert _format_wind_direction(degrees) == expected
++
++    # =========================================================================
++    # Secondary Intercardinal Directions (16-point compass)
++    # =========================================================================
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (22.5, "NNE"),
++        (67.5, "ENE"),
++        (112.5, "ESE"),
++        (157.5, "SSE"),
++        (202.5, "SSW"),
++        (247.5, "WSW"),
++        (292.5, "WNW"),
++        (337.5, "NNW"),
++    ])
++    def test_secondary_intercardinal_directions(self, degrees, expected):
++        """Test all 16-point compass secondary intercardinal directions."""
++        assert _format_wind_direction(degrees) == expected
++
++    # =========================================================================
++    # Boundary Tests (edges of direction segments)
++    # =========================================================================
++
++    @pytest.mark.parametrize("degrees,expected", [
++        # Just below N threshold
++        (11.24, "N"),
++        # Just above N threshold  
++        (11.26, "NNE"),
++        # Near E boundary
++        (78.74, "ENE"),
++        (78.76, "E"),
++        # Near S boundary
++        (168.74, "SSE"),
++        (168.76, "S"),
++        # Near W boundary
++        (258.74, "WSW"),
++        (258.76, "W"),
++    ])
++    def test_direction_boundaries(self, degrees, expected):
++        """Test values near the boundaries between directions."""
++        assert _format_wind_direction(degrees) == expected
++
++    # =========================================================================
++    # Normalization (values outside 0-360)
++    # =========================================================================
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (360, "N"),      # Exactly 360 normalizes to 0
++        (450, "E"),      # 450 - 360 = 90
++        (720, "N"),      # 720 - 720 = 0
++        (540, "S"),      # 540 - 360 = 180
++        (630, "W"),      # 630 - 360 = 270
++    ])
++    def test_values_over_360_normalize(self, degrees, expected):
++        """Test that values over 360 are normalized correctly."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (-90, "W"),      # -90 + 360 = 270
++        (-180, "S"),     # -180 + 360 = 180
++        (-270, "E"),     # -270 + 360 = 90
++        (-360, "N"),     # -360 + 360 = 0
++    ])
++    def test_negative_values_normalize(self, degrees, expected):
++        """Test that negative values are normalized correctly."""
++        # Note: Python's % operator handles negatives, so -90 % 360 = 270
++        assert _format_wind_direction(degrees) == expected
++
++    # =========================================================================
++    # Edge Cases
++    # =========================================================================
++
++    def test_none_returns_na(self):
++        """Test that None input returns 'N/A'."""
++        assert _format_wind_direction(None) == "N/A"
++
++    def test_zero_is_north(self):
++        """Test that 0 degrees is North."""
++        assert _format_wind_direction(0) == "N"
++        assert _format_wind_direction(0.0) == "N"
++
++    @pytest.mark.parametrize("degrees", [
++        359.99,  # Just before full circle
++        0.01,    # Just after zero
++        179.99,  # Just before south
++        180.01,  # Just after south
++    ])
++    def test_floating_point_precision(self, degrees):
++        """Test that floating point values work correctly."""
++        result = _format_wind_direction(degrees)
++        assert result in ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
++                         "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
++
++    # =========================================================================
++    # Fixture-Based Tests
++    # =========================================================================
++
++    def test_cardinal_directions_fixture(self, cardinal_directions):
++        """Test using cardinal_directions fixture from conftest.py."""
++        for degrees, expected in cardinal_directions:
++            assert _format_wind_direction(degrees) == expected
++
++    def test_intercardinal_directions_fixture(self, intercardinal_directions):
++        """Test using intercardinal_directions fixture from conftest.py."""
++        for degrees, expected in intercardinal_directions:
++            assert _format_wind_direction(degrees) == expected
++
++
++class TestWindDirectionCompleteness:
++    """Tests to verify the wind direction function covers all compass points."""
++
++    def test_all_16_directions_reachable(self):
++        """Test that all 16 compass directions can be produced."""
++        expected_directions = {
++            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
++            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"
++        }
++        
++        # Test at 22.5 degree increments (center of each segment)
++        actual_directions = set()
++        for i in range(16):
++            degrees = i * 22.5
++            direction = _format_wind_direction(degrees)
++            actual_directions.add(direction)
++        
++        assert actual_directions == expected_directions
++
++    def test_full_rotation_returns_same_direction(self):
++        """Test that adding 360 to any angle returns the same direction."""
++        for degrees in [0, 45, 90, 135, 180, 225, 270, 315]:
++            original = _format_wind_direction(degrees)
++            rotated = _format_wind_direction(degrees + 360)
++            assert original == rotated, f"Failed at {degrees}°"
