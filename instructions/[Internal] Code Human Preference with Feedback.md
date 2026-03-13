@@ -1,15 +1,146 @@
 ### Technical Setup & Delivery
 
 **Interface:** Anthropic’s interface  
-Python: [https://feedback.anthropic.com/pr\_writer\_v2\_feedback?email\_login=true](https://feedback.anthropic.com/pr_writer_v2_feedback?email_login=true)  
-**Tools Required:** 
+Python: [https://feedback.anthropic.com/pr\_writer\_v2\_feedback?email\_login=true](https://feedback.anthropic.com/pr_writer_v2_feedback?email_login=true)
 
-* A preferred code editor to easily review and/or run model generated code
+**Tools Required:** 
+- A preferred code editor to easily review and/or run model generated code
 
 # Worker Instructions
 
 *The instructions below will be given to workers either in HFI or by the vendor.*
 
-| PR Writer Instructions What You'll Be Doing  For this task, you will select a codebase that is a git repository, and ask the model to perform a single task in that codebase. Your goal is to, over multiple turns, iterate on the model’s solution for that task until it reaches a “production-ready” state (defined later in these instructions). In addition to iterating on the model’s solution, you should be iterating on the model’s workflow with it to ensure it is working like a real engineer \- meaning ensuring the model is reviewing the code it wrote, validating code against task requirements, committing regularly, etc. Before You Begin \- Review these instructions completely \- Ensure you understand git concepts (commits, SHAs, diffs) \- Review your own personal workflow you follow when you write code in a production setting \--- Instructions Selecting a codebase  Choose a codebase, which must be a git repository, written in the language corresponding to the interface you are working on Aim for diversity when selecting codebases. Some should be libraries, some should be applications. Some should be simple and small, some should be large and complex (and everything in between) Codebases should be a mix of libraries, applications, SDKs, etc Codebases should be high quality, open source projects when possible For libraries, SDKs, and packages, this should always be the case For applications, default to highly used open source applications (as measured by GitHub stars, the general popularity/notoriety of the project, or other public usage metrics) The codebase must have clear instructions on how to build and run it. If not, see the “Preparing the codebase” section The codebase should not have external dependencies other than what could be fetched from that language’s standard package manager (e.g. npm for JS/TS, pip/conda for Python, cargo for Rust) You can use a codebase from a previous interaction with the model. For example, if you started with codebase A, and you had the model add a new feature to it in interaction 1 to produce codebase B, you can use codebase B as the starting point for interaction 2 Codebases should often but not always include common developer productivity tools like linters and formatters Codebases should often but not always include tests Preparing the codebase If the codebase does not have clear build instructions, you should either: Select a different codebase, or Write thorough build instructions for the codebase yourself, and commit them to the repo. If you choose to do so, ensure that you follow the build instructions you write yourself at least once to make sure they work Note: you will have to delete any “lock” files (package-lock.json, Pipfile.lock, etc) from the repo so the model can properly download dependencies. In order to ensure the model downloads the correct dependencies, you might have to also modify the dependency specification file (package.json, requirements.txt, etc) to pin package versions. You should do so locally and test that the repo is buildable/tests run after your changes before using the codebase in the interface Familiarizing yourself with the codebase Take some time to familiarize yourself with the codebase \- its purpose, features, history, etc. By the end of this process, you should be comfortable reviewing any code added to the codebase, have ideas for features to add, refactors to make, and ways to improve it Selecting a task for the model Come up with a task for the model to implement. This task could be: A brand new feature An extension of an existing feature A refactor A reimplementation of an existing feature Adding tests for existing features Adding tests to a codebase with no tests at all Your task can start from any point in the repo’s commit history. Feel free to checkout a specific historical commit, ensuring the repo is clearly buildable at that point in time, and come up with your task from there Tasks should be of varying levels of complexity and size If you notice the model perfectly nailing your chosen task in 1-2 turns, it is too easy and you should come up with more challenging tasks IMPORTANT: Task descriptions should be well-scoped. A good heuristic here is the level of details you would provide in a Jira/Asana ticket to a mid-level engineer. You want enough detail that the task is clear, but you don’t need to necessarily spell out every edge case and consideration Examples of well-scoped tasks: Implement async/await support for all existing callback-based API methods while maintaining backward compatibility Add a \--dry-run flag to the deploy command that shows what changes would be made without executing them Refactor the data validation logic in the user registration form to use a schema validation library instead of manual checks Examples of poorly-scoped tasks: Add a complete admin dashboard with user management, analytics, and reporting (too broad) Change the variable name from 'str' to 'string (as a full task, too trivial, but this might be a follow-up comment you provide the model when iterating on the solution with it) Add some validation to the forms Add a cross product function If a task could realistically be broken down into multiple tickets you might give separate engineers or sequence if you were the developer, it is too broad Iteratively prompting the model Prompt the model with the task you came up with. Over multiple turns, iterate with the model on its outputs until the final code is in a “production-ready” state Your follow up turns should not increase the scope of the task Think of your follow up turns as code review \- you should be pointing out to the model the same kinds of issues you would point out if you were reviewing a peer’s code. With an emphasis on comments and follow ups that result in more production ready code (as defined below) Definition of production ready The question that should always be in your mind when determining if the model’s output is “production-ready” is: “If the model was my co-worker and presented me with this code in a PR, would I happily approve the PR?” Until the answer to that question is yes, you should continue to iterate on the code Production ready code should: Implement the feature requested thoroughly and completely Consider legitimate edge cases and handle them Consider security implications and handle security holes in its implementation where appropriate given the task being completed Should not contain comments that add no value, are just the model’s chain of thought, explain what the model just did (e.g. “\# removed code because it’s no longer used”), or explain exactly what the code does (instead of the why), or explain obvious things Should match the style of the existing code (which is why it’s extremely important for you to familiarize yourself with the codebase) Should be well factored, using reasonable abstractions that match the style of the codebase (e.g. don’t use classes in a purely function codebase, or vice versa) Should write comprehensive tests in the style of the codebase if the codebase has tests or the task is to add tests to a codebase with no tests Reviewing model outputs Ensure the model is following software engineering best practices. Writing appropriate documentation in the appropriate places, committing regularly with meaningful commit messages, reviewing its own work, etc. Any time you see the model not following these practices, you should prompt it to do so Ensure the model’s output is production-ready. If it’s not, prompt it to make changes, similar to how you might leave comments on a PR. Nothing is too small to comment on. If you think a comment is unnecessary, ask the model to remove it or reword it. If you think the model’s implementation does not have the correct architecture, tell it so. If you think it missed an edge case, let it know Ensure the model works with you to clarify requirements, edge cases, task scope, and expectations Definition of done An interaction is done when, to the best of your abilities, you’ve determined that the model has completed the task in a production-ready way Submitting a task Submit analysis and feedback for both model responses. For each turn, you must provide detailed analysis and feedback across six required fields. This feedback is critical for understanding model behavior and guiding improvements. Ideal Response Description:  Describe what an ideal response would look like for this specific turn. Be concrete and specific: What actions should the model have taken? What code changes would be optimal? What clarifying questions (if any) should the model have asked? What software engineering practices should have been demonstrated? This serves as the "gold standard" against which both model responses are compared. Model A Response Summary Provide a balanced summary of Model A's response, covering: What it did: Describe the actions taken, code written, and approach used Strengths: What did Model A do well? (e.g., correct logic, good abstractions, appropriate error handling) Weaknesses: Where did Model A fall short? (e.g., missed edge cases, poor naming, unnecessary comments) Model A Response Feedback Provide actionable, specific feedback on Model A's response: How could the code be improved? What specific issues need addressing before this would be production-ready? Point to concrete examples in the output (e.g., "The processData function lacks input validation for null values") Note any hallucinations, incorrect assumptions, or deviations from best practices Model B Response Summary Model B Response Feedback Overall Preference Justification Explain precisely why you preferred the model you selected for the overall preference: Which differences between the responses were most significant in your decision? How did each model compare against the ideal response you described? If your overall preference differs from preferences on individual axes, explain why the deciding factors outweighed the others Submit preference labeling: You’ll notice when you choose a preferred output, there are multiple “axes” on which you can submit a preference. These are: Logic and correctness Naming and clarity Organization and modularity Interface design Error handling Comments and documentation Review/production readiness Descriptions of each axis are in the “info” bubble next to the axis name in the interface. Please familiarize yourself with these descriptions You should submit a preference along each of these axes *in addition* to your overall preference, only when that axes applies to that specific turn of the conversation. For example, if the model writes a new function in a turn, you should submit a preference for all of the above axes. However, if the only action the model performs during the turn is committing some code it wrote in the previous turn, you should submit a preference for the “Review/production readiness” axis and submit choose N/A for the other axes, as they do not apply to that turn Your preference for a specific axis does not need to line up with your overall preference. For example, response A might have written code with better error handling and comments, but response B was better overall. In that case, you can prefer response A for those two axes, but still select response B as the overall preference In addition to submitting the task, in the deliverable excel sheet, add a row with: The conversation uuid The task you requested the model to complete  |
-| :---- |
 
+PR Writer
+
+#### Instructions
+**What You'll Be Doing**
+
+For this task, you will select a codebase that is a git repository, and ask the model to perform a single task in that codebase. Your goal is to, over multiple turns, iterate on the model’s solution for that task until it reaches a “production-ready” state (defined later in these instructions). In addition to iterating on the model’s solution, you should be iterating on the model’s workflow with it to ensure it is working like a real engineer - meaning ensuring the model is reviewing the code it wrote, validating code against task requirements, committing regularly, etc.
+
+**Before You Begin**
+- Review these instructions completely
+- Ensure you understand git concepts (commits, SHAs, diffs)
+- Review your own personal workflow you follow when you write code in a production setting
+
+---
+
+#### Instructions
+
+**Selecting a codebase**
+
+- Choose a codebase, which must be a git repository, written in the language corresponding to the interface you are working on
+- Aim for diversity when selecting codebases. Some should be libraries, some should be applications. Some should be simple and small, some should be large and complex (and everything in between)
+  - Codebases should be a mix of libraries, applications, SDKs, etc
+  - Codebases should be high quality, open source projects when possible
+    - For libraries, SDKs, and packages, this should always be the case
+    - For applications, default to highly used open source applications (as measured by GitHub stars, the general popularity/notoriety of the project, or other public usage metrics)
+- The codebase must have clear instructions on how to build and run it. If not, see the “Preparing the codebase” section
+- The codebase should not have external dependencies other than what could be fetched from that language’s standard package manager (e.g. npm for JS/TS, pip/conda for Python, cargo for Rust)
+- You can use a codebase from a previous interaction with the model. For example, if you started with codebase A, and you had the model add a new feature to it in interaction 1 to produce codebase B, you can use codebase B as the starting point for interaction 2
+- Codebases should often but not always include common developer productivity tools like linters and formatters
+- Codebases should often but not always include tests
+
+**Preparing the codebase**
+
+- If the codebase does not have clear build instructions, you should either:
+  - Select a different codebase, or
+  - Write thorough build instructions for the codebase yourself, and commit them to the repo. If you choose to do so, ensure that you follow the build instructions you write yourself at least once to make sure they work
+- Note: you will have to delete any “lock” files (package-lock.json, Pipfile.lock, etc) from the repo so the model can properly download dependencies. In order to ensure the model downloads the correct dependencies, you might have to also modify the dependency specification file (package.json, requirements.txt, etc) to pin package versions. You should do so locally and test that the repo is buildable/tests run after your changes before using the codebase in the interface
+
+**Familiarizing yourself with the codebase**
+
+- Take some time to familiarize yourself with the codebase - its purpose, features, history, etc. By the end of this process, you should be comfortable reviewing any code added to the codebase, have ideas for features to add, refactors to make, and ways to improve it
+
+**Selecting a task for the model**
+
+- Come up with a task for the model to implement. This task could be:
+  - A brand new feature
+  - An extension of an existing feature
+  - A refactor
+  - A reimplementation of an existing feature
+  - Adding tests for existing features
+  - Adding tests to a codebase with no tests at all
+- Your task can start from any point in the repo’s commit history. Feel free to checkout a specific historical commit, ensuring the repo is clearly buildable at that point in time, and come up with your task from there
+- Tasks should be of varying levels of complexity and size
+  - If you notice the model perfectly nailing your chosen task in 1-2 turns, it is too easy and you should come up with more challenging tasks
+- **IMPORTANT**: Task descriptions should be well-scoped. A good heuristic here is the level of details you would provide in a Jira/Asana ticket to a mid-level engineer. **You want enough detail that the task is clear, but you don’t need to necessarily spell out every edge case and consideration**
+  - Examples of well-scoped tasks:
+    - Implement async/await support for all existing callback-based API methods while maintaining backward compatibility
+    - Add a --dry-run flag to the deploy command that shows what changes would be made without executing them
+    - Refactor the data validation logic in the user registration form to use a schema validation library instead of manual checks
+  - Examples of poorly-scoped tasks:
+    - Add a complete admin dashboard with user management, analytics, and reporting (too broad)
+    - Change the variable name from 'str' to 'string (as a full task, too trivial, but this might be a follow-up comment you provide the model when iterating on the solution with it)
+    - Add some validation to the forms
+    - Add a cross product function
+  - If a task could realistically be broken down into multiple tickets you might give separate engineers or sequence if you were the developer, it is too broad
+
+**Iteratively prompting the model**
+
+- Prompt the model with the task you came up with. Over multiple turns, iterate with the model on its outputs until the final code is in a “production-ready” state
+- Your follow up turns should not increase the scope of the task
+- Think of your follow up turns as code review - you should be pointing out to the model the same kinds of issues you would point out if you were reviewing a peer’s code. With an emphasis on comments and follow ups that result in more production ready code (as defined below)
+
+**Definition of production ready**
+
+- The question that should always be in your mind when determining if the model’s output is “production-ready” is: “If the model was my co-worker and presented me with this code in a PR, would I happily approve the PR?” Until the answer to that question is yes, you should continue to iterate on the code
+- Production ready code should:
+  - Implement the feature requested thoroughly and completely
+  - Consider legitimate edge cases and handle them
+  - Consider security implications and handle security holes in its implementation where appropriate given the task being completed
+  - Should not contain comments that add no value, are just the model’s chain of thought, explain what the model just did (e.g. “# removed code because it’s no longer used”), or explain exactly what the code does (instead of the why), or explain obvious things
+  - Should match the style of the existing code (which is why it’s extremely important for you to familiarize yourself with the codebase)
+  - Should be well factored, using reasonable abstractions that match the style of the codebase (e.g. don’t use classes in a purely function codebase, or vice versa)
+  - Should write comprehensive tests in the style of the codebase if the codebase has tests or the task is to add tests to a codebase with no tests
+
+**Reviewing model outputs**
+- Ensure the model is following software engineering best practices. Writing appropriate documentation in the appropriate places, committing regularly with meaningful commit messages, reviewing its own work, etc. Any time you see the model not following these practices, you should prompt it to do so
+- Ensure the model’s output is production-ready. If it’s not, prompt it to make changes, similar to how you might leave comments on a PR. Nothing is too small to comment on. If you think a comment is unnecessary, ask the model to remove it or reword it. If you think the model’s implementation does not have the correct architecture, tell it so. If you think it missed an edge case, let it know
+- Ensure the model works with you to clarify requirements, edge cases, task scope, and expectations
+
+**Definition of done**
+- An interaction is done when, to the best of your abilities, you’ve determined that the model has completed the task in a production-ready way
+
+**Submitting a task**
+- Submit analysis and feedback for both model responses. For each turn, you must provide detailed analysis and feedback across six required fields. This feedback is critical for understanding model behavior and guiding improvements.
+  - Ideal Response Description: 
+    - Describe what an ideal response would look like for this specific turn. Be concrete and specific:
+      - What actions should the model have taken?
+      - What code changes would be optimal?
+      - What clarifying questions (if any) should the model have asked?
+      - What software engineering practices should have been demonstrated?
+    - This serves as the "gold standard" against which both model responses are compared.
+  - Model A Response Summary
+    - Provide a balanced summary of Model A's response, covering:
+      - What it did: Describe the actions taken, code written, and approach used
+      - Strengths: What did Model A do well? (e.g., correct logic, good abstractions, appropriate error handling)
+      - Weaknesses: Where did Model A fall short? (e.g., missed edge cases, poor naming, unnecessary comments)
+  - Model A Response Feedback
+    - Provide actionable, specific feedback on Model A's response:
+      - How could the code be improved?
+      - What specific issues need addressing before this would be production-ready?
+      - Point to concrete examples in the output (e.g., "The processData function lacks input validation for null values")
+    - Note any hallucinations, incorrect assumptions, or deviations from best practices
+  - Model B Response Summary
+  - Model B Response Feedback
+  - Overall Preference Justification
+    - Explain precisely why you preferred the model you selected for the overall preference:
+      - Which differences between the responses were most significant in your decision?
+      - How did each model compare against the ideal response you described?
+    - If your overall preference differs from preferences on individual axes, explain why the deciding factors outweighed the others
+- Submit preference labeling:
+  - You’ll notice when you choose a preferred output, there are multiple “axes” on which you can submit a preference. These are:
+    - Logic and correctness
+    - Naming and clarity
+    - Organization and modularity
+    - Interface design
+    - Error handling
+    - Comments and documentation
+    - Review/production readiness
+  - Descriptions of each axis are in the “info” bubble next to the axis name in the interface. Please familiarize yourself with these descriptions
+  - You should submit a preference along each of these axes in addition to your overall preference, **only when that axes applies to that specific turn of the conversation**. For example, if the model writes a new function in a turn, you should submit a preference for all of the above axes. However, if the only action the model performs during the turn is committing some code it wrote in the previous turn, you should submit a preference for the “Review/production readiness” axis and submit choose N/A for the other axes, as they do not apply to that turn
+  - Your preference for a specific axis does not need to line up with your overall preference. For example, response A might have written code with better error handling and comments, but response B was better overall. In that case, you can prefer response A for those two axes, but still select response B as the overall preference
+- In addition to submitting the task, in the deliverable excel sheet, add a row with:
+  - The conversation uuid
+  - The task you requested the model to complete
