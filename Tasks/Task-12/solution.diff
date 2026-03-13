@@ -1,8 +1,284 @@
+diff --git a/src/incident_detection.py b/src/incident_detection.py
+new file mode 100644
+index 0000000..4202e61
+--- /dev/null
++++ b/src/incident_detection.py
+@@ -0,0 +1,260 @@
++"""
++Incident Detection Module
++
++Analyzes race telemetry to detect and classify significant race events:
++- Overtakes (position changes between drivers)
++- Near-misses (drivers close together at high speed)
++- Collisions (sudden distance reduction)
++- Pit stops
++- DRS usage patterns
++"""
++
++from dataclasses import dataclass
++from typing import List, Tuple
++import numpy as np
++import pandas as pd
++
++
++@dataclass
++class Incident:
++    """Represents a single race incident"""
++    frame_number: int
++    time_seconds: float
++    lap_number: int
++    incident_type: str  # 'overtake', 'near_miss', 'collision', 'pit_stop'
++    primary_driver: str
++    secondary_driver: str = None
++    description: str = ""
++    severity: int = 1  # 1-5 scale
++    
++    def __str__(self):
++        if self.secondary_driver:
++            return f"[Lap {int(self.lap_number)}] {self.incident_type.title()}: {self.primary_driver} vs {self.secondary_driver} - {self.description}"
++        else:
++            return f"[Lap {int(self.lap_number)}] {self.incident_type.title()}: {self.primary_driver} - {self.description}"
++
++
++class IncidentDetector:
++    """Detects and classifies race incidents from telemetry data"""
++    
++    def __init__(self, frames: List[dict], drivers: pd.DataFrame, track_length: float = 5000):
++        """
++        Initialize incident detector
++        
++        Args:
++            frames: List of frame dictionaries from race telemetry
++            drivers: DataFrame of driver information
++            track_length: Approximate track length in meters
++        """
++        self.frames = frames
++        self.drivers = drivers
++        self.track_length = track_length
++        self.incidents = []
++        self._driver_positions_history = {}  # Track position changes over time
++        
++    def detect_all_incidents(self) -> List[Incident]:
++        """Run all incident detection methods and return sorted incidents"""
++        self.incidents = []
++        
++        self._detect_overtakes()
++        self._detect_near_misses()
++        self._detect_pit_stops()
++        
++        # Sort by frame number
++        self.incidents.sort(key=lambda x: x.frame_number)
++        return self.incidents
++    
++    def _detect_overtakes(self):
++        """Detect position changes (overtakes and being overtaken)"""
++        if not self.frames or len(self.frames) < 2:
++            return
++        
++        # Build position history
++        position_history = {}  # frame_idx -> {driver_code: position}
++        
++        for frame_idx, frame in enumerate(self.frames):
++            if 'driver_positions' not in frame:
++                continue
++            
++            positions = {}
++            # Build list of (driver_code, progress_score) for ranking
++            driver_progress_list = []
++            for driver_code, (x, y, lap, gap) in frame['driver_positions'].items():
++                # Calculate progress metric: lap * 1000 + (1 - normalized_gap) gives priority to lap count
++                progress_score = lap * 1000.0 + (1.0 - min(gap, 1.0))
++                driver_progress_list.append((driver_code, progress_score))
++            
++            # Sort by progress score (descending) and assign integer positions
++            driver_progress_list.sort(key=lambda item: item[1], reverse=True)
++            for position, (driver_code, _) in enumerate(driver_progress_list, start=1):
++                positions[driver_code] = position
++            
++            position_history[frame_idx] = positions
++        
++        # Detect position changes
++        frame_indices = sorted(position_history.keys())
++        check_interval = max(1, len(frame_indices) // 100)  # Sample roughly 100 checks across the entire sequence
++        
++        for i in range(check_interval, len(frame_indices), check_interval):
++            prev_frame_idx = frame_indices[i - check_interval]
++            curr_frame_idx = frame_indices[i]
++            
++            prev_positions = position_history.get(prev_frame_idx, {})
++            curr_positions = position_history.get(curr_frame_idx, {})
++            
++            # Find drivers in both frames
++            common_drivers = set(prev_positions.keys()) & set(curr_positions.keys())
++            
++            # Build position rankings
++            prev_ranking = sorted(common_drivers, 
++                                 key=lambda d: prev_positions[d], 
++                                 reverse=True)
++            curr_ranking = sorted(common_drivers, 
++                                 key=lambda d: curr_positions[d], 
++                                 reverse=True)
++            
++            # Find position changes
++            for driver in common_drivers:
++                prev_pos = prev_ranking.index(driver) if driver in prev_ranking else -1
++                curr_pos = curr_ranking.index(driver) if driver in curr_ranking else -1
++                
++                if prev_pos >= 0 and curr_pos >= 0 and prev_pos > curr_pos:
++                    # Driver moved up in position
++                    frame = self.frames[curr_frame_idx]
++                    driver_positions = frame.get('driver_positions', {})
++                    
++                    if driver in driver_positions:
++                        _, _, lap, _ = driver_positions[driver]
++                        
++                        # Find who was overtaken: identify drivers whose position worsened
++                        overtaken = None
++                        for other_driver in common_drivers:
++                            other_prev_pos = prev_ranking.index(other_driver) if other_driver in prev_ranking else -1
++                            other_curr_pos = curr_ranking.index(other_driver) if other_driver in curr_ranking else -1
++                            # Driver's position worsened if their rank decreased (lower index = worse in worst-first ranking)
++                            if other_prev_pos >= 0 and other_curr_pos >= 0 and other_curr_pos < other_prev_pos:
++                                # Check if this worsening is due to our driver passing
++                                # Our driver passed if other was ahead (higher index) and now is not (lower or equal index)
++                                if other_prev_pos > prev_pos and other_curr_pos <= curr_pos:
++                                    overtaken = other_driver
++                                    break
++                        
++                        # Only record if we found who was overtaken (actual overtake)
++                        if overtaken and overtaken in driver_positions:
++                            incident = Incident(
++                                frame_number=frame.get('frame_number', curr_frame_idx),
++                                time_seconds=frame.get('time_seconds', 0),
++                                lap_number=lap,
++                                incident_type='overtake',
++                                primary_driver=driver,
++                                secondary_driver=overtaken,
++                                description=f"Position gain on track",
++                                severity=3
++                            )
++                            self.incidents.append(incident)
++    
++    def _detect_near_misses(self):
++        """Detect drivers in close proximity at high speed"""
++        if not self.frames:
++            return
++        
++        for frame_idx, frame in enumerate(self.frames):
++            driver_positions = frame.get('driver_positions', {})
++            
++            if len(driver_positions) < 2:
++                continue
++            
++            # Get all driver positions as list
++            drivers_list = list(driver_positions.items())
++            
++            # Check all pairs
++            for i in range(len(drivers_list)):
++                for j in range(i + 1, len(drivers_list)):
++                    driver1, (x1, y1, lap1, gap1) = drivers_list[i]
++                    driver2, (x2, y2, lap2, gap2) = drivers_list[j]
++                    
++                    # Skip if on different laps
++                    if abs(lap1 - lap2) > 0.5:
++                        continue
++                    
++                    # Calculate distance between drivers
++                    distance = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
++                    
++                    # Near miss threshold (200 meters)
++                    if distance < 200 and distance > 0:
++                        speed1 = frame.get('driver_speeds', {}).get(driver1, 0)
++                        speed2 = frame.get('driver_speeds', {}).get(driver2, 0)
++                        
++                        # Only flag if both at decent speed (not in pits)
++                        if speed1 > 50 and speed2 > 50:
++                            incident = Incident(
++                                frame_number=frame.get('frame_number', frame_idx),
++                                time_seconds=frame.get('time_seconds', 0),
++                                lap_number=lap1,
++                                incident_type='near_miss',
++                                primary_driver=driver1,
++                                secondary_driver=driver2,
++                                description=f"Close proximity (~{int(distance)}m)",
++                                severity=2
++                            )
++                            # Only add if we haven't already recorded this incident
++                            if not self._incident_exists(incident):
++                                self.incidents.append(incident)
++    
++    def _detect_pit_stops(self):
++        """Detect pit stop events"""
++        if not self.frames or len(self.frames) < 10:
++            return
++        
++        # Track speed drops to identify pit stops
++        window_size = 10
++        
++        for frame_idx in range(window_size, len(self.frames)):
++            frame = self.frames[frame_idx]
++            driver_speeds = frame.get('driver_speeds', {})
++            
++            for driver, speed in driver_speeds.items():
++                # Check if speed drops significantly
++                prev_speeds = []
++                for i in range(1, window_size + 1):
++                    prev_frame = self.frames[frame_idx - i]
++                    prev_speeds.append(prev_frame.get('driver_speeds', {}).get(driver, speed))
++                
++                avg_prev_speed = np.mean(prev_speeds) if prev_speeds else speed
++                
++                # Significant speed drop = pit stop
++                if avg_prev_speed > 100 and speed < 40 and avg_prev_speed - speed > 50:
++                    driver_positions = frame.get('driver_positions', {})
++                    if driver in driver_positions:
++                        _, _, lap, _ = driver_positions[driver]
++                        
++                        incident = Incident(
++                            frame_number=frame.get('frame_number', frame_idx),
++                            time_seconds=frame.get('time_seconds', 0),
++                            lap_number=lap,
++                            incident_type='pit_stop',
++                            primary_driver=driver,
++                            description="Pit stop",
++                            severity=1
++                        )
++                        if not self._incident_exists(incident):
++                            self.incidents.append(incident)
++    
++    def _incident_exists(self, incident: Incident, time_tolerance: float = 5.0) -> bool:
++        """Check if similar incident already exists"""
++        for existing in self.incidents:
++            if (existing.incident_type == incident.incident_type and
++                existing.primary_driver == incident.primary_driver and
++                existing.secondary_driver == incident.secondary_driver and
++                abs(existing.time_seconds - incident.time_seconds) < time_tolerance):
++                return True
++        return False
++    
++    def get_incidents_for_driver(self, driver_code: str) -> List[Incident]:
++        """Get all incidents involving a specific driver"""
++        return [i for i in self.incidents 
++                if i.primary_driver == driver_code or i.secondary_driver == driver_code]
++    
++    def get_incidents_by_type(self, incident_type: str) -> List[Incident]:
++        """Get all incidents of a specific type"""
++        return [i for i in self.incidents if i.incident_type == incident_type]
+\ No newline at end of file
 diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
-index f44af73..ea190d9 100644
+index 1e2a1a6..ea190d9 100644
 --- a/src/interfaces/race_replay.py
 +++ b/src/interfaces/race_replay.py
-@@ -10,23 +10,26 @@ from src.ui_components import (
+@@ -1,44 +1,63 @@
+ import os
+ import arcade
+ import numpy as np
++from scipy.spatial import cKDTree
+ from src.f1_data import FPS
+ from src.ui_components import (
+     LeaderboardComponent, 
+     WeatherComponent, 
+     LegendComponent, 
      DriverInfoComponent, 
      RaceProgressBarComponent,
      RaceControlsComponent,
@@ -15,10 +291,10 @@ index f44af73..ea190d9 100644
  from src.tyre_degradation_integration import TyreDegradationIntegrator
 +from src.incident_detection import IncidentDetector
 +from src.ui_components_incidents import IncidentsPanelComponent
- from src.services.stream import TelemetryStreamServer
- 
- 
++from src.services.stream import TelemetryStreamServer
 +
+ 
+ 
  SCREEN_WIDTH = 1280
  SCREEN_HEIGHT = 720
  SCREEN_TITLE = "F1 Race Replay"
@@ -28,8 +304,37 @@ index f44af73..ea190d9 100644
      def __init__(self, frames, track_statuses, example_lap, drivers, title,
                   playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
                   left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
-                  session_info=None, session=None, enable_telemetry=False):
-@@ -125,20 +128,24 @@ class F1RaceReplayWindow(arcade.Window):
+-                 session_info=None, session=None):
++                 session_info=None, session=None, enable_telemetry=False):
+         # Set resizable to True so the user can adjust mid-sim
+         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
+         self.maximize()
+ 
++        self.telemetry_stream = None
++        if enable_telemetry:
++            try:
++                self.telemetry_stream = TelemetryStreamServer()
++                self.telemetry_stream.start()
++                print("Telemetry stream server started on localhost:9999")
++            except OSError as e:
++                print(f"Failed to start telemetry server: {e}")
++                print("Continuing without telemetry streaming...")
++                self.telemetry_stream = None
++            except Exception as e:
++                print(f"Error starting telemetry server: {e}")
++                self.telemetry_stream = None
++
+         self.frames = frames
+         self.track_statuses = track_statuses
+         self.n_frames = len(frames)
+         self.drivers = list(drivers)
+         self.playback_speed = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.index(playback_speed)] if playback_speed in PLAYBACK_SPEEDS else 1.0
+         self.driver_colors = driver_colors or {}
+         self.frame_index = 0.0  # use float for fractional-frame accumulation
+         self.paused = False
+         self.total_laps = total_laps
+         self.has_weather = any("weather" in frame for frame in frames) if frames else False
+@@ -109,20 +128,24 @@ class F1RaceReplayWindow(arcade.Window):
              self.session_info_comp.set_info(
                  event_name=session_info.get('event_name', ''),
                  circuit_name=session_info.get('circuit_name', ''),
@@ -54,17 +359,97 @@ index f44af73..ea190d9 100644
              total_frames=len(frames),
              total_laps=total_laps or 0,
              events=race_events
-@@ -264,20 +271,33 @@ class F1RaceReplayWindow(arcade.Window):
-             "is_paused": self.paused,
-             "total_frames": self.n_frames,
-             "session_data": {
-                 "time": time_str,
-                 "lap": leader_lap,
-                 "leader": leader_code,
-                 "total_laps": self.total_laps
-             }
-         })
+@@ -142,20 +165,23 @@ class F1RaceReplayWindow(arcade.Window):
+         self._ref_ys = np.array([p[1] for p in ref_points])
  
+         # Calculate normals for the reference line
+         dx = np.gradient(self._ref_xs)
+         dy = np.gradient(self._ref_ys)
+         norm = np.sqrt(dx**2 + dy**2)
+         norm[norm == 0] = 1.0
+         self._ref_nx = -dy / norm
+         self._ref_ny = dx / norm
+ 
++        # Build KD-Tree for fast closest-point lookup
++        self.track_tree = cKDTree(np.column_stack((self._ref_xs, self._ref_ys)))
++
+         # Determine track winding using the shoelace formula to ensure normals point outwards.
+         # A positive area indicates counter-clockwise winding (normals point Left=Inside, so we flip).
+         # A negative area indicates clockwise winding (normals point Left=Outside, so we keep).
+         signed_area = np.sum(self._ref_xs[:-1] * self._ref_ys[1:] - self._ref_xs[1:] * self._ref_ys[:-1])
+         signed_area += (self._ref_xs[-1] * self._ref_ys[0] - self._ref_xs[0] * self._ref_ys[-1])
+         if signed_area > 0:
+             self._ref_nx = -self._ref_nx
+             self._ref_ny = -self._ref_ny
+ 
+         # cumulative distances along the reference polyline (metres)
+@@ -189,40 +215,107 @@ class F1RaceReplayWindow(arcade.Window):
+         self.status_text = arcade.Text("", 20, self.height - 120, arcade.color.WHITE, 24, bold=True, anchor_y="top")
+ 
+         # Trigger initial scaling calculation
+         self.update_scaling(self.width, self.height)
+ 
+         # Selection & hit-testing state for leaderboard
+         self.selected_driver = None
+         self.leaderboard_rects = []  # list of tuples: (code, left, bottom, right, top)
+         # store previous leaderboard order for up/down arrows
+         self.last_leaderboard_order = None
++        
++        # Broadcast initial telemetry state
++        self._broadcast_telemetry_state()
++
++    def _broadcast_telemetry_state(self):
++        """Broadcast current telemetry state to connected clients."""
++        if not hasattr(self, 'telemetry_stream') or not self.telemetry_stream:
++            return
++            
++        current_frame = self.frames[min(int(self.frame_index), len(self.frames) - 1)] if self.frames else None
++        
++        # Get current track status
++        current_track_status = "GREEN"
++        if current_frame:
++            current_time = current_frame["t"]
++            for status in self.track_statuses:
++                if (current_time >= status["start_time"] and 
++                    (status["end_time"] is None or current_time <= status["end_time"])):
++                    current_track_status = status["status"]
++                    
++        # Calculate leader info
++        leader_code = ""
++        leader_lap = 1
++        if current_frame and "drivers" in current_frame:
++            driver_progress = {}
++            for code, pos in current_frame["drivers"].items():
++                x, y = pos["x"], pos["y"]
++                progress_m = self._project_to_reference(x, y)
++                driver_progress[code] = progress_m
++                
++            if driver_progress:
++                leader_code = max(driver_progress.keys(), key=lambda k: driver_progress[k])
++                leader_lap = current_frame["drivers"].get(leader_code, {}).get("lap", 1)
++        
++        # Format time
++        t = current_frame["t"] if current_frame else 0
++        hours = int(t // 3600)
++        minutes = int((t % 3600) // 60)
++        seconds = int(t % 60)
++        time_str = f"{hours:02}:{minutes:02}:{seconds:02}"
++        
++        self.telemetry_stream.broadcast({
++            "frame_index": int(self.frame_index),
++            "frame": current_frame,
++            "track_status": current_track_status,
++            "playback_speed": self.playback_speed,
++            "is_paused": self.paused,
++            "total_frames": self.n_frames,
++            "session_data": {
++                "time": time_str,
++                "lap": leader_lap,
++                "leader": leader_code,
++                "total_laps": self.total_laps
++            }
++        })
++
 +    def _initialize_incidents(self):
 +        """Initialize incident detection from telemetry data"""
 +        try:
@@ -77,7 +462,7 @@ index f44af73..ea190d9 100644
 +            print(f"✗ Incident detection failed: {e}")
 +            # Ensure panel is initialized with safe default even on failure
 +            self.incidents_panel_comp.set_incidents([])
-+
+ 
      def _interpolate_points(self, xs, ys, interp_points=2000):
          t_old = np.linspace(0, 1, len(xs))
          t_new = np.linspace(0, 1, interp_points)
@@ -88,7 +473,30 @@ index f44af73..ea190d9 100644
      def _project_to_reference(self, x, y):
          if self._ref_total_length == 0.0:
              return 0.0
-@@ -363,21 +383,21 @@ class F1RaceReplayWindow(arcade.Window):
+ 
+-        # Vectorized nearest-point to dense polyline points (sufficient for our purposes)
+-        dx = self._ref_xs - x
+-        dy = self._ref_ys - y
+-        d2 = dx * dx + dy * dy
+-        idx = int(np.argmin(d2))
++        # Vectorized nearest-point lookup using KD-Tree (O(log N))
++        _, idx = self.track_tree.query([x, y])
++        idx = int(idx)
+ 
+         # For a slightly better estimate, optionally project onto the adjacent segment
+         if idx < len(self._ref_xs) - 1:
++
+             x1, y1 = self._ref_xs[idx], self._ref_ys[idx]
+             x2, y2 = self._ref_xs[idx+1], self._ref_ys[idx+1]
+             vx, vy = x2 - x1, y2 - y1
+             seg_len2 = vx*vx + vy*vy
+             if seg_len2 > 0:
+                 t = ((x - x1) * vx + (y - y1) * vy) / seg_len2
+                 t_clamped = max(0.0, min(1.0, t))
+                 proj_x = x1 + t_clamped * vx
+                 proj_y = y1 + t_clamped * vy
+                 # distance along segment from x1,y1
+@@ -290,21 +383,21 @@ class F1RaceReplayWindow(arcade.Window):
          # Update the polyline screen coordinates based on new scale
          self.screen_inner_points = [self.world_to_screen(x, y) for x, y in self.world_inner_points]
          self.screen_outer_points = [self.world_to_screen(x, y) for x, y in self.world_outer_points]
@@ -111,7 +519,39 @@ index f44af73..ea190d9 100644
          self.status_text.x = 20
          self.status_text.y = self.height - 120
  
-@@ -604,20 +624,23 @@ class F1RaceReplayWindow(arcade.Window):
+@@ -409,27 +502,27 @@ class F1RaceReplayWindow(arcade.Window):
+         if not selected_drivers and getattr(self, "selected_driver", None):
+             selected_drivers = [self.selected_driver]
+ 
+         for i, (code, pos) in enumerate(frame["drivers"].items()):
+             sx, sy = self.world_to_screen(pos["x"], pos["y"])
+             color = self.driver_colors.get(code, arcade.color.WHITE)
+             
+             is_selected = code in selected_drivers
+             
+             if self.show_driver_labels or is_selected:
+-                # Find closest point index on reference track
+-                r_dx = self._ref_xs - pos["x"]
+-                r_dy = self._ref_ys - pos["y"]
+-                idx = int(np.argmin(r_dx*r_dx + r_dy*r_dy))
++                # Find closest point index on reference track (Optimized KD-Tree)
++                _, idx = self.track_tree.query([pos["x"], pos["y"]])
++                idx = int(idx)
+                 
+                 # Get normal vector in world space
+                 nx = self._ref_nx[idx]
++
+                 ny = self._ref_ny[idx]
+                 
+                 # Rotate normal to screen space
+                 if self._rot_rad:
+                     snx = nx * self._cos_rot - ny * self._sin_rot
+                     sny = nx * self._sin_rot + ny * self._cos_rot
+                 else:
+                     snx, sny = nx, ny
+                 
+                 offset_dist = 45 if i % 2 == 0 else 75
+@@ -531,20 +624,23 @@ class F1RaceReplayWindow(arcade.Window):
          self.leaderboard_comp.draw(self)
          # expose rects for existing hit test compatibility if needed
          self.leaderboard_rects = self.leaderboard_comp.rects
@@ -135,7 +575,87 @@ index f44af73..ea190d9 100644
          self.session_info_comp.draw(self)
  
          # Draw Controls popup box
-@@ -718,20 +741,38 @@ class F1RaceReplayWindow(arcade.Window):
+@@ -564,68 +660,79 @@ class F1RaceReplayWindow(arcade.Window):
+             self.frame_index = min(self.n_frames - 1, self.frame_index + delta_time * FPS * seek_speed)
+             self.race_controls_comp.flash_button('forward')
+ 
+         if self.paused:
+             return
+ 
+         self.frame_index += delta_time * FPS * self.playback_speed
+         
+         if self.frame_index >= self.n_frames:
+             self.frame_index = float(self.n_frames - 1)
++            
++        # Broadcast telemetry state during playback
++        self._broadcast_telemetry_state()
+ 
+     def on_key_press(self, symbol: int, modifiers: int):
+         # Allow ESC to close window at any time
+         if symbol == arcade.key.ESCAPE:
+             arcade.close_window()
+             return
+         if symbol == arcade.key.SPACE:
+             self.paused = not self.paused
++            self._broadcast_telemetry_state()
+             self.race_controls_comp.flash_button('play_pause')
+         elif symbol == arcade.key.RIGHT:
+             self.was_paused_before_hold = self.paused
+             self.is_forwarding = True
+             self.paused = True
+         elif symbol == arcade.key.LEFT:
+             self.was_paused_before_hold = self.paused
+             self.is_rewinding = True
+             self.paused = True
+         elif symbol == arcade.key.UP:
+             if self.playback_speed < PLAYBACK_SPEEDS[-1]:
+                 # Increase to next higher speed
+                 for spd in PLAYBACK_SPEEDS:
+                     if spd > self.playback_speed:
+                         self.playback_speed = spd
++                        self._broadcast_telemetry_state()
+                         break
+             self.race_controls_comp.flash_button('speed_increase')
+         elif symbol == arcade.key.DOWN:
+             if self.playback_speed > PLAYBACK_SPEEDS[0]:
+                 # Decrease to next lower speed
+                 for spd in reversed(PLAYBACK_SPEEDS):
+                     if spd < self.playback_speed:
+                         self.playback_speed = spd
++                        self._broadcast_telemetry_state()
+                         break
+             self.race_controls_comp.flash_button('speed_decrease')
+         elif symbol == arcade.key.KEY_1:
+             self.playback_speed = 0.5
++            self._broadcast_telemetry_state()
+             self.race_controls_comp.flash_button('speed_decrease')
+         elif symbol == arcade.key.KEY_2:
+             self.playback_speed = 1.0
++            self._broadcast_telemetry_state()
+             self.race_controls_comp.flash_button('speed_decrease')
+         elif symbol == arcade.key.KEY_3:
+             self.playback_speed = 2.0
++            self._broadcast_telemetry_state()
+             self.race_controls_comp.flash_button('speed_increase')
+         elif symbol == arcade.key.KEY_4:
+             self.playback_speed = 4.0
++            self._broadcast_telemetry_state()
+             self.race_controls_comp.flash_button('speed_increase')
+         elif symbol == arcade.key.R:
+             self.frame_index = 0.0
+             self.playback_speed = 1.0
++            self._broadcast_telemetry_state()
+             # Clear degradation cache on restart
+             if self.degradation_integrator:
+                 self.degradation_integrator.clear_cache()
+             self.race_controls_comp.flash_button('rewind')
+         elif symbol == arcade.key.D:
+             self.toggle_drs_zones = not self.toggle_drs_zones
+         elif symbol == arcade.key.L:
+             self.show_driver_labels = not self.show_driver_labels
+         elif symbol == arcade.key.H:
+             # Toggle Controls popup with 'H' key — show anchored to bottom-left with 20px margin
+@@ -634,20 +741,38 @@ class F1RaceReplayWindow(arcade.Window):
              left_pos = float(margin_x)
              top_pos = float(margin_y + self.controls_popup_comp.height)
              if self.controls_popup_comp.visible:
@@ -174,3 +694,510 @@ index f44af73..ea190d9 100644
              self.paused = self.was_paused_before_hold
  
      def on_mouse_release(self, x: float, y: float, button: int, modifiers: int):
+@@ -667,11 +792,18 @@ class F1RaceReplayWindow(arcade.Window):
+         if self.leaderboard_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.legend_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         # default: clear selection if clicked elsewhere
+         self.selected_driver = None
+         
+     def on_mouse_motion(self, x: float, y: float, dx: float, dy: float):
+         """Handle mouse motion for hover effects on progress bar and controls."""
+         self.progress_bar_comp.on_mouse_motion(self, x, y, dx, dy)
+-        self.race_controls_comp.on_mouse_motion(self, x, y, dx, dy)
+\ No newline at end of file
++        self.race_controls_comp.on_mouse_motion(self, x, y, dx, dy)
++        
++    def close(self):
++        """Clean up resources when window closes."""
++        if hasattr(self, 'telemetry_stream') and self.telemetry_stream:
++            print("Stopping telemetry stream server...")
++            self.telemetry_stream.stop()
++        super().close()
+\ No newline at end of file
+diff --git a/src/ui_components_incidents.py b/src/ui_components_incidents.py
+new file mode 100644
+index 0000000..b136065
+--- /dev/null
++++ b/src/ui_components_incidents.py
+@@ -0,0 +1,209 @@
++"""
++Incidents Panel UI Component
++
++Displays a list of detected race incidents (overtakes, near misses, pit stops)
++with the ability to jump to incidents via keyboard navigation.
++"""
++
++import arcade
++from typing import List, Optional
++from src.incident_detection import Incident
++
++
++class IncidentsPanelComponent:
++    """UI component for displaying and navigating race incidents"""
++    
++    def __init__(self, left: float = 20, top: float = 600, width: float = 310, visible: bool = True):
++        """
++        Initialize incidents panel
++        
++        Args:
++            left: Left edge x-coordinate
++            top: Top edge y-coordinate  
++            width: Panel width
++            visible: Whether panel is initially visible
++        """
++        self.left = left
++        self.top = top
++        self.width = width
++        self.visible = visible
++        
++        self.incidents: List[Incident] = []
++        self.filtered_incidents: List[Incident] = []
++        self.selected_incident_idx = -1
++        self.scroll_offset = 0  # Track which incident is at top of visible list
++        self.filter_type = None  # None = all, 'overtake', 'near_miss', 'pit_stop'
++        
++        # Visual params
++        self.font_size = 11
++        self.header_height = 30
++        self.item_height = 22
++        self.panel_height = 180
++        self.bg_color = (30, 30, 30, 200)
++        self.border_color = arcade.color.ORANGE
++        self.text_color = arcade.color.WHITE
++        self.selected_color = arcade.color.ORANGE
++        self.accent_colors = {
++            'overtake': arcade.color.YELLOW,
++            'near_miss': arcade.color.ORANGE,
++            'pit_stop': arcade.color.LIGHT_BLUE,
++        }
++        
++    def set_incidents(self, incidents: List[Incident]):
++        """Update the incidents list"""
++        self.incidents = incidents
++        self.filter_incidents()
++        self.selected_incident_idx = -1
++        self.scroll_offset = 0  # Reset scroll when incidents change
++        
++    def filter_incidents(self):
++        """Apply current filter to incidents"""
++        if self.filter_type is None:
++            self.filtered_incidents = self.incidents
++        else:
++            self.filtered_incidents = [i for i in self.incidents if i.incident_type == self.filter_type]
++    
++    def toggle_filter(self):
++        """Cycle through incident type filters"""
++        filters = [None, 'overtake', 'near_miss', 'pit_stop']
++        current_idx = filters.index(self.filter_type) if self.filter_type in filters else 0
++        self.filter_type = filters[(current_idx + 1) % len(filters)]
++        self.filter_incidents()
++        self.selected_incident_idx = min(self.selected_incident_idx, len(self.filtered_incidents) - 1)
++        self.scroll_offset = 0  # Reset scroll when filter changes
++        
++    def select_next_incident(self) -> Optional[int]:
++        """Select next incident, return frame number or None"""
++        if not self.filtered_incidents:
++            return None
++        self.selected_incident_idx = min(self.selected_incident_idx + 1, len(self.filtered_incidents) - 1)
++        self._update_scroll_offset()
++        return self.filtered_incidents[self.selected_incident_idx].frame_number
++    
++    def select_prev_incident(self) -> Optional[int]:
++        """Select previous incident, return frame number or None"""
++        if not self.filtered_incidents:
++            return None
++        self.selected_incident_idx = max(self.selected_incident_idx - 1, 0)
++        self._update_scroll_offset()
++        return self.filtered_incidents[self.selected_incident_idx].frame_number
++    
++    def _update_scroll_offset(self):
++        """Update scroll offset to keep selected incident visible"""
++        max_visible = (self.panel_height - self.header_height) // self.item_height
++        # If selected is before visible window, scroll to show it at top
++        if self.selected_incident_idx < self.scroll_offset:
++            self.scroll_offset = self.selected_incident_idx
++        # If selected is after visible window, scroll to show it at bottom
++        elif self.selected_incident_idx >= self.scroll_offset + max_visible:
++            self.scroll_offset = self.selected_incident_idx - max_visible + 1
++        # Clamp scroll offset to valid range
++        self.scroll_offset = max(0, min(self.scroll_offset, max(0, len(self.filtered_incidents) - max_visible)))
++    
++    def get_selected_incident(self) -> Optional[Incident]:
++        """Get currently selected incident"""
++        if 0 <= self.selected_incident_idx < len(self.filtered_incidents):
++            return self.filtered_incidents[self.selected_incident_idx]
++        return None
++    
++    def toggle_visibility(self):
++        """Toggle panel visibility"""
++        self.visible = not self.visible
++    
++    def on_resize(self, window):
++        """Handle window resize - no-op but required for consistency with other components"""
++        pass
++    
++    def draw(self, viewport_width: float, viewport_height: float):
++        """Draw the incidents panel"""
++        if not self.visible:
++            return
++        
++        # Draw semi-transparent background
++        arcade.draw_rectangle_filled(
++            self.left + self.width // 2,
++            self.top - self.panel_height // 2,
++            self.width,
++            self.panel_height,
++            self.bg_color
++        )
++        
++        # Draw border
++        arcade.draw_rectangle_outline(
++            self.left + self.width // 2,
++            self.top - self.panel_height // 2,
++            self.width,
++            self.panel_height,
++            self.border_color,
++            border_width=2
++        )
++        
++        # Draw header
++        header_text = f"Incidents ({len(self.filtered_incidents)})"
++        filter_label = f" [{self.filter_type.upper()}]" if self.filter_type else ""
++        arcade.draw_text(
++            header_text + filter_label,
++            self.left + 8,
++            self.top - 8,
++            self.text_color,
++            font_size=self.font_size + 1,
++            bold=True
++        )
++        
++        # Draw incidents list
++        start_y = self.top - self.header_height - 5
++        max_visible = (self.panel_height - self.header_height) // self.item_height
++        
++        # Clamp scroll offset to valid range
++        self.scroll_offset = max(0, min(self.scroll_offset, max(0, len(self.filtered_incidents) - max_visible)))
++        
++        for list_idx, incident in enumerate(self.filtered_incidents[self.scroll_offset:self.scroll_offset + max_visible]):
++            y = start_y - (list_idx * self.item_height)
++            # Check if this item is selected (compare absolute index)
++            absolute_idx = self.scroll_offset + list_idx
++            is_selected = (absolute_idx == self.selected_incident_idx)
++            
++            # Highlight selected incident
++            if is_selected:
++                arcade.draw_rectangle_filled(
++                    self.left + self.width // 2,
++                    y - self.item_height // 2,
++                    self.width - 4,
++                    self.item_height - 2,
++                    (50, 50, 50, 180)
++                )
++                arcade.draw_rectangle_outline(
++                    self.left + self.width // 2,
++                    y - self.item_height // 2,
++                    self.width - 4,
++                    self.item_height - 2,
++                    self.selected_color,
++                    border_width=1
++                )
++            
++            # Incident text with color coding
++            incident_type_color = self.accent_colors.get(incident.incident_type, self.text_color)
++            
++            text = f"L{int(incident.lap_number)} "
++            arcade.draw_text(
++                text,
++                self.left + 8,
++                y - 7,
++                self.text_color,
++                font_size=self.font_size
++            )
++            
++            # Type and drivers
++            detail = f"{incident.incident_type[:4].upper()}"
++            if incident.secondary_driver:
++                detail += f": {incident.primary_driver} vs {incident.secondary_driver}"
++            else:
++                detail += f": {incident.primary_driver}"
++            
++            arcade.draw_text(
++                detail,
++                self.left + 35,
++                y - 7,
++                incident_type_color,
++                font_size=self.font_size - 1
++            )
+\ No newline at end of file
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..8bdb25a
+--- /dev/null
++++ b/tests/__init__.py
+@@ -0,0 +1 @@
++# Test module for F1 Race Replay
+\ No newline at end of file
+diff --git a/tests/test_incidents.py b/tests/test_incidents.py
+new file mode 100644
+index 0000000..3211306
+--- /dev/null
++++ b/tests/test_incidents.py
+@@ -0,0 +1,254 @@
++"""
++Test suite for Race Incidents & Overtakes Tracker feature
++
++Run with: python -m pytest tests/test_incidents.py -v
++"""
++
++import pytest
++import numpy as np
++from src.incident_detection import Incident, IncidentDetector
++
++
++class TestIncident:
++    """Test Incident data class"""
++    
++    def test_incident_creation(self):
++        """Test basic incident object creation"""
++        incident = Incident(
++            frame_number=100,
++            time_seconds=50.5,
++            lap_number=5,
++            incident_type='overtake',
++            primary_driver='VER',
++            secondary_driver='LEC',
++            description='Position gain'
++        )
++        assert incident.frame_number == 100
++        assert incident.primary_driver == 'VER'
++        assert incident.secondary_driver == 'LEC'
++        assert 'VER' in str(incident)
++        assert 'LEC' in str(incident)
++    
++    def test_incident_without_secondary_driver(self):
++        """Test incident with only primary driver (e.g., pit stop)"""
++        incident = Incident(
++            frame_number=200,
++            time_seconds=100.0,
++            lap_number=10,
++            incident_type='pit_stop',
++            primary_driver='HAM',
++            description='Pit stop'
++        )
++        assert incident.secondary_driver is None
++        assert 'HAM' in str(incident)
++        assert 'pit_stop' in str(incident).lower()
++
++
++class TestIncidentDetector:
++    """Test IncidentDetector functionality"""
++    
++    def create_mock_frames(self, num_frames=50):
++        """Create mock frame data for testing"""
++        frames = []
++        drivers = ['VER', 'LEC', 'SAI', 'HAM']
++        
++        for frame_idx in range(num_frames):
++            driver_positions = {}
++            # Simulate VER and LEC getting closer (overtake setup)
++            if frame_idx < 20:
++                # LEC ahead
++                driver_positions['LEC'] = (100, 100, 5, 0.5)
++                driver_positions['VER'] = (95, 95, 5, 0.0)
++            else:
++                # VER gains position
++                driver_positions['VER'] = (105, 105, 5, 1.0)
++                driver_positions['LEC'] = (98, 98, 5, 0.5)
++            
++            driver_positions['SAI'] = (80, 80, 4, 0.0)
++            driver_positions['HAM'] = (70, 70, 4, 0.0)
++            
++            frame = {
++                'frame_number': frame_idx,
++                'time_seconds': float(frame_idx),
++                'drivers': {code: {'x': x, 'y': y, 'lap': lap, 'dist': gap} 
++                           for code, (x, y, lap, gap) in driver_positions.items()},
++                'driver_positions': driver_positions,
++                'driver_speeds': {code: 250.0 + np.sin(frame_idx / 10) * 50 for code in drivers}
++            }
++            frames.append(frame)
++        
++        return frames, drivers
++    
++    def test_detector_initialization(self):
++        """Test incident detector can be initialized"""
++        frames, drivers = self.create_mock_frames(20)
++        detector = IncidentDetector(frames, drivers)
++        assert detector.frames == frames
++        assert detector.incidents == []
++    
++    def test_detect_all_incidents(self):
++        """Test incident detection runs without error"""
++        frames, drivers = self.create_mock_frames(50)
++        detector = IncidentDetector(frames, drivers)
++        incidents = detector.detect_all_incidents()
++        
++        # Should return a list
++        assert isinstance(incidents, list)
++        # Should be sorted by frame number
++        if len(incidents) > 1:
++            for i in range(len(incidents) - 1):
++                assert incidents[i].frame_number <= incidents[i + 1].frame_number
++    
++    def test_get_incidents_for_driver(self):
++        """Test filtering incidents by driver"""
++        frames, drivers = self.create_mock_frames(50)
++        detector = IncidentDetector(frames, drivers)
++        detector.detect_all_incidents()
++        
++        # Get incidents for specific driver
++        ver_incidents = detector.get_incidents_for_driver('VER')
++        assert isinstance(ver_incidents, list)
++        
++        # All incidents should involve VER
++        for incident in ver_incidents:
++            assert incident.primary_driver == 'VER' or incident.secondary_driver == 'VER'
++    
++    def test_get_incidents_by_type(self):
++        """Test filtering incidents by type"""
++        frames, drivers = self.create_mock_frames(100)
++        detector = IncidentDetector(frames, drivers)
++        detector.detect_all_incidents()
++        
++        # Get incidents of specific type
++        overtakes = detector.get_incidents_by_type('overtake')
++        pit_stops = detector.get_incidents_by_type('pit_stop')
++        
++        assert isinstance(overtakes, list)
++        assert isinstance(pit_stops, list)
++        
++        # All filtered incidents should match type
++        for incident in overtakes:
++            assert incident.incident_type == 'overtake'
++        for incident in pit_stops:
++            assert incident.incident_type == 'pit_stop'
++    
++    def test_pit_stop_detection(self):
++        """Test pit stop detection from speed drop"""
++        frames = []
++        # Create frames with a sudden speed drop
++        for i in range(50):
++            frame = {
++                'frame_number': i,
++                'time_seconds': float(i),
++                'drivers': {'VER': {'x': 100 + i, 'y': 100, 'lap': 10, 'dist': 1000}},
++                'driver_positions': {'VER': (100 + i, 100, 10, 0.0)},
++                'driver_speeds': {'VER': 300.0 if i < 20 else max(0.0, 300.0 - (i - 20) * 15)}
++            }
++            frames.append(frame)
++        
++        detector = IncidentDetector(frames, ['VER'])
++        incidents = detector.detect_all_incidents()
++        
++        # Should detect pit stop from speed drop
++        pit_stops = [i for i in incidents if i.incident_type == 'pit_stop']
++        assert len(pit_stops) > 0
++    
++    def test_incident_deduplication(self):
++        """Test that duplicate incidents aren't recorded"""
++        frames, drivers = self.create_mock_frames(100)
++        detector = IncidentDetector(frames, drivers)
++        incidents = detector.detect_all_incidents()
++        
++        # Check no duplicate pit stops for same driver in close time
++        pit_stops = [i for i in incidents if i.incident_type == 'pit_stop']
++        for i, pit1 in enumerate(pit_stops):
++            for pit2 in pit_stops[i + 1:]:
++                if pit1.primary_driver == pit2.primary_driver:
++                    # Different incidents should be > 5 seconds apart
++                    assert abs(pit1.time_seconds - pit2.time_seconds) >= 5.0
++
++
++class TestIncidentsPanelComponent:
++    """Test incidents UI component"""
++    
++    def test_panel_initialization(self):
++        """Test panel can be created"""
++        from src.ui_components_incidents import IncidentsPanelComponent
++        panel = IncidentsPanelComponent(left=20, top=600)
++        assert panel.visible == True
++        assert panel.filtered_incidents == []
++    
++    def test_set_incidents(self):
++        """Test setting incidents on panel"""
++        from src.ui_components_incidents import IncidentsPanelComponent
++        panel = IncidentsPanelComponent()
++        
++        incidents = [
++            Incident(0, 0.0, 1, 'overtake', 'VER', 'LEC', 'Test'),
++            Incident(100, 50.0, 5, 'pit_stop', 'HAM'),
++        ]
++        
++        panel.set_incidents(incidents)
++        assert len(panel.filtered_incidents) == 2
++    
++    def test_incident_filtering(self):
++        """Test incident type filtering"""
++        from src.ui_components_incidents import IncidentsPanelComponent
++        panel = IncidentsPanelComponent()
++        
++        incidents = [
++            Incident(0, 0.0, 1, 'overtake', 'VER', 'LEC'),
++            Incident(100, 50.0, 5, 'pit_stop', 'HAM'),
++            Incident(200, 100.0, 10, 'overtake', 'SAI', 'RUS'),
++        ]
++        
++        panel.set_incidents(incidents)
++        assert len(panel.filtered_incidents) == 3
++        
++        # Filter to overtakes only
++        panel.filter_type = 'overtake'
++        panel.filter_incidents()
++        assert len(panel.filtered_incidents) == 2
++        
++        # All filtered should be overtakes
++        for incident in panel.filtered_incidents:
++            assert incident.incident_type == 'overtake'
++    
++    def test_incident_navigation(self):
++        """Test selecting next/previous incidents"""
++        from src.ui_components_incidents import IncidentsPanelComponent
++        panel = IncidentsPanelComponent()
++        
++        incidents = [
++            Incident(10, 5.0, 1, 'overtake', 'VER', 'LEC'),
++            Incident(100, 50.0, 5, 'overtake', 'SAI', 'RUS'),
++            Incident(200, 100.0, 10, 'overtake', 'ALO', 'STR'),
++        ]
++        
++        panel.set_incidents(incidents)
++        
++        # Should return frame numbers
++        frame = panel.select_next_incident()
++        assert frame == 10
++        
++        frame = panel.select_next_incident()
++        assert frame == 100
++        
++        frame = panel.select_prev_incident()
++        assert frame == 10
++    
++    def test_panel_visibility_toggle(self):
++        """Test toggling panel visibility"""
++        from src.ui_components_incidents import IncidentsPanelComponent
++        panel = IncidentsPanelComponent(visible=True)
++        assert panel.visible == True
++        
++        panel.toggle_visibility()
++        assert panel.visible == False
++        
++        panel.toggle_visibility()
++        assert panel.visible == True
++
++
++if __name__ == '__main__':
++    pytest.main([__file__, '-v'])
+\ No newline at end of file
