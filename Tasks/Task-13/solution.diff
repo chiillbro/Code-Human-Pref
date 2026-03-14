@@ -1,8 +1,40 @@
 diff --git a/main.py b/main.py
-index 932008e..75dc87f 100644
+index 0870c95..217b70f 100644
 --- a/main.py
 +++ b/main.py
-@@ -96,21 +96,22 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
+@@ -1,11 +1,11 @@
+-from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, list_rounds, list_sprints
++from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, list_rounds, list_sprints, get_race_results
+ from src.arcade_replay import run_arcade_replay
+ 
+ from src.interfaces.qualifying import run_qualifying_replay
+ import sys
+ from src.cli.race_selection import cli_load
+ from src.gui.race_selection import RaceSelectionWindow
+ from PySide6.QtWidgets import QApplication
+ 
+ def main(year=None, round_number=None, playback_speed=1, session_type='R', visible_hud=True, ready_file=None):
+   print(f"Loading F1 {year} Round {round_number} Session '{session_type}'")
+@@ -76,45 +76,48 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
+     session_info = {
+         'event_name': session.event.get('EventName', ''),
+         'circuit_name': session.event.get('Location', ''),  # Circuit location/name
+         'country': session.event.get('Country', ''),
+         'year': year,
+         'round': round_number,
+         'date': session.event.get('EventDate', '').strftime('%B %d, %Y') if session.event.get('EventDate') else '',
+         'total_laps': race_telemetry['total_laps']
+     }
+ 
++    # Get race results for podium display
++    race_results = get_race_results(session)
++
+     # Run the arcade replay
+ 
+     run_arcade_replay(
+       frames=race_telemetry['frames'],
+       track_statuses=race_telemetry['track_statuses'],
+       example_lap=example_lap,
        drivers=drivers,
        playback_speed=playback_speed,
        driver_colors=race_telemetry['driver_colors'],
@@ -11,11 +43,9 @@ index 932008e..75dc87f 100644
        circuit_rotation=circuit_rotation,
        visible_hud=visible_hud,
        ready_file=ready_file,
-       session_info=session_info,
-       session=session,
--      enable_telemetry=True # This is now permanently enabled to support the telemetry insights menu if the user decides to use it
-+      enable_telemetry=True, # This is now permanently enabled to support the telemetry insights menu if the user decides to use it
-+      max_tyre_life=race_telemetry.get('max_tyre_life')
+-      session_info=session_info
++      session_info=session_info,
++      race_results=race_results
      )
  
  if __name__ == "__main__":
@@ -25,599 +55,30 @@ index 932008e..75dc87f 100644
  
      cli_load()
      sys.exit(0)
+-
+   if "--year" in sys.argv:
+     year_index = sys.argv.index("--year") + 1
+     year = int(sys.argv[year_index])
+   else:
+     year = 2025  # Default year
  
-diff --git a/requirements.txt b/requirements.txt
-index 8a90ffa..82781ec 100644
---- a/requirements.txt
-+++ b/requirements.txt
-@@ -1,9 +1,10 @@
- fastf1
- pandas
- matplotlib
--numpy
-+numpy>=2.0.0,<2.5.0
-+scipy>=1.15.0,<1.18.0
- arcade
- pyglet
- pyside6
- questionary
- rich
-\ No newline at end of file
-diff --git a/src/gui/insights_menu.py b/src/gui/insights_menu.py
-index 47b6143..70f02b2 100644
---- a/src/gui/insights_menu.py
-+++ b/src/gui/insights_menu.py
-@@ -53,21 +53,26 @@ class InsightsMenu(QMainWindow):
-         ))
- 
-         content_layout.addWidget(self.create_category_section(
-             "Live Telemetry",
-             [
-                 ("Telemetry Stream Viewer", "View raw telemetry data", self.launch_telemetry_viewer),
-                 ("Driver Live Telemetry", "Speed, gear, throttle & braking for a selected driver", self.launch_driver_telemetry),
-             ]
-         ))
-         
--        content_layout.addStretch()
-+        content_layout.addWidget(self.create_category_section(
-+            "Tyre Analysis",
-+            [
-+                ("Tyre Degradation Analysis", "View cumulative tyre degradation impact for a selected driver", self.launch_tyre_degradation_analysis),
-+            ]
-+        ))
-         
-         scroll.setWidget(content_widget)
-         main_layout.addWidget(scroll)
-         
-         # Footer
-         footer = self.create_footer()
-         main_layout.addWidget(footer)
-     
-     def create_header(self):
-         header = QFrame()
-@@ -183,23 +188,26 @@ class InsightsMenu(QMainWindow):
-             self.show_placeholder_message("Telemetry Stream Viewer")
-     
-     def launch_speed_monitor(self):
-         print("🚀 Launching: Speed Monitor")
-         self.show_placeholder_message("Speed Monitor")
-     
-     def launch_position_tracker(self):
-         print("🚀 Launching: Position Tracker")
-         self.show_placeholder_message("Position Tracker")
-     
--    def launch_tyre_strategy(self):
--        print("🚀 Launching: Tyre Strategy")
--        self.show_placeholder_message("Tyre Strategy")
-+    def launch_tyre_degradation_analysis(self):
-+        print("🚀 Launching: Tyre Degradation Analysis")
-+        from src.gui.tyre_degradation_window import TyreDegradationWindow
-+        window = TyreDegradationWindow()
-+        window.show()
-+        self.opened_windows.append(window)
-     
-     def launch_pit_analysis(self):
-         print("🚀 Launching: Pit Stop Analysis")
-         self.show_placeholder_message("Pit Stop Analysis")
-     
-     def launch_gap_analysis(self):
-         print("🚀 Launching: Gap Analysis")
-         self.show_placeholder_message("Gap Analysis")
-     
-     def launch_sector_times(self):
-diff --git a/src/gui/tyre_degradation_window.py b/src/gui/tyre_degradation_window.py
-new file mode 100644
-index 0000000..c093430
---- /dev/null
-+++ b/src/gui/tyre_degradation_window.py
-@@ -0,0 +1,368 @@
-+import sys
-+from PySide6.QtWidgets import (
-+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-+    QPushButton, QFrame
-+)
-+from PySide6.QtCore import Qt, QTimer
-+from PySide6.QtGui import QFont
-+import matplotlib.pyplot as plt
-+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-+from matplotlib.figure import Figure
-+import numpy as np
-+
-+from src.gui.pit_wall_window import PitWallWindow
-+from src.lib.tyres import get_tyre_compound_str
-+
-+
-+class TyreDegradationWindow(PitWallWindow):
-+    """
-+    Window for analyzing tyre degradation impact over the course of a race.
-+    Shows cumulative degradation for all drivers by default; user can select
-+    an individual driver to focus.
-+    """
-+
-+    def __init__(self):
-+        # Initialize attributes before calling parent __init__ because
-+        # PitWallWindow.__init__ calls setup_ui() which expects these
-+        # attributes to exist.
-+        self.current_driver = "All Drivers"
-+        self.driver_data = {}  # Store data list for each driver
-+
-+        # Fallback tyre degradation rates (seconds per lap)
-+        self.degradation_rates = {
-+            0: 0.0179,  # SOFT (example value)
-+            1: 0.015,   # MEDIUM (estimated)
-+            2: 0.0179,  # HARD (user specified)
-+            3: 0.02,    # INTERMEDIATE (estimated)
-+            4: 0.012    # WET (estimated)
-+        }
-+        self._fallback_degradation_rates = dict(self.degradation_rates)
-+
-+        # Expected tyre life (laps) per compound for health normalization
-+        # 100% at lap 1 of stint, 0% at expected life, negative beyond expected life
-+        self.expected_tyre_life = {
-+            0: 20,  # SOFT
-+            1: 25,  # MEDIUM
-+            2: 30,  # HARD
-+            3: 18,  # INTERMEDIATE
-+            4: 22   # WET
-+        }
-+        self._fallback_expected_tyre_life = dict(self.expected_tyre_life)
-+        self.tyre_profile_source = "Fallback"
-+
-+        super().__init__()
-+        self.setWindowTitle("F1 Tyre Degradation Analysis")
-+        self.setGeometry(200, 200, 1000, 700)
-+
-+        # Timer for periodic plot updates to reduce lag
-+        self.update_timer = QTimer()
-+        self.update_timer.timeout.connect(self.update_plot)
-+        self.update_timer.start(100)  # Update every 0.1 seconds
-+
-+    def setup_ui(self):
-+        """Create the UI components."""
-+        central_widget = QWidget()
-+        self.setCentralWidget(central_widget)
-+
-+        main_layout = QVBoxLayout(central_widget)
-+
-+        # Header
-+        header = self.create_header()
-+        main_layout.addWidget(header)
-+
-+        # Controls
-+        controls = self.create_controls()
-+        main_layout.addWidget(controls)
-+
-+        # Plot area
-+        self.figure = Figure(figsize=(10, 6))
-+        self.canvas = FigureCanvas(self.figure)
-+        main_layout.addWidget(self.canvas)
-+
-+        # Initial plot
-+        self.update_plot()
-+
-+    def create_header(self):
-+        """Create the header section."""
-+        header = QFrame()
-+        header.setFrameShape(QFrame.NoFrame)
-+
-+        layout = QVBoxLayout(header)
-+
-+        title = QLabel("🛞 Tyre Degradation Analysis")
-+        title.setFont(QFont("Arial", 20, QFont.Bold))
-+        layout.addWidget(title)
-+
-+        self.subtitle = QLabel(
-+            f"Cumulative degradation impact for selected driver • Profile: {self.tyre_profile_source}"
-+        )
-+        self.subtitle.setFont(QFont("Arial", 12))
-+        layout.addWidget(self.subtitle)
-+
-+        return header
-+
-+    def create_controls(self):
-+        """Create the control panel."""
-+        controls = QFrame()
-+        controls.setFrameShape(QFrame.NoFrame)
-+
-+        layout = QHBoxLayout(controls)
-+
-+        # Driver selection
-+        driver_label = QLabel("Select Driver:")
-+        driver_label.setFont(QFont("Arial", 12, QFont.Bold))
-+        layout.addWidget(driver_label)
-+
-+        self.driver_combo = QComboBox()
-+        # Default option to show all drivers
-+        self.driver_combo.addItem("All Drivers")
-+        self.driver_combo.setMinimumWidth(150)
-+        self.driver_combo.currentTextChanged.connect(self.on_driver_changed)
-+        layout.addWidget(self.driver_combo)
-+
-+        layout.addStretch()
-+
-+        # Refresh button
-+        refresh_btn = QPushButton("Refresh Data")
-+        refresh_btn.clicked.connect(self.refresh_data)
-+        layout.addWidget(refresh_btn)
-+
-+        return controls
-+
-+    def on_telemetry_data(self, data):
-+        """Process incoming telemetry data and store per-driver tyre info."""
-+        profile = data.get('tyre_profile')
-+        if profile:
-+            self._update_tyre_profile(profile)
-+
-+        if 'frame' in data and 'drivers' in data['frame']:
-+            drivers = data['frame']['drivers']
-+
-+            # Keep combo: All Drivers + driver codes
-+            driver_codes = list(drivers.keys())
-+            desired = ["All Drivers"] + driver_codes
-+            current_items = [self.driver_combo.itemText(i) for i in range(self.driver_combo.count())]
-+            if current_items != desired:
-+                try:
-+                    self.driver_combo.currentTextChanged.disconnect(self.on_driver_changed)
-+                except Exception:
-+                    pass
-+                self.driver_combo.clear()
-+                self.driver_combo.addItems(desired)
-+                self.driver_combo.currentTextChanged.connect(self.on_driver_changed)
-+                if self.current_driver not in desired:
-+                    self.current_driver = "All Drivers"
-+                    self.driver_combo.setCurrentText(self.current_driver)
-+
-+            # Append telemetry entry for each driver
-+            frame_index = data.get('frame_index', 0)
-+            for code, pos in drivers.items():
-+                if code not in self.driver_data:
-+                    self.driver_data[code] = []
-+
-+                tyre_data = {
-+                    'frame': frame_index,
-+                    'tyre': pos.get('tyre', 0),
-+                    'tyre_life': pos.get('tyre_life', 0),
-+                    'lap': pos.get('lap', 0)
-+                }
-+                self.driver_data[code].append(tyre_data)
-+                # cap memory per driver to last 1000 points for performance
-+                if len(self.driver_data[code]) > 1000:
-+                    self.driver_data[code] = self.driver_data[code][-1000:]
-+
-+        # Plot updates are now handled by a timer to reduce lag
-+
-+    def on_driver_changed(self, driver):
-+        """Handle driver selection change."""
-+        if driver:
-+            self.current_driver = driver
-+            self.update_plot()
-+
-+    def refresh_data(self):
-+        """Refresh the data collection (clears stored telemetry)."""
-+        self.driver_data = {}
-+        self.update_plot()
-+
-+    def _update_tyre_profile(self, profile):
-+        """Update race-specific tyre degradation profile from telemetry stream."""
-+        updated = False
-+
-+        max_life = profile.get('max_tyre_life', {}) if isinstance(profile, dict) else {}
-+        if isinstance(max_life, dict) and max_life:
-+            parsed_life = {}
-+            for key, value in max_life.items():
-+                try:
-+                    tyre_key = int(key)
-+                    tyre_life = int(value)
-+                except (TypeError, ValueError):
-+                    continue
-+                if tyre_life > 0:
-+                    parsed_life[tyre_key] = tyre_life
-+
-+            merged_life = dict(self._fallback_expected_tyre_life)
-+            merged_life.update(parsed_life)
-+            if parsed_life and merged_life != self.expected_tyre_life:
-+                self.expected_tyre_life = merged_life
-+                self.tyre_profile_source = "Race Session"
-+                updated = True
-+
-+        rates = profile.get('degradation_rates', {}) if isinstance(profile, dict) else {}
-+        if isinstance(rates, dict) and rates:
-+            parsed_rates = {}
-+            for key, value in rates.items():
-+                try:
-+                    tyre_key = int(key)
-+                    rate = float(value)
-+                except (TypeError, ValueError):
-+                    continue
-+                if rate >= 0:
-+                    parsed_rates[tyre_key] = rate
-+
-+            merged_rates = dict(self._fallback_degradation_rates)
-+            merged_rates.update(parsed_rates)
-+            if parsed_rates and merged_rates != self.degradation_rates:
-+                self.degradation_rates = merged_rates
-+                self.tyre_profile_source = "Race Session"
-+                updated = True
-+
-+        if updated and hasattr(self, 'subtitle'):
-+            self.subtitle.setText(
-+                f"Cumulative degradation impact for selected driver • Profile: {self.tyre_profile_source}"
-+            )
-+
-+    def update_plot(self):
-+        """Update the degradation plot for all drivers or a single driver."""
-+        self.figure.clear()
-+
-+        ax = self.figure.add_subplot(111)
-+
-+        # If no telemetry yet, show placeholder
-+        if not self.driver_data:
-+            ax.text(0.5, 0.5, "Waiting for telemetry data...\nSelect a driver to view degradation analysis",
-+                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
-+            ax.set_xlim(0, 1)
-+            ax.set_ylim(0, 1)
-+            self.canvas.draw()
-+            return
-+
-+        # Helper to compute plot points for a single driver's stored data
-+        def compute_degradation_series(entries):
-+            if not entries:
-+                return [], []
-+            entries = sorted(entries, key=lambda x: x['frame'])
-+            tyre_lives = [e['tyre_life'] for e in entries]
-+            compounds = [e['tyre'] for e in entries]
-+            laps = [e['lap'] for e in entries]
-+
-+            # Build stints
-+            stints = []
-+            current_stint = None
-+            previous_life = None
-+            for i, (life, compound, lap) in enumerate(zip(tyre_lives, compounds, laps)):
-+                # Start a new stint when:
-+                # 1) compound changes, or
-+                # 2) tyre life resets/decreases (pit stop on same compound)
-+                is_new_stint = (
-+                    current_stint is None
-+                    or current_stint['compound'] != compound
-+                    or (previous_life is not None and life < previous_life)
-+                )
-+
-+                if is_new_stint:
-+                    current_stint = {
-+                        'compound': compound,
-+                        'start_life': life,
-+                        'start_lap': lap,
-+                        'lives': [life],
-+                        'laps': [lap]
-+                    }
-+                    stints.append(current_stint)
-+                else:
-+                    current_stint['lives'].append(life)
-+                    current_stint['laps'].append(lap)
-+
-+                previous_life = life
-+
-+            plot_x = []
-+            plot_y = []
-+            for stint in stints:
-+                compound = stint['compound']
-+                expected_life = self.expected_tyre_life.get(compound, 25)
-+                start_lap = stint['start_lap']
-+                start_life = stint['start_life']
-+                for life, lap in zip(stint['lives'], stint['laps']):
-+                    # Degrade health by race laps completed in this stint
-+                    # so the curve decreases gradually lap-by-lap.
-+                    # If the tyre is already used at stint start, initial
-+                    # health starts below 100% based on start_life.
-+                    laps_in_stint = max(0, lap - start_lap)
-+                    effective_life_progress = max(0, (start_life - 1) + laps_in_stint)
-+                    if expected_life > 1:
-+                        health_pct = 100 - (effective_life_progress / (expected_life - 1)) * 100
-+                    else:
-+                        health_pct = 100.0
-+                    plot_x.append(lap)
-+                    plot_y.append(health_pct)
-+
-+            return plot_x, plot_y
-+
-+        # Compute the current max lap across all drivers for x-axis synchronization
-+        max_lap = max((max(e['lap'] for e in entries) for entries in self.driver_data.values() if entries), default=0)
-+
-+        # If a single driver is selected, show only that driver
-+        if self.current_driver and self.current_driver != "All Drivers":
-+            driver = self.current_driver
-+            entries = self.driver_data.get(driver, [])
-+            px, py = compute_degradation_series(entries)
-+            if px and py:
-+                ax.plot(px, py, linewidth=2, color='tab:blue', label=driver)
-+            ax.set_title(f'Tyre Degradation Analysis - {driver}')
-+            ax.set_xlabel('Race Lap')
-+            ax.set_ylabel('Tyre Health (%)')
-+            ax.set_xlim(0, max_lap + 1)
-+            ax.grid(True, alpha=0.3)
-+            ax.legend()
-+            self.figure.tight_layout()
-+            self.canvas.draw()
-+            return
-+
-+        # Otherwise plot all drivers
-+        cmap = plt.get_cmap('tab10')
-+        drivers_sorted = sorted(self.driver_data.keys())
-+        plotted = False
-+        for idx, driver in enumerate(drivers_sorted):
-+            entries = self.driver_data.get(driver, [])
-+            px, py = compute_degradation_series(entries)
-+            if px and py:
-+                color = cmap(idx % 10)
-+                ax.plot(px, py, linewidth=1.5, color=color, label=driver, alpha=0.9)
-+                plotted = True
-+
-+        if not plotted:
-+            ax.text(0.5, 0.5, "No tyre data to plot yet", ha='center', va='center', transform=ax.transAxes)
-+
-+        ax.set_title('Tyre Degradation Analysis - All Drivers')
-+        ax.set_xlabel('Race Lap')
-+        ax.set_ylabel('Tyre Health (%)')
-+        ax.set_xlim(0, max_lap + 1)
-+        ax.grid(True, alpha=0.3)
-+        ax.legend(loc='upper left', fontsize='small', ncol=2)
-+        self.figure.tight_layout()
-+        self.canvas.draw()
-+
-+
-+def main():
-+    """Launch the tyre degradation analysis window."""
-+    app = QApplication.instance()
-+    if app is None:
-+        app = QApplication(sys.argv)
-+
-+    window = TyreDegradationWindow()
-+    window.show()
-+
-+    return app.exec()
-+
-+
-+if __name__ == "__main__":
-+    sys.exit(main())
-\ No newline at end of file
-diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
-index 40700c2..adf85b2 100644
---- a/src/interfaces/race_replay.py
-+++ b/src/interfaces/race_replay.py
-@@ -1,15 +1,16 @@
+   if "--round" in sys.argv:
+     round_index = sys.argv.index("--round") + 1
+     round_number = int(sys.argv[round_index])
+   else:
+diff --git a/src/arcade_replay.py b/src/arcade_replay.py
+index 2eab154..f35d8c3 100644
+--- a/src/arcade_replay.py
++++ b/src/arcade_replay.py
+@@ -1,28 +1,28 @@
  import os
  import arcade
- import numpy as np
- from scipy.spatial import cKDTree
- from src.f1_data import FPS
-+from src.lib.tyres import get_tyre_compound_int
- from src.ui_components import (
-     LeaderboardComponent, 
-     WeatherComponent, 
-     LegendComponent, 
-     DriverInfoComponent, 
-     RaceProgressBarComponent,
-     RaceControlsComponent,
-     ControlsPopupComponent,
-     SessionInfoComponent,
-     extract_race_events,
-@@ -22,21 +23,21 @@ from src.services.stream import TelemetryStreamServer
- 
- SCREEN_WIDTH = 1280
- SCREEN_HEIGHT = 720
- SCREEN_TITLE = "F1 Race Replay"
- PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
- 
- class F1RaceReplayWindow(arcade.Window):
-     def __init__(self, frames, track_statuses, example_lap, drivers, title,
-                  playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
-                  left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
--                 session_info=None, session=None, enable_telemetry=False):
-+                 session_info=None, session=None, enable_telemetry=False, max_tyre_life=None):
-         # Set resizable to True so the user can adjust mid-sim
-         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
-         self.maximize()
- 
-         self.telemetry_stream = None
-         if enable_telemetry:
-             try:
-                 self.telemetry_stream = TelemetryStreamServer()
-                 self.telemetry_stream.start()
-                 print("Telemetry stream server started on localhost:9999")
-@@ -50,22 +51,24 @@ class F1RaceReplayWindow(arcade.Window):
- 
-         self.frames = frames
-         self.track_statuses = track_statuses
-         self.n_frames = len(frames)
-         self.drivers = list(drivers)
-         self.playback_speed = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.index(playback_speed)] if playback_speed in PLAYBACK_SPEEDS else 1.0
-         self.driver_colors = driver_colors or {}
-         self.frame_index = 0.0  # use float for fractional-frame accumulation
-         self.paused = False
-         self.total_laps = total_laps
-+        self.max_tyre_life = max_tyre_life or {}
-         self.has_weather = any("weather" in frame for frame in frames) if frames else False
-         self.visible_hud = visible_hud # If it displays HUD or not (leaderboard, controls, weather, etc)
-+        self.tyre_degradation_rates = {}
- 
-         # Rotation (degrees) to apply to the whole circuit around its centre
-         self.circuit_rotation = circuit_rotation
-         self._rot_rad = float(np.deg2rad(self.circuit_rotation)) if self.circuit_rotation else 0.0
-         self._cos_rot = float(np.cos(self._rot_rad))
-         self._sin_rot = float(np.sin(self._rot_rad))
-         self.finished_drivers = []
-         self.left_ui_margin = left_ui_margin
-         self.right_ui_margin = right_ui_margin
-         self.toggle_drs_zones = True 
-@@ -86,20 +89,25 @@ class F1RaceReplayWindow(arcade.Window):
-                 print("Initializing tyre degradation model...")
-                 self.degradation_integrator = TyreDegradationIntegrator(session=session)
-                 
-                 # This computes curves once at startup (1-2 seconds)
-                 init_success = self.degradation_integrator.initialize_from_session()
-                 
-                 if init_success:
-                     print("✓ Tyre degradation model initialized successfully")
-                     # Link integrator to driver info component
-                     self.driver_info_comp.degradation_integrator = self.degradation_integrator
-+                    rates = self.degradation_integrator.get_degradation_rates()
-+                    for compound_name, rate in rates.items():
-+                        compound_key = get_tyre_compound_int(compound_name)
-+                        if compound_key is not None and compound_key >= 0:
-+                            self.tyre_degradation_rates[int(compound_key)] = float(rate)
-                 else:
-                     print("✗ Tyre degradation model initialization failed")
-                     self.degradation_integrator = None
-             except Exception as e:
-                 print(f"✗ Tyre degradation initialization error: {e}")
-                 self.degradation_integrator = None
-         else:
-             print("Note: Session not provided, tyre degradation disabled")
- 
- 
-@@ -258,20 +266,24 @@ class F1RaceReplayWindow(arcade.Window):
-         time_str = f"{hours:02}:{minutes:02}:{seconds:02}"
-         
-         self.telemetry_stream.broadcast({
-             "frame_index": int(self.frame_index),
-             "frame": current_frame,
-             "track_status": current_track_status,
-             "playback_speed": self.playback_speed,
-             "is_paused": self.paused,
-             "total_frames": self.n_frames,
-             "circuit_length_m": self.circuit_length_m,
-+            "tyre_profile": {
-+                "max_tyre_life": self.max_tyre_life,
-+                "degradation_rates": self.tyre_degradation_rates,
-+            },
-             "session_data": {
-                 "time": time_str,
-                 "lap": leader_lap,
-                 "leader": leader_code,
-                 "total_laps": self.total_laps
-             }
-         })
- 
-     def _interpolate_points(self, xs, ys, interp_points=2000):
-         t_old = np.linspace(0, 1, len(xs))
-diff --git a/src/run_session.py b/src/run_session.py
-index 77c9c0a..73f9098 100644
---- a/src/run_session.py
-+++ b/src/run_session.py
-@@ -2,35 +2,37 @@ import os
- import subprocess
- import sys
- import threading
- import time
- import arcade
  from src.interfaces.race_replay import F1RaceReplayWindow
- from src.insights.telemetry_stream_viewer import main as telemetry_viewer_main
  
  def run_arcade_replay(frames, track_statuses, example_lap, drivers, title,
                        playback_speed=1.0, driver_colors=None, circuit_rotation=0.0, total_laps=None,
--                      visible_hud=True, ready_file=None, session_info=None, session=None, enable_telemetry=True):
-+                      visible_hud=True, ready_file=None, session_info=None, session=None, enable_telemetry=True,
-+                      max_tyre_life=None):
+-                      visible_hud=True, ready_file=None, session_info=None):
++                      visible_hud=True, ready_file=None, session_info=None, race_results=None):
      window = F1RaceReplayWindow(
          frames=frames,
          track_statuses=track_statuses,
@@ -630,12 +91,9 @@ index 77c9c0a..73f9098 100644
          circuit_rotation=circuit_rotation,
          visible_hud=visible_hud,
          session_info=session_info,
-         session=session,
--        enable_telemetry=enable_telemetry
-+        enable_telemetry=enable_telemetry,
-+        max_tyre_life=max_tyre_life
++        race_results=race_results,
      )
-     # Signal readiness to parent process (if requested) after window created
+-    # Signal readiness to parent process (if requested) after window created
      if ready_file:
          try:
              with open(ready_file, 'w') as f:
@@ -643,38 +101,882 @@ index 77c9c0a..73f9098 100644
          except Exception:
              pass
      arcade.run()
+diff --git a/src/cli/race_selection.py b/src/cli/race_selection.py
+index fe629f8..9333dad 100644
+--- a/src/cli/race_selection.py
++++ b/src/cli/race_selection.py
+@@ -51,27 +51,26 @@ def cli_load():
+         
+     if session in ("Sprint", "Race"):
+         HUD = [Choice(title="Yes", value=True), Choice(title="No", value=False)]
+         hud = select("HUD?", choices=HUD, qmark="🖥️ ", style=style).ask()
+         if hud is None:
+             sys.exit(0)
+     else:
+         hud = True
  
-diff --git a/src/tyre_degradation_integration.py b/src/tyre_degradation_integration.py
-index 049ac59..5de7814 100644
---- a/src/tyre_degradation_integration.py
-+++ b/src/tyre_degradation_integration.py
-@@ -104,20 +104,29 @@ class TyreDegradationIntegrator:
-         
-         
-         track_condition = frame_data.get("track_condition")
-         
-         return self.get_tyre_health(driver_code, lap_num, track_condition)
-     
-     def clear_cache(self):
-         """Clear cache."""
-         self._cache.clear()
+     flag = None
+-    match session:
+-        case "Qualifying":
+-            flag = "--qualifying" 
+-        case "Sprint Qualifying":
+-            flag = "--sprint-qualifying"  
+-        case "Sprint":
+-            flag = "--sprint"     
++    if session == "Qualifying":
++        flag = "--qualifying"
++    elif session == "Sprint Qualifying":
++        flag = "--sprint-qualifying"
++    elif session == "Sprint":
++        flag = "--sprint"
+     main_path = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', '..', 'main.py'))
+     cmd = [sys.executable, main_path, "--viewer"]
+     if year is not None:
+         cmd += ["--year", str(year)]
+     if round_number is not None:
+         cmd += ["--round", str(round_number)]
+     if flag:
+         cmd.append(flag)
+     if not hud:
+         cmd.append("--no-hud")
+diff --git a/src/f1_data.py b/src/f1_data.py
+index fb6ae67..1be2ec3 100644
+--- a/src/f1_data.py
++++ b/src/f1_data.py
+@@ -1,25 +1,144 @@
+ import os
+ import sys
+ import fastf1
+ import fastf1.plotting
+ from multiprocessing import Pool, cpu_count
+ import numpy as np
+ import json
+ import pickle
++import importlib
+ from datetime import timedelta
  
-+    def get_degradation_rates(self) -> Dict[str, float]:
-+        """Get fitted degradation rates per compound in seconds/lap."""
-+        if not self._initialized:
-+            return {}
-+        return {
-+            compound_name: float(profile.degradation_rate)
-+            for compound_name, profile in self._model.tyre_profiles.items()
-+        }
+ from src.lib.tyres import get_tyre_compound_int
+ from src.lib.time import parse_time_string, format_time
+ 
+ import pandas as pd
+ 
 +
++def _safe_int(value, default=0):
++    try:
++        if pd.isna(value):
++            return default
++        return int(value)
++    except Exception:
++        return default
++
++
++def _safe_float(value, default=0.0):
++    try:
++        if pd.isna(value):
++            return default
++        return float(value)
++    except Exception:
++        return default
++
++
++def _parse_time_value(value):
++    if value is None or pd.isna(value):
++        return None
++    if hasattr(value, "total_seconds"):
++        try:
++            return float(value.total_seconds())
++        except Exception:
++            return None
++    if isinstance(value, (int, float, np.number)):
++        return float(value)
++    text = str(value).strip()
++    if text == "" or text.lower() in {"nan", "nat"}:
++        return None
++    if any(token in text.lower() for token in ["lap", "dnf", "ret", "disq", "dns", "not classified"]):
++        return None
++    text = text.lstrip("+")
++    return parse_time_string(text)
++
++
++def _pick_dataframe(candidate):
++    if isinstance(candidate, pd.DataFrame):
++        return candidate
++    if isinstance(candidate, (list, tuple)):
++        for item in candidate:
++            if isinstance(item, pd.DataFrame):
++                return item
++    return None
++
++
++def _extract_driver_code(row, code_col=None):
++    if code_col and code_col in row:
++        return row.get(code_col)
++    for key in ["driverCode", "DriverCode", "code", "Abbreviation"]:
++        if key in row:
++            return row.get(key)
++    driver_info = row.get("Driver") if "Driver" in row else None
++    if isinstance(driver_info, dict):
++        return driver_info.get("driverCode") or driver_info.get("code") or driver_info.get("abbreviation")
++    return None
++
++
++def _get_wdc_maps(session):
++    wdc_positions = {}
++    wdc_points = {}
++    wdc_wins = {}
++
++    event_date = session.event.get("EventDate") if session.event is not None else None
++    year = event_date.year if event_date is not None else session.event.get("EventYear")
++    current_round = session.event.get("RoundNumber") if session.event is not None else None
++
++    standings_df = None
++    try:
++        standings_df = _pick_dataframe(fastf1.get_driver_standings(year))
++    except Exception:
++        standings_df = None
++
++    if standings_df is None:
++        try:
++            ergast_module = importlib.import_module("fastf1.ergast")
++            ergast = ergast_module.Ergast()
++            response = ergast.get_driver_standings(season=year)
++            standings_df = _pick_dataframe(getattr(response, "content", response))
++        except Exception:
++            standings_df = None
++
++    if standings_df is None or standings_df.empty:
++        return wdc_positions, wdc_points, wdc_wins
++
++    columns = {col.lower(): col for col in standings_df.columns}
++    round_col = columns.get("round") or columns.get("roundnumber")
++    code_col = columns.get("drivercode") or columns.get("code") or columns.get("abbreviation")
++    position_col = columns.get("position")
++    points_col = columns.get("points")
++    wins_col = columns.get("wins")
++
++    filtered_df = standings_df
++    if round_col and current_round is not None:
++        try:
++            filtered_df = standings_df[standings_df[round_col].astype(int) <= int(current_round)]
++        except Exception:
++            filtered_df = standings_df
++
++    for _, row in filtered_df.iterrows():
++        driver_code = _extract_driver_code(row, code_col)
++        if not driver_code:
++            continue
++        position = _safe_int(row.get(position_col) if position_col else row.get("position"), None)
++        points = _safe_float(row.get(points_col) if points_col else row.get("points"), None)
++        wins = _safe_int(row.get(wins_col) if wins_col else row.get("wins"), None)
++
++        if position is not None:
++            wdc_positions[driver_code] = position
++        if points is not None:
++            wdc_points[driver_code] = points
++        if wins is not None:
++            wdc_wins[driver_code] = wins
++
++    return wdc_positions, wdc_points, wdc_wins
++
+ def enable_cache():
+     # Check if cache folder exists
+     if not os.path.exists('.fastf1-cache'):
+         os.makedirs('.fastf1-cache')
  
- def format_tyre_health_bar(health: int, width: int = 100, height: int = 12) -> Dict:
-     """Format health bar visualization data."""
-     health = max(0, min(100, health))
-     fill_width = (health / 100.0) * width
+     # Enable local cache
+     fastf1.Cache.enable_cache('.fastf1-cache')
+ 
+ FPS = 25
+ DT = 1 / FPS
+@@ -430,20 +549,88 @@ def get_race_telemetry(session, session_type='R'):
+     print("Saved Successfully!")
+     print("The replay should begin in a new window shortly")
+     return {
+         "frames": frames,
+         "driver_colors": get_driver_colors(session),
+         "track_statuses": formatted_track_statuses,
+         "total_laps": int(max_lap_number),
+     }
+ 
+ 
++def get_race_results(session):
++    """
++    Extract the race results including podium positions and driver stats.
++    Returns a list of dicts with driver info, position, time, points, etc.
++    Also includes WDC standings and race wins at this point in the season.
++    """
++    results = session.results
++    driver_colors = get_driver_colors(session)
++    
++    # Get driver standings (WDC) at this point in the season
++    try:
++        wdc_positions, wdc_points, wdc_wins = _get_wdc_maps(session)
++    except Exception as e:
++        print(f"Could not load driver standings: {e}")
++        wdc_positions, wdc_points, wdc_wins = {}, {}, {}
++    
++    race_data = []
++    
++    for _, row in results.iterrows():
++        driver_code = row.get("Abbreviation", "")
++        # Skip drivers with no position
++        if pd.isna(row.get("Position")):
++            continue
++            
++        position = int(row["Position"])
++        full_name = row.get("FullName", driver_code)
++        team_name = row.get("TeamName", "Unknown")
++        
++        # Time to leader (or race time for winner)
++        time_seconds = _parse_time_value(row.get("Time"))
++        
++        # Status (Finished, +1 Lap, DNF, etc.)
++        status = row.get("Status", "Finished")
++        
++        # Points scored
++        points = _safe_float(row.get("Points", 0), 0.0)
++        
++        # Grid position (starting position)
++        grid_pos = _safe_int(row.get("GridPosition", 0), 0)
++        
++        # Fastest lap info
++        fastest_lap_seconds = _parse_time_value(row.get("FastestLapTime"))
++        
++        # Number of laps completed
++        laps_completed = _safe_int(row.get("LapsCompleted", 0), 0)
++        
++        race_data.append({
++            "code": driver_code,
++            "full_name": full_name,
++            "team": team_name,
++            "position": position,
++            "color": driver_colors.get(driver_code, (128, 128, 128)),
++            "time": time_seconds,
++            "status": status,
++            "points": points,
++            "grid_position": grid_pos,
++            "fastest_lap": fastest_lap_seconds,
++            "laps_completed": laps_completed,
++            "wdc_position": wdc_positions.get(driver_code),
++            "wdc_points": wdc_points.get(driver_code),
++            "wdc_wins": wdc_wins.get(driver_code),
++        })
++    
++    # Sort by position
++    race_data.sort(key=lambda x: x["position"])
++    
++    return race_data
++
+ def get_qualifying_results(session):
+ 
+     # Extract the qualifying results and return a list of the drivers, their positions and their lap times in each qualifying segment
+ 
+     results = session.results
+ 
+     qualifying_data = []
+ 
+     for _, row in results.iterrows():
+         driver_code = row["Abbreviation"]
+diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
+index d7f95a5..1d5bb40 100644
+--- a/src/interfaces/race_replay.py
++++ b/src/interfaces/race_replay.py
+@@ -4,41 +4,43 @@ import numpy as np
+ from src.f1_data import FPS
+ from src.ui_components import (
+     LeaderboardComponent, 
+     WeatherComponent, 
+     LegendComponent, 
+     DriverInfoComponent, 
+     RaceProgressBarComponent,
+     RaceControlsComponent,
+     ControlsPopupComponent,
+     SessionInfoComponent,
++    PodiumComponent,
+     extract_race_events,
+     build_track_from_example_lap,
+     draw_finish_line
+ )
+ 
+ 
+ SCREEN_WIDTH = 1280
+ SCREEN_HEIGHT = 720
+ SCREEN_TITLE = "F1 Race Replay"
+ PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+ 
+ class F1RaceReplayWindow(arcade.Window):
+     def __init__(self, frames, track_statuses, example_lap, drivers, title,
+                  playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
+                  left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
+-                 session_info=None):
++                 session_info=None, race_results=None):
+         # Set resizable to True so the user can adjust mid-sim
+         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
+         self.maximize()
+ 
+         self.frames = frames
++        self.race_results = race_results or []  # Store race results for podium
+         self.track_statuses = track_statuses
+         self.n_frames = len(frames)
+         self.drivers = list(drivers)
+         self.playback_speed = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.index(playback_speed)] if playback_speed in PLAYBACK_SPEEDS else 1.0
+         self.driver_colors = driver_colors or {}
+         self.frame_index = 0.0  # use float for fractional-frame accumulation
+         self.paused = False
+         self.total_laps = total_laps
+         self.has_weather = any("weather" in frame for frame in frames) if frames else False
+         self.visible_hud = visible_hud # If it displays HUD or not (leaderboard, controls, weather, etc)
+@@ -87,20 +89,26 @@ class F1RaceReplayWindow(arcade.Window):
+             self.session_info_comp.set_info(
+                 event_name=session_info.get('event_name', ''),
+                 circuit_name=session_info.get('circuit_name', ''),
+                 country=session_info.get('country', ''),
+                 year=session_info.get('year'),
+                 round_num=session_info.get('round'),
+                 date=session_info.get('date', ''),
+                 total_laps=total_laps
+             )
+ 
++        # Podium component for end-of-race celebration
++        self.podium_comp = PodiumComponent(visible=False)
++        if self.race_results:
++            self.podium_comp.set_results(self.race_results)
++        self.podium_shown_once = False  # Track if podium was auto-shown
++
+         self.is_rewinding = False
+         self.is_forwarding = False
+         self.was_paused_before_hold = False
+         
+         # Extract race events for the progress bar
+         race_events = extract_race_events(frames, track_statuses, total_laps or 0)
+         self.progress_bar_comp.set_race_data(
+             total_frames=len(frames),
+             total_laps=total_laps or 0,
+             events=race_events
+@@ -519,45 +527,62 @@ class F1RaceReplayWindow(arcade.Window):
+         self.race_controls_comp.draw(self)
+         
+         # Session info banner (top of screen)
+         self.session_info_comp.draw(self)
+ 
+         # Draw Controls popup box
+         self.controls_popup_comp.draw(self)
+         
+         # Draw tooltips and overlays on top of everything
+         self.progress_bar_comp.draw_overlays(self)
++        
++        # Draw podium overlay (on top of everything when visible)
++        self.podium_comp.draw(self)
+                     
+     def on_update(self, delta_time: float):
+         self.race_controls_comp.on_update(delta_time)
+         
+         seek_speed = 3.0 * max(1.0, self.playback_speed) # Multiplier for seeking speed, scales with current playback speed
+         if self.is_rewinding:
+             self.frame_index = max(0.0, self.frame_index - delta_time * FPS * seek_speed)
+             self.race_controls_comp.flash_button('rewind')
+         elif self.is_forwarding:
+             self.frame_index = min(self.n_frames - 1, self.frame_index + delta_time * FPS * seek_speed)
+             self.race_controls_comp.flash_button('forward')
+ 
+         if self.paused:
+             return
+ 
+         self.frame_index += delta_time * FPS * self.playback_speed
+         
+         if self.frame_index >= self.n_frames:
+             self.frame_index = float(self.n_frames - 1)
++            # Auto-show podium when race reaches the end (only once)
++            if not self.podium_shown_once and self.race_results:
++                self.paused = True
++                self.podium_comp.show()
++                self.podium_shown_once = True
+ 
+     def on_key_press(self, symbol: int, modifiers: int):
+         # Allow ESC to close window at any time
+         if symbol == arcade.key.ESCAPE:
+             arcade.close_window()
+             return
++        # Toggle podium with P key
++        if symbol == arcade.key.P:
++            if self.race_results:
++                self.podium_comp.toggle_visibility()
++            return
++        # If podium is visible, most keys should just close it
++        if self.podium_comp.visible:
++            self.podium_comp.hide()
++            return
+         if symbol == arcade.key.SPACE:
+             self.paused = not self.paused
+             self.race_controls_comp.flash_button('play_pause')
+         elif symbol == arcade.key.RIGHT:
+             self.was_paused_before_hold = self.paused
+             self.is_forwarding = True
+             self.paused = True
+         elif symbol == arcade.key.LEFT:
+             self.was_paused_before_hold = self.paused
+             self.is_rewinding = True
+@@ -621,20 +646,23 @@ class F1RaceReplayWindow(arcade.Window):
+             self.is_rewinding = False
+             self.paused = self.was_paused_before_hold
+ 
+     def on_mouse_release(self, x: float, y: float, button: int, modifiers: int):
+         if self.is_forwarding or self.is_rewinding:
+             self.is_forwarding = False
+             self.is_rewinding = False
+             self.paused = self.was_paused_before_hold
+ 
+     def on_mouse_press(self, x: float, y: float, button: int, modifiers: int):
++        # If podium is visible, clicking anywhere dismisses it
++        if self.podium_comp.on_mouse_press(self, x, y, button, modifiers):
++            return
+         # forward to components; stop at first that handled it
+         if self.controls_popup_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.race_controls_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.progress_bar_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.leaderboard_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.legend_comp.on_mouse_press(self, x, y, button, modifiers):
+diff --git a/src/ui_components.py b/src/ui_components.py
+index cc4bb28..b41b975 100644
+--- a/src/ui_components.py
++++ b/src/ui_components.py
+@@ -824,20 +824,21 @@ class ControlsPopupComponent(BaseComponent):
+         lines = [
+             " ",
+             "[SPACE] Pause/Resume",
+             "← / →  Jump back/forward",
+             "↑ / ↓  Speed +/-",
+             "[1-4]  Set speed: 0.5x / 1x / 2x / 4x",
+             "[R]    Restart",
+             "[D]    Toggle DRS Zones",
+             "[B]    Toggle Progress Bar",
+             "[L]    Toggle Driver Labels",
++            "[P]    Toggle Podium",
+             "[H]    Toggle Help Popup",
+         ]
+         
+         line_spacing = max(18, int(self.body_font_size + 8))
+         y = header_cy - 20
+         for l in lines:
+             self._body_text.font_size = self.body_font_size
+             self._body_text.bold = False
+             self._body_text.color = arcade.color.LIGHT_GRAY
+             self._body_text.text = l
+@@ -859,20 +860,367 @@ class ControlsPopupComponent(BaseComponent):
+ 
+         # If click inside the box, do nothing
+         if left <= x <= right and bottom <= y <= top:
+             return True
+ 
+         # Click outside closes popup
+         self.hide()
+         return True
+ 
+ 
++class PodiumComponent(BaseComponent):
++    """
++    Displays a podium celebration screen at the end of the race showing:
++    - Top 3 drivers on podium blocks with staggered reveal (P3 -> P2 -> P1)
++    - Stats for each podium driver
++    - Confetti celebration effect
++    """
++    def __init__(self, visible=False):
++        self.visible = visible
++        self.race_results = []  # Full race results list
++        self._text = arcade.Text("", 0, 0, arcade.color.WHITE, 14)
++        
++        # Animation timing (in frames at 60fps)
++        self._animation_frame = 0
++        self._p3_reveal_start = 10   # P3 starts appearing at frame 10
++        self._p2_reveal_start = 35   # P2 starts appearing at frame 35
++        self._p1_reveal_start = 60   # P1 starts appearing at frame 60
++        self._reveal_duration = 20    # Each podium takes 20 frames to fully appear
++        
++        # Confetti particles
++        self._confetti = []
++        self._confetti_colors = [
++            (255, 215, 0),    # Gold
++            (192, 192, 192),  # Silver
++            (205, 127, 50),   # Bronze
++            (255, 0, 0),      # Red
++            (0, 255, 0),      # Green
++            (0, 100, 255),    # Blue
++            (255, 255, 255),  # White
++            (255, 105, 180),  # Pink
++        ]
++        
++    def set_results(self, results: list):
++        """Set the race results data"""
++        self.race_results = results
++        
++    def show(self):
++        """Show the podium screen"""
++        self.visible = True
++        self._animation_frame = 0
++        self._init_confetti()
++        
++    def hide(self):
++        """Hide the podium screen"""
++        self.visible = False
++        self._animation_frame = 0
++        self._confetti = []
++        
++    def _init_confetti(self):
++        """Initialize confetti particles"""
++        import random
++        self._confetti = []
++        for _ in range(150):
++            self._confetti.append({
++                'x': random.uniform(0, 1920),
++                'y': random.uniform(800, 1200),
++                'vx': random.uniform(-2, 2),
++                'vy': random.uniform(-8, -3),
++                'size': random.uniform(4, 10),
++                'color': random.choice(self._confetti_colors),
++                'rotation': random.uniform(0, 360),
++                'rot_speed': random.uniform(-10, 10),
++            })
++        
++    def toggle_visibility(self) -> bool:
++        """Toggle podium visibility"""
++        if self.visible:
++            self.hide()
++        else:
++            self.show()
++        return self.visible
++    
++    def _format_time(self, seconds: float) -> str:
++        """Format time in seconds to hh:mm:ss.xxx or mm:ss.xxx"""
++        if seconds is None:
++            return "N/A"
++        if seconds < 0:
++            return "N/A"
++        hours = int(seconds // 3600)
++        minutes = int((seconds % 3600) // 60)
++        secs = seconds % 60
++        if hours > 0:
++            return f"{hours:02}:{minutes:02}:{secs:06.3f}"
++        if minutes > 0:
++            return f"{minutes}:{secs:06.3f}"
++        return f"{secs:.3f}s"
++    
++    def _format_gap(self, seconds: float, position: int) -> str:
++        """Format gap to leader"""
++        if position == 1:
++            return self._format_time(seconds)
++        if seconds is None:
++            return "N/A"
++        return f"+{seconds:.3f}s"
++
++    def _format_points(self, points: float) -> str:
++        """Format points without truncating half points."""
++        if points is None:
++            return "N/A"
++        if abs(points - round(points)) < 1e-6:
++            return f"+{int(round(points))}"
++        return f"+{points:.1f}"
++
++    def _format_wdc_position(self, position) -> str:
++        if position is None:
++            return "?"
++        return f"P{position}"
++    
++    def _get_reveal_alpha(self, podium_pos: int) -> int:
++        """Get the alpha value for a podium position based on animation progress"""
++        if podium_pos == 3:
++            start = self._p3_reveal_start
++        elif podium_pos == 2:
++            start = self._p2_reveal_start
++        else:
++            start = self._p1_reveal_start
++        
++        if self._animation_frame < start:
++            return 0
++        
++        progress = (self._animation_frame - start) / self._reveal_duration
++        return int(min(255, max(0, progress * 255)))
++    
++    def _update_confetti(self):
++        """Update confetti particle positions"""
++        # Determine the effective width for horizontal wrapping. Fall back to 1920 if
++        # there is no active window yet so behavior remains consistent.
++        window = arcade.get_window()
++        effective_width = window.width if window is not None else 1920
++
++        for p in self._confetti:
++            p['x'] += p['vx']
++            p['y'] += p['vy']
++            p['vy'] += 0.15  # Gravity
++            p['rotation'] += p['rot_speed']
++            # Wrap horizontally with a small off-screen margin
++            if p['x'] < -20:
++                p['x'] = effective_width + 20
++            elif p['x'] > effective_width + 20:
++                p['x'] = -20
++    
++    def _draw_confetti(self, window):
++        """Draw confetti particles"""
++        for p in self._confetti:
++            if 0 < p['y'] < window.height + 50:
++                # Scale x position to window width, using the actual window width
++                x = (p['x'] / window.width) * window.width
++                rect = arcade.XYWH(x, p['y'], p['size'], p['size'] * 0.6)
++                arcade.draw_rect_filled(
++                    rect,
++                    (*p['color'], 220),
++                    p['rotation']
++                )
++    
++    def draw(self, window):
++        if not self.visible or not self.race_results:
++            return
++        
++        # Update animation
++        self._animation_frame += 1
++        self._update_confetti()
++        
++        # Draw full-screen semi-transparent overlay
++        overlay_alpha = min(200, self._animation_frame * 15)
++        overlay_rect = arcade.XYWH(window.width / 2, window.height / 2, window.width, window.height)
++        arcade.draw_rect_filled(overlay_rect, (0, 0, 0, overlay_alpha))
++        
++        # Draw confetti behind podium
++        self._draw_confetti(window)
++        
++        # Get top 3 drivers
++        podium_drivers = self.race_results[:3]
++        if len(podium_drivers) < 3:
++            return
++        
++        center_x = window.width / 2
++        center_y = window.height / 2
++        
++        # Podium block dimensions
++        block_width = 200
++        p1_height = 160
++        p2_height = 120
++        p3_height = 85
++        block_gap = 25
++        
++        p1_x = center_x
++        p2_x = center_x - block_width - block_gap
++        p3_x = center_x + block_width + block_gap
++        
++        podium_base_y = center_y - 60
++        
++        # Draw "RACE COMPLETE" header (always visible after brief delay)
++        header_alpha = min(255, max(0, (self._animation_frame - 5) * 20))
++        if header_alpha > 0:
++            header_y = window.height - 60
++            self._text.font_size = 38
++            self._text.bold = True
++            self._text.color = (255, 215, 0, header_alpha)
++            self._text.text = "*** RACE COMPLETE ***"
++            self._text.x = center_x
++            self._text.y = header_y
++            self._text.anchor_x = "center"
++            self._text.anchor_y = "center"
++            self._text.draw()
++        
++        # Podium positions: Draw P3 first, then P2, then P1
++        positions = [
++            (3, p3_x, p3_height, podium_drivers[2], (205, 127, 50)),   # Bronze - first
++            (2, p2_x, p2_height, podium_drivers[1], (192, 192, 192)),  # Silver - second
++            (1, p1_x, p1_height, podium_drivers[0], (255, 215, 0)),    # Gold - last
++        ]
++        
++        for pos, x, height, driver, medal_color in positions:
++            alpha = self._get_reveal_alpha(pos)
++            if alpha == 0:
++                continue
++            
++            block_bottom = podium_base_y
++            block_top = podium_base_y + height
++            
++            # Draw podium block
++            block_rect = arcade.XYWH(x, block_bottom + height/2, block_width, height)
++            driver_color = driver.get("color", (128, 128, 128))
++            arcade.draw_rect_filled(block_rect, (*driver_color[:3], alpha))
++            arcade.draw_rect_outline(block_rect, (255, 255, 255, alpha), 3)
++            
++            # Position number on block
++            self._text.font_size = 42
++            self._text.bold = True
++            self._text.color = (255, 255, 255, alpha)
++            self._text.text = str(pos)
++            self._text.x = x
++            self._text.y = block_bottom + height/2
++            self._text.anchor_x = "center"
++            self._text.anchor_y = "center"
++            self._text.draw()
++            
++            # Driver code above block
++            name_y = block_top + 20
++            self._text.font_size = 22
++            self._text.bold = True
++            self._text.color = (255, 255, 255, alpha)
++            self._text.text = driver.get("code", "???")
++            self._text.x = x
++            self._text.y = name_y
++            self._text.anchor_x = "center"
++            self._text.draw()
++            
++            # Full name
++            self._text.font_size = 12
++            self._text.bold = False
++            self._text.color = (200, 200, 200, alpha)
++            self._text.text = driver.get("full_name", "Unknown Driver")
++            self._text.y = name_y + 20
++            self._text.draw()
++            
++            # Team name
++            self._text.font_size = 11
++            self._text.color = (*medal_color[:3], alpha)
++            self._text.text = driver.get("team", "Unknown Team")
++            self._text.y = name_y + 35
++            self._text.draw()
++            
++            # Stats card below podium - fixed sizing
++            card_height = 145
++            card_width = block_width - 5
++            stats_card_y = podium_base_y - 20 - card_height/2
++            card_rect = arcade.XYWH(x, stats_card_y, card_width, card_height)
++            arcade.draw_rect_filled(card_rect, (25, 25, 30, alpha))
++            arcade.draw_rect_outline(card_rect, (*medal_color[:3], alpha), 2)
++            
++            # Stats content - properly centered in card
++            self._text.font_size = 10
++            line_height = 18
++            card_top = stats_card_y + card_height/2 - 12
++            label_x = x - card_width/2 + 10
++            value_x = x + 5
++            
++            stats = [
++                ("Time", self._format_gap(driver.get("time"), pos), (150, 255, 150)),
++                ("Points", self._format_points(driver.get("points")), (255, 215, 0)),
++                ("Grid", self._get_grid_text(driver, pos), self._get_grid_color(driver, pos)),
++                ("Best Lap", self._format_time(driver.get("fastest_lap")), (150, 150, 255)),
++                ("WDC Pos", self._format_wdc_position(driver.get("wdc_position")), (255, 200, 100)),
++            ]
++            
++            for i, (label, value, color) in enumerate(stats):
++                y = card_top - i * line_height
++                
++                # Label
++                self._text.bold = True
++                self._text.color = (180, 180, 180, alpha)
++                self._text.text = f"{label}:"
++                self._text.x = label_x
++                self._text.y = y
++                self._text.anchor_x = "left"
++                self._text.draw()
++                
++                # Value
++                self._text.bold = False
++                self._text.color = (*color, alpha)
++                self._text.text = value
++                self._text.x = value_x
++                self._text.anchor_x = "left"
++                self._text.draw()
++        
++        # Draw instruction at bottom
++        if self._animation_frame > 80:
++            inst_alpha = min(255, (self._animation_frame - 80) * 10)
++            self._text.font_size = 14
++            self._text.bold = False
++            self._text.color = (180, 180, 180, inst_alpha)
++            self._text.text = "Press P to toggle podium • Click to dismiss • ESC to exit"
++            self._text.x = center_x
++            self._text.y = 40
++            self._text.anchor_x = "center"
++            self._text.anchor_y = "center"
++            self._text.draw()
++    
++    def _get_grid_text(self, driver, pos):
++        """Get formatted grid position text"""
++        grid = driver.get("grid_position", 0)
++        pos_change = grid - pos
++        if pos_change > 0:
++            return f"P{grid}→P{pos} (+{pos_change})"
++        elif pos_change < 0:
++            return f"P{grid}→P{pos} ({pos_change})"
++        return f"P{grid}→P{pos} (=)"
++    
++    def _get_grid_color(self, driver, pos):
++        """Get color for grid position change"""
++        grid = driver.get("grid_position", 0)
++        pos_change = grid - pos
++        if pos_change > 0:
++            return (100, 255, 100)
++        elif pos_change < 0:
++            return (255, 100, 100)
++        return (200, 200, 200)
++    
++    def on_mouse_press(self, window, x: float, y: float, button: int, modifiers: int) -> bool:
++        """Handle mouse click to dismiss podium"""
++        if self.visible:
++            self.hide()
++            return True
++        return False
++
++
+ class SessionInfoComponent(BaseComponent):
+     """
+     Displays session information banner at the top-center of the screen.
+     Shows: Circuit name, Country, Event name, Year, Round, Date, Total laps
+     """
+     def __init__(self, visible=True):
+         self.visible = visible
+         self.session_info = {}
+         self._text = arcade.Text("", 0, 0, arcade.color.WHITE, 14)
+         
+@@ -1652,21 +2000,21 @@ class RaceControlsComponent(BaseComponent):
+         elif self._point_in_rect(x, y, self.speed_decrease_rect):
+             if hasattr(window, 'playback_speed'):
+                 # FIX: Use index lookup to decrement speed safely within defined PLAYBACK_SPEEDS.
+                 if window.playback_speed > min(self.PLAYBACK_SPEEDS):
+                     current_index = self.PLAYBACK_SPEEDS.index(window.playback_speed)
+                     window.playback_speed = self.PLAYBACK_SPEEDS[max(0, current_index - 1)]
+                     self.flash_button('speed_decrease')
+             return True
+         return False
      
-     if health >= 75:
-         color = (0, 220, 0)
-     elif health >= 50:
-         ratio = (health - 50) / 25.0
+-    def _point_in_rect(self, x: float, y: float, rect: tuple[float, float, float, float] | None) -> bool:
++    def _point_in_rect(self, x: float, y: float, rect: Optional[Tuple[float, float, float, float]]) -> bool:
+         """Check if point is inside rectangle."""
+         if rect is None:
+             return False
+         left, bottom, right, top = rect
+         return left <= x <= right and bottom <= y <= top
+ 
+ class QualifyingLapTimeComponent(BaseComponent):
+     """
+     A component to display the qualifying lap time with sector times and current tyre info.
+     """
+@@ -1828,21 +2176,21 @@ class QualifyingLapTimeComponent(BaseComponent):
+         s2_val = sector_times.get("sector2") or 0
+         s2_time = s1_time + s2_val
+         s2_color = arcade.color.GREEN if s2_time > 0 and current_t >= s2_time else arcade.color.LIGHT_GRAY
+         arcade.Text("S2", self.x + 115, self.y - 120, s2_color, 9, bold=True).draw()
+         
+         s3_val = sector_times.get("sector3") or 0
+         s3_time = s2_time + s3_val
+         s3_color = arcade.color.GREEN if s3_time > 0 and current_t >= s3_time else arcade.color.LIGHT_GRAY
+         arcade.Text("S3", self.x + 200, self.y - 120, s3_color, 9, bold=True).draw()      
+     
+-    def show_delta_sector_times(self, sector_idx: int, sector_time: float, delta_sector_time: float | None, text_color: tuple):
++    def show_delta_sector_times(self, sector_idx: int, sector_time: float, delta_sector_time: Optional[float], text_color: tuple):
+         if self._delta_sector == sector_idx and self._time_elapsed < 1.0 and delta_sector_time is not None:
+             # Show delta for 1 second
+             if delta_sector_time < 0:
+                 text = f"-{abs(delta_sector_time):.3f}s"
+                 text_color = arcade.color.GREEN
+             else:
+                 text = f"+{delta_sector_time:.3f}s"
+                 text_color = arcade.color.YELLOW
+         else:
+             text = f"{sector_time:.1f}s"
