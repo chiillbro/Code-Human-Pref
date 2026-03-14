@@ -1,0 +1,322 @@
+diff --git a/pytest.ini b/pytest.ini
+new file mode 100644
+index 0000000..ee23f6c
+--- /dev/null
++++ b/pytest.ini
+@@ -0,0 +1,8 @@
++[pytest]
++testpaths = tests
++python_files = test_*.py
++python_classes = Test*
++python_functions = test_*
++addopts = -v --tb=short
++filterwarnings =
++    ignore::DeprecationWarning
+diff --git a/requirements.txt b/requirements.txt
+index 8a90ffa..926402c 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,9 +1,11 @@
+ fastf1
+ pandas
+ matplotlib
+ numpy
+ arcade
+ pyglet
+ pyside6
+ questionary
+-rich
+\ No newline at end of file
++rich
++pytest
++pytest-cov
+\ No newline at end of file
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_tyres.py b/tests/test_tyres.py
+new file mode 100644
+index 0000000..68ae33d
+--- /dev/null
++++ b/tests/test_tyres.py
+@@ -0,0 +1,133 @@
++import pytest
++from src.lib.tyres import get_tyre_compound_int, get_tyre_compound_str
++
++
++class TestGetTyreCompoundInt:
++    """Tests for get_tyre_compound_int function."""
++
++    @pytest.mark.parametrize("compound_str,expected", [
++        ("SOFT", 0),
++        ("MEDIUM", 1),
++        ("HARD", 2),
++        ("INTERMEDIATE", 3),
++        ("WET", 4),
++    ])
++    def test_standard_compounds(self, compound_str, expected):
++        """Valid compound strings should return their corresponding integers."""
++        assert get_tyre_compound_int(compound_str) == expected
++
++    @pytest.mark.parametrize("compound_str,expected", [
++        ("soft", 0),
++        ("Soft", 0),
++        ("SoFt", 0),
++        ("medium", 1),
++        ("Medium", 1),
++        ("hard", 2),
++        ("Hard", 2),
++        ("intermediate", 3),
++        ("Intermediate", 3),
++        ("wet", 4),
++        ("Wet", 4),
++    ])
++    def test_case_insensitivity(self, compound_str, expected):
++        """Compound strings should be case-insensitive."""
++        assert get_tyre_compound_int(compound_str) == expected
++
++    @pytest.mark.parametrize("compound_str", [
++        "UNKNOWN",
++        "ULTRASOFT",
++        "SUPERSOFT",
++        "HYPERSOFT",
++        "",
++        "invalid",
++        "S",
++        "M",
++        "H",
++        "I",
++        "W",
++    ])
++    def test_invalid_compounds_return_negative_one(self, compound_str):
++        """Invalid compound strings should return -1."""
++        assert get_tyre_compound_int(compound_str) == -1
++
++    @pytest.mark.parametrize("compound_str", [
++        " SOFT",
++        "SOFT ",
++        " SOFT ",
++        "SO FT",
++    ])
++    def test_whitespace_in_input_returns_negative_one(self, compound_str):
++        """Strings with extra whitespace should return -1."""
++        assert get_tyre_compound_int(compound_str) == -1
++
++
++class TestGetTyreCompoundStr:
++    """Tests for get_tyre_compound_str function."""
++
++    @pytest.mark.parametrize("compound_int,expected", [
++        (0, "SOFT"),
++        (1, "MEDIUM"),
++        (2, "HARD"),
++        (3, "INTERMEDIATE"),
++        (4, "WET"),
++    ])
++    def test_standard_compounds(self, compound_int, expected):
++        """Valid compound integers should return their corresponding strings."""
++        assert get_tyre_compound_str(compound_int) == expected
++
++    @pytest.mark.parametrize("compound_int", [
++        -1,
++        5,
++        10,
++        100,
++        -100,
++    ])
++    def test_invalid_integers_return_unknown(self, compound_int):
++        """Invalid compound integers should return 'UNKNOWN'."""
++        assert get_tyre_compound_str(compound_int) == "UNKNOWN"
++
++    @pytest.mark.parametrize("compound_int", [
++        0.0,
++        1.0,
++        2.0,
++        3.0,
++        4.0,
++    ])
++    def test_float_equivalents(self, compound_int):
++        """Float values equal to valid integers should work due to Python equality."""
++        expected_map = {0.0: "SOFT", 1.0: "MEDIUM", 2.0: "HARD", 3.0: "INTERMEDIATE", 4.0: "WET"}
++        assert get_tyre_compound_str(compound_int) == expected_map[compound_int]
++
++    @pytest.mark.parametrize("compound_int", [
++        0.5,
++        1.5,
++        2.5,
++        -0.5,
++    ])
++    def test_non_integer_floats_return_unknown(self, compound_int):
++        """Float values that don't equal valid integers should return 'UNKNOWN'."""
++        assert get_tyre_compound_str(compound_int) == "UNKNOWN"
++
++
++class TestRoundTripConversion:
++    """Tests for round-trip conversion between int and string."""
++
++    @pytest.mark.parametrize("compound_str", [
++        "SOFT",
++        "MEDIUM",
++        "HARD",
++        "INTERMEDIATE",
++        "WET",
++    ])
++    def test_string_to_int_to_string(self, compound_str):
++        """Converting string to int and back should return original string."""
++        compound_int = get_tyre_compound_int(compound_str)
++        result = get_tyre_compound_str(compound_int)
++        assert result == compound_str
++
++    @pytest.mark.parametrize("compound_int", [0, 1, 2, 3, 4])
++    def test_int_to_string_to_int(self, compound_int):
++        """Converting int to string and back should return original int."""
++        compound_str = get_tyre_compound_str(compound_int)
++        result = get_tyre_compound_int(compound_str)
++        assert result == compound_int
+diff --git a/tests/test_ui_components.py b/tests/test_ui_components.py
+new file mode 100644
+index 0000000..7f87809
+--- /dev/null
++++ b/tests/test_ui_components.py
+@@ -0,0 +1,141 @@
++import pytest
++from typing import Optional
++
++
++def _format_wind_direction(degrees: Optional[float]) -> str:
++    """
++    Local copy of the function from src/ui_components.py for isolated testing.
++    This avoids importing the entire module which has heavy dependencies (arcade)
++    and Python 3.10+ type hints incompatible with older Python versions.
++    """
++    if degrees is None:
++        return "N/A"
++    deg_norm = degrees % 360
++    dirs = [
++        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
++        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
++    ]
++    idx = int((deg_norm / 22.5) + 0.5) % len(dirs)
++    return dirs[idx]
++
++
++class TestFormatWindDirection:
++    """Tests for _format_wind_direction function."""
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (0, "N"),
++        (90, "E"),
++        (180, "S"),
++        (270, "W"),
++    ])
++    def test_cardinal_directions(self, degrees, expected):
++        """Cardinal directions (N, E, S, W) at exact angles."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (45, "NE"),
++        (135, "SE"),
++        (225, "SW"),
++        (315, "NW"),
++    ])
++    def test_intercardinal_directions(self, degrees, expected):
++        """Intercardinal directions (NE, SE, SW, NW) at 45-degree intervals."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (22.5, "NNE"),
++        (67.5, "ENE"),
++        (112.5, "ESE"),
++        (157.5, "SSE"),
++        (202.5, "SSW"),
++        (247.5, "WSW"),
++        (292.5, "WNW"),
++        (337.5, "NNW"),
++    ])
++    def test_secondary_intercardinal_directions(self, degrees, expected):
++        """Secondary intercardinal directions at 22.5-degree intervals."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (360, "N"),
++        (450, "E"),
++        (540, "S"),
++        (720, "N"),
++        (810, "E"),
++    ])
++    def test_degrees_above_360_normalized(self, degrees, expected):
++        """Degrees >= 360 should be normalized using modulo."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (-90, "W"),
++        (-180, "S"),
++        (-270, "E"),
++        (-360, "N"),
++        (-45, "NW"),
++    ])
++    def test_negative_degrees_normalized(self, degrees, expected):
++        """Negative degrees should be normalized correctly."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (11.24, "N"),
++        (11.25, "NNE"),  # Exact boundary rounds to next direction
++        (11.26, "NNE"),
++        (33.74, "NNE"),
++        (33.75, "NE"),  # Exact boundary rounds to next direction
++        (33.76, "NE"),
++        (348.75, "N"),  # 348.75 / 22.5 + 0.5 = 16, wraps to 0 (N)
++        (348.74, "NNW"),
++    ])
++    def test_boundary_conditions(self, degrees, expected):
++        """Test values at direction boundaries (rounding behavior)."""
++        assert _format_wind_direction(degrees) == expected
++
++    def test_none_input_returns_na(self):
++        """None input should return 'N/A'."""
++        assert _format_wind_direction(None) == "N/A"
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (0.0, "N"),
++        (90.0, "E"),
++        (180.0, "S"),
++        (270.0, "W"),
++        (45.0, "NE"),
++    ])
++    def test_float_inputs(self, degrees, expected):
++        """Float inputs should work the same as integers."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (359.9, "N"),
++        (0.1, "N"),
++        (89.9, "E"),
++        (90.1, "E"),
++    ])
++    def test_near_cardinal_directions(self, degrees, expected):
++        """Values very close to cardinal directions should round correctly."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees", [
++        1000,
++        -1000,
++        3600,
++        -3600,
++    ])
++    def test_extreme_values(self, degrees):
++        """Extreme positive and negative values should normalize correctly."""
++        result = _format_wind_direction(degrees)
++        valid_directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
++                           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
++        assert result in valid_directions
++
++    def test_all_16_directions_coverage(self):
++        """Verify all 16 compass directions can be reached."""
++        expected_directions = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
++                               "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
++        results = set()
++        for i in range(16):
++            degrees = i * 22.5
++            results.add(_format_wind_direction(degrees))
++        assert results == set(expected_directions)

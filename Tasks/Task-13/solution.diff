@@ -1,0 +1,680 @@
+diff --git a/main.py b/main.py
+index 932008e..75dc87f 100644
+--- a/main.py
++++ b/main.py
+@@ -96,21 +96,22 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
+       drivers=drivers,
+       playback_speed=playback_speed,
+       driver_colors=race_telemetry['driver_colors'],
+       title=f"{session.event['EventName']} - {'Sprint' if session_type == 'S' else 'Race'}",
+       total_laps=race_telemetry['total_laps'],
+       circuit_rotation=circuit_rotation,
+       visible_hud=visible_hud,
+       ready_file=ready_file,
+       session_info=session_info,
+       session=session,
+-      enable_telemetry=True # This is now permanently enabled to support the telemetry insights menu if the user decides to use it
++      enable_telemetry=True, # This is now permanently enabled to support the telemetry insights menu if the user decides to use it
++      max_tyre_life=race_telemetry.get('max_tyre_life')
+     )
+ 
+ if __name__ == "__main__":
+ 
+   if "--cli" in sys.argv:
+     # Run the CLI
+ 
+     cli_load()
+     sys.exit(0)
+ 
+diff --git a/requirements.txt b/requirements.txt
+index 8a90ffa..82781ec 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,9 +1,10 @@
+ fastf1
+ pandas
+ matplotlib
+-numpy
++numpy>=2.0.0,<2.5.0
++scipy>=1.15.0,<1.18.0
+ arcade
+ pyglet
+ pyside6
+ questionary
+ rich
+\ No newline at end of file
+diff --git a/src/gui/insights_menu.py b/src/gui/insights_menu.py
+index 47b6143..70f02b2 100644
+--- a/src/gui/insights_menu.py
++++ b/src/gui/insights_menu.py
+@@ -53,21 +53,26 @@ class InsightsMenu(QMainWindow):
+         ))
+ 
+         content_layout.addWidget(self.create_category_section(
+             "Live Telemetry",
+             [
+                 ("Telemetry Stream Viewer", "View raw telemetry data", self.launch_telemetry_viewer),
+                 ("Driver Live Telemetry", "Speed, gear, throttle & braking for a selected driver", self.launch_driver_telemetry),
+             ]
+         ))
+         
+-        content_layout.addStretch()
++        content_layout.addWidget(self.create_category_section(
++            "Tyre Analysis",
++            [
++                ("Tyre Degradation Analysis", "View cumulative tyre degradation impact for a selected driver", self.launch_tyre_degradation_analysis),
++            ]
++        ))
+         
+         scroll.setWidget(content_widget)
+         main_layout.addWidget(scroll)
+         
+         # Footer
+         footer = self.create_footer()
+         main_layout.addWidget(footer)
+     
+     def create_header(self):
+         header = QFrame()
+@@ -183,23 +188,26 @@ class InsightsMenu(QMainWindow):
+             self.show_placeholder_message("Telemetry Stream Viewer")
+     
+     def launch_speed_monitor(self):
+         print("🚀 Launching: Speed Monitor")
+         self.show_placeholder_message("Speed Monitor")
+     
+     def launch_position_tracker(self):
+         print("🚀 Launching: Position Tracker")
+         self.show_placeholder_message("Position Tracker")
+     
+-    def launch_tyre_strategy(self):
+-        print("🚀 Launching: Tyre Strategy")
+-        self.show_placeholder_message("Tyre Strategy")
++    def launch_tyre_degradation_analysis(self):
++        print("🚀 Launching: Tyre Degradation Analysis")
++        from src.gui.tyre_degradation_window import TyreDegradationWindow
++        window = TyreDegradationWindow()
++        window.show()
++        self.opened_windows.append(window)
+     
+     def launch_pit_analysis(self):
+         print("🚀 Launching: Pit Stop Analysis")
+         self.show_placeholder_message("Pit Stop Analysis")
+     
+     def launch_gap_analysis(self):
+         print("🚀 Launching: Gap Analysis")
+         self.show_placeholder_message("Gap Analysis")
+     
+     def launch_sector_times(self):
+diff --git a/src/gui/tyre_degradation_window.py b/src/gui/tyre_degradation_window.py
+new file mode 100644
+index 0000000..c093430
+--- /dev/null
++++ b/src/gui/tyre_degradation_window.py
+@@ -0,0 +1,368 @@
++import sys
++from PySide6.QtWidgets import (
++    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
++    QPushButton, QFrame
++)
++from PySide6.QtCore import Qt, QTimer
++from PySide6.QtGui import QFont
++import matplotlib.pyplot as plt
++from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
++from matplotlib.figure import Figure
++import numpy as np
++
++from src.gui.pit_wall_window import PitWallWindow
++from src.lib.tyres import get_tyre_compound_str
++
++
++class TyreDegradationWindow(PitWallWindow):
++    """
++    Window for analyzing tyre degradation impact over the course of a race.
++    Shows cumulative degradation for all drivers by default; user can select
++    an individual driver to focus.
++    """
++
++    def __init__(self):
++        # Initialize attributes before calling parent __init__ because
++        # PitWallWindow.__init__ calls setup_ui() which expects these
++        # attributes to exist.
++        self.current_driver = "All Drivers"
++        self.driver_data = {}  # Store data list for each driver
++
++        # Fallback tyre degradation rates (seconds per lap)
++        self.degradation_rates = {
++            0: 0.0179,  # SOFT (example value)
++            1: 0.015,   # MEDIUM (estimated)
++            2: 0.0179,  # HARD (user specified)
++            3: 0.02,    # INTERMEDIATE (estimated)
++            4: 0.012    # WET (estimated)
++        }
++        self._fallback_degradation_rates = dict(self.degradation_rates)
++
++        # Expected tyre life (laps) per compound for health normalization
++        # 100% at lap 1 of stint, 0% at expected life, negative beyond expected life
++        self.expected_tyre_life = {
++            0: 20,  # SOFT
++            1: 25,  # MEDIUM
++            2: 30,  # HARD
++            3: 18,  # INTERMEDIATE
++            4: 22   # WET
++        }
++        self._fallback_expected_tyre_life = dict(self.expected_tyre_life)
++        self.tyre_profile_source = "Fallback"
++
++        super().__init__()
++        self.setWindowTitle("F1 Tyre Degradation Analysis")
++        self.setGeometry(200, 200, 1000, 700)
++
++        # Timer for periodic plot updates to reduce lag
++        self.update_timer = QTimer()
++        self.update_timer.timeout.connect(self.update_plot)
++        self.update_timer.start(100)  # Update every 0.1 seconds
++
++    def setup_ui(self):
++        """Create the UI components."""
++        central_widget = QWidget()
++        self.setCentralWidget(central_widget)
++
++        main_layout = QVBoxLayout(central_widget)
++
++        # Header
++        header = self.create_header()
++        main_layout.addWidget(header)
++
++        # Controls
++        controls = self.create_controls()
++        main_layout.addWidget(controls)
++
++        # Plot area
++        self.figure = Figure(figsize=(10, 6))
++        self.canvas = FigureCanvas(self.figure)
++        main_layout.addWidget(self.canvas)
++
++        # Initial plot
++        self.update_plot()
++
++    def create_header(self):
++        """Create the header section."""
++        header = QFrame()
++        header.setFrameShape(QFrame.NoFrame)
++
++        layout = QVBoxLayout(header)
++
++        title = QLabel("🛞 Tyre Degradation Analysis")
++        title.setFont(QFont("Arial", 20, QFont.Bold))
++        layout.addWidget(title)
++
++        self.subtitle = QLabel(
++            f"Cumulative degradation impact for selected driver • Profile: {self.tyre_profile_source}"
++        )
++        self.subtitle.setFont(QFont("Arial", 12))
++        layout.addWidget(self.subtitle)
++
++        return header
++
++    def create_controls(self):
++        """Create the control panel."""
++        controls = QFrame()
++        controls.setFrameShape(QFrame.NoFrame)
++
++        layout = QHBoxLayout(controls)
++
++        # Driver selection
++        driver_label = QLabel("Select Driver:")
++        driver_label.setFont(QFont("Arial", 12, QFont.Bold))
++        layout.addWidget(driver_label)
++
++        self.driver_combo = QComboBox()
++        # Default option to show all drivers
++        self.driver_combo.addItem("All Drivers")
++        self.driver_combo.setMinimumWidth(150)
++        self.driver_combo.currentTextChanged.connect(self.on_driver_changed)
++        layout.addWidget(self.driver_combo)
++
++        layout.addStretch()
++
++        # Refresh button
++        refresh_btn = QPushButton("Refresh Data")
++        refresh_btn.clicked.connect(self.refresh_data)
++        layout.addWidget(refresh_btn)
++
++        return controls
++
++    def on_telemetry_data(self, data):
++        """Process incoming telemetry data and store per-driver tyre info."""
++        profile = data.get('tyre_profile')
++        if profile:
++            self._update_tyre_profile(profile)
++
++        if 'frame' in data and 'drivers' in data['frame']:
++            drivers = data['frame']['drivers']
++
++            # Keep combo: All Drivers + driver codes
++            driver_codes = list(drivers.keys())
++            desired = ["All Drivers"] + driver_codes
++            current_items = [self.driver_combo.itemText(i) for i in range(self.driver_combo.count())]
++            if current_items != desired:
++                try:
++                    self.driver_combo.currentTextChanged.disconnect(self.on_driver_changed)
++                except Exception:
++                    pass
++                self.driver_combo.clear()
++                self.driver_combo.addItems(desired)
++                self.driver_combo.currentTextChanged.connect(self.on_driver_changed)
++                if self.current_driver not in desired:
++                    self.current_driver = "All Drivers"
++                    self.driver_combo.setCurrentText(self.current_driver)
++
++            # Append telemetry entry for each driver
++            frame_index = data.get('frame_index', 0)
++            for code, pos in drivers.items():
++                if code not in self.driver_data:
++                    self.driver_data[code] = []
++
++                tyre_data = {
++                    'frame': frame_index,
++                    'tyre': pos.get('tyre', 0),
++                    'tyre_life': pos.get('tyre_life', 0),
++                    'lap': pos.get('lap', 0)
++                }
++                self.driver_data[code].append(tyre_data)
++                # cap memory per driver to last 1000 points for performance
++                if len(self.driver_data[code]) > 1000:
++                    self.driver_data[code] = self.driver_data[code][-1000:]
++
++        # Plot updates are now handled by a timer to reduce lag
++
++    def on_driver_changed(self, driver):
++        """Handle driver selection change."""
++        if driver:
++            self.current_driver = driver
++            self.update_plot()
++
++    def refresh_data(self):
++        """Refresh the data collection (clears stored telemetry)."""
++        self.driver_data = {}
++        self.update_plot()
++
++    def _update_tyre_profile(self, profile):
++        """Update race-specific tyre degradation profile from telemetry stream."""
++        updated = False
++
++        max_life = profile.get('max_tyre_life', {}) if isinstance(profile, dict) else {}
++        if isinstance(max_life, dict) and max_life:
++            parsed_life = {}
++            for key, value in max_life.items():
++                try:
++                    tyre_key = int(key)
++                    tyre_life = int(value)
++                except (TypeError, ValueError):
++                    continue
++                if tyre_life > 0:
++                    parsed_life[tyre_key] = tyre_life
++
++            merged_life = dict(self._fallback_expected_tyre_life)
++            merged_life.update(parsed_life)
++            if parsed_life and merged_life != self.expected_tyre_life:
++                self.expected_tyre_life = merged_life
++                self.tyre_profile_source = "Race Session"
++                updated = True
++
++        rates = profile.get('degradation_rates', {}) if isinstance(profile, dict) else {}
++        if isinstance(rates, dict) and rates:
++            parsed_rates = {}
++            for key, value in rates.items():
++                try:
++                    tyre_key = int(key)
++                    rate = float(value)
++                except (TypeError, ValueError):
++                    continue
++                if rate >= 0:
++                    parsed_rates[tyre_key] = rate
++
++            merged_rates = dict(self._fallback_degradation_rates)
++            merged_rates.update(parsed_rates)
++            if parsed_rates and merged_rates != self.degradation_rates:
++                self.degradation_rates = merged_rates
++                self.tyre_profile_source = "Race Session"
++                updated = True
++
++        if updated and hasattr(self, 'subtitle'):
++            self.subtitle.setText(
++                f"Cumulative degradation impact for selected driver • Profile: {self.tyre_profile_source}"
++            )
++
++    def update_plot(self):
++        """Update the degradation plot for all drivers or a single driver."""
++        self.figure.clear()
++
++        ax = self.figure.add_subplot(111)
++
++        # If no telemetry yet, show placeholder
++        if not self.driver_data:
++            ax.text(0.5, 0.5, "Waiting for telemetry data...\nSelect a driver to view degradation analysis",
++                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
++            ax.set_xlim(0, 1)
++            ax.set_ylim(0, 1)
++            self.canvas.draw()
++            return
++
++        # Helper to compute plot points for a single driver's stored data
++        def compute_degradation_series(entries):
++            if not entries:
++                return [], []
++            entries = sorted(entries, key=lambda x: x['frame'])
++            tyre_lives = [e['tyre_life'] for e in entries]
++            compounds = [e['tyre'] for e in entries]
++            laps = [e['lap'] for e in entries]
++
++            # Build stints
++            stints = []
++            current_stint = None
++            previous_life = None
++            for i, (life, compound, lap) in enumerate(zip(tyre_lives, compounds, laps)):
++                # Start a new stint when:
++                # 1) compound changes, or
++                # 2) tyre life resets/decreases (pit stop on same compound)
++                is_new_stint = (
++                    current_stint is None
++                    or current_stint['compound'] != compound
++                    or (previous_life is not None and life < previous_life)
++                )
++
++                if is_new_stint:
++                    current_stint = {
++                        'compound': compound,
++                        'start_life': life,
++                        'start_lap': lap,
++                        'lives': [life],
++                        'laps': [lap]
++                    }
++                    stints.append(current_stint)
++                else:
++                    current_stint['lives'].append(life)
++                    current_stint['laps'].append(lap)
++
++                previous_life = life
++
++            plot_x = []
++            plot_y = []
++            for stint in stints:
++                compound = stint['compound']
++                expected_life = self.expected_tyre_life.get(compound, 25)
++                start_lap = stint['start_lap']
++                start_life = stint['start_life']
++                for life, lap in zip(stint['lives'], stint['laps']):
++                    # Degrade health by race laps completed in this stint
++                    # so the curve decreases gradually lap-by-lap.
++                    # If the tyre is already used at stint start, initial
++                    # health starts below 100% based on start_life.
++                    laps_in_stint = max(0, lap - start_lap)
++                    effective_life_progress = max(0, (start_life - 1) + laps_in_stint)
++                    if expected_life > 1:
++                        health_pct = 100 - (effective_life_progress / (expected_life - 1)) * 100
++                    else:
++                        health_pct = 100.0
++                    plot_x.append(lap)
++                    plot_y.append(health_pct)
++
++            return plot_x, plot_y
++
++        # Compute the current max lap across all drivers for x-axis synchronization
++        max_lap = max((max(e['lap'] for e in entries) for entries in self.driver_data.values() if entries), default=0)
++
++        # If a single driver is selected, show only that driver
++        if self.current_driver and self.current_driver != "All Drivers":
++            driver = self.current_driver
++            entries = self.driver_data.get(driver, [])
++            px, py = compute_degradation_series(entries)
++            if px and py:
++                ax.plot(px, py, linewidth=2, color='tab:blue', label=driver)
++            ax.set_title(f'Tyre Degradation Analysis - {driver}')
++            ax.set_xlabel('Race Lap')
++            ax.set_ylabel('Tyre Health (%)')
++            ax.set_xlim(0, max_lap + 1)
++            ax.grid(True, alpha=0.3)
++            ax.legend()
++            self.figure.tight_layout()
++            self.canvas.draw()
++            return
++
++        # Otherwise plot all drivers
++        cmap = plt.get_cmap('tab10')
++        drivers_sorted = sorted(self.driver_data.keys())
++        plotted = False
++        for idx, driver in enumerate(drivers_sorted):
++            entries = self.driver_data.get(driver, [])
++            px, py = compute_degradation_series(entries)
++            if px and py:
++                color = cmap(idx % 10)
++                ax.plot(px, py, linewidth=1.5, color=color, label=driver, alpha=0.9)
++                plotted = True
++
++        if not plotted:
++            ax.text(0.5, 0.5, "No tyre data to plot yet", ha='center', va='center', transform=ax.transAxes)
++
++        ax.set_title('Tyre Degradation Analysis - All Drivers')
++        ax.set_xlabel('Race Lap')
++        ax.set_ylabel('Tyre Health (%)')
++        ax.set_xlim(0, max_lap + 1)
++        ax.grid(True, alpha=0.3)
++        ax.legend(loc='upper left', fontsize='small', ncol=2)
++        self.figure.tight_layout()
++        self.canvas.draw()
++
++
++def main():
++    """Launch the tyre degradation analysis window."""
++    app = QApplication.instance()
++    if app is None:
++        app = QApplication(sys.argv)
++
++    window = TyreDegradationWindow()
++    window.show()
++
++    return app.exec()
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+\ No newline at end of file
+diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
+index 40700c2..adf85b2 100644
+--- a/src/interfaces/race_replay.py
++++ b/src/interfaces/race_replay.py
+@@ -1,15 +1,16 @@
+ import os
+ import arcade
+ import numpy as np
+ from scipy.spatial import cKDTree
+ from src.f1_data import FPS
++from src.lib.tyres import get_tyre_compound_int
+ from src.ui_components import (
+     LeaderboardComponent, 
+     WeatherComponent, 
+     LegendComponent, 
+     DriverInfoComponent, 
+     RaceProgressBarComponent,
+     RaceControlsComponent,
+     ControlsPopupComponent,
+     SessionInfoComponent,
+     extract_race_events,
+@@ -22,21 +23,21 @@ from src.services.stream import TelemetryStreamServer
+ 
+ SCREEN_WIDTH = 1280
+ SCREEN_HEIGHT = 720
+ SCREEN_TITLE = "F1 Race Replay"
+ PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+ 
+ class F1RaceReplayWindow(arcade.Window):
+     def __init__(self, frames, track_statuses, example_lap, drivers, title,
+                  playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
+                  left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
+-                 session_info=None, session=None, enable_telemetry=False):
++                 session_info=None, session=None, enable_telemetry=False, max_tyre_life=None):
+         # Set resizable to True so the user can adjust mid-sim
+         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
+         self.maximize()
+ 
+         self.telemetry_stream = None
+         if enable_telemetry:
+             try:
+                 self.telemetry_stream = TelemetryStreamServer()
+                 self.telemetry_stream.start()
+                 print("Telemetry stream server started on localhost:9999")
+@@ -50,22 +51,24 @@ class F1RaceReplayWindow(arcade.Window):
+ 
+         self.frames = frames
+         self.track_statuses = track_statuses
+         self.n_frames = len(frames)
+         self.drivers = list(drivers)
+         self.playback_speed = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.index(playback_speed)] if playback_speed in PLAYBACK_SPEEDS else 1.0
+         self.driver_colors = driver_colors or {}
+         self.frame_index = 0.0  # use float for fractional-frame accumulation
+         self.paused = False
+         self.total_laps = total_laps
++        self.max_tyre_life = max_tyre_life or {}
+         self.has_weather = any("weather" in frame for frame in frames) if frames else False
+         self.visible_hud = visible_hud # If it displays HUD or not (leaderboard, controls, weather, etc)
++        self.tyre_degradation_rates = {}
+ 
+         # Rotation (degrees) to apply to the whole circuit around its centre
+         self.circuit_rotation = circuit_rotation
+         self._rot_rad = float(np.deg2rad(self.circuit_rotation)) if self.circuit_rotation else 0.0
+         self._cos_rot = float(np.cos(self._rot_rad))
+         self._sin_rot = float(np.sin(self._rot_rad))
+         self.finished_drivers = []
+         self.left_ui_margin = left_ui_margin
+         self.right_ui_margin = right_ui_margin
+         self.toggle_drs_zones = True 
+@@ -86,20 +89,25 @@ class F1RaceReplayWindow(arcade.Window):
+                 print("Initializing tyre degradation model...")
+                 self.degradation_integrator = TyreDegradationIntegrator(session=session)
+                 
+                 # This computes curves once at startup (1-2 seconds)
+                 init_success = self.degradation_integrator.initialize_from_session()
+                 
+                 if init_success:
+                     print("✓ Tyre degradation model initialized successfully")
+                     # Link integrator to driver info component
+                     self.driver_info_comp.degradation_integrator = self.degradation_integrator
++                    rates = self.degradation_integrator.get_degradation_rates()
++                    for compound_name, rate in rates.items():
++                        compound_key = get_tyre_compound_int(compound_name)
++                        if compound_key is not None and compound_key >= 0:
++                            self.tyre_degradation_rates[int(compound_key)] = float(rate)
+                 else:
+                     print("✗ Tyre degradation model initialization failed")
+                     self.degradation_integrator = None
+             except Exception as e:
+                 print(f"✗ Tyre degradation initialization error: {e}")
+                 self.degradation_integrator = None
+         else:
+             print("Note: Session not provided, tyre degradation disabled")
+ 
+ 
+@@ -258,20 +266,24 @@ class F1RaceReplayWindow(arcade.Window):
+         time_str = f"{hours:02}:{minutes:02}:{seconds:02}"
+         
+         self.telemetry_stream.broadcast({
+             "frame_index": int(self.frame_index),
+             "frame": current_frame,
+             "track_status": current_track_status,
+             "playback_speed": self.playback_speed,
+             "is_paused": self.paused,
+             "total_frames": self.n_frames,
+             "circuit_length_m": self.circuit_length_m,
++            "tyre_profile": {
++                "max_tyre_life": self.max_tyre_life,
++                "degradation_rates": self.tyre_degradation_rates,
++            },
+             "session_data": {
+                 "time": time_str,
+                 "lap": leader_lap,
+                 "leader": leader_code,
+                 "total_laps": self.total_laps
+             }
+         })
+ 
+     def _interpolate_points(self, xs, ys, interp_points=2000):
+         t_old = np.linspace(0, 1, len(xs))
+diff --git a/src/run_session.py b/src/run_session.py
+index 77c9c0a..73f9098 100644
+--- a/src/run_session.py
++++ b/src/run_session.py
+@@ -2,35 +2,37 @@ import os
+ import subprocess
+ import sys
+ import threading
+ import time
+ import arcade
+ from src.interfaces.race_replay import F1RaceReplayWindow
+ from src.insights.telemetry_stream_viewer import main as telemetry_viewer_main
+ 
+ def run_arcade_replay(frames, track_statuses, example_lap, drivers, title,
+                       playback_speed=1.0, driver_colors=None, circuit_rotation=0.0, total_laps=None,
+-                      visible_hud=True, ready_file=None, session_info=None, session=None, enable_telemetry=True):
++                      visible_hud=True, ready_file=None, session_info=None, session=None, enable_telemetry=True,
++                      max_tyre_life=None):
+     window = F1RaceReplayWindow(
+         frames=frames,
+         track_statuses=track_statuses,
+         example_lap=example_lap,
+         drivers=drivers,
+         playback_speed=playback_speed,
+         driver_colors=driver_colors,
+         title=title,
+         total_laps=total_laps,
+         circuit_rotation=circuit_rotation,
+         visible_hud=visible_hud,
+         session_info=session_info,
+         session=session,
+-        enable_telemetry=enable_telemetry
++        enable_telemetry=enable_telemetry,
++        max_tyre_life=max_tyre_life
+     )
+     # Signal readiness to parent process (if requested) after window created
+     if ready_file:
+         try:
+             with open(ready_file, 'w') as f:
+                 f.write('ready')
+         except Exception:
+             pass
+     arcade.run()
+ 
+diff --git a/src/tyre_degradation_integration.py b/src/tyre_degradation_integration.py
+index 049ac59..5de7814 100644
+--- a/src/tyre_degradation_integration.py
++++ b/src/tyre_degradation_integration.py
+@@ -104,20 +104,29 @@ class TyreDegradationIntegrator:
+         
+         
+         track_condition = frame_data.get("track_condition")
+         
+         return self.get_tyre_health(driver_code, lap_num, track_condition)
+     
+     def clear_cache(self):
+         """Clear cache."""
+         self._cache.clear()
+ 
++    def get_degradation_rates(self) -> Dict[str, float]:
++        """Get fitted degradation rates per compound in seconds/lap."""
++        if not self._initialized:
++            return {}
++        return {
++            compound_name: float(profile.degradation_rate)
++            for compound_name, profile in self._model.tyre_profiles.items()
++        }
++
+ 
+ def format_tyre_health_bar(health: int, width: int = 100, height: int = 12) -> Dict:
+     """Format health bar visualization data."""
+     health = max(0, min(100, health))
+     fill_width = (health / 100.0) * width
+     
+     if health >= 75:
+         color = (0, 220, 0)
+     elif health >= 50:
+         ratio = (health - 50) / 25.0
