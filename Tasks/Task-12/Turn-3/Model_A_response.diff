@@ -1,0 +1,912 @@
+diff --git a/pytest.ini b/pytest.ini
+new file mode 100644
+index 0000000..8cff5f3
+--- /dev/null
++++ b/pytest.ini
+@@ -0,0 +1,9 @@
++[pytest]
++testpaths = tests
++python_files = test_*.py
++python_classes = Test*
++python_functions = test_*
++addopts = -v --tb=short
++filterwarnings =
++    ignore::DeprecationWarning
++    ignore::PendingDeprecationWarning
+diff --git a/requirements.txt b/requirements.txt
+index 8a90ffa..e6d7751 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,9 +1,11 @@
+ fastf1
+ pandas
+ matplotlib
+ numpy
+ arcade
+ pyglet
+ pyside6
+ questionary
+-rich
+\ No newline at end of file
++rich
++pytest>=7.0.0,<9.0.0
++pytest-cov>=4.0.0,<6.0.0
+\ No newline at end of file
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..6db2b88
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,115 @@
++"""
++Shared fixtures and configuration for pytest test suite.
++"""
++import pytest
++
++
++# Tyre compound test data
++@pytest.fixture
++def valid_tyre_compounds():
++    """Valid tyre compound mappings."""
++    return {
++        "SOFT": 0,
++        "MEDIUM": 1,
++        "HARD": 2,
++        "INTERMEDIATE": 3,
++        "WET": 4,
++    }
++
++
++@pytest.fixture
++def invalid_tyre_strings():
++    """Invalid tyre compound strings that should return -1."""
++    return [
++        "UNKNOWN",
++        "ULTRASOFT",
++        "SUPERSOFT",
++        "HYPERSOFT",
++        "",
++        "invalid",
++        "S",
++        "M",
++        "H",
++        "I",
++        "W",
++    ]
++
++
++@pytest.fixture
++def invalid_tyre_integers():
++    """Invalid tyre compound integers that should return 'UNKNOWN'."""
++    return [-1, 5, 10, 100, -100]
++
++
++# Wind direction test data
++@pytest.fixture
++def cardinal_directions():
++    """Cardinal direction test cases (N, E, S, W)."""
++    return [
++        (0, "N"),
++        (90, "E"),
++        (180, "S"),
++        (270, "W"),
++    ]
++
++
++@pytest.fixture
++def intercardinal_directions():
++    """Intercardinal direction test cases (NE, SE, SW, NW)."""
++    return [
++        (45, "NE"),
++        (135, "SE"),
++        (225, "SW"),
++        (315, "NW"),
++    ]
++
++
++@pytest.fixture
++def all_16_directions():
++    """All 16 compass directions in order starting from N."""
++    return [
++        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
++        "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
++    ]
++
++
++# Time formatting test data
++@pytest.fixture
++def standard_time_cases():
++    """Standard time formatting test cases (seconds -> formatted string)."""
++    return [
++        (0, "00:00.000"),
++        (1, "00:01.000"),
++        (60, "01:00.000"),
++        (61, "01:01.000"),
++        (90, "01:30.000"),
++        (3600, "60:00.000"),
++        (3661, "61:01.000"),
++    ]
++
++
++@pytest.fixture
++def precision_time_cases():
++    """Time formatting with millisecond precision."""
++    return [
++        (1.5, "00:01.500"),
++        (1.123, "00:01.123"),
++        (1.1234, "00:01.123"),
++        (1.1239, "00:01.124"),
++        (0.001, "00:00.001"),
++        (0.0001, "00:00.000"),
++        (59.999, "00:59.999"),
++        (86.123, "01:26.123"),
++    ]
++
++
++@pytest.fixture
++def time_string_formats():
++    """Various time string formats for parsing."""
++    return [
++        ("01:26.123", 86.123),
++        ("01:26", 86.0),
++        ("00:01:26.123000", 86.123),
++        ("00:01:26:123000", 86.123),
++        ("0 days 00:01:27.060000", 87.06),
++    ]
+diff --git a/tests/test_time.py b/tests/test_time.py
+new file mode 100644
+index 0000000..433c125
+--- /dev/null
++++ b/tests/test_time.py
+@@ -0,0 +1,449 @@
++"""
++Tests for time formatting and parsing functions in src/lib/time.py.
++"""
++import pytest
++from src.lib.time import format_time, parse_time_string
++
++
++class TestFormatTime:
++    """Tests for format_time function."""
++
++    @pytest.mark.parametrize("seconds,expected", [
++        (0, "00:00.000"),
++        (1, "00:01.000"),
++        (59, "00:59.000"),
++        (60, "01:00.000"),
++        (61, "01:01.000"),
++        (90, "01:30.000"),
++        (119, "01:59.000"),
++        (120, "02:00.000"),
++    ])
++    def test_standard_whole_seconds(self, seconds, expected):
++        """Whole second values should format correctly."""
++        assert format_time(seconds) == expected
++
++    @pytest.mark.parametrize("seconds,expected", [
++        (3600, "60:00.000"),
++        (3660, "61:00.000"),
++        (3661, "61:01.000"),
++        (7200, "120:00.000"),
++    ])
++    def test_times_over_one_hour(self, seconds, expected):
++        """Times over 60 minutes should display minutes > 59."""
++        assert format_time(seconds) == expected
++
++    @pytest.mark.parametrize("seconds,expected", [
++        (1.5, "00:01.500"),
++        (1.123, "00:01.123"),
++        (1.001, "00:01.001"),
++        (0.001, "00:00.001"),
++        (0.999, "00:00.999"),
++        (59.999, "00:59.999"),
++        (86.123, "01:26.123"),
++    ])
++    def test_millisecond_precision(self, seconds, expected):
++        """Millisecond precision should be preserved."""
++        assert format_time(seconds) == expected
++
++    @pytest.mark.parametrize("seconds,expected", [
++        (1.1234, "00:01.123"),
++        (1.1239, "00:01.124"),
++        (1.9999, "00:02.000"),
++        (0.0001, "00:00.000"),
++        (0.0009, "00:00.001"),
++        (0.0004, "00:00.000"),
++    ])
++    def test_rounding_behavior(self, seconds, expected):
++        """Sub-millisecond values should round correctly."""
++        assert format_time(seconds) == expected
++
++    def test_none_input_returns_na(self):
++        """None input should return 'N/A'."""
++        assert format_time(None) == "N/A"
++
++    @pytest.mark.parametrize("seconds", [-1, -0.001, -60, -100])
++    def test_negative_input_returns_na(self, seconds):
++        """Negative values should return 'N/A'."""
++        assert format_time(seconds) == "N/A"
++
++    def test_zero_returns_formatted(self):
++        """Zero should be formatted, not treated as invalid."""
++        assert format_time(0) == "00:00.000"
++        assert format_time(0.0) == "00:00.000"
++
++    @pytest.mark.parametrize("seconds,expected", [
++        (0.0, "00:00.000"),
++        (1.0, "00:01.000"),
++        (60.0, "01:00.000"),
++    ])
++    def test_float_whole_numbers(self, seconds, expected):
++        """Float values that are whole numbers should format correctly."""
++        assert format_time(seconds) == expected
++
++    def test_very_small_positive_value(self):
++        """Very small positive values should format to 00:00.000."""
++        assert format_time(0.0001) == "00:00.000"
++        assert format_time(0.00001) == "00:00.000"
++
++    def test_large_values(self):
++        """Very large values should still format correctly."""
++        assert format_time(86400) == "1440:00.000"  # 24 hours
++        assert format_time(360000) == "6000:00.000"  # 100 hours
++
++
++class TestParseTimeString:
++    """Tests for parse_time_string function."""
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26", 86.0),
++        ("00:01", 1.0),
++        ("00:00", 0.0),
++        ("59:59", 3599.0),
++    ])
++    def test_mm_ss_format(self, time_str, expected):
++        """MM:SS format should parse correctly."""
++        assert parse_time_string(time_str) == expected
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26.123", 86.123),
++        ("01:26.123000", 86.123),
++        ("00:01.500", 1.5),
++        ("00:00.001", 0.001),
++        ("59:59.999", 3599.999),
++    ])
++    def test_mm_ss_micro_format(self, time_str, expected):
++        """MM:SS.micro format should parse correctly."""
++        assert parse_time_string(time_str) == expected
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("00:01:26.123000", 86.123),
++        ("00:01:26:123000", 86.123),
++        ("00:00:01.000000", 1.0),
++        ("01:00:00.000000", 3600.0),
++        ("01:30:30.500000", 5430.5),
++    ])
++    def test_hh_mm_ss_micro_format(self, time_str, expected):
++        """HH:MM:SS.micro and HH:MM:SS:micro formats should parse correctly."""
++        assert parse_time_string(time_str) == expected
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("0 days 00:01:27.060000", 87.06),
++        ("0 days 00:00:00.000000", 0.0),
++        ("0 days 01:00:00.000000", 3600.0),
++    ])
++    def test_timedelta_format(self, time_str, expected):
++        """Pandas timedelta string format should parse correctly.
++        
++        Note: The parser extracts only the time portion after 'days ',
++        so multi-day values lose the day component.
++        """
++        assert parse_time_string(time_str) == expected
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26.123", 86.123),
++        ("01:26.1234", 86.123),
++        ("01:26.12345", 86.123),
++        ("01:26.123456", 86.123),
++        ("01:26.1234567", 86.123),
++        ("01:26.100000", 86.1),
++        ("01:26.120000", 86.12),
++    ])
++    def test_variable_microsecond_precision(self, time_str, expected):
++        """Various microsecond precision levels should parse correctly.
++        
++        Note: Short microsecond values (1-2 digits) are interpreted as
++        part of the seconds in MM:SS.micro format, so we test with
++        properly padded values.
++        """
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++    @pytest.mark.parametrize("time_str", [
++        "",
++        "   ",
++        "invalid",
++        "abc:def",
++        "12",
++        "12:34:56:78:90",
++    ])
++    def test_invalid_formats_return_none(self, time_str):
++        """Invalid time strings should return None."""
++        assert parse_time_string(time_str) is None
++
++    def test_none_input_returns_none(self):
++        """None input should return None."""
++        assert parse_time_string(None) is None
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26.123", 86.123),
++        ("00:01:26.123000", 86.123),
++    ])
++    def test_standard_format_parsing(self, time_str, expected):
++        """Standard time formats should parse correctly."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++
++class TestParseTimeStringEdgeCases:
++    """
++    Edge case tests for parse_time_string documenting known behaviors and limitations.
++    
++    These tests document the current behavior of the parser, including cases where
++    the behavior may be unexpected. This helps maintain awareness of edge cases
++    and prevents regressions.
++    """
++
++    @pytest.mark.parametrize("time_str", [
++        " 01:26.123",
++        "  01:26.123",
++        " 01:26.123 ",
++    ])
++    def test_leading_whitespace_returns_none(self, time_str):
++        """
++        KNOWN BEHAVIOR: Leading whitespace causes parse failure.
++        
++        The parser splits on space before stripping, so ' 01:26.123' becomes
++        '' after split(' ')[0], which then returns None.
++        
++        This is a limitation of the current implementation.
++        """
++        assert parse_time_string(time_str) is None
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26.123 ", 86.123),
++        ("01:26.123  ", 86.123),
++        ("01:26.123   extra", 86.123),
++        ("01:26.123 trailing text", 86.123),
++    ])
++    def test_trailing_whitespace_and_text_handled(self, time_str, expected):
++        """Trailing whitespace and extra text after space are handled correctly."""
++        assert parse_time_string(time_str) == expected
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("\t01:26.123", 86.123),
++        ("01:26.123\t", 86.123),
++        ("01:26.123\n", 86.123),
++        ("\n01:26.123", 86.123),
++    ])
++    def test_tab_and_newline_handling(self, time_str, expected):
++        """Tab and newline characters are handled by strip() after split."""
++        assert parse_time_string(time_str) == expected
++
++    @pytest.mark.parametrize("time_str", [
++        "01: 26.123",
++        "01 :26.123",
++    ])
++    def test_space_within_time_returns_none(self, time_str):
++        """Spaces within the time string cause parse failure."""
++        assert parse_time_string(time_str) is None
++
++    def test_space_in_later_component_truncates(self):
++        """
++        KNOWN BEHAVIOR: Space in later components truncates the string.
++        
++        '01:2 6.123' -> split(' ')[0] = '01:2' -> parses as MM:SS = 1*60 + 2 = 62.0
++        """
++        assert parse_time_string("01:2 6.123") == 62.0
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26.1", 5161.0),
++        ("01:26.12", 5172.0),
++    ])
++    def test_short_microseconds_misinterpreted(self, time_str, expected):
++        """
++        KNOWN BEHAVIOR: Short microsecond values (1-2 digits) are misinterpreted.
++        
++        '01:26.1' is parsed as HH:MM:SS (1 hour, 26 minutes, 1 second = 5161s)
++        because the last part has <= 2 digits, triggering the HH:MM:SS branch.
++        
++        Use fully padded microseconds (e.g., '01:26.100000') to avoid this.
++        """
++        assert parse_time_string(time_str) == expected
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26.100000", 86.1),
++        ("01:26.120000", 86.12),
++        ("01:26.123000", 86.123),
++    ])
++    def test_padded_microseconds_parsed_correctly(self, time_str, expected):
++        """Fully padded microsecond values are parsed as MM:SS.micro."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01:26.123456789", 86.123),
++        ("01:26.1234567890123", 86.123),
++    ])
++    def test_extra_long_microseconds_truncated(self, time_str, expected):
++        """Microseconds longer than 6 digits are truncated to first 6."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++    def test_empty_microseconds_returns_none(self):
++        """
++        KNOWN BEHAVIOR: Trailing dot with no microseconds causes parse failure.
++        
++        '01:26.' splits into ['01', '26', ''], and empty string fails int conversion.
++        """
++        assert parse_time_string("01:26.") is None
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("01.26.123", 86.123),
++        ("01:26:123", 86.123),
++    ])
++    def test_mixed_separators_handled(self, time_str, expected):
++        """
++        Dots and colons are both valid separators (split on [:\.]).
++        
++        Both '01.26.123' and '01:26:123' parse the same way.
++        """
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("-01:26.123", -33.877),
++    ])
++    def test_negative_sign_produces_unexpected_result(self, time_str, expected):
++        """
++        KNOWN BEHAVIOR: Negative sign is parsed as part of hours, producing unexpected results.
++        
++        '-01:26.123' parses as hh=-1, mm=26, ss=123ms, resulting in:
++        -1*3600 + 26*60 + 0.123 = -3600 + 1560 + 0.123 = -2039.877? 
++        Actually: The negative applies only to hh, so -3600 + 1560 + 0.123 ≈ -2039.877
++        
++        Wait, let me recalculate: if it's MM:SS.micro format:
++        parts = ['-01', '26', '123'] -> since len(parts[2])=3 > 2, it's MM:SS.micro
++        mm = int('-01') = -1, ss = int('26') = 26, micro = 123000
++        total = -1*60 + 26 + 0.123 = -60 + 26.123 = -33.877
++        
++        This is likely unintended behavior - negative times should probably return None.
++        """
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("+01:26.123", 86.123),
++    ])
++    def test_plus_sign_handled(self, time_str, expected):
++        """Plus sign prefix is handled (int() accepts '+' prefix)."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("001:26.123", 86.123),
++        ("01:026.123", 86.123),
++    ])
++    def test_leading_zeros_handled(self, time_str, expected):
++        """Extra leading zeros in components are handled by int()."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++    def test_leading_zeros_in_microseconds(self):
++        """
++        KNOWN BEHAVIOR: Leading zeros in microseconds affect parsing.
++        
++        '01:26.000123' has 6+ digits after dot, so micro = '000123' -> 123 microseconds
++        Result: 1*60 + 26 + 0.000123 = 86.000123 ≈ 86.0
++        """
++        result = parse_time_string("01:26.000123")
++        assert result == pytest.approx(86.0, abs=0.001)
++
++    @pytest.mark.parametrize("time_str", [
++        "01：26.123",  # Fullwidth colon (Unicode)
++        "01:26．123",  # Fullwidth period (Unicode)
++    ])
++    def test_unicode_separators_return_none(self, time_str):
++        """
++        KNOWN BEHAVIOR: Unicode separators (fullwidth colon/period) are not recognized.
++        
++        Only ASCII colon ':' and period '.' are valid separators.
++        """
++        assert parse_time_string(time_str) is None
++
++    @pytest.mark.parametrize("time_str", [
++        "01:26.1e3",
++        "01:26.1E3",
++        "1e2:26.123",
++    ])
++    def test_scientific_notation_returns_none(self, time_str):
++        """Scientific notation in time components causes parse failure."""
++        assert parse_time_string(time_str) is None
++
++    def test_five_parts_returns_none(self):
++        """5 parts after splitting returns None."""
++        assert parse_time_string("01:26:12:34:56") is None
++
++    def test_four_parts_parsed_as_hh_mm_ss_micro(self):
++        """
++        KNOWN BEHAVIOR: 4 parts are parsed as HH:MM:SS:micro.
++        
++        '01:26:123:456' -> hh=1, mm=26, ss=123, micro=456000
++        Result: 1*3600 + 26*60 + 123 + 0.456 = 3600 + 1560 + 123.456 = 5283.456
++        """
++        result = parse_time_string("01:26:123:456")
++        assert result == pytest.approx(5283.456, abs=0.001)
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("1 days 00:00:00.000000", 0.0),
++        ("2 days 12:30:45.500000", 45045.5),
++    ])
++    def test_multi_day_timedelta_loses_days(self, time_str, expected):
++        """
++        KNOWN BEHAVIOR: Multi-day timedelta strings lose the day component.
++        
++        The parser extracts only the time portion after 'X days ', so
++        '1 days 00:00:00' returns 0.0 instead of 86400.0.
++        
++        This is a limitation when parsing pandas timedelta strings > 24 hours.
++        """
++        assert parse_time_string(time_str) == expected
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("99:59.999", 5999.999),
++        ("999:59.999", 59999.999),
++    ])
++    def test_large_minute_values(self, time_str, expected):
++        """Large minute values (>59) are accepted and computed correctly."""
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++    @pytest.mark.parametrize("time_str,expected", [
++        ("00:99.000", 99.0),
++        ("00:999.000", 999.0),
++    ])
++    def test_large_second_values(self, time_str, expected):
++        """
++        KNOWN BEHAVIOR: Second values > 59 are accepted without validation.
++        
++        '00:99.000' parses as 0 minutes + 99 seconds = 99.0 seconds.
++        No range validation is performed on components.
++        """
++        result = parse_time_string(time_str)
++        assert result == pytest.approx(expected, abs=0.001)
++
++
++
++class TestTimeRoundTrip:
++    """Tests for round-trip conversion between format and parse."""
++
++    @pytest.mark.parametrize("seconds", [
++        0, 1, 59, 60, 61, 90, 3599, 3600, 3661,
++        1.5, 1.123, 59.999, 86.123,
++    ])
++    def test_format_then_parse_preserves_value(self, seconds):
++        """Formatting then parsing should preserve the original value."""
++        formatted = format_time(seconds)
++        parsed = parse_time_string(formatted)
++        assert parsed == pytest.approx(seconds, abs=0.001)
++
++    @pytest.mark.parametrize("time_str,expected_seconds", [
++        ("01:26.123", 86.123),
++        ("00:01.500", 1.5),
++        ("02:00.000", 120.0),
++    ])
++    def test_parse_then_format_consistency(self, time_str, expected_seconds):
++        """Parsing then formatting should produce consistent output."""
++        parsed = parse_time_string(time_str)
++        formatted = format_time(parsed)
++        reparsed = parse_time_string(formatted)
++        assert reparsed == pytest.approx(expected_seconds, abs=0.001)
+diff --git a/tests/test_tyres.py b/tests/test_tyres.py
+new file mode 100644
+index 0000000..68ae33d
+--- /dev/null
++++ b/tests/test_tyres.py
+@@ -0,0 +1,133 @@
++import pytest
++from src.lib.tyres import get_tyre_compound_int, get_tyre_compound_str
++
++
++class TestGetTyreCompoundInt:
++    """Tests for get_tyre_compound_int function."""
++
++    @pytest.mark.parametrize("compound_str,expected", [
++        ("SOFT", 0),
++        ("MEDIUM", 1),
++        ("HARD", 2),
++        ("INTERMEDIATE", 3),
++        ("WET", 4),
++    ])
++    def test_standard_compounds(self, compound_str, expected):
++        """Valid compound strings should return their corresponding integers."""
++        assert get_tyre_compound_int(compound_str) == expected
++
++    @pytest.mark.parametrize("compound_str,expected", [
++        ("soft", 0),
++        ("Soft", 0),
++        ("SoFt", 0),
++        ("medium", 1),
++        ("Medium", 1),
++        ("hard", 2),
++        ("Hard", 2),
++        ("intermediate", 3),
++        ("Intermediate", 3),
++        ("wet", 4),
++        ("Wet", 4),
++    ])
++    def test_case_insensitivity(self, compound_str, expected):
++        """Compound strings should be case-insensitive."""
++        assert get_tyre_compound_int(compound_str) == expected
++
++    @pytest.mark.parametrize("compound_str", [
++        "UNKNOWN",
++        "ULTRASOFT",
++        "SUPERSOFT",
++        "HYPERSOFT",
++        "",
++        "invalid",
++        "S",
++        "M",
++        "H",
++        "I",
++        "W",
++    ])
++    def test_invalid_compounds_return_negative_one(self, compound_str):
++        """Invalid compound strings should return -1."""
++        assert get_tyre_compound_int(compound_str) == -1
++
++    @pytest.mark.parametrize("compound_str", [
++        " SOFT",
++        "SOFT ",
++        " SOFT ",
++        "SO FT",
++    ])
++    def test_whitespace_in_input_returns_negative_one(self, compound_str):
++        """Strings with extra whitespace should return -1."""
++        assert get_tyre_compound_int(compound_str) == -1
++
++
++class TestGetTyreCompoundStr:
++    """Tests for get_tyre_compound_str function."""
++
++    @pytest.mark.parametrize("compound_int,expected", [
++        (0, "SOFT"),
++        (1, "MEDIUM"),
++        (2, "HARD"),
++        (3, "INTERMEDIATE"),
++        (4, "WET"),
++    ])
++    def test_standard_compounds(self, compound_int, expected):
++        """Valid compound integers should return their corresponding strings."""
++        assert get_tyre_compound_str(compound_int) == expected
++
++    @pytest.mark.parametrize("compound_int", [
++        -1,
++        5,
++        10,
++        100,
++        -100,
++    ])
++    def test_invalid_integers_return_unknown(self, compound_int):
++        """Invalid compound integers should return 'UNKNOWN'."""
++        assert get_tyre_compound_str(compound_int) == "UNKNOWN"
++
++    @pytest.mark.parametrize("compound_int", [
++        0.0,
++        1.0,
++        2.0,
++        3.0,
++        4.0,
++    ])
++    def test_float_equivalents(self, compound_int):
++        """Float values equal to valid integers should work due to Python equality."""
++        expected_map = {0.0: "SOFT", 1.0: "MEDIUM", 2.0: "HARD", 3.0: "INTERMEDIATE", 4.0: "WET"}
++        assert get_tyre_compound_str(compound_int) == expected_map[compound_int]
++
++    @pytest.mark.parametrize("compound_int", [
++        0.5,
++        1.5,
++        2.5,
++        -0.5,
++    ])
++    def test_non_integer_floats_return_unknown(self, compound_int):
++        """Float values that don't equal valid integers should return 'UNKNOWN'."""
++        assert get_tyre_compound_str(compound_int) == "UNKNOWN"
++
++
++class TestRoundTripConversion:
++    """Tests for round-trip conversion between int and string."""
++
++    @pytest.mark.parametrize("compound_str", [
++        "SOFT",
++        "MEDIUM",
++        "HARD",
++        "INTERMEDIATE",
++        "WET",
++    ])
++    def test_string_to_int_to_string(self, compound_str):
++        """Converting string to int and back should return original string."""
++        compound_int = get_tyre_compound_int(compound_str)
++        result = get_tyre_compound_str(compound_int)
++        assert result == compound_str
++
++    @pytest.mark.parametrize("compound_int", [0, 1, 2, 3, 4])
++    def test_int_to_string_to_int(self, compound_int):
++        """Converting int to string and back should return original int."""
++        compound_str = get_tyre_compound_str(compound_int)
++        result = get_tyre_compound_int(compound_str)
++        assert result == compound_int
+diff --git a/tests/test_ui_components.py b/tests/test_ui_components.py
+new file mode 100644
+index 0000000..7ff3299
+--- /dev/null
++++ b/tests/test_ui_components.py
+@@ -0,0 +1,154 @@
++"""
++Tests for utility functions in src/ui_components.py.
++
++Note: The source file uses Python 3.10+ type hints (tuple | None) which are not
++compatible with older Python versions. We extract and test _format_wind_direction
++by reading the source and compiling just that function, ensuring we test the
++actual source code while avoiding the incompatible syntax elsewhere in the module.
++"""
++import ast
++import textwrap
++from pathlib import Path
++from typing import Optional
++
++import pytest
++
++
++def _extract_format_wind_direction():
++    """
++    Extract _format_wind_direction from source file and compile it.
++    This avoids importing the full module which has Python 3.10+ type hints.
++    """
++    source_path = Path(__file__).parent.parent / "src" / "ui_components.py"
++    source_code = source_path.read_text()
++
++    tree = ast.parse(source_code)
++
++    for node in ast.walk(tree):
++        if isinstance(node, ast.FunctionDef) and node.name == "_format_wind_direction":
++            func_source = ast.get_source_segment(source_code, node)
++            local_ns = {"Optional": Optional}
++            exec(compile(ast.parse(func_source), "<string>", "exec"), local_ns)
++            return local_ns["_format_wind_direction"]
++
++    raise RuntimeError("Could not find _format_wind_direction in source")
++
++
++_format_wind_direction = _extract_format_wind_direction()
++
++
++class TestFormatWindDirection:
++    """Tests for _format_wind_direction function."""
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (0, "N"),
++        (90, "E"),
++        (180, "S"),
++        (270, "W"),
++    ])
++    def test_cardinal_directions(self, degrees, expected):
++        """Cardinal directions (N, E, S, W) at exact angles."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (45, "NE"),
++        (135, "SE"),
++        (225, "SW"),
++        (315, "NW"),
++    ])
++    def test_intercardinal_directions(self, degrees, expected):
++        """Intercardinal directions (NE, SE, SW, NW) at 45-degree intervals."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (22.5, "NNE"),
++        (67.5, "ENE"),
++        (112.5, "ESE"),
++        (157.5, "SSE"),
++        (202.5, "SSW"),
++        (247.5, "WSW"),
++        (292.5, "WNW"),
++        (337.5, "NNW"),
++    ])
++    def test_secondary_intercardinal_directions(self, degrees, expected):
++        """Secondary intercardinal directions at 22.5-degree intervals."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (360, "N"),
++        (450, "E"),
++        (540, "S"),
++        (720, "N"),
++        (810, "E"),
++    ])
++    def test_degrees_above_360_normalized(self, degrees, expected):
++        """Degrees >= 360 should be normalized using modulo."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (-90, "W"),
++        (-180, "S"),
++        (-270, "E"),
++        (-360, "N"),
++        (-45, "NW"),
++    ])
++    def test_negative_degrees_normalized(self, degrees, expected):
++        """Negative degrees should be normalized correctly."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (11.24, "N"),
++        (11.25, "NNE"),
++        (11.26, "NNE"),
++        (33.74, "NNE"),
++        (33.75, "NE"),
++        (33.76, "NE"),
++        (348.75, "N"),
++        (348.74, "NNW"),
++    ])
++    def test_boundary_conditions(self, degrees, expected):
++        """Test values at direction boundaries (rounding behavior)."""
++        assert _format_wind_direction(degrees) == expected
++
++    def test_none_input_returns_na(self):
++        """None input should return 'N/A'."""
++        assert _format_wind_direction(None) == "N/A"
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (0.0, "N"),
++        (90.0, "E"),
++        (180.0, "S"),
++        (270.0, "W"),
++        (45.0, "NE"),
++    ])
++    def test_float_inputs(self, degrees, expected):
++        """Float inputs should work the same as integers."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees,expected", [
++        (359.9, "N"),
++        (0.1, "N"),
++        (89.9, "E"),
++        (90.1, "E"),
++    ])
++    def test_near_cardinal_directions(self, degrees, expected):
++        """Values very close to cardinal directions should round correctly."""
++        assert _format_wind_direction(degrees) == expected
++
++    @pytest.mark.parametrize("degrees", [1000, -1000, 3600, -3600])
++    def test_extreme_values(self, degrees):
++        """Extreme positive and negative values should normalize correctly."""
++        result = _format_wind_direction(degrees)
++        valid_directions = [
++            "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
++            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"
++        ]
++        assert result in valid_directions
++
++    def test_all_16_directions_coverage(self, all_16_directions):
++        """Verify all 16 compass directions can be reached."""
++        results = set()
++        for i in range(16):
++            degrees = i * 22.5
++            results.add(_format_wind_direction(degrees))
++        assert results == set(all_16_directions)
