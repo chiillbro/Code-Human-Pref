@@ -1,0 +1,53 @@
+diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
+index d7f95a5..2e5c912 100644
+--- a/src/interfaces/race_replay.py
++++ b/src/interfaces/race_replay.py
+@@ -54,21 +54,21 @@ class F1RaceReplayWindow(arcade.Window):
+         self.toggle_drs_zones = True 
+         self.show_driver_labels = False
+         # UI components
+         leaderboard_x = max(20, self.width - self.right_ui_margin + 12)
+         self.leaderboard_comp = LeaderboardComponent(x=leaderboard_x, width=240, visible=visible_hud)
+         self.weather_comp = WeatherComponent(left=20, top_offset=170, visible=visible_hud)
+         self.legend_comp = LegendComponent(x=max(12, self.left_ui_margin - 320), visible=visible_hud)
+         self.driver_info_comp = DriverInfoComponent(left=20, width=300)
+         self.controls_popup_comp = ControlsPopupComponent()
+ 
+-        self.controls_popup_comp.set_size(340, 250) # width/height of the popup box
++        self.controls_popup_comp.set_size(340, 270) # width/height of the popup box
+         self.controls_popup_comp.set_font_sizes(header_font_size=16, body_font_size=13) # adjust font sizes
+ 
+ 
+         # Progress bar component with race event markers
+         self.progress_bar_comp = RaceProgressBarComponent(
+             left_margin=left_ui_margin,
+             right_margin=right_ui_margin,
+             bottom=30,
+             height=24,
+             marker_height=16
+diff --git a/src/ui_components.py b/src/ui_components.py
+index cc4bb28..550a8d8 100644
+--- a/src/ui_components.py
++++ b/src/ui_components.py
+@@ -824,20 +824,21 @@ class ControlsPopupComponent(BaseComponent):
+         lines = [
+             " ",
+             "[SPACE] Pause/Resume",
+             "← / →  Jump back/forward",
+             "↑ / ↓  Speed +/-",
+             "[1-4]  Set speed: 0.5x / 1x / 2x / 4x",
+             "[R]    Restart",
+             "[D]    Toggle DRS Zones",
+             "[B]    Toggle Progress Bar",
+             "[L]    Toggle Driver Labels",
++            "[P]    Toggle Podium",
+             "[H]    Toggle Help Popup",
+         ]
+         
+         line_spacing = max(18, int(self.body_font_size + 8))
+         y = header_cy - 20
+         for l in lines:
+             self._body_text.font_size = self.body_font_size
+             self._body_text.bold = False
+             self._body_text.color = arcade.color.LIGHT_GRAY
+             self._body_text.text = l
