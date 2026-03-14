@@ -1,0 +1,603 @@
+diff --git a/main.py b/main.py
+index 0870c95..d28a2a9 100644
+--- a/main.py
++++ b/main.py
+@@ -1,11 +1,11 @@
+-from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, list_rounds, list_sprints
++from src.f1_data import get_race_telemetry, enable_cache, get_circuit_rotation, load_session, get_quali_telemetry, list_rounds, list_sprints, get_race_results
+ from src.arcade_replay import run_arcade_replay
+ 
+ from src.interfaces.qualifying import run_qualifying_replay
+ import sys
+ from src.cli.race_selection import cli_load
+ from src.gui.race_selection import RaceSelectionWindow
+ from PySide6.QtWidgets import QApplication
+ 
+ def main(year=None, round_number=None, playback_speed=1, session_type='R', visible_hud=True, ready_file=None):
+   print(f"Loading F1 {year} Round {round_number} Session '{session_type}'")
+@@ -76,35 +76,39 @@ def main(year=None, round_number=None, playback_speed=1, session_type='R', visib
+     session_info = {
+         'event_name': session.event.get('EventName', ''),
+         'circuit_name': session.event.get('Location', ''),  # Circuit location/name
+         'country': session.event.get('Country', ''),
+         'year': year,
+         'round': round_number,
+         'date': session.event.get('EventDate', '').strftime('%B %d, %Y') if session.event.get('EventDate') else '',
+         'total_laps': race_telemetry['total_laps']
+     }
+ 
++    # Get race results for podium display
++    race_results = get_race_results(session)
++
+     # Run the arcade replay
+ 
+     run_arcade_replay(
+       frames=race_telemetry['frames'],
+       track_statuses=race_telemetry['track_statuses'],
+       example_lap=example_lap,
+       drivers=drivers,
+       playback_speed=playback_speed,
+       driver_colors=race_telemetry['driver_colors'],
+       title=f"{session.event['EventName']} - {'Sprint' if session_type == 'S' else 'Race'}",
+       total_laps=race_telemetry['total_laps'],
+       circuit_rotation=circuit_rotation,
+       visible_hud=visible_hud,
+       ready_file=ready_file,
+-      session_info=session_info
++      session_info=session_info,
++      race_results=race_results
+     )
+ 
+ if __name__ == "__main__":
+ 
+   if "--cli" in sys.argv:
+     # Run the CLI
+ 
+     cli_load()
+     sys.exit(0)
+ 
+diff --git a/src/arcade_replay.py b/src/arcade_replay.py
+index 2eab154..cb5d736 100644
+--- a/src/arcade_replay.py
++++ b/src/arcade_replay.py
+@@ -1,28 +1,29 @@
+ import os
+ import arcade
+ from src.interfaces.race_replay import F1RaceReplayWindow
+ 
+ def run_arcade_replay(frames, track_statuses, example_lap, drivers, title,
+                       playback_speed=1.0, driver_colors=None, circuit_rotation=0.0, total_laps=None,
+-                      visible_hud=True, ready_file=None, session_info=None):
++                      visible_hud=True, ready_file=None, session_info=None, race_results=None):
+     window = F1RaceReplayWindow(
+         frames=frames,
+         track_statuses=track_statuses,
+         example_lap=example_lap,
+         drivers=drivers,
+         playback_speed=playback_speed,
+         driver_colors=driver_colors,
+         title=title,
+         total_laps=total_laps,
+         circuit_rotation=circuit_rotation,
+         visible_hud=visible_hud,
+         session_info=session_info,
++        race_results=race_results,
+     )
+     # Signal readiness to parent process (if requested) after window created
+     if ready_file:
+         try:
+             with open(ready_file, 'w') as f:
+                 f.write('ready')
+         except Exception:
+             pass
+     arcade.run()
+diff --git a/src/f1_data.py b/src/f1_data.py
+index fb6ae67..f941a67 100644
+--- a/src/f1_data.py
++++ b/src/f1_data.py
+@@ -430,20 +430,79 @@ def get_race_telemetry(session, session_type='R'):
+     print("Saved Successfully!")
+     print("The replay should begin in a new window shortly")
+     return {
+         "frames": frames,
+         "driver_colors": get_driver_colors(session),
+         "track_statuses": formatted_track_statuses,
+         "total_laps": int(max_lap_number),
+     }
+ 
+ 
++def get_race_results(session):
++    """Extract race results for podium display."""
++    results = session.results
++    driver_colors = get_driver_colors(session)
++    
++    race_data = []
++    
++    for _, row in results.iterrows():
++        driver_code = row.get("Abbreviation", "???")
++        if pd.isna(row.get("Position")):
++            continue
++        
++        position = int(row["Position"])
++        full_name = row.get("FullName", driver_code)
++        team = row.get("TeamName", "Unknown")
++        grid_pos = int(row.get("GridPosition", 0)) if pd.notna(row.get("GridPosition")) else 0
++        points = float(row.get("Points", 0)) if pd.notna(row.get("Points")) else 0
++        
++        # Race time handling
++        race_time = row.get("Time")
++        if position == 1:
++            if pd.notna(race_time):
++                total_secs = race_time.total_seconds()
++                hours = int(total_secs // 3600)
++                mins = int((total_secs % 3600) // 60)
++                secs = total_secs % 60
++                time_str = f"{hours}:{mins:02d}:{secs:06.3f}"
++            else:
++                time_str = "N/A"
++        else:
++            if pd.notna(race_time):
++                total_secs = race_time.total_seconds()
++                time_str = f"+{total_secs:.3f}s"
++            else:
++                status = row.get("Status", "")
++                time_str = status if status else "DNF"
++        
++        # Check for fastest lap
++        fastest_lap = bool(row.get("FastestLap", False)) if pd.notna(row.get("FastestLap")) else False
++        
++        # WDC position (ClassifiedPosition can be used as proxy, or we default to race position)
++        wdc_pos = int(row.get("ClassifiedPosition", position)) if pd.notna(row.get("ClassifiedPosition")) else position
++        
++        race_data.append({
++            "code": driver_code,
++            "name": full_name,
++            "team": team,
++            "position": position,
++            "grid_pos": grid_pos,
++            "race_time": time_str,
++            "points": int(points),
++            "fastest_lap": fastest_lap,
++            "wdc_position": wdc_pos,
++            "color": driver_colors.get(driver_code, (128, 128, 128)),
++        })
++    
++    return race_data
++
++
+ def get_qualifying_results(session):
+ 
+     # Extract the qualifying results and return a list of the drivers, their positions and their lap times in each qualifying segment
+ 
+     results = session.results
+ 
+     qualifying_data = []
+ 
+     for _, row in results.iterrows():
+         driver_code = row["Abbreviation"]
+diff --git a/src/interfaces/race_replay.py b/src/interfaces/race_replay.py
+index d7f95a5..65300de 100644
+--- a/src/interfaces/race_replay.py
++++ b/src/interfaces/race_replay.py
+@@ -4,39 +4,42 @@ import numpy as np
+ from src.f1_data import FPS
+ from src.ui_components import (
+     LeaderboardComponent, 
+     WeatherComponent, 
+     LegendComponent, 
+     DriverInfoComponent, 
+     RaceProgressBarComponent,
+     RaceControlsComponent,
+     ControlsPopupComponent,
+     SessionInfoComponent,
++    PodiumOverlayComponent,
+     extract_race_events,
+     build_track_from_example_lap,
+     draw_finish_line
+ )
+ 
+ 
+ SCREEN_WIDTH = 1280
+ SCREEN_HEIGHT = 720
+ SCREEN_TITLE = "F1 Race Replay"
+ PLAYBACK_SPEEDS = [0.1, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0]
+ 
+ class F1RaceReplayWindow(arcade.Window):
+     def __init__(self, frames, track_statuses, example_lap, drivers, title,
+                  playback_speed=1.0, driver_colors=None, circuit_rotation=0.0,
+                  left_ui_margin=340, right_ui_margin=260, total_laps=None, visible_hud=True,
+-                 session_info=None):
++                 session_info=None, race_results=None):
+         # Set resizable to True so the user can adjust mid-sim
+         super().__init__(SCREEN_WIDTH, SCREEN_HEIGHT, title, resizable=True)
+         self.maximize()
++        
++        self.race_results = race_results or []
+ 
+         self.frames = frames
+         self.track_statuses = track_statuses
+         self.n_frames = len(frames)
+         self.drivers = list(drivers)
+         self.playback_speed = PLAYBACK_SPEEDS[PLAYBACK_SPEEDS.index(playback_speed)] if playback_speed in PLAYBACK_SPEEDS else 1.0
+         self.driver_colors = driver_colors or {}
+         self.frame_index = 0.0  # use float for fractional-frame accumulation
+         self.paused = False
+         self.total_laps = total_laps
+@@ -86,20 +89,28 @@ class F1RaceReplayWindow(arcade.Window):
+         if session_info:
+             self.session_info_comp.set_info(
+                 event_name=session_info.get('event_name', ''),
+                 circuit_name=session_info.get('circuit_name', ''),
+                 country=session_info.get('country', ''),
+                 year=session_info.get('year'),
+                 round_num=session_info.get('round'),
+                 date=session_info.get('date', ''),
+                 total_laps=total_laps
+             )
++        
++        # Podium overlay component for end of race
++        self.podium_comp = PodiumOverlayComponent()
++        self._podium_triggered = False
++        if self.race_results:
++            # Extract top 3 finishers
++            podium_data = [r for r in self.race_results if r.get('position') in [1, 2, 3]]
++            self.podium_comp.set_podium_data(podium_data)
+ 
+         self.is_rewinding = False
+         self.is_forwarding = False
+         self.was_paused_before_hold = False
+         
+         # Extract race events for the progress bar
+         race_events = extract_race_events(frames, track_statuses, total_laps or 0)
+         self.progress_bar_comp.set_race_data(
+             total_frames=len(frames),
+             total_laps=total_laps or 0,
+@@ -519,45 +530,65 @@ class F1RaceReplayWindow(arcade.Window):
+         self.race_controls_comp.draw(self)
+         
+         # Session info banner (top of screen)
+         self.session_info_comp.draw(self)
+ 
+         # Draw Controls popup box
+         self.controls_popup_comp.draw(self)
+         
+         # Draw tooltips and overlays on top of everything
+         self.progress_bar_comp.draw_overlays(self)
++        
++        # Draw podium overlay (on top of everything when visible)
++        self.podium_comp.draw(self)
+                     
+     def on_update(self, delta_time: float):
+         self.race_controls_comp.on_update(delta_time)
++        self.podium_comp.on_update(delta_time)
+         
+         seek_speed = 3.0 * max(1.0, self.playback_speed) # Multiplier for seeking speed, scales with current playback speed
+         if self.is_rewinding:
+             self.frame_index = max(0.0, self.frame_index - delta_time * FPS * seek_speed)
+             self.race_controls_comp.flash_button('rewind')
++            # Reset podium trigger if rewinding away from end
++            if self._podium_triggered and self.frame_index < self.n_frames - 1:
++                self._podium_triggered = False
++                self.podium_comp.hide()
+         elif self.is_forwarding:
+             self.frame_index = min(self.n_frames - 1, self.frame_index + delta_time * FPS * seek_speed)
+             self.race_controls_comp.flash_button('forward')
+ 
+         if self.paused:
+             return
+ 
+         self.frame_index += delta_time * FPS * self.playback_speed
+         
+         if self.frame_index >= self.n_frames:
+             self.frame_index = float(self.n_frames - 1)
++            # Trigger podium overlay at end of race
++            if not self._podium_triggered and self.race_results:
++                self._podium_triggered = True
++                self.paused = True
++                self.podium_comp.show()
+ 
+     def on_key_press(self, symbol: int, modifiers: int):
+         # Allow ESC to close window at any time
+         if symbol == arcade.key.ESCAPE:
++            if self.podium_comp.visible:
++                self.podium_comp.hide()
++                return
+             arcade.close_window()
+             return
++        # Dismiss podium on any key if visible
++        if self.podium_comp.visible:
++            self.podium_comp.hide()
++            return
+         if symbol == arcade.key.SPACE:
+             self.paused = not self.paused
+             self.race_controls_comp.flash_button('play_pause')
+         elif symbol == arcade.key.RIGHT:
+             self.was_paused_before_hold = self.paused
+             self.is_forwarding = True
+             self.paused = True
+         elif symbol == arcade.key.LEFT:
+             self.was_paused_before_hold = self.paused
+             self.is_rewinding = True
+@@ -621,20 +652,23 @@ class F1RaceReplayWindow(arcade.Window):
+             self.is_rewinding = False
+             self.paused = self.was_paused_before_hold
+ 
+     def on_mouse_release(self, x: float, y: float, button: int, modifiers: int):
+         if self.is_forwarding or self.is_rewinding:
+             self.is_forwarding = False
+             self.is_rewinding = False
+             self.paused = self.was_paused_before_hold
+ 
+     def on_mouse_press(self, x: float, y: float, button: int, modifiers: int):
++        # Podium overlay takes priority when visible
++        if self.podium_comp.on_mouse_press(self, x, y, button, modifiers):
++            return
+         # forward to components; stop at first that handled it
+         if self.controls_popup_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.race_controls_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.progress_bar_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.leaderboard_comp.on_mouse_press(self, x, y, button, modifiers):
+             return
+         if self.legend_comp.on_mouse_press(self, x, y, button, modifiers):
+diff --git a/src/ui_components.py b/src/ui_components.py
+index cc4bb28..1e6a797 100644
+--- a/src/ui_components.py
++++ b/src/ui_components.py
+@@ -1846,20 +1846,254 @@ class QualifyingLapTimeComponent(BaseComponent):
+                 text_color = arcade.color.YELLOW
+         else:
+             text = f"{sector_time:.1f}s"
+             # Detect if sector just completed to trigger delta display (only once)
+             if self._last_completed_sector < sector_idx and delta_sector_time is not None:
+                 self._delta_sector = sector_idx
+                 self._time_elapsed = 0.0
+                 self._last_completed_sector = sector_idx
+         return text, text_color
+ 
++class PodiumOverlayComponent(BaseComponent):
++    """
++    End-of-race podium overlay showing top 3 finishers with animated reveal.
++    P3 appears first, then P2, then P1 (tallest center podium).
++    Each driver shows name, team, stats card with race time/gap, points, grid change, fastest lap, WDC position.
++    """
++    
++    PODIUM_HEIGHTS = {1: 180, 2: 140, 3: 110}
++    PODIUM_WIDTHS = 200
++    REVEAL_DELAY = 0.8  # seconds between each podium reveal
++    ANIMATION_DURATION = 0.5  # seconds for slide-up animation
++    
++    def __init__(self):
++        self.visible = False
++        self._animation_start_time = None
++        self._elapsed_time = 0.0
++        self._podium_data = []  # list of dicts with driver info for P1, P2, P3
++        self._race_results = None
++        
++    def set_race_results(self, race_results: dict):
++        """Set race results data for podium display.
++        
++        race_results should contain:
++        - results: list of driver result dicts sorted by position
++        - driver_colors: dict mapping driver code to RGB tuple
++        """
++        self._race_results = race_results
++        
++    def set_podium_data(self, podium_data: list):
++        """Set the top 3 finishers data directly.
++        
++        podium_data: list of dicts with keys:
++        - code: driver abbreviation
++        - name: full name
++        - team: team name
++        - position: 1, 2, or 3
++        - race_time: race time or gap string
++        - points: points scored
++        - grid_pos: starting grid position
++        - fastest_lap: bool if had fastest lap
++        - wdc_position: WDC standings position
++        - color: RGB tuple
++        """
++        self._podium_data = podium_data
++        
++    def show(self):
++        """Show the podium overlay and start animation."""
++        self.visible = True
++        self._animation_start_time = None
++        self._elapsed_time = 0.0
++        
++    def hide(self):
++        """Hide the podium overlay."""
++        self.visible = False
++        self._animation_start_time = None
++        
++    def on_update(self, delta_time: float):
++        """Update animation timer."""
++        if self.visible:
++            self._elapsed_time += delta_time
++            
++    def _get_podium_alpha(self, position: int) -> float:
++        """Calculate alpha/progress for podium reveal animation.
++        P3 reveals first, then P2, then P1.
++        """
++        reveal_order = {3: 0, 2: 1, 1: 2}
++        start_time = reveal_order[position] * self.REVEAL_DELAY
++        
++        if self._elapsed_time < start_time:
++            return 0.0
++        
++        progress = (self._elapsed_time - start_time) / self.ANIMATION_DURATION
++        return min(1.0, max(0.0, progress))
++    
++    def _get_slide_offset(self, position: int) -> float:
++        """Calculate vertical slide offset for animation."""
++        alpha = self._get_podium_alpha(position)
++        return (1.0 - alpha) * 100  # slides up from 100px below
++    
++    def draw(self, window):
++        if not self.visible or not self._podium_data:
++            return
++            
++        # Semi-transparent overlay background
++        overlay_rect = arcade.XYWH(window.width / 2, window.height / 2, window.width, window.height)
++        arcade.draw_rect_filled(overlay_rect, (0, 0, 0, 180))
++        
++        # Title
++        title_alpha = min(255, int(self._elapsed_time * 500))
++        arcade.Text("RACE RESULTS", window.width / 2, window.height - 60, 
++                   (255, 255, 255, title_alpha), 36, bold=True, 
++                   anchor_x="center", anchor_y="center").draw()
++        
++        # Podium base Y position
++        base_y = window.height * 0.35
++        center_x = window.width / 2
++        spacing = self.PODIUM_WIDTHS + 40
++        
++        # Podium positions: P2 left, P1 center, P3 right
++        podium_positions = {
++            1: center_x,
++            2: center_x - spacing,
++            3: center_x + spacing
++        }
++        
++        for driver_data in self._podium_data:
++            pos = driver_data.get('position', 0)
++            if pos not in [1, 2, 3]:
++                continue
++                
++            alpha = self._get_podium_alpha(pos)
++            if alpha <= 0:
++                continue
++                
++            slide_offset = self._get_slide_offset(pos)
++            x = podium_positions[pos]
++            podium_height = self.PODIUM_HEIGHTS[pos]
++            
++            self._draw_podium_block(window, driver_data, x, base_y - slide_offset, 
++                                   podium_height, alpha)
++    
++    def _draw_podium_block(self, window, driver_data: dict, x: float, base_y: float, 
++                           podium_height: float, alpha: float):
++        """Draw a single podium block with driver info."""
++        pos = driver_data.get('position', 1)
++        color = driver_data.get('color', (128, 128, 128))
++        code = driver_data.get('code', '???')
++        name = driver_data.get('name', 'Unknown Driver')
++        team = driver_data.get('team', 'Unknown Team')
++        race_time = driver_data.get('race_time', '')
++        points = driver_data.get('points', 0)
++        grid_pos = driver_data.get('grid_pos', 0)
++        fastest_lap = driver_data.get('fastest_lap', False)
++        wdc_position = driver_data.get('wdc_position', 0)
++        
++        alpha_byte = int(alpha * 255)
++        
++        # Podium block (platform)
++        block_width = self.PODIUM_WIDTHS
++        block_rect = arcade.XYWH(x, base_y - podium_height / 2, block_width, podium_height)
++        
++        # Gradient-style podium colors based on position
++        podium_colors = {
++            1: (218, 165, 32, alpha_byte),   # Gold
++            2: (192, 192, 192, alpha_byte),  # Silver
++            3: (205, 127, 50, alpha_byte)    # Bronze
++        }
++        arcade.draw_rect_filled(block_rect, podium_colors[pos])
++        arcade.draw_rect_outline(block_rect, (255, 255, 255, alpha_byte), 3)
++        
++        # Position number on podium
++        arcade.Text(str(pos), x, base_y - podium_height / 2, 
++                   (255, 255, 255, alpha_byte), 48, bold=True,
++                   anchor_x="center", anchor_y="center").draw()
++        
++        # Driver card above podium
++        card_height = 180
++        card_y = base_y + card_height / 2 + 20
++        card_rect = arcade.XYWH(x, card_y, block_width, card_height)
++        arcade.draw_rect_filled(card_rect, (30, 30, 30, alpha_byte))
++        
++        # Team color strip at top of card
++        strip_rect = arcade.XYWH(x, card_y + card_height / 2 - 8, block_width, 16)
++        arcade.draw_rect_filled(strip_rect, (*color, alpha_byte))
++        
++        # Driver info
++        text_y = card_y + card_height / 2 - 30
++        
++        # Driver code/name
++        arcade.Text(code, x, text_y, (255, 255, 255, alpha_byte), 24, bold=True,
++                   anchor_x="center", anchor_y="center").draw()
++        
++        # Full name (truncate if needed)
++        display_name = name if len(name) <= 18 else name[:15] + "..."
++        arcade.Text(display_name, x, text_y - 25, (200, 200, 200, alpha_byte), 12,
++                   anchor_x="center", anchor_y="center").draw()
++        
++        # Team name
++        display_team = team if len(team) <= 20 else team[:17] + "..."
++        arcade.Text(display_team, x, text_y - 42, (*color, alpha_byte), 11,
++                   anchor_x="center", anchor_y="center").draw()
++        
++        # Stats section
++        stats_y = text_y - 70
++        stat_spacing = 18
++        stat_font_size = 10
++        
++        # Race time/gap
++        time_label = "TIME" if pos == 1 else "GAP"
++        arcade.Text(f"{time_label}: {race_time}", x, stats_y, 
++                   (180, 180, 180, alpha_byte), stat_font_size,
++                   anchor_x="center", anchor_y="center").draw()
++        
++        # Points
++        arcade.Text(f"PTS: +{points}", x, stats_y - stat_spacing, 
++                   (180, 180, 180, alpha_byte), stat_font_size,
++                   anchor_x="center", anchor_y="center").draw()
++        
++        # Grid position change
++        grid_change = grid_pos - pos
++        if grid_change > 0:
++            change_str = f"▲{grid_change}"
++            change_color = (0, 200, 0, alpha_byte)
++        elif grid_change < 0:
++            change_str = f"▼{abs(grid_change)}"
++            change_color = (200, 0, 0, alpha_byte)
++        else:
++            change_str = "—"
++            change_color = (150, 150, 150, alpha_byte)
++        
++        arcade.Text(f"GRID: P{grid_pos} ({change_str})", x, stats_y - stat_spacing * 2, 
++                   change_color, stat_font_size,
++                   anchor_x="center", anchor_y="center").draw()
++        
++        # Fastest lap indicator
++        if fastest_lap:
++            arcade.Text("⏱ FASTEST LAP", x, stats_y - stat_spacing * 3, 
++                       (138, 43, 226, alpha_byte), stat_font_size, bold=True,
++                       anchor_x="center", anchor_y="center").draw()
++        
++        # WDC position
++        if wdc_position > 0:
++            arcade.Text(f"WDC: P{wdc_position}", x, stats_y - stat_spacing * 4, 
++                       (255, 215, 0, alpha_byte), stat_font_size,
++                       anchor_x="center", anchor_y="center").draw()
++
++    def on_mouse_press(self, window, x: float, y: float, button: int, modifiers: int) -> bool:
++        """Handle click to dismiss podium."""
++        if self.visible:
++            self.hide()
++            return True
++        return False
++
++
+ def extract_race_events(frames: List[dict], track_statuses: List[dict], total_laps: int) -> List[dict]:
+     """
+     Extract race events from frame data for the progress bar.
+     
+     This function analyzes the telemetry frames to identify:
+     - DNF events (when a driver stops appearing)
+     - Leader changes (when the P1 position changes hands)
+     - Flag events (from track_statuses)
+     
+     Args:
