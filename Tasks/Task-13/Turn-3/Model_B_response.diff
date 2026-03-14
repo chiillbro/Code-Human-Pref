@@ -1,0 +1,381 @@
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..66dc905
+--- /dev/null
++++ b/tests/__init__.py
+@@ -0,0 +1 @@
++undefined
+\ No newline at end of file
+diff --git a/tests/test_f1_data.py b/tests/test_f1_data.py
+new file mode 100644
+index 0000000..57af0cb
+--- /dev/null
++++ b/tests/test_f1_data.py
+@@ -0,0 +1,367 @@
++import pytest
++import pandas as pd
++import numpy as np
++from unittest.mock import Mock, patch, MagicMock
++from datetime import timedelta
++import sys
++
++# Mock fastf1 before importing f1_data
++sys.modules['fastf1'] = MagicMock()
++sys.modules['fastf1.plotting'] = MagicMock()
++sys.modules['fastf1.ergast'] = MagicMock()
++
++sys.path.insert(0, '/tmp/outputs')
++
++from src.f1_data import _safe_int, _safe_float, _safe_str, get_race_results, _get_wdc_standings
++
++
++class TestSafeInt:
++    def test_valid_int(self):
++        assert _safe_int(42) == 42
++        
++    def test_valid_float_converts(self):
++        assert _safe_int(3.7) == 3
++        
++    def test_valid_string_converts(self):
++        assert _safe_int("123") == 123
++        
++    def test_none_returns_default(self):
++        assert _safe_int(None) == 0
++        assert _safe_int(None, default=99) == 99
++        
++    def test_nan_returns_default(self):
++        assert _safe_int(float('nan')) == 0
++        assert _safe_int(np.nan) == 0
++        assert _safe_int(np.nan, default=5) == 5
++        
++    def test_pd_na_returns_default(self):
++        assert _safe_int(pd.NA) == 0
++        assert _safe_int(pd.NaT) == 0
++        
++    def test_invalid_string_returns_default(self):
++        assert _safe_int("not_a_number") == 0
++        assert _safe_int("abc", default=-1) == -1
++        
++    def test_empty_string_returns_default(self):
++        assert _safe_int("") == 0
++        
++    def test_negative_int(self):
++        assert _safe_int(-5) == -5
++        assert _safe_int("-10") == -10
++
++
++class TestSafeFloat:
++    def test_valid_float(self):
++        assert _safe_float(3.14) == 3.14
++        
++    def test_valid_int_converts(self):
++        assert _safe_float(42) == 42.0
++        
++    def test_valid_string_converts(self):
++        assert _safe_float("3.14159") == 3.14159
++        
++    def test_none_returns_default(self):
++        assert _safe_float(None) == 0.0
++        assert _safe_float(None, default=1.5) == 1.5
++        
++    def test_nan_returns_default(self):
++        assert _safe_float(float('nan')) == 0.0
++        assert _safe_float(np.nan) == 0.0
++        assert _safe_float(np.nan, default=2.5) == 2.5
++        
++    def test_pd_na_returns_default(self):
++        assert _safe_float(pd.NA) == 0.0
++        assert _safe_float(pd.NaT) == 0.0
++        
++    def test_invalid_string_returns_default(self):
++        assert _safe_float("not_a_number") == 0.0
++        assert _safe_float("xyz", default=-1.0) == -1.0
++        
++    def test_negative_float(self):
++        assert _safe_float(-2.5) == -2.5
++        assert _safe_float("-3.14") == -3.14
++        
++    def test_scientific_notation(self):
++        assert _safe_float("1e-3") == 0.001
++
++
++class TestSafeStr:
++    def test_valid_string(self):
++        assert _safe_str("hello") == "hello"
++        
++    def test_int_converts(self):
++        assert _safe_str(42) == "42"
++        
++    def test_float_converts(self):
++        assert _safe_str(3.14) == "3.14"
++        
++    def test_none_returns_default(self):
++        assert _safe_str(None) == ""
++        assert _safe_str(None, default="N/A") == "N/A"
++        
++    def test_nan_returns_default(self):
++        assert _safe_str(float('nan')) == ""
++        assert _safe_str(np.nan) == ""
++        assert _safe_str(np.nan, default="unknown") == "unknown"
++        
++    def test_pd_na_returns_default(self):
++        assert _safe_str(pd.NA) == ""
++        assert _safe_str(pd.NaT) == ""
++        
++    def test_empty_string(self):
++        assert _safe_str("") == ""
++
++
++class TestGetRaceResults:
++    @pytest.fixture
++    def mock_session(self):
++        """Create a mock session with race results."""
++        session = Mock()
++        
++        # Mock event data for WDC standings
++        session.event = {
++            'EventDate': pd.Timestamp('2024-03-10'),
++            'RoundNumber': 3
++        }
++        
++        # Create mock results DataFrame
++        results_data = {
++            'Abbreviation': ['VER', 'PER', 'SAI', 'LEC', 'NOR'],
++            'Position': [1, 2, 3, 4, np.nan],  # NOR has no position (DNF)
++            'FullName': ['Max Verstappen', 'Sergio Perez', 'Carlos Sainz', 'Charles Leclerc', 'Lando Norris'],
++            'TeamName': ['Red Bull Racing', 'Red Bull Racing', 'Ferrari', 'Ferrari', 'McLaren'],
++            'GridPosition': [1, 3, 4, 2, 5],
++            'Points': [25.0, 18.0, 15.0, 12.0, 0.0],
++            'Time': [
++                timedelta(hours=1, minutes=30, seconds=45.123),
++                timedelta(seconds=5.432),
++                timedelta(seconds=12.876),
++                timedelta(seconds=25.111),
++                pd.NaT
++            ],
++            'Status': ['Finished', 'Finished', 'Finished', 'Finished', 'Retired'],
++            'FastestLap': [1, 2, 3, 4, np.nan],  # VER has fastest lap (rank 1)
++        }
++        session.results = pd.DataFrame(results_data)
++        
++        return session
++    
++    @pytest.fixture
++    def mock_driver_colors(self):
++        return {
++            'VER': (30, 65, 255),
++            'PER': (30, 65, 255),
++            'SAI': (220, 0, 0),
++            'LEC': (220, 0, 0),
++            'NOR': (255, 135, 0),
++        }
++    
++    @patch('src.f1_data.get_driver_colors')
++    @patch('src.f1_data._get_wdc_standings')
++    def test_basic_race_results(self, mock_wdc, mock_colors, mock_session, mock_driver_colors):
++        mock_colors.return_value = mock_driver_colors
++        mock_wdc.return_value = {'VER': 1, 'PER': 2, 'SAI': 3, 'LEC': 4}
++        
++        results = get_race_results(mock_session)
++        
++        assert len(results) == 4  # NOR excluded due to no position
++        
++        # Check P1
++        p1 = next(r for r in results if r['position'] == 1)
++        assert p1['code'] == 'VER'
++        assert p1['name'] == 'Max Verstappen'
++        assert p1['team'] == 'Red Bull Racing'
++        assert p1['grid_pos'] == 1
++        assert p1['points'] == 25
++        assert p1['fastest_lap'] is True
++        assert p1['wdc_position'] == 1
++        assert p1['race_time_secs'] is not None
++        
++    @patch('src.f1_data.get_driver_colors')
++    @patch('src.f1_data._get_wdc_standings')
++    def test_race_time_seconds(self, mock_wdc, mock_colors, mock_session, mock_driver_colors):
++        mock_colors.return_value = mock_driver_colors
++        mock_wdc.return_value = {}
++        
++        results = get_race_results(mock_session)
++        
++        # P1 should have full race time
++        p1 = next(r for r in results if r['position'] == 1)
++        expected_secs = 1 * 3600 + 30 * 60 + 45.123
++        assert abs(p1['race_time_secs'] - expected_secs) < 0.001
++        
++        # P2 should have gap time
++        p2 = next(r for r in results if r['position'] == 2)
++        assert abs(p2['race_time_secs'] - 5.432) < 0.001
++        
++    @patch('src.f1_data.get_driver_colors')
++    @patch('src.f1_data._get_wdc_standings')
++    def test_fastest_lap_detection(self, mock_wdc, mock_colors, mock_session, mock_driver_colors):
++        mock_colors.return_value = mock_driver_colors
++        mock_wdc.return_value = {}
++        
++        results = get_race_results(mock_session)
++        
++        # Only VER should have fastest lap (rank 1)
++        for r in results:
++            if r['code'] == 'VER':
++                assert r['fastest_lap'] is True
++            else:
++                assert r['fastest_lap'] is False
++                
++    @patch('src.f1_data.get_driver_colors')
++    @patch('src.f1_data._get_wdc_standings')
++    def test_grid_position(self, mock_wdc, mock_colors, mock_session, mock_driver_colors):
++        mock_colors.return_value = mock_driver_colors
++        mock_wdc.return_value = {}
++        
++        results = get_race_results(mock_session)
++        
++        p2 = next(r for r in results if r['position'] == 2)
++        assert p2['grid_pos'] == 3  # PER started P3
++        
++        p4 = next(r for r in results if r['position'] == 4)
++        assert p4['grid_pos'] == 2  # LEC started P2
++        
++    @patch('src.f1_data.get_driver_colors')
++    @patch('src.f1_data._get_wdc_standings')
++    def test_driver_colors_applied(self, mock_wdc, mock_colors, mock_session, mock_driver_colors):
++        mock_colors.return_value = mock_driver_colors
++        mock_wdc.return_value = {}
++        
++        results = get_race_results(mock_session)
++        
++        ver = next(r for r in results if r['code'] == 'VER')
++        assert ver['color'] == (30, 65, 255)
++        
++        sai = next(r for r in results if r['code'] == 'SAI')
++        assert sai['color'] == (220, 0, 0)
++        
++    @patch('src.f1_data.get_driver_colors')
++    @patch('src.f1_data._get_wdc_standings')
++    def test_missing_color_uses_default(self, mock_wdc, mock_colors, mock_session):
++        mock_colors.return_value = {}  # No colors
++        mock_wdc.return_value = {}
++        
++        results = get_race_results(mock_session)
++        
++        # All should have default gray color
++        for r in results:
++            assert r['color'] == (128, 128, 128)
++            
++    @patch('src.f1_data.get_driver_colors')
++    @patch('src.f1_data._get_wdc_standings')
++    def test_handles_nan_values(self, mock_wdc, mock_colors):
++        """Test handling of various NaN/None values in results."""
++        session = Mock()
++        session.event = {'EventDate': pd.Timestamp('2024-03-10'), 'RoundNumber': 3}
++        
++        results_data = {
++            'Abbreviation': ['VER', pd.NA],
++            'Position': [1, 2],
++            'FullName': ['Max Verstappen', np.nan],
++            'TeamName': [np.nan, 'Team'],
++            'GridPosition': [pd.NA, 2],
++            'Points': [np.nan, 10.0],
++            'Time': [pd.NaT, timedelta(seconds=5)],
++            'Status': ['Finished', np.nan],
++            'FastestLap': [np.nan, np.nan],
++        }
++        session.results = pd.DataFrame(results_data)
++        
++        mock_colors.return_value = {}
++        mock_wdc.return_value = {}
++        
++        results = get_race_results(session)
++        
++        # Should handle NaN gracefully
++        assert len(results) == 2
++        
++        p1 = next(r for r in results if r['position'] == 1)
++        assert p1['code'] == 'VER'
++        assert p1['team'] == 'Unknown'  # NaN team
++        assert p1['grid_pos'] == 0  # NaN grid
++        assert p1['points'] == 0  # NaN points
++        assert p1['race_time_secs'] is None  # NaT time
++        assert p1['fastest_lap'] is False  # NaN fastest lap
++
++
++class TestGetWdcStandings:
++    @pytest.fixture
++    def mock_session(self):
++        session = Mock()
++        session.event = {
++            'EventDate': pd.Timestamp('2024-03-10'),
++            'RoundNumber': 3
++        }
++        return session
++        
++    def test_missing_year_returns_empty(self):
++        session = Mock()
++        session.event = {'EventDate': None, 'RoundNumber': 3}
++        
++        result = _get_wdc_standings(session)
++        assert result == {}
++        
++    def test_missing_round_returns_empty(self):
++        session = Mock()
++        session.event = {'EventDate': pd.Timestamp('2024-03-10'), 'RoundNumber': None}
++        
++        result = _get_wdc_standings(session)
++        assert result == {}
++        
++    def test_fastf1_ergast_success(self, mock_session):
++        # Mock the Ergast class inside fastf1.ergast
++        mock_ergast_instance = Mock()
++        standings_df = pd.DataFrame({
++            'driverCode': ['VER', 'PER', 'LEC'],
++            'position': [1, 2, 3]
++        })
++        mock_standings = Mock()
++        mock_standings.content = [standings_df]
++        mock_ergast_instance.get_driver_standings.return_value = mock_standings
++        
++        mock_ergast_class = Mock(return_value=mock_ergast_instance)
++        
++        with patch.dict('sys.modules', {'fastf1.ergast': Mock(Ergast=mock_ergast_class)}):
++            result = _get_wdc_standings(mock_session)
++        
++        assert result == {'VER': 1, 'PER': 2, 'LEC': 3}
++        
++    @patch('requests.get')
++    def test_fallback_to_ergast_api(self, mock_requests, mock_session):
++        # Make fastf1.ergast import fail
++        with patch.dict('sys.modules', {'fastf1.ergast': None}):
++            # Mock successful requests fallback
++            mock_response = Mock()
++            mock_response.status_code = 200
++            mock_response.json.return_value = {
++                'MRData': {
++                    'StandingsTable': {
++                        'StandingsLists': [{
++                            'DriverStandings': [
++                                {'position': '1', 'Driver': {'code': 'VER'}},
++                                {'position': '2', 'Driver': {'code': 'PER'}},
++                            ]
++                        }]
++                    }
++                }
++            }
++            mock_requests.return_value = mock_response
++            
++            result = _get_wdc_standings(mock_session)
++        
++        assert result == {'VER': 1, 'PER': 2}
++        
++    @patch('requests.get')
++    def test_both_methods_fail_returns_empty(self, mock_requests, mock_session):
++        mock_requests.side_effect = Exception("requests failed")
++        
++        with patch.dict('sys.modules', {'fastf1.ergast': None}):
++            result = _get_wdc_standings(mock_session)
++        
++        assert result == {}
++
++
++if __name__ == '__main__':
++    pytest.main([__file__, '-v'])
