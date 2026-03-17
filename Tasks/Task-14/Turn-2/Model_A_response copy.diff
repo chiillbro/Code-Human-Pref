@@ -54,6 +54,174 @@ index 2c2df22f..54757c04 100644
      def _check_kwargs(kwargs: Dict) -> None:
          for invalid_keyword in kwargs.keys():
              raise ValueError(f'widget addition optional parameter kwargs.{invalid_keyword} is not valid')
+diff --git a/pygame_menu/themes.py b/pygame_menu/themes.py
+index 680df55c..0c2b63f9 100644
+--- a/pygame_menu/themes.py
++++ b/pygame_menu/themes.py
+@@ -313,20 +313,30 @@ class Theme(object):
+     widget_offset: Tuple2NumberType
+     widget_padding: PaddingType
+     widget_selection_effect: 'pygame_menu.widgets.core.Selection'
+     widget_shadow_aa: int
+     widget_shadow_color: ColorType
+     widget_shadow_radius: int
+     widget_shadow_type: str
+     widget_shadow_width: int
+     widget_tab_size: int
+     widget_url_color: ColorType
++    widget_tooltip_background_color: ColorType
++    widget_tooltip_border_color: ColorType
++    widget_tooltip_border_width: int
++    widget_tooltip_delay: NumberType
++    widget_tooltip_font: FontType
++    widget_tooltip_font_antialias: bool
++    widget_tooltip_font_color: ColorType
++    widget_tooltip_font_size: int
++    widget_tooltip_max_width: int
++    widget_tooltip_padding: Tuple2IntType
+ 
+     def __init__(self, **kwargs) -> None:
+ 
+         # Menu general
+         self.background_color = self._get(kwargs, 'background_color', 'color_image', (220, 220, 220))
+         self.border_color = self._get(kwargs, 'border_color', 'color_image_none')
+         self.border_width = self._get(kwargs, 'border_width', int, 0)
+         self.focus_background_color = self._get(kwargs, 'focus_background_color', 'color', (0, 0, 0, 180))
+         self.fps = self._get(kwargs, 'fps', NumberInstance, 30)
+         self.readonly_color = self._get(kwargs, 'readonly_color', 'color', (120, 120, 120))
+@@ -409,20 +419,32 @@ class Theme(object):
+         self.widget_padding = self._get(kwargs, 'widget_padding', PaddingInstance, (4, 8))
+         self.widget_selection_effect = self._get(kwargs, 'widget_selection_effect', Selection, HighlightSelection(margin_x=0, margin_y=0))
+         self.widget_shadow_aa = self._get(kwargs, 'widget_shadow_aa', int, 4)
+         self.widget_shadow_color = self._get(kwargs, 'widget_shadow_color', 'color', (0, 0, 0))
+         self.widget_shadow_radius = self._get(kwargs, 'widget_shadow_radius', int, 0)
+         self.widget_shadow_type = self._get(kwargs, 'widget_shadow_type', str, WIDGET_SHADOW_TYPE_RECTANGULAR)
+         self.widget_shadow_width = self._get(kwargs, 'widget_shadow_width', int, 0)
+         self.widget_tab_size = self._get(kwargs, 'widget_tab_size', int, 4)
+         self.widget_url_color = self._get(kwargs, 'widget_url_color', 'color', (6, 69, 173))
+ 
++        # Widget tooltip themes
++        self.widget_tooltip_background_color = self._get(kwargs, 'widget_tooltip_background_color', 'color', (255, 255, 225))
++        self.widget_tooltip_border_color = self._get(kwargs, 'widget_tooltip_border_color', 'color', (0, 0, 0))
++        self.widget_tooltip_border_width = self._get(kwargs, 'widget_tooltip_border_width', int, 1)
++        self.widget_tooltip_delay = self._get(kwargs, 'widget_tooltip_delay', NumberInstance, 500)
++        self.widget_tooltip_font = self._get(kwargs, 'widget_tooltip_font', 'font', FONT_OPEN_SANS)
++        self.widget_tooltip_font_antialias = self._get(kwargs, 'widget_tooltip_font_antialias', bool, True)
++        self.widget_tooltip_font_color = self._get(kwargs, 'widget_tooltip_font_color', 'color', (0, 0, 0))
++        self.widget_tooltip_font_size = self._get(kwargs, 'widget_tooltip_font_size', int, 14)
++        self.widget_tooltip_max_width = self._get(kwargs, 'widget_tooltip_max_width', int, 0)
++        self.widget_tooltip_padding = self._get(kwargs, 'widget_tooltip_padding', 'tuple2int', (5, 8))
++
+         # Upon this, no more kwargs should exist, raise exception if there's more
+         for invalid_keyword in kwargs.keys():
+             raise ValueError(f'parameter Theme.{invalid_keyword} does not exist')
+ 
+         # Test purpose only, if True disables any validation
+         self._disable_validation = False
+ 
+     def validate(self) -> 'Theme':
+         """
+         Validate the values of the theme. If there's an invalid parameter throws an
+@@ -481,20 +503,26 @@ class Theme(object):
+         assert isinstance(self.widget_border_width, int)
+         assert isinstance(self.widget_box_border_width, int)
+         assert isinstance(self.widget_font_shadow_offset, int)
+         assert isinstance(self.widget_font_size, int)
+         assert isinstance(self.widget_padding, PaddingInstance)
+         assert isinstance(self.widget_selection_effect, Selection)
+         assert isinstance(self.widget_shadow_aa, int)
+         assert isinstance(self.widget_shadow_radius, int)
+         assert isinstance(self.widget_shadow_width, int)
+         assert isinstance(self.widget_tab_size, int)
++        assert isinstance(self.widget_tooltip_border_width, int)
++        assert isinstance(self.widget_tooltip_delay, NumberInstance)
++        assert isinstance(self.widget_tooltip_font_antialias, bool)
++        assert isinstance(self.widget_tooltip_font_size, int)
++        assert isinstance(self.widget_tooltip_max_width, int)
++        assert_font(self.widget_tooltip_font)
+ 
+         # Format colors, this converts all color lists to tuples automatically,
+         # if it is an image, return the same object
+         self.background_color = self._format_color_opacity(self.background_color)
+         self.border_color = self._format_color_opacity(self.border_color, none=True)
+         self.cursor_color = self._format_color_opacity(self.cursor_color)
+         self.cursor_selection_color = self._format_color_opacity(self.cursor_selection_color)
+         self.focus_background_color = self._format_color_opacity(self.focus_background_color)
+         self.readonly_color = self._format_color_opacity(self.readonly_color)
+         self.readonly_selected_color = self._format_color_opacity(self.readonly_selected_color)
+@@ -511,20 +539,23 @@ class Theme(object):
+         self.widget_background_color = self._format_color_opacity(self.widget_background_color, none=True)
+         self.widget_border_color = self._format_color_opacity(self.widget_border_color)
+         self.widget_box_arrow_color = self._format_color_opacity(self.widget_box_arrow_color)
+         self.widget_box_background_color = self._format_color_opacity(self.widget_box_background_color)
+         self.widget_box_border_color = self._format_color_opacity(self.widget_box_border_color)
+         self.widget_font_background_color = self._format_color_opacity(self.widget_font_background_color, none=True)
+         self.widget_font_color = self._format_color_opacity(self.widget_font_color)
+         self.widget_font_shadow_color = self._format_color_opacity(self.widget_font_shadow_color)
+         self.widget_shadow_color = self._format_color_opacity(self.widget_shadow_color)
+         self.widget_url_color = self._format_color_opacity(self.widget_url_color)
++        self.widget_tooltip_background_color = self._format_color_opacity(self.widget_tooltip_background_color)
++        self.widget_tooltip_border_color = self._format_color_opacity(self.widget_tooltip_border_color)
++        self.widget_tooltip_font_color = self._format_color_opacity(self.widget_tooltip_font_color)
+ 
+         # List to tuple
+         self.scrollarea_outer_margin = self._vec_to_tuple(self.scrollarea_outer_margin, 2, NumberInstance)
+         self.title_offset = self._vec_to_tuple(self.title_offset, 2, NumberInstance)
+         self.widget_background_inflate = self._vec_to_tuple(self.widget_background_inflate, 2, int)
+         self.widget_border_inflate = self._vec_to_tuple(self.widget_border_inflate, 2, int)
+         self.widget_box_arrow_margin = self._vec_to_tuple(self.widget_box_arrow_margin, 3, int)
+         self.widget_box_inflate = self._vec_to_tuple(self.widget_box_inflate, 2, int)
+         self.widget_box_margin = self._vec_to_tuple(self.widget_box_margin, 2, NumberInstance)
+         self.widget_margin = self._vec_to_tuple(self.widget_margin, 2, NumberInstance)
+@@ -533,20 +564,21 @@ class Theme(object):
+             assert 2 <= len(self.widget_padding) <= 4, \
+                 'widget padding tuple length must be 2, 3 or 4'
+             for p in self.widget_padding:
+                 assert isinstance(p, NumberInstance), \
+                     'each padding element must be numeric (integer or float)'
+                 assert p >= 0, \
+                     'all padding elements must be equal or greater than zero'
+         else:
+             assert self.widget_padding >= 0, 'padding cannot be a negative number'
+         self.widget_offset = self._vec_to_tuple(self.widget_offset, 2, NumberInstance)
++        self.widget_tooltip_padding = self._vec_to_tuple(self.widget_tooltip_padding, 2, int)
+ 
+         # Check sizes
+         assert self.border_width >= 0, 'border width must be equal or greater than zero'
+         assert self.scrollarea_outer_margin[0] >= 0 and self.scrollarea_outer_margin[1] >= 0, \
+             'scroll area outer margin must be equal or greater than zero on both axis'
+         assert self.widget_offset[0] >= 0 and self.widget_offset[1] >= 0, \
+             'widget offset must be equal or greater than zero'
+         assert self.widget_background_inflate[0] >= 0 and self.widget_background_inflate[1] >= 0, \
+             'widget background inflate must be equal or greater than zero on both axis'
+         assert self.widget_border_inflate[0] >= 0 and self.widget_border_inflate[1] >= 0, \
+@@ -565,20 +597,26 @@ class Theme(object):
+         assert self.scrollbar_shadow_offset > 0, 'scrollbar shadow offset must be greater than zero'
+         assert self.scrollbar_slider_pad >= 0, 'slider pad must be equal or greater than zero'
+         assert self.scrollbar_thick > 0, 'scrollbar thickness must be greater than zero'
+         assert self.title_font_size > 0, 'title font size must be greater than zero'
+         assert self.widget_border_width >= 0, 'widget border width must be equal or greater than zero'
+         assert self.widget_box_border_width >= 0, 'widget border box width must be equal or greater than zero'
+         assert self.widget_font_shadow_offset > 0, 'widget font shadow offset must be greater than zero'
+         assert self.widget_font_size > 0, 'widget font size must be greater than zero'
+         assert self.widget_shadow_aa >= 1, 'widget shadow antialiasing must be equal or greater than one'
+         assert self.widget_tab_size >= 0, 'widget tab size must be equal or greater than zero'
++        assert self.widget_tooltip_border_width >= 0, 'widget tooltip border width must be equal or greater than zero'
++        assert self.widget_tooltip_delay >= 0, 'widget tooltip delay must be equal or greater than zero'
++        assert self.widget_tooltip_font_size > 0, 'widget tooltip font size must be greater than zero'
++        assert self.widget_tooltip_max_width >= 0, 'widget tooltip max width must be equal or greater than zero'
++        assert self.widget_tooltip_padding[0] >= 0 and self.widget_tooltip_padding[1] >= 0, \
++            'widget tooltip padding must be equal or greater than zero on both axes'
+ 
+         # Color asserts
+         assert self.focus_background_color[3] != 0, \
+             'focus background color cannot be fully transparent, suggested opacity between 1 and 255'
+ 
+         return self
+ 
+     def set_background_color_opacity(self, opacity: float) -> 'Theme':
+         """
+         Modify the Menu background color with given opacity.
 diff --git a/pygame_menu/widgets/core/tooltip.py b/pygame_menu/widgets/core/tooltip.py
 new file mode 100644
 index 00000000..571ad5c6
