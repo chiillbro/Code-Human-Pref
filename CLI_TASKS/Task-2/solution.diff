@@ -1,0 +1,955 @@
+diff --git a/pygame_menu/menu.py b/pygame_menu/menu.py
+index 4dcc083c..71cfbf18 100644
+--- a/pygame_menu/menu.py
++++ b/pygame_menu/menu.py
+@@ -23,21 +23,21 @@ from pygame_menu._decorator import Decorator
+ from pygame_menu._widgetmanager import WidgetManager
+ from pygame_menu.controls import Controller
+ from pygame_menu.locals import ALIGN_CENTER, ALIGN_LEFT, ALIGN_RIGHT, \
+     ORIENTATION_HORIZONTAL, ORIENTATION_VERTICAL, FINGERDOWN, FINGERUP, FINGERMOTION
+ from pygame_menu._scrollarea import ScrollArea, get_scrollbars_from_position
+ from pygame_menu.sound import Sound
+ from pygame_menu.themes import Theme, THEME_DEFAULT
+ from pygame_menu.utils import assert_vector, make_surface, warn, \
+     check_key_pressed_valid, mouse_motion_current_mouse_position, get_finger_pos, \
+     print_menu_widget_structure
+-from pygame_menu.widgets import Frame, Widget, MenuBar
++from pygame_menu.widgets import Breadcrumb, Frame, Widget, MenuBar
+ from pygame_menu.widgets.core.widget import check_widget_mouseleave, WIDGET_MOUSEOVER
+ 
+ # Import types
+ from pygame_menu._types import Callable, Any, Dict, NumberType, VectorType, \
+     Vector2NumberType, Union, Tuple, List, Vector2IntType, Vector2BoolType, \
+     Tuple4Tuple2IntType, Tuple2IntType, MenuColumnMaxWidthType, MenuColumnMinWidthType, \
+     MenuRowsType, Optional, Tuple2BoolType, NumberInstance, VectorInstance, EventType, \
+     EventVectorType, EventListType, CallableNoArgsType
+ 
+ # Joy events
+@@ -535,20 +535,35 @@ class Menu(Base):
+             keyboard=self._keyboard
+         )
+         self._menubar.set_position(*self.get_position())
+         if self._theme.title_floating:
+             self._menubar.set_float()
+         if not self._theme.title:
+             self._menubar.hide()
+         self._menubar.configured = True
+         self._menubar.fixed = self._theme.title_fixed
+ 
++        # Breadcrumb navigation trail
++        if self._theme.breadcrumb_enabled:
++            self._breadcrumb = Breadcrumb(
++                separator=self._theme.breadcrumb_separator,
++                font_size=self._theme.breadcrumb_font_size,
++                font_color=self._theme.breadcrumb_font_color,
++                active_color=self._theme.breadcrumb_active_color,
++                background_color=self._theme.breadcrumb_background_color,
++                breadcrumb_id=self._id + '+breadcrumb',
++            )
++            self._breadcrumb.set_menu(self)
++            self._breadcrumb.configured = True
++        else:
++            self._breadcrumb = None
++
+         # Scrolling area
+         menubar_height = self._menubar.get_height()
+         if self._height - menubar_height <= 0:
+             raise ValueError(f'menubar is higher than menu height ({menubar_height} > {self._height})')
+ 
+         extend_y = 0 if self._theme.title_fixed else menubar_height
+ 
+         self._scrollarea = ScrollArea(
+             area_color=self._theme.background_color,
+             area_height=self._height - extend_y,
+@@ -2080,20 +2095,29 @@ class Menu(Base):
+                 widget.draw(self._current._widgets_surface)
+ 
+             if selected_widget_draw[0] is not None:
+                 selected_widget_draw[0].draw_after_if_selected(selected_widget_draw[1])
+ 
+             self._current._stats.draw_update_cached += 1
+ 
+         self._current._scrollarea.draw(surface)
+         self._current._menubar.draw(surface)
+ 
++        # Draw breadcrumb trail below the menubar
++        if self._current._breadcrumb is not None:
++            bc = self._current._breadcrumb
++            bc._render()
++            menubar_h = self._current._menubar.get_height()
++            bc._rect.x = self._current._position[0]
++            bc._rect.y = self._current._position[1] + menubar_h
++            bc._draw(surface)
++
+         # Draw focus on selected if the widget is active
+         self._current._draw_focus_widget(surface, self._current.get_selected_widget())
+         self._current._decorator.draw_post(surface)
+         self._current._stats.draw += 1
+ 
+         # Update cursor if not mainloop
+         if self._current._mainloop:
+             check_widget_mouseleave()
+ 
+         return self._current
+@@ -2508,20 +2532,24 @@ class Menu(Base):
+         elif not selected_widget_disable_frame_update and self._current._scrollarea.update(events):
+             self._current._last_update_mode.append(_events.MENU_LAST_SCROLL_AREA)
+             updated = True
+ 
+         # Update the menubar, it may change the status of the widget because
+         # of the button back/close
+         elif self._current._menubar.update(events):
+             self._current._last_update_mode.append(_events.MENU_LAST_MENUBAR)
+             updated = True
+ 
++        # Update breadcrumb (click navigation)
++        elif self._current._breadcrumb is not None and self._current._breadcrumb.update(events):
++            updated = True
++
+         # Check selected widget
+         elif selected_widget is not None and self._current._widget_selected_update and \
+                 selected_widget.update(events):
+             self._current._last_update_mode.append(
+                 f'{_events.MENU_LAST_SELECTED_WIDGET_EVENT}#{selected_widget.get_id()}'
+             )
+             updated = True
+ 
+         # Check others
+         else:
+diff --git a/pygame_menu/themes.py b/pygame_menu/themes.py
+index 680df55c..e4471829 100644
+--- a/pygame_menu/themes.py
++++ b/pygame_menu/themes.py
+@@ -314,20 +314,28 @@ class Theme(object):
+     widget_padding: PaddingType
+     widget_selection_effect: 'pygame_menu.widgets.core.Selection'
+     widget_shadow_aa: int
+     widget_shadow_color: ColorType
+     widget_shadow_radius: int
+     widget_shadow_type: str
+     widget_shadow_width: int
+     widget_tab_size: int
+     widget_url_color: ColorType
+ 
++    # Breadcrumb
++    breadcrumb_active_color: ColorType
++    breadcrumb_background_color: Optional[ColorType]
++    breadcrumb_enabled: bool
++    breadcrumb_font_color: ColorType
++    breadcrumb_font_size: int
++    breadcrumb_separator: str
++
+     def __init__(self, **kwargs) -> None:
+ 
+         # Menu general
+         self.background_color = self._get(kwargs, 'background_color', 'color_image', (220, 220, 220))
+         self.border_color = self._get(kwargs, 'border_color', 'color_image_none')
+         self.border_width = self._get(kwargs, 'border_width', int, 0)
+         self.focus_background_color = self._get(kwargs, 'focus_background_color', 'color', (0, 0, 0, 180))
+         self.fps = self._get(kwargs, 'fps', NumberInstance, 30)
+         self.readonly_color = self._get(kwargs, 'readonly_color', 'color', (120, 120, 120))
+         self.readonly_selected_color = self._get(kwargs, 'readonly_selected_color', 'color', (190, 190, 190))
+@@ -409,20 +417,28 @@ class Theme(object):
+         self.widget_padding = self._get(kwargs, 'widget_padding', PaddingInstance, (4, 8))
+         self.widget_selection_effect = self._get(kwargs, 'widget_selection_effect', Selection, HighlightSelection(margin_x=0, margin_y=0))
+         self.widget_shadow_aa = self._get(kwargs, 'widget_shadow_aa', int, 4)
+         self.widget_shadow_color = self._get(kwargs, 'widget_shadow_color', 'color', (0, 0, 0))
+         self.widget_shadow_radius = self._get(kwargs, 'widget_shadow_radius', int, 0)
+         self.widget_shadow_type = self._get(kwargs, 'widget_shadow_type', str, WIDGET_SHADOW_TYPE_RECTANGULAR)
+         self.widget_shadow_width = self._get(kwargs, 'widget_shadow_width', int, 0)
+         self.widget_tab_size = self._get(kwargs, 'widget_tab_size', int, 4)
+         self.widget_url_color = self._get(kwargs, 'widget_url_color', 'color', (6, 69, 173))
+ 
++        # Breadcrumb
++        self.breadcrumb_active_color = self._get(kwargs, 'breadcrumb_active_color', 'color', (50, 50, 50))
++        self.breadcrumb_background_color = self._get(kwargs, 'breadcrumb_background_color', 'color_none')
++        self.breadcrumb_enabled = self._get(kwargs, 'breadcrumb_enabled', bool, False)
++        self.breadcrumb_font_color = self._get(kwargs, 'breadcrumb_font_color', 'color', (120, 120, 120))
++        self.breadcrumb_font_size = self._get(kwargs, 'breadcrumb_font_size', int, 16)
++        self.breadcrumb_separator = self._get(kwargs, 'breadcrumb_separator', str, ' > ')
++
+         # Upon this, no more kwargs should exist, raise exception if there's more
+         for invalid_keyword in kwargs.keys():
+             raise ValueError(f'parameter Theme.{invalid_keyword} does not exist')
+ 
+         # Test purpose only, if True disables any validation
+         self._disable_validation = False
+ 
+     def validate(self) -> 'Theme':
+         """
+         Validate the values of the theme. If there's an invalid parameter throws an
+@@ -481,20 +497,23 @@ class Theme(object):
+         assert isinstance(self.widget_border_width, int)
+         assert isinstance(self.widget_box_border_width, int)
+         assert isinstance(self.widget_font_shadow_offset, int)
+         assert isinstance(self.widget_font_size, int)
+         assert isinstance(self.widget_padding, PaddingInstance)
+         assert isinstance(self.widget_selection_effect, Selection)
+         assert isinstance(self.widget_shadow_aa, int)
+         assert isinstance(self.widget_shadow_radius, int)
+         assert isinstance(self.widget_shadow_width, int)
+         assert isinstance(self.widget_tab_size, int)
++        assert isinstance(self.breadcrumb_enabled, bool)
++        assert isinstance(self.breadcrumb_font_size, int)
++        assert isinstance(self.breadcrumb_separator, str)
+ 
+         # Format colors, this converts all color lists to tuples automatically,
+         # if it is an image, return the same object
+         self.background_color = self._format_color_opacity(self.background_color)
+         self.border_color = self._format_color_opacity(self.border_color, none=True)
+         self.cursor_color = self._format_color_opacity(self.cursor_color)
+         self.cursor_selection_color = self._format_color_opacity(self.cursor_selection_color)
+         self.focus_background_color = self._format_color_opacity(self.focus_background_color)
+         self.readonly_color = self._format_color_opacity(self.readonly_color)
+         self.readonly_selected_color = self._format_color_opacity(self.readonly_selected_color)
+@@ -511,20 +530,23 @@ class Theme(object):
+         self.widget_background_color = self._format_color_opacity(self.widget_background_color, none=True)
+         self.widget_border_color = self._format_color_opacity(self.widget_border_color)
+         self.widget_box_arrow_color = self._format_color_opacity(self.widget_box_arrow_color)
+         self.widget_box_background_color = self._format_color_opacity(self.widget_box_background_color)
+         self.widget_box_border_color = self._format_color_opacity(self.widget_box_border_color)
+         self.widget_font_background_color = self._format_color_opacity(self.widget_font_background_color, none=True)
+         self.widget_font_color = self._format_color_opacity(self.widget_font_color)
+         self.widget_font_shadow_color = self._format_color_opacity(self.widget_font_shadow_color)
+         self.widget_shadow_color = self._format_color_opacity(self.widget_shadow_color)
+         self.widget_url_color = self._format_color_opacity(self.widget_url_color)
++        self.breadcrumb_active_color = self._format_color_opacity(self.breadcrumb_active_color)
++        self.breadcrumb_background_color = self._format_color_opacity(self.breadcrumb_background_color, none=True)
++        self.breadcrumb_font_color = self._format_color_opacity(self.breadcrumb_font_color)
+ 
+         # List to tuple
+         self.scrollarea_outer_margin = self._vec_to_tuple(self.scrollarea_outer_margin, 2, NumberInstance)
+         self.title_offset = self._vec_to_tuple(self.title_offset, 2, NumberInstance)
+         self.widget_background_inflate = self._vec_to_tuple(self.widget_background_inflate, 2, int)
+         self.widget_border_inflate = self._vec_to_tuple(self.widget_border_inflate, 2, int)
+         self.widget_box_arrow_margin = self._vec_to_tuple(self.widget_box_arrow_margin, 3, int)
+         self.widget_box_inflate = self._vec_to_tuple(self.widget_box_inflate, 2, int)
+         self.widget_box_margin = self._vec_to_tuple(self.widget_box_margin, 2, NumberInstance)
+         self.widget_margin = self._vec_to_tuple(self.widget_margin, 2, NumberInstance)
+@@ -548,20 +570,22 @@ class Theme(object):
+         assert self.widget_offset[0] >= 0 and self.widget_offset[1] >= 0, \
+             'widget offset must be equal or greater than zero'
+         assert self.widget_background_inflate[0] >= 0 and self.widget_background_inflate[1] >= 0, \
+             'widget background inflate must be equal or greater than zero on both axis'
+         assert self.widget_border_inflate[0] >= 0 and self.widget_border_inflate[1] >= 0, \
+             'widget border inflate must be equal or greater than zero on both axis'
+         assert self.widget_box_inflate[0] >= 0 and self.widget_box_inflate[1] >= 0, \
+             'widget box inflate inflate must be equal or greater than zero on both axis'
+         assert self.widget_shadow_width >= 0 and self.widget_shadow_radius >= 0, \
+             'widget shadow width and radius must be equal or greater than zero'
++        assert self.breadcrumb_font_size > 0, \
++            'breadcrumb font size must be greater than zero'
+ 
+         # Check shadow type
+         assert self.widget_shadow_type in (WIDGET_SHADOW_TYPE_ELLIPSE, WIDGET_SHADOW_TYPE_RECTANGULAR), \
+             'widget shadow type must be ellipse or rectangular'
+ 
+         assert self.cursor_switch_ms > 0, 'cursor switch ms must be greater than zero'
+         assert self.fps >= 0, 'fps must be equal or greater than zero'
+         assert self.scrollbar_shadow_offset > 0, 'scrollbar shadow offset must be greater than zero'
+         assert self.scrollbar_slider_pad >= 0, 'slider pad must be equal or greater than zero'
+         assert self.scrollbar_thick > 0, 'scrollbar thickness must be greater than zero'
+diff --git a/pygame_menu/widgets/__init__.py b/pygame_menu/widgets/__init__.py
+index 174e0700..c12272b7 100644
+--- a/pygame_menu/widgets/__init__.py
++++ b/pygame_menu/widgets/__init__.py
+@@ -8,21 +8,21 @@ Widgets elements that can be added to the Menu.
+ 
+ # Widgets core
+ import pygame_menu.widgets.core
+ from pygame_menu.widgets.core import Widget
+ 
+ # Selection
+ from pygame_menu.widgets.selection import HighlightSelection, LeftArrowSelection, \
+     NoneSelection, RightArrowSelection, SimpleSelection
+ 
+ # Widgets
+-from pygame_menu.widgets.widget import Button, ColorInput, DropSelect, \
++from pygame_menu.widgets.widget import Breadcrumb, Button, ColorInput, DropSelect, \
+     DropSelectMultiple, Frame, HMargin, Image, Label, MenuBar, MenuLink, NoneWidget, \
+     ProgressBar, RangeSlider, ScrollBar, Selector, SurfaceWidget, Table, TextInput, \
+     ToggleSwitch, VFill, VMargin
+ 
+ # Widget constants
+ from pygame_menu.widgets.widget.colorinput import COLORINPUT_TYPE_RGB, \
+     COLORINPUT_TYPE_HEX, COLORINPUT_HEX_FORMAT_UPPER, COLORINPUT_HEX_FORMAT_NONE, \
+     COLORINPUT_HEX_FORMAT_LOWER
+ 
+ from pygame_menu.widgets.widget.dropselect_multiple import \
+diff --git a/pygame_menu/widgets/widget/__init__.py b/pygame_menu/widgets/widget/__init__.py
+index 1bc99743..ed3c47ce 100644
+--- a/pygame_menu/widgets/widget/__init__.py
++++ b/pygame_menu/widgets/widget/__init__.py
+@@ -1,18 +1,19 @@
+ """
+ pygame-menu
+ https://github.com/ppizarror/pygame-menu
+ 
+ WIDGET
+ This module contains the widgets of pygame-menu.
+ """
+ 
++from pygame_menu.widgets.widget.breadcrumb import Breadcrumb
+ from pygame_menu.widgets.widget.button import Button
+ from pygame_menu.widgets.widget.colorinput import ColorInput
+ from pygame_menu.widgets.widget.dropselect import DropSelect
+ from pygame_menu.widgets.widget.dropselect_multiple import DropSelectMultiple
+ from pygame_menu.widgets.widget.frame import Frame
+ from pygame_menu.widgets.widget.hmargin import HMargin
+ from pygame_menu.widgets.widget.image import Image
+ from pygame_menu.widgets.widget.label import Label
+ from pygame_menu.widgets.widget.menubar import MenuBar
+ from pygame_menu.widgets.widget.menulink import MenuLink
+diff --git a/pygame_menu/widgets/widget/breadcrumb.py b/pygame_menu/widgets/widget/breadcrumb.py
+new file mode 100644
+index 00000000..093d945e
+--- /dev/null
++++ b/pygame_menu/widgets/widget/breadcrumb.py
+@@ -0,0 +1,252 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++BREADCRUMB
++Displays a navigation breadcrumb trail showing the path from the root menu
++to the currently displayed menu (e.g. "Main > Settings > Audio").
++
++The widget is non-selectable and is drawn automatically by the Menu when
++breadcrumbs are enabled via the theme.
++"""
++
++__all__ = ['Breadcrumb']
++
++import pygame
++import pygame_menu
++
++from pygame_menu.font import get_font as _get_font
++from pygame_menu.utils import make_surface
++from pygame_menu.widgets.core.widget import Widget
++
++from pygame_menu._types import Optional, List, Tuple, Any, CallbackType, ColorType
++
++
++class Breadcrumb(Widget):
++    """
++    Breadcrumb navigation widget.  Builds a text trail from the menu-navigation
++    history (using the ``_prev`` linked-list on the root menu) and renders it as
++    a single surface.
++
++    Rendering is lazy: the surface is only rebuilt when the navigation depth
++    changes.
++
++    :param separator: String placed between path segments
++    :param font_name: Font used for the breadcrumb text
++    :param font_size: Font size in px
++    :param font_color: Text colour for ancestor segments
++    :param active_color: Text colour for the current (last) segment
++    :param background_color: Optional background colour behind the breadcrumb
++    :param padding_x: Horizontal padding in px
++    :param padding_y: Vertical padding in px
++    :param breadcrumb_id: Widget ID
++    """
++    _separator: str
++    _bc_font_name: Any
++    _bc_font_size: int
++    _bc_font_color: ColorType
++    _bc_active_color: ColorType
++    _bc_background_color: Optional[ColorType]
++    _bc_padding_x: int
++    _bc_padding_y: int
++    _bc_font: Optional['pygame.font.Font']
++    _last_depth: int
++    _path_titles: List[str]
++
++    def __init__(
++            self,
++            separator: str = ' > ',
++            font_name: Any = None,
++            font_size: int = 16,
++            font_color: ColorType = (120, 120, 120),
++            active_color: ColorType = (50, 50, 50),
++            background_color: Optional[ColorType] = None,
++            padding_x: int = 10,
++            padding_y: int = 4,
++            breadcrumb_id: str = '',
++    ) -> None:
++        super(Breadcrumb, self).__init__(
++            title='',
++            widget_id=breadcrumb_id,
++        )
++        self._separator = separator
++        self._bc_font_name = font_name
++        self._bc_font_size = font_size
++        self._bc_font_color = font_color
++        self._bc_active_color = active_color
++        self._bc_background_color = background_color
++        self._bc_padding_x = padding_x
++        self._bc_padding_y = padding_y
++        self._bc_font = None
++        self._last_depth = -1
++        self._path_titles = []
++
++        # Breadcrumb is never selectable and is always floating
++        self.is_selectable = False
++
++    # ------------------------------------------------------------------
++    # Path building
++    # ------------------------------------------------------------------
++
++    def _build_path(self) -> List[str]:
++        """
++        Traverse the ``_prev`` linked-list on the root menu to collect the
++        ordered list of menu titles from root to current.
++
++        :return: List of menu title strings, root first
++        """
++        menu = self._menu
++        if menu is None:
++            return []
++
++        top = menu._top
++
++        # Collect menus from the _prev chain.
++        # _prev structure: [parent_state, current_menu]
++        # Walking prev[0] goes towards root; prev[1] is the menu at that depth.
++        menus: List['pygame_menu.Menu'] = []
++        prev = top._prev
++        if prev is not None:
++            while prev is not None:
++                menus.append(prev[1])
++                prev = prev[0]
++
++        # menus is in reverse order (deepest parent first), so reverse it
++        menus.reverse()
++
++        # Append current menu at the end
++        titles = [m.get_title() for m in menus]
++        titles.append(top._current.get_title())
++
++        return titles
++
++    # ------------------------------------------------------------------
++    # Rendering
++    # ------------------------------------------------------------------
++
++    def _ensure_font(self) -> None:
++        """Lazy-load the pygame font object."""
++        if self._bc_font is None:
++            if self._bc_font_name is None and self._menu is not None:
++                self._bc_font_name = self._menu.get_theme().widget_font
++            if self._bc_font_name is None:
++                from pygame_menu.font import FONT_OPEN_SANS
++                self._bc_font_name = FONT_OPEN_SANS
++            self._bc_font = _get_font(self._bc_font_name, self._bc_font_size)
++
++    def _render(self) -> Optional[bool]:
++        """Build the breadcrumb surface.  Re-renders only when depth changes."""
++        menu = self._menu
++        if menu is None:
++            return None
++
++        depth = menu._get_depth()
++        titles = self._build_path()
++
++        if not self._render_hash_changed(depth, tuple(titles), self._visible):
++            return True
++
++        self._path_titles = titles
++        self._last_depth = depth
++
++        # If at root (depth 0 → only one title), make a 0×0 surface so it's
++        # effectively invisible.
++        if depth == 0:
++            self._surface = make_surface(1, 1, alpha=True)
++            self._rect.width, self._rect.height = 0, 0
++            return None
++
++        self._ensure_font()
++        font = self._bc_font
++
++        # Render each segment and separator individually so we can apply
++        # different colours to ancestor vs. current segment.
++        segment_surfaces: List['pygame.Surface'] = []
++        sep_surface = font.render(self._separator, True, self._bc_font_color)
++
++        for idx, title in enumerate(titles):
++            is_last = idx == len(titles) - 1
++            color = self._bc_active_color if is_last else self._bc_font_color
++            segment_surfaces.append(font.render(title, True, color))
++
++        # Compute total width and height
++        total_w = sum(s.get_width() for s in segment_surfaces) + \
++                  sep_surface.get_width() * (len(segment_surfaces) - 1) + \
++                  self._bc_padding_x * 2
++        total_h = max(s.get_height() for s in segment_surfaces) + \
++                  self._bc_padding_y * 2
++
++        self._surface = make_surface(total_w, total_h, alpha=True)
++
++        # Draw background
++        if self._bc_background_color is not None:
++            self._surface.fill(self._bc_background_color)
++
++        # Blit segments
++        x = self._bc_padding_x
++        y = self._bc_padding_y
++        for idx, seg_surf in enumerate(segment_surfaces):
++            self._surface.blit(seg_surf, (x, y))
++            x += seg_surf.get_width()
++            if idx < len(segment_surfaces) - 1:
++                self._surface.blit(sep_surface, (x, y))
++                x += sep_surface.get_width()
++
++        self._rect.width, self._rect.height = total_w, total_h
++
++    def _draw(self, surface: 'pygame.Surface') -> None:
++        """Blit the pre-rendered breadcrumb surface."""
++        if self._surface is None or self._last_depth == 0:
++            return
++        surface.blit(self._surface, (self._rect.x, self._rect.y))
++
++    def get_path_titles(self) -> List[str]:
++        """
++        Return the current breadcrumb path as a list of menu title strings.
++
++        :return: Ordered list from root menu to current menu
++        """
++        return list(self._path_titles)
++
++    def _apply_font(self) -> None:
++        """No-op: breadcrumb manages its own font."""
++        pass
++
++    def update(self, events: 'pygame_menu._types.EventVectorType') -> bool:
++        """
++        Process click events — clicking an ancestor segment navigates back to
++        that depth.
++
++        :param events: Pygame events
++        :return: True if event was consumed
++        """
++        menu = self._menu
++        if menu is None or self._last_depth == 0:
++            return False
++
++        for event in events:
++            if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
++                mx, my = event.pos
++                rect = self.get_rect(to_real_position=True)
++                if not rect.collidepoint(mx, my):
++                    continue
++
++                # Determine which segment was clicked based on x position
++                self._ensure_font()
++                font = self._bc_font
++                sep_w = font.size(self._separator)[0]
++
++                local_x = mx - rect.x - self._bc_padding_x
++                running_x = 0
++                for idx, title in enumerate(self._path_titles):
++                    seg_w = font.size(title)[0]
++                    if local_x < running_x + seg_w:
++                        # Clicked on segment idx
++                        levels_back = len(self._path_titles) - 1 - idx
++                        if levels_back > 0:
++                            menu.reset(levels_back)
++                            return True
++                        return False  # Already on this menu
++                    running_x += seg_w + sep_w
++
++        return False
+diff --git a/test/test_widget_breadcrumb.py b/test/test_widget_breadcrumb.py
+new file mode 100644
+index 00000000..7ea6d4bd
+--- /dev/null
++++ b/test/test_widget_breadcrumb.py
+@@ -0,0 +1,389 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++TEST WIDGET - BREADCRUMB
++Tests for the Breadcrumb navigation widget.
++"""
++
++import pygame
++import pygame_menu
++
++from test._utils import BaseTest, MenuUtils, surface, reset_widgets_over
++
++
++class BreadcrumbWidgetTest(BaseTest):
++
++    def setUp(self) -> None:
++        """Set up breadcrumb-enabled theme."""
++        self.theme = pygame_menu.themes.THEME_DEFAULT.copy()
++        self.theme.breadcrumb_enabled = True
++        reset_widgets_over()
++
++    # ------------------------------------------------------------------
++    # Construction / defaults
++    # ------------------------------------------------------------------
++
++    def test_breadcrumb_created_when_enabled(self) -> None:
++        """Menu creates a Breadcrumb widget when theme.breadcrumb_enabled is True."""
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        self.assertIsNotNone(menu._breadcrumb)
++        self.assertIsInstance(menu._breadcrumb, pygame_menu.widgets.Breadcrumb)
++
++    def test_breadcrumb_none_when_disabled(self) -> None:
++        """Menu does NOT create a Breadcrumb when the flag is off."""
++        theme = pygame_menu.themes.THEME_DEFAULT.copy()
++        theme.breadcrumb_enabled = False
++        menu = MenuUtils.generic_menu(title='Root', theme=theme)
++        self.assertIsNone(menu._breadcrumb)
++
++    def test_breadcrumb_default_properties(self) -> None:
++        """Breadcrumb inherits separator / font settings from the theme."""
++        self.theme.breadcrumb_separator = ' / '
++        self.theme.breadcrumb_font_size = 20
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        bc = menu._breadcrumb
++        self.assertEqual(bc._separator, ' / ')
++        self.assertEqual(bc._bc_font_size, 20)
++
++    def test_breadcrumb_is_not_selectable(self) -> None:
++        """Breadcrumb widgets must never be selectable."""
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        self.assertFalse(menu._breadcrumb.is_selectable)
++
++    # ------------------------------------------------------------------
++    # Path building
++    # ------------------------------------------------------------------
++
++    def test_path_at_root(self) -> None:
++        """At root depth the path should contain only the root title."""
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        menu.enable()
++        menu._breadcrumb._render()
++        titles = menu._breadcrumb.get_path_titles()
++        self.assertEqual(titles, ['Root'])
++
++    def test_path_single_submenu(self) -> None:
++        """After opening one submenu the path is [Root, Sub]."""
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        sub = MenuUtils.generic_menu(title='Settings', theme=self.theme)
++        btn = menu.add.button('go', sub)
++        btn.apply()
++        menu.enable()
++
++        bc = menu.get_current()._breadcrumb
++        bc._render()
++        self.assertEqual(bc.get_path_titles(), ['Root', 'Settings'])
++
++    def test_path_deep_navigation(self) -> None:
++        """Navigate three levels deep and verify the full breadcrumb path."""
++        m1 = MenuUtils.generic_menu(title='Main', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='Audio', theme=self.theme)
++        m3 = MenuUtils.generic_menu(title='EQ', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m2.add.button('go', m3).apply()
++        m1.enable()
++
++        bc = m1.get_current()._breadcrumb
++        bc._render()
++        self.assertEqual(bc.get_path_titles(), ['Main', 'Audio', 'EQ'])
++
++    def test_path_after_back(self) -> None:
++        """Going back one level removes the last segment from the path."""
++        m1 = MenuUtils.generic_menu(title='Main', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='Video', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m1.enable()
++
++        # Depth is 1
++        bc = m1.get_current()._breadcrumb
++        bc._render()
++        self.assertEqual(bc.get_path_titles(), ['Main', 'Video'])
++
++        # Go back
++        m1.reset(1)
++        bc_root = m1.get_current()._breadcrumb
++        bc_root._render()
++        self.assertEqual(bc_root.get_path_titles(), ['Main'])
++
++    # ------------------------------------------------------------------
++    # Rendering
++    # ------------------------------------------------------------------
++
++    def test_render_invisible_at_root(self) -> None:
++        """At depth 0 the breadcrumb surface should be effectively invisible."""
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        menu.enable()
++        bc = menu._breadcrumb
++        bc._render()
++        # At root the rect dimensions should be 0×0
++        self.assertEqual(bc._rect.width, 0)
++        self.assertEqual(bc._rect.height, 0)
++
++    def test_render_visible_at_depth(self) -> None:
++        """At depth > 0 the breadcrumb should have a non-zero surface."""
++        m1 = MenuUtils.generic_menu(title='Main', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='Sub', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m1.enable()
++
++        bc = m1.get_current()._breadcrumb
++        bc._render()
++        self.assertGreater(bc._rect.width, 0)
++        self.assertGreater(bc._rect.height, 0)
++
++    def test_render_hash_caching(self) -> None:
++        """Calling _render twice without navigation should not rebuild."""
++        m1 = MenuUtils.generic_menu(title='A', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='B', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m1.enable()
++
++        bc = m1.get_current()._breadcrumb
++        bc._render()
++        surf1 = bc._surface
++        bc._render()
++        surf2 = bc._surface
++        # surface object identity should be preserved when hash hasn't changed
++        self.assertIs(surf1, surf2)
++
++    # ------------------------------------------------------------------
++    # Draw integration
++    # ------------------------------------------------------------------
++
++    def test_draw_at_root_no_error(self) -> None:
++        """Drawing at root depth must not raise."""
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        menu.enable()
++        menu.draw(surface)
++
++    def test_draw_at_depth_no_error(self) -> None:
++        """Drawing at depth > 0 must not raise."""
++        m1 = MenuUtils.generic_menu(title='A', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='B', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m1.enable()
++        m1.draw(surface)
++
++    def test_draw_multiple_depths(self) -> None:
++        """Navigate 5 levels and draw at each level."""
++        menus = [MenuUtils.generic_menu(title=f'M{i}', theme=self.theme) for i in range(6)]
++        for i in range(5):
++            menus[i].add.button('go', menus[i + 1]).apply()
++        menus[0].enable()
++
++        # Draw at the deepest level
++        menus[0].draw(surface)
++
++        # Now go back one level and draw again
++        menus[0].reset(1)
++        menus[0].draw(surface)
++
++    # ------------------------------------------------------------------
++    # Theme integration
++    # ------------------------------------------------------------------
++
++    def test_theme_custom_separator(self) -> None:
++        """Custom separator appears in the rendered path."""
++        self.theme.breadcrumb_separator = ' :: '
++        m1 = MenuUtils.generic_menu(title='A', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='B', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m1.enable()
++
++        bc = m1.get_current()._breadcrumb
++        self.assertEqual(bc._separator, ' :: ')
++
++    def test_theme_font_size(self) -> None:
++        """Font size from theme is used by breadcrumb."""
++        self.theme.breadcrumb_font_size = 24
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        self.assertEqual(menu._breadcrumb._bc_font_size, 24)
++
++    def test_theme_colors(self) -> None:
++        """Font and active colours from theme are forwarded."""
++        self.theme.breadcrumb_font_color = (200, 200, 200)
++        self.theme.breadcrumb_active_color = (10, 10, 10)
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        bc = menu._breadcrumb
++        # Colors may be extended by _format_color_opacity (adds alpha)
++        self.assertEqual(bc._bc_font_color[:3], (200, 200, 200))
++        self.assertEqual(bc._bc_active_color[:3], (10, 10, 10))
++
++    def test_theme_background_color(self) -> None:
++        """Background colour can be set via theme and is forwarded."""
++        self.theme.breadcrumb_background_color = (0, 0, 0)
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        bc = menu._breadcrumb
++        self.assertEqual(bc._bc_background_color[:3], (0, 0, 0))
++
++    def test_theme_validate_breadcrumb(self) -> None:
++        """Theme.validate() should succeed with breadcrumb defaults."""
++        theme = pygame_menu.themes.THEME_DEFAULT.copy()
++        theme.breadcrumb_enabled = True
++        theme.validate()  # Should not raise
++
++    def test_theme_validate_bad_font_size(self) -> None:
++        """Theme.validate() should reject non-positive font size."""
++        theme = pygame_menu.themes.THEME_DEFAULT.copy()
++        theme.breadcrumb_font_size = -1
++        self.assertRaises(AssertionError, theme.validate)
++
++    # ------------------------------------------------------------------
++    # Click navigation
++    # ------------------------------------------------------------------
++
++    def test_click_ancestor_navigates_back(self) -> None:
++        """Clicking an ancestor segment should call menu.reset() to go back."""
++        m1 = MenuUtils.generic_menu(title='Main', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='Sub1', theme=self.theme)
++        m3 = MenuUtils.generic_menu(title='Sub2', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m2.add.button('go', m3).apply()
++        m1.enable()
++
++        # We should be at depth 2 (Main > Sub1 > Sub2)
++        self.assertEqual(m1._get_depth(), 2)
++        self.assertEqual(m1.get_current().get_title(), 'Sub2')
++
++        # Render breadcrumb to set up the surface & rect
++        bc = m1.get_current()._breadcrumb
++        bc._render()
++
++        # Position breadcrumb at (0, 0) for easy clicking
++        bc._rect.x = 0
++        bc._rect.y = 0
++
++        # Create a click event inside the first segment ("Main")
++        # x=5 should land on the first segment
++        click_event = pygame.event.Event(
++            pygame.MOUSEBUTTONUP,
++            {'button': 1, 'pos': (5, 5)}
++        )
++        result = bc.update([click_event])
++        self.assertTrue(result)
++
++        # Should be back at root level
++        self.assertEqual(m1._get_depth(), 0)
++        self.assertEqual(m1.get_current().get_title(), 'Main')
++
++    def test_click_current_segment_no_navigation(self) -> None:
++        """Clicking on the current (last) segment should not navigate."""
++        m1 = MenuUtils.generic_menu(title='Main', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='Sub', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m1.enable()
++
++        bc = m1.get_current()._breadcrumb
++        bc._render()
++        bc._rect.x = 0
++        bc._rect.y = 0
++
++        # Click far right — should land on the last (current) segment
++        click_x = bc._rect.width - 5
++        click_event = pygame.event.Event(
++            pygame.MOUSEBUTTONUP,
++            {'button': 1, 'pos': (click_x, 5)}
++        )
++        result = bc.update([click_event])
++        self.assertFalse(result)
++        # Still at depth 1
++        self.assertEqual(m1._get_depth(), 1)
++
++    def test_click_outside_breadcrumb(self) -> None:
++        """Click outside the breadcrumb rect should not trigger navigation."""
++        m1 = MenuUtils.generic_menu(title='Main', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='Sub', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m1.enable()
++
++        bc = m1.get_current()._breadcrumb
++        bc._render()
++        bc._rect.x = 0
++        bc._rect.y = 0
++
++        click_event = pygame.event.Event(
++            pygame.MOUSEBUTTONUP,
++            {'button': 1, 'pos': (9999, 9999)}
++        )
++        result = bc.update([click_event])
++        self.assertFalse(result)
++
++    def test_update_at_root_returns_false(self) -> None:
++        """At root depth (no breadcrumb visible), update always returns False."""
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        menu.enable()
++        bc = menu._breadcrumb
++        bc._render()
++
++        click_event = pygame.event.Event(
++            pygame.MOUSEBUTTONUP,
++            {'button': 1, 'pos': (5, 5)}
++        )
++        self.assertFalse(bc.update([click_event]))
++
++    # ------------------------------------------------------------------
++    # Menu.update integration
++    # ------------------------------------------------------------------
++
++    def test_menu_update_passes_events_to_breadcrumb(self) -> None:
++        """When breadcrumb is enabled, Menu.update should try breadcrumb.update."""
++        m1 = MenuUtils.generic_menu(title='Main', theme=self.theme)
++        m2 = MenuUtils.generic_menu(title='Sub', theme=self.theme)
++        m1.add.button('go', m2).apply()
++        m1.enable()
++
++        # Render/draw first to initialise the breadcrumb surface
++        m1.draw(surface)
++
++        depth_before = m1._get_depth()
++        self.assertEqual(depth_before, 1)
++
++        # Simulate a click on the breadcrumb's first segment (the root title)
++        bc = m1.get_current()._breadcrumb
++        click_x = bc._rect.x + 5
++        click_y = bc._rect.y + 2
++
++        click_event = pygame.event.Event(
++            pygame.MOUSEBUTTONUP,
++            {'button': 1, 'pos': (click_x, click_y)}
++        )
++        m1.update([click_event])
++        self.assertEqual(m1._get_depth(), 0)
++
++    # ------------------------------------------------------------------
++    # Edge cases
++    # ------------------------------------------------------------------
++
++    def test_breadcrumb_no_menu(self) -> None:
++        """Breadcrumb without a menu should return empty path."""
++        from pygame_menu.widgets import Breadcrumb
++        bc = Breadcrumb()
++        self.assertEqual(bc._build_path(), [])
++        self.assertEqual(bc.get_path_titles(), [])
++
++    def test_breadcrumb_render_no_menu(self) -> None:
++        """Rendering a breadcrumb with no associated menu returns None."""
++        from pygame_menu.widgets import Breadcrumb
++        bc = Breadcrumb()
++        result = bc._render()
++        self.assertIsNone(result)
++
++    def test_apply_font_noop(self) -> None:
++        """Breadcrumb._apply_font() should be a no-op."""
++        menu = MenuUtils.generic_menu(title='Root', theme=self.theme)
++        # Should not raise
++        menu._breadcrumb._apply_font()
++
++    def test_predefined_themes_validate(self) -> None:
++        """All predefined themes should still validate with breadcrumb properties."""
++        for theme in (
++            pygame_menu.themes.THEME_DEFAULT,
++            pygame_menu.themes.THEME_DARK,
++            pygame_menu.themes.THEME_BLUE,
++            pygame_menu.themes.THEME_GREEN,
++            pygame_menu.themes.THEME_ORANGE,
++            pygame_menu.themes.THEME_SOLARIZED,
++        ):
++            t = theme.copy()
++            t.validate()  # Must not raise
