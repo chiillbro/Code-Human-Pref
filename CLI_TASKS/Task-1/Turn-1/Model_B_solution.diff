@@ -1,0 +1,1076 @@
+diff --git a/pygame_menu/__init__.py b/pygame_menu/__init__.py
+index c8c3c42a..b63a856d 100644
+--- a/pygame_menu/__init__.py
++++ b/pygame_menu/__init__.py
+@@ -68,20 +68,25 @@ if __pygame_version__ is not None:
+     """
+     import pygame_menu.sound
+     from pygame_menu.sound import Sound
+ 
+     """
+     Themes: Menu themes
+     """
+     import pygame_menu.themes
+     from pygame_menu.themes import Theme
+ 
++    """
++    Validation: Widget validation system
++    """
++    import pygame_menu.validation
++
+     """
+     Widgets: Menu widgets
+     """
+     import pygame_menu.widgets
+ 
+ """
+ Version: Library version
+ """
+ import pygame_menu.version
+ 
+diff --git a/pygame_menu/menu.py b/pygame_menu/menu.py
+index 4dcc083c..a4884dbb 100644
+--- a/pygame_menu/menu.py
++++ b/pygame_menu/menu.py
+@@ -3540,20 +3540,46 @@ class Menu(Base):
+         :param ids: Widget id list. If ``None``, return all the widgets, otherwise, return the widgets from that list
+         :return: Widgets tuple
+         """
+         if not ids:
+             return tuple(self._widgets)
+         widgets = []
+         for i in ids:
+             widgets.append(self.get_widget(i, recursive=True))
+         return tuple(widgets)
+ 
++    def validate(self, recursive: bool = False) -> 'pygame_menu.validation.ValidationResult':
++        """
++        Validate all widgets in the Menu. Each widget's attached validation
++        rules are checked, and a combined
++        :py:class:`pygame_menu.validation.ValidationResult` is returned.
++
++        .. note::
++
++            This is applied only to the base Menu (not the currently displayed,
++            stored in ``_current`` pointer); for such behaviour apply to
++            :py:meth:`pygame_menu.menu.Menu.get_current` object.
++
++        :param recursive: If ``True``, also validate widgets in submenus
++        :return: Aggregated validation result
++        """
++        from pygame_menu.validation import ValidationResult
++        all_errors = []
++        for widget in self._widgets:
++            result = widget.validate()
++            all_errors.extend(result.errors)
++        if recursive:
++            for sm in self._submenus.keys():
++                result = sm.validate(recursive)
++                all_errors.extend(result.errors)
++        return ValidationResult(all_errors)
++
+     def reset_value(self, recursive: bool = False) -> 'Menu':
+         """
+         Reset all widget values to default.
+ 
+         .. note::
+ 
+             This is applied only to the base Menu (not the currently displayed,
+             stored in ``_current`` pointer); for such behaviour apply to
+             :py:meth:`pygame_menu.menu.Menu.get_current` object.
+ 
+diff --git a/pygame_menu/validation.py b/pygame_menu/validation.py
+new file mode 100644
+index 00000000..8da9a382
+--- /dev/null
++++ b/pygame_menu/validation.py
+@@ -0,0 +1,212 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++VALIDATION
++Per-widget validation system with built-in rules for required fields,
++min/max length, regex pattern matching, and numeric range checks.
++"""
++
++__all__ = [
++    'ValidationRule',
++    'RequiredRule',
++    'MinLengthRule',
++    'MaxLengthRule',
++    'RegexRule',
++    'NumericRangeRule',
++    'ValidationResult',
++    'ValidationError'
++]
++
++import re
++
++from pygame_menu._types import Optional, List, Any, Union
++
++
++class ValidationError:
++    """
++    Represents a single validation failure.
++    """
++
++    def __init__(self, rule: str, message: str, widget_id: str = '') -> None:
++        """
++        :param rule: Rule name that failed (e.g. ``'required'``, ``'min_length'``)
++        :param message: Human-readable error message
++        :param widget_id: ID of the widget that failed validation
++        """
++        self.rule = rule
++        self.message = message
++        self.widget_id = widget_id
++
++    def __repr__(self) -> str:
++        return f'ValidationError(rule={self.rule!r}, message={self.message!r}, widget_id={self.widget_id!r})'
++
++
++class ValidationResult:
++    """
++    Structured result from validating one or more widgets.
++    """
++
++    def __init__(self, errors: Optional[List[ValidationError]] = None) -> None:
++        """
++        :param errors: List of validation errors. Empty list means valid.
++        """
++        self.errors: List[ValidationError] = errors if errors is not None else []
++
++    @property
++    def valid(self) -> bool:
++        """Return ``True`` if there are no validation errors."""
++        return len(self.errors) == 0
++
++    def __repr__(self) -> str:
++        return f'ValidationResult(valid={self.valid}, errors={self.errors})'
++
++    def __bool__(self) -> bool:
++        return self.valid
++
++
++class ValidationRule:
++    """
++    Base class for validation rules. Subclass this to create custom rules.
++    """
++    name: str = 'base'
++
++    def validate(self, value: Any) -> 'tuple[bool, str]':
++        """
++        Validate a value.
++
++        :param value: The value to validate
++        :return: Tuple of (is_valid, error_message). error_message is empty string if valid.
++        """
++        raise NotImplementedError('subclasses must implement validate()')
++
++    def __repr__(self) -> str:
++        return f'{self.__class__.__name__}()'
++
++
++class RequiredRule(ValidationRule):
++    """
++    Validates that the widget value is not empty or None.
++    """
++    name = 'required'
++
++    def __init__(self, message: str = 'This field is required') -> None:
++        """
++        :param message: Custom error message
++        """
++        self._message = message
++
++    def validate(self, value: Any) -> 'tuple[bool, str]':
++        if value is None:
++            return False, self._message
++        if isinstance(value, str) and value.strip() == '':
++            return False, self._message
++        return True, ''
++
++
++class MinLengthRule(ValidationRule):
++    """
++    Validates that the string value length is at least ``min_length``.
++    """
++    name = 'min_length'
++
++    def __init__(self, min_length: int, message: str = '') -> None:
++        """
++        :param min_length: Minimum required length
++        :param message: Custom error message. If empty, a default is generated.
++        """
++        assert isinstance(min_length, int) and min_length >= 0
++        self._min_length = min_length
++        self._message = message
++
++    def validate(self, value: Any) -> 'tuple[bool, str]':
++        text = str(value) if value is not None else ''
++        if len(text) < self._min_length:
++            msg = self._message or f'Must be at least {self._min_length} characters'
++            return False, msg
++        return True, ''
++
++
++class MaxLengthRule(ValidationRule):
++    """
++    Validates that the string value length is at most ``max_length``.
++    """
++    name = 'max_length'
++
++    def __init__(self, max_length: int, message: str = '') -> None:
++        """
++        :param max_length: Maximum allowed length
++        :param message: Custom error message. If empty, a default is generated.
++        """
++        assert isinstance(max_length, int) and max_length >= 0
++        self._max_length = max_length
++        self._message = message
++
++    def validate(self, value: Any) -> 'tuple[bool, str]':
++        text = str(value) if value is not None else ''
++        if len(text) > self._max_length:
++            msg = self._message or f'Must be at most {self._max_length} characters'
++            return False, msg
++        return True, ''
++
++
++class RegexRule(ValidationRule):
++    """
++    Validates that the string value matches a regular expression pattern.
++    """
++    name = 'regex'
++
++    def __init__(self, pattern: str, message: str = '') -> None:
++        """
++        :param pattern: Regular expression pattern (must fully match)
++        :param message: Custom error message. If empty, a default is generated.
++        """
++        self._pattern = re.compile(pattern)
++        self._message = message
++
++    def validate(self, value: Any) -> 'tuple[bool, str]':
++        text = str(value) if value is not None else ''
++        if not self._pattern.fullmatch(text):
++            msg = self._message or f'Does not match required pattern'
++            return False, msg
++        return True, ''
++
++
++class NumericRangeRule(ValidationRule):
++    """
++    Validates that the numeric value falls within [min_value, max_value].
++    Either bound can be ``None`` to skip that check.
++    """
++    name = 'numeric_range'
++
++    def __init__(
++            self,
++            min_value: Optional[Union[int, float]] = None,
++            max_value: Optional[Union[int, float]] = None,
++            message: str = ''
++    ) -> None:
++        """
++        :param min_value: Minimum allowed value (inclusive), or ``None`` for no minimum
++        :param max_value: Maximum allowed value (inclusive), or ``None`` for no maximum
++        :param message: Custom error message. If empty, a default is generated.
++        """
++        if min_value is not None and max_value is not None:
++            assert min_value <= max_value, 'min_value must be <= max_value'
++        self._min_value = min_value
++        self._max_value = max_value
++        self._message = message
++
++    def validate(self, value: Any) -> 'tuple[bool, str]':
++        try:
++            num = float(value)
++        except (TypeError, ValueError):
++            msg = self._message or 'Must be a valid number'
++            return False, msg
++
++        if self._min_value is not None and num < self._min_value:
++            msg = self._message or f'Must be at least {self._min_value}'
++            return False, msg
++        if self._max_value is not None and num > self._max_value:
++            msg = self._message or f'Must be at most {self._max_value}'
++            return False, msg
++        return True, ''
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index 11c7972b..507b900f 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -422,20 +422,25 @@ class Widget(Base):
+             'rect': None,
+             'surface': None
+         }
+ 
+         # Border
+         self._border_color = (0, 0, 0)
+         self._border_inflate = (0, 0)
+         self._border_position = 'none'
+         self._border_width = 0
+ 
++        # Validation
++        self._validation_rules = []
++        self._validation_errors = []
++        self._validation_error_color = (255, 0, 0)
++
+         # Rendering, this variable may be used by render() method. If the hash
+         # of the variables change respect to the last render hash (hash computed
+         # using self._hash_variables() method) then the widget should render and
+         # update the hash
+         self._last_render_hash = 0
+ 
+         # Selection effect, for avoiding exception while getting object rect,
+         # NullSelection was created. Initially it was None
+         self._selection_effect = pygame_menu.widgets.NoneSelection()
+         # If False, the selection effect is drawn previous the widget surface
+@@ -1378,20 +1383,21 @@ class Widget(Base):
+         self._render()
+ 
+         if self.is_selected() and not self._selection_effect_draw_post:
+             self._selection_effect.draw(surface, self)
+ 
+         self._draw_shadow(surface)
+         self._draw_background_color(surface)
+         self._decorator.draw_prev(surface)
+         self._draw(surface)
+         self._draw_border(surface)
++        self._draw_validation_error(surface)
+         self._decorator.draw_post(surface)
+ 
+         # Apply callbacks
+         self.apply_draw_callbacks()
+ 
+         # Store last surface
+         self.last_surface = surface
+ 
+         return self
+ 
+@@ -1573,20 +1579,140 @@ class Widget(Base):
+         will be passed to the callbacks.
+ 
+         .. warning::
+ 
+             Not all widgets return a value.
+ 
+         :return: Widget data value
+         """
+         raise ValueError(f'{self.get_class_id()} does not accept value')
+ 
++    def add_validation(self, rule: 'pygame_menu.validation.ValidationRule') -> 'Widget':
++        """
++        Attach a validation rule to this widget. Rules are checked when
++        :py:meth:`validate` is called.
++
++        :param rule: Validation rule instance
++        :return: Self reference
++        """
++        from pygame_menu.validation import ValidationRule
++        assert isinstance(rule, ValidationRule), 'rule must be a ValidationRule instance'
++        self._validation_rules.append(rule)
++        return self
++
++    def remove_validation(self, rule_type: type) -> 'Widget':
++        """
++        Remove all validation rules of the given type.
++
++        :param rule_type: The class of rules to remove (e.g. ``RequiredRule``)
++        :return: Self reference
++        """
++        self._validation_rules = [r for r in self._validation_rules if not isinstance(r, rule_type)]
++        return self
++
++    def clear_validation(self) -> 'Widget':
++        """
++        Remove all validation rules from this widget.
++
++        :return: Self reference
++        """
++        self._validation_rules.clear()
++        self._validation_errors.clear()
++        return self
++
++    def validate(self) -> 'pygame_menu.validation.ValidationResult':
++        """
++        Run all attached validation rules against the current widget value.
++        Stores error messages internally for visual display and returns a
++        structured :py:class:`pygame_menu.validation.ValidationResult`.
++
++        :return: Validation result with ``valid`` flag and ``errors`` list
++        """
++        from pygame_menu.validation import ValidationResult, ValidationError
++        self._validation_errors.clear()
++        errors = []
++
++        if not self._validation_rules:
++            return ValidationResult()
++
++        try:
++            value = self.get_value()
++        except ValueError:
++            value = None
++
++        widget_id = self.get_id()
++        for rule in self._validation_rules:
++            is_valid, msg = rule.validate(value)
++            if not is_valid:
++                errors.append(ValidationError(
++                    rule=rule.name,
++                    message=msg,
++                    widget_id=widget_id
++                ))
++                self._validation_errors.append(msg)
++
++        return ValidationResult(errors)
++
++    def clear_validation_errors(self) -> 'Widget':
++        """
++        Clear the current validation error state without removing rules.
++
++        :return: Self reference
++        """
++        self._validation_errors.clear()
++        return self
++
++    def get_validation_errors(self) -> List[str]:
++        """
++        Return the list of current validation error messages.
++
++        :return: List of error message strings
++        """
++        return list(self._validation_errors)
++
++    def set_validation_error_color(self, color: ColorInputType) -> 'Widget':
++        """
++        Set the color used for the validation error border and text.
++
++        :param color: Error color
++        :return: Self reference
++        """
++        self._validation_error_color = assert_color(color)
++        return self
++
++    def _draw_validation_error(self, surface: 'pygame.Surface') -> None:
++        """
++        Draw validation error indicator: a red border and error text below the widget.
++
++        :param surface: Surface to draw on
++        """
++        if not self._validation_errors:
++            return
++
++        rect = self.get_rect(inflate=self._get_background_inflate())
++        color = self._validation_error_color
++
++        # Draw error border around widget
++        pygame.draw.rect(surface, color, rect, 2)
++
++        # Render the first error message below the widget
++        if self._font is not None:
++            error_font_size = max(self._font_size - 4, 10)
++            try:
++                error_font = pygame.font.Font(self._font_name, error_font_size)
++            except Exception:
++                error_font = pygame.font.SysFont('', error_font_size)
++            error_surface = error_font.render(self._validation_errors[0], True, color)
++            error_x = rect.x
++            error_y = rect.bottom + 2
++            surface.blit(error_surface, (error_x, error_y))
++
+     def add_self_to_kwargs(self, key: str = 'widget') -> 'Widget':
+         """
+         Adds the Widget object to kwargs, it helps to get the Widget reference for
+         callbacks. It raises ``KeyError`` if key is duplicated.
+ 
+         :param key: Name of the parameter
+         :return: Self reference
+         """
+         assert isinstance(key, str)
+         if key in self._kwargs.keys():
+diff --git a/test/test_validation.py b/test/test_validation.py
+new file mode 100644
+index 00000000..def4b216
+--- /dev/null
++++ b/test/test_validation.py
+@@ -0,0 +1,578 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++TEST VALIDATION
++Tests for the widget validation system.
++"""
++
++from test._utils import *
++import pygame_menu
++
++from pygame_menu.validation import (
++    ValidationRule,
++    RequiredRule,
++    MinLengthRule,
++    MaxLengthRule,
++    RegexRule,
++    NumericRangeRule,
++    ValidationResult,
++    ValidationError
++)
++
++
++class ValidationRuleTest(BaseTest):
++    """
++    Tests for individual validation rules.
++    """
++
++    def test_required_rule(self) -> None:
++        """
++        Test RequiredRule.
++        """
++        rule = RequiredRule()
++        self.assertEqual(rule.name, 'required')
++
++        # Empty string fails
++        valid, msg = rule.validate('')
++        self.assertFalse(valid)
++        self.assertNotEqual(msg, '')
++
++        # Whitespace-only fails
++        valid, msg = rule.validate('   ')
++        self.assertFalse(valid)
++
++        # None fails
++        valid, msg = rule.validate(None)
++        self.assertFalse(valid)
++
++        # Non-empty passes
++        valid, msg = rule.validate('hello')
++        self.assertTrue(valid)
++        self.assertEqual(msg, '')
++
++        # Number passes
++        valid, msg = rule.validate(42)
++        self.assertTrue(valid)
++
++        # Custom message
++        rule2 = RequiredRule(message='Field cannot be blank')
++        valid, msg = rule2.validate('')
++        self.assertFalse(valid)
++        self.assertEqual(msg, 'Field cannot be blank')
++
++    def test_min_length_rule(self) -> None:
++        """
++        Test MinLengthRule.
++        """
++        rule = MinLengthRule(3)
++        self.assertEqual(rule.name, 'min_length')
++
++        # Too short
++        valid, msg = rule.validate('ab')
++        self.assertFalse(valid)
++
++        # Exact length
++        valid, msg = rule.validate('abc')
++        self.assertTrue(valid)
++
++        # Longer than min
++        valid, msg = rule.validate('abcdef')
++        self.assertTrue(valid)
++
++        # Empty with min 0
++        rule0 = MinLengthRule(0)
++        valid, msg = rule0.validate('')
++        self.assertTrue(valid)
++
++        # None treated as empty string
++        valid, msg = rule.validate(None)
++        self.assertFalse(valid)
++
++        # Custom message
++        rule2 = MinLengthRule(5, message='Too short!')
++        valid, msg = rule2.validate('ab')
++        self.assertEqual(msg, 'Too short!')
++
++    def test_max_length_rule(self) -> None:
++        """
++        Test MaxLengthRule.
++        """
++        rule = MaxLengthRule(5)
++        self.assertEqual(rule.name, 'max_length')
++
++        # Within limit
++        valid, msg = rule.validate('abc')
++        self.assertTrue(valid)
++
++        # Exact limit
++        valid, msg = rule.validate('abcde')
++        self.assertTrue(valid)
++
++        # Over limit
++        valid, msg = rule.validate('abcdef')
++        self.assertFalse(valid)
++
++        # Custom message
++        rule2 = MaxLengthRule(3, message='Too long!')
++        valid, msg = rule2.validate('abcd')
++        self.assertEqual(msg, 'Too long!')
++
++    def test_regex_rule(self) -> None:
++        """
++        Test RegexRule.
++        """
++        # Email-like pattern
++        rule = RegexRule(r'[^@]+@[^@]+\.[^@]+')
++        self.assertEqual(rule.name, 'regex')
++
++        valid, msg = rule.validate('user@example.com')
++        self.assertTrue(valid)
++
++        valid, msg = rule.validate('not-an-email')
++        self.assertFalse(valid)
++
++        # Alphanumeric pattern
++        rule2 = RegexRule(r'[a-zA-Z0-9]+', message='Alphanumeric only')
++        valid, msg = rule2.validate('hello123')
++        self.assertTrue(valid)
++
++        valid, msg = rule2.validate('hello world')
++        self.assertFalse(valid)
++        self.assertEqual(msg, 'Alphanumeric only')
++
++        # None treated as empty string
++        valid, msg = rule2.validate(None)
++        self.assertFalse(valid)
++
++    def test_numeric_range_rule(self) -> None:
++        """
++        Test NumericRangeRule.
++        """
++        rule = NumericRangeRule(min_value=0, max_value=100)
++        self.assertEqual(rule.name, 'numeric_range')
++
++        # Within range
++        valid, msg = rule.validate(50)
++        self.assertTrue(valid)
++
++        # At boundaries
++        valid, msg = rule.validate(0)
++        self.assertTrue(valid)
++        valid, msg = rule.validate(100)
++        self.assertTrue(valid)
++
++        # Below range
++        valid, msg = rule.validate(-1)
++        self.assertFalse(valid)
++
++        # Above range
++        valid, msg = rule.validate(101)
++        self.assertFalse(valid)
++
++        # String number
++        valid, msg = rule.validate('50')
++        self.assertTrue(valid)
++
++        # Non-numeric
++        valid, msg = rule.validate('abc')
++        self.assertFalse(valid)
++
++        # Min only
++        rule_min = NumericRangeRule(min_value=10)
++        valid, msg = rule_min.validate(5)
++        self.assertFalse(valid)
++        valid, msg = rule_min.validate(15)
++        self.assertTrue(valid)
++
++        # Max only
++        rule_max = NumericRangeRule(max_value=10)
++        valid, msg = rule_max.validate(5)
++        self.assertTrue(valid)
++        valid, msg = rule_max.validate(15)
++        self.assertFalse(valid)
++
++        # Float values
++        valid, msg = rule.validate(50.5)
++        self.assertTrue(valid)
++
++        # Custom message
++        rule2 = NumericRangeRule(min_value=0, max_value=10, message='Out of range')
++        valid, msg = rule2.validate(20)
++        self.assertEqual(msg, 'Out of range')
++
++    def test_numeric_range_rule_bad_args(self) -> None:
++        """
++        Test NumericRangeRule rejects min > max.
++        """
++        with self.assertRaises(AssertionError):
++            NumericRangeRule(min_value=10, max_value=5)
++
++
++class ValidationResultTest(BaseTest):
++    """
++    Tests for ValidationResult and ValidationError.
++    """
++
++    def test_valid_result(self) -> None:
++        """
++        Test that empty errors means valid.
++        """
++        result = ValidationResult()
++        self.assertTrue(result.valid)
++        self.assertTrue(bool(result))
++        self.assertEqual(len(result.errors), 0)
++
++    def test_invalid_result(self) -> None:
++        """
++        Test result with errors.
++        """
++        errors = [
++            ValidationError(rule='required', message='This field is required', widget_id='name'),
++            ValidationError(rule='min_length', message='Too short', widget_id='name')
++        ]
++        result = ValidationResult(errors)
++        self.assertFalse(result.valid)
++        self.assertFalse(bool(result))
++        self.assertEqual(len(result.errors), 2)
++        self.assertEqual(result.errors[0].rule, 'required')
++        self.assertEqual(result.errors[0].widget_id, 'name')
++
++    def test_validation_error_repr(self) -> None:
++        """
++        Test ValidationError repr.
++        """
++        err = ValidationError(rule='required', message='Required', widget_id='w1')
++        self.assertIn('required', repr(err))
++        self.assertIn('w1', repr(err))
++
++
++class WidgetValidationTest(BaseRSTest):
++    """
++    Tests for validation methods on widgets.
++    """
++
++    def test_add_and_clear_validation(self) -> None:
++        """
++        Test adding and clearing validation rules on a widget.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++
++        # No rules initially
++        result = w.validate()
++        self.assertTrue(result.valid)
++
++        # Add a rule
++        ret = w.add_validation(RequiredRule())
++        self.assertIs(ret, w)  # Returns self for chaining
++
++        # Validate empty input
++        result = w.validate()
++        self.assertFalse(result.valid)
++        self.assertEqual(len(result.errors), 1)
++        self.assertEqual(result.errors[0].rule, 'required')
++
++        # Set a value and validate again
++        w.set_value('John')
++        result = w.validate()
++        self.assertTrue(result.valid)
++
++        # Clear rules
++        w.clear_validation()
++        result = w.validate()
++        self.assertTrue(result.valid)
++
++    def test_multiple_rules(self) -> None:
++        """
++        Test multiple rules on one widget.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Username: ', textinput_id='username')
++
++        w.add_validation(RequiredRule())
++        w.add_validation(MinLengthRule(3))
++        w.add_validation(MaxLengthRule(20))
++        w.add_validation(RegexRule(r'[a-zA-Z0-9_]+', message='Alphanumeric and underscores only'))
++
++        # Empty fails required and min_length
++        result = w.validate()
++        self.assertFalse(result.valid)
++        rule_names = [e.rule for e in result.errors]
++        self.assertIn('required', rule_names)
++        self.assertIn('min_length', rule_names)
++
++        # Short input
++        w.set_value('ab')
++        result = w.validate()
++        self.assertFalse(result.valid)
++        rule_names = [e.rule for e in result.errors]
++        self.assertIn('min_length', rule_names)
++
++        # Invalid characters
++        w.set_value('hello world')
++        result = w.validate()
++        self.assertFalse(result.valid)
++        rule_names = [e.rule for e in result.errors]
++        self.assertIn('regex', rule_names)
++
++        # Valid input
++        w.set_value('valid_user')
++        result = w.validate()
++        self.assertTrue(result.valid)
++
++    def test_remove_validation_by_type(self) -> None:
++        """
++        Test removing rules by type.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++
++        w.add_validation(RequiredRule())
++        w.add_validation(MinLengthRule(3))
++
++        # Remove only RequiredRule
++        w.remove_validation(RequiredRule)
++        w.set_value('')
++        result = w.validate()
++        # min_length still triggers on empty
++        rule_names = [e.rule for e in result.errors]
++        self.assertIn('min_length', rule_names)
++        self.assertNotIn('required', rule_names)
++
++    def test_validation_errors_state(self) -> None:
++        """
++        Test that validation errors are stored and can be cleared.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++        w.add_validation(RequiredRule())
++
++        # No errors initially
++        self.assertEqual(len(w.get_validation_errors()), 0)
++
++        # Validate populates errors
++        w.validate()
++        errors = w.get_validation_errors()
++        self.assertEqual(len(errors), 1)
++
++        # Clear errors without removing rules
++        w.clear_validation_errors()
++        self.assertEqual(len(w.get_validation_errors()), 0)
++
++        # Rules still in place
++        w.validate()
++        self.assertEqual(len(w.get_validation_errors()), 1)
++
++    def test_validation_error_color(self) -> None:
++        """
++        Test setting custom error color.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++        ret = w.set_validation_error_color((255, 128, 0))
++        self.assertIs(ret, w)
++        self.assertEqual(w._validation_error_color, (255, 128, 0, 255))
++
++    def test_widget_id_in_errors(self) -> None:
++        """
++        Test that widget ID is included in validation errors.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++        w.add_validation(RequiredRule())
++
++        result = w.validate()
++        self.assertFalse(result.valid)
++        self.assertIn('name', result.errors[0].widget_id)
++
++    def test_chaining(self) -> None:
++        """
++        Test method chaining.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++        ret = w.add_validation(RequiredRule()).add_validation(MinLengthRule(3))
++        self.assertIs(ret, w)
++
++    def test_numeric_widget_validation(self) -> None:
++        """
++        Test validation on a numeric text input.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Age: ', textinput_id='age', input_type=pygame_menu.locals.INPUT_INT, default=0)
++        w.add_validation(NumericRangeRule(min_value=0, max_value=150))
++
++        # Default value 0 is valid
++        result = w.validate()
++        self.assertTrue(result.valid)
++
++        # Set valid value
++        w.set_value(25)
++        result = w.validate()
++        self.assertTrue(result.valid)
++
++
++class MenuValidationTest(BaseRSTest):
++    """
++    Tests for Menu.validate().
++    """
++
++    def test_menu_validate_all_valid(self) -> None:
++        """
++        Test menu validation when all widgets are valid.
++        """
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input('Name: ', textinput_id='name', default='John')
++        w2 = menu.add.text_input('Email: ', textinput_id='email', default='a@b.com')
++
++        w1.add_validation(RequiredRule())
++        w2.add_validation(RequiredRule())
++
++        result = menu.validate()
++        self.assertTrue(result.valid)
++        self.assertEqual(len(result.errors), 0)
++
++    def test_menu_validate_some_invalid(self) -> None:
++        """
++        Test menu validation when some widgets fail.
++        """
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input('Name: ', textinput_id='name')
++        w2 = menu.add.text_input('Email: ', textinput_id='email', default='a@b.com')
++
++        w1.add_validation(RequiredRule())
++        w2.add_validation(RequiredRule())
++
++        result = menu.validate()
++        self.assertFalse(result.valid)
++        self.assertEqual(len(result.errors), 1)
++        self.assertIn('name', result.errors[0].widget_id)
++
++    def test_menu_validate_aggregates_errors(self) -> None:
++        """
++        Test that menu validation aggregates errors from all widgets.
++        """
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input('Name: ', textinput_id='name')
++        w2 = menu.add.text_input('Email: ', textinput_id='email')
++
++        w1.add_validation(RequiredRule())
++        w1.add_validation(MinLengthRule(3))
++        w2.add_validation(RequiredRule())
++
++        result = menu.validate()
++        self.assertFalse(result.valid)
++        # w1 fails required + min_length, w2 fails required = 3 errors
++        self.assertEqual(len(result.errors), 3)
++
++    def test_menu_validate_widgets_without_rules(self) -> None:
++        """
++        Test that widgets without rules pass validation.
++        """
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input('Name: ', textinput_id='name')
++        menu.add.label('Some label')
++        menu.add.button('Submit')
++
++        result = menu.validate()
++        self.assertTrue(result.valid)
++
++    def test_menu_validate_sets_widget_error_state(self) -> None:
++        """
++        Test that menu.validate() sets error state on individual widgets.
++        """
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input('Name: ', textinput_id='name')
++        w2 = menu.add.text_input('Email: ', textinput_id='email', default='a@b.com')
++
++        w1.add_validation(RequiredRule())
++        w2.add_validation(RequiredRule())
++
++        menu.validate()
++        # w1 should have errors, w2 should not
++        self.assertTrue(len(w1.get_validation_errors()) > 0)
++        self.assertEqual(len(w2.get_validation_errors()), 0)
++
++    def test_menu_validate_recursive(self) -> None:
++        """
++        Test recursive menu validation including submenus.
++        """
++        menu = MenuUtils.generic_menu()
++        submenu = MenuUtils.generic_menu()
++
++        w1 = menu.add.text_input('Name: ', textinput_id='name')
++        w1.add_validation(RequiredRule())
++
++        w2 = submenu.add.text_input('Address: ', textinput_id='address')
++        w2.add_validation(RequiredRule())
++
++        menu.add.button('Submenu', submenu)
++
++        result = menu.validate(recursive=True)
++        self.assertFalse(result.valid)
++        # Both w1 and w2 fail
++        self.assertEqual(len(result.errors), 2)
++
++    def test_menu_validate_non_recursive(self) -> None:
++        """
++        Test non-recursive menu validation excludes submenus.
++        """
++        menu = MenuUtils.generic_menu()
++        submenu = MenuUtils.generic_menu()
++
++        w1 = menu.add.text_input('Name: ', textinput_id='name')
++        w1.add_validation(RequiredRule())
++
++        w2 = submenu.add.text_input('Address: ', textinput_id='address')
++        w2.add_validation(RequiredRule())
++
++        menu.add.button('Submenu', submenu)
++
++        result = menu.validate(recursive=False)
++        self.assertFalse(result.valid)
++        # Only w1 fails
++        self.assertEqual(len(result.errors), 1)
++
++
++class ValidationDrawTest(BaseRSTest):
++    """
++    Test validation error visual rendering.
++    """
++
++    def test_draw_with_validation_errors(self) -> None:
++        """
++        Test that drawing works when validation errors are present.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++        w.add_validation(RequiredRule())
++        w.validate()
++
++        # Should not raise any exceptions
++        menu.draw(surface)
++
++    def test_draw_without_validation_errors(self) -> None:
++        """
++        Test that drawing works when no validation errors are present.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name', default='John')
++        w.add_validation(RequiredRule())
++        w.validate()
++
++        # Should not raise any exceptions
++        menu.draw(surface)
++
++    def test_draw_after_clear_errors(self) -> None:
++        """
++        Test that drawing works after clearing validation errors.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++        w.add_validation(RequiredRule())
++        w.validate()
++        w.clear_validation_errors()
++
++        # Should not raise any exceptions
++        menu.draw(surface)

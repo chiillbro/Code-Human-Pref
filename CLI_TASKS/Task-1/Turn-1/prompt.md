@@ -1,0 +1,4 @@
+hey, currently, the app, pygame-menu has no built in way to validate user input across widgets and display errors inline. can you add a validation system that is per widget that will
+  let the developers like me attach appropriate validation rules, at minimum, for required, min/max length, regex pattern matching and numeric range to any widget. and next, when
+  validatte() is called on a widget or on the menu if you see a whole, every rule should be checked and a structured result should be returned. also, widgets that fail this implemented
+  validation shoudl indicate something visually for the error
