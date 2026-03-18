@@ -1,0 +1,4 @@
+looks great, few things to address, firstly, the theme integration is missing, right now, the error border style is hardcoded per widget, this codebase handles all visual
+  styling through themes.py, so please make this change. next, you used re.match in the Regex validation which only validates at the start, switch to re.fullmatch so that a pattern like
+  r'\d+' will not falsely pass '123abc', for validation we want entire input to match not just a prefix. next, there is no inline error text rendered, the border color change only
+  cannot tell users what went wrong, please update this to also have a inline error text. next please wire up the validator kwarg through _widgetmanager.py

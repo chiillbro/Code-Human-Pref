@@ -1,0 +1,1835 @@
+diff --git a/pygame_menu/__init__.py b/pygame_menu/__init__.py
+index c8c3c42a..b22d425d 100644
+--- a/pygame_menu/__init__.py
++++ b/pygame_menu/__init__.py
+@@ -68,20 +68,25 @@ if __pygame_version__ is not None:
+     """
+     import pygame_menu.sound
+     from pygame_menu.sound import Sound
+ 
+     """
+     Themes: Menu themes
+     """
+     import pygame_menu.themes
+     from pygame_menu.themes import Theme
+ 
++    """
++    Validation: Widget validation rules
++    """
++    import pygame_menu.validation
++
+     """
+     Widgets: Menu widgets
+     """
+     import pygame_menu.widgets
+ 
+ """
+ Version: Library version
+ """
+ import pygame_menu.version
+ 
+diff --git a/pygame_menu/_widgetmanager.py b/pygame_menu/_widgetmanager.py
+index 2c2df22f..1af377a0 100644
+--- a/pygame_menu/_widgetmanager.py
++++ b/pygame_menu/_widgetmanager.py
+@@ -240,20 +240,67 @@ class WidgetManager(
+         # shadow
+         attributes['shadow_aa'] = kwargs.pop('shadow_aa', self._theme.widget_shadow_aa)
+         attributes['shadow_color'] = kwargs.pop('shadow_color', self._theme.widget_shadow_color)
+         attributes['shadow_radius'] = kwargs.pop('shadow_radius', self._theme.widget_shadow_radius)
+         attributes['shadow_type'] = kwargs.pop('shadow_type', self._theme.widget_shadow_type)
+         attributes['shadow_width'] = kwargs.pop('shadow_width', self._theme.widget_shadow_width)
+ 
+         # tab_size
+         attributes['tab_size'] = kwargs.pop('tab_size', self._theme.widget_tab_size)
+ 
++        # validation_error_border_color
++        validation_error_border_color = kwargs.pop(
++            'validation_error_border_color', self._theme.widget_validation_error_border_color)
++        attributes['validation_error_border_color'] = assert_color(validation_error_border_color)
++
++        # validation_error_border_inflate
++        validation_error_border_inflate = kwargs.pop(
++            'validation_error_border_inflate', self._theme.widget_validation_error_border_inflate)
++        assert_vector(validation_error_border_inflate, 2, int)
++        assert validation_error_border_inflate[0] >= 0 and validation_error_border_inflate[1] >= 0
++        attributes['validation_error_border_inflate'] = validation_error_border_inflate
++
++        # validation_error_border_width
++        validation_error_border_width = kwargs.pop(
++            'validation_error_border_width', self._theme.widget_validation_error_border_width)
++        assert isinstance(validation_error_border_width, int) and validation_error_border_width >= 0
++        attributes['validation_error_border_width'] = validation_error_border_width
++
++        # validation_error_font_color
++        validation_error_font_color = kwargs.pop(
++            'validation_error_font_color', self._theme.widget_validation_error_font_color)
++        attributes['validation_error_font_color'] = assert_color(validation_error_font_color)
++
++        # validation_error_font_size
++        validation_error_font_size = kwargs.pop(
++            'validation_error_font_size', self._theme.widget_validation_error_font_size)
++        assert isinstance(validation_error_font_size, int) and validation_error_font_size >= 0
++        attributes['validation_error_font_size'] = validation_error_font_size
++
++        # validation_error_margin
++        validation_error_margin = kwargs.pop(
++            'validation_error_margin', self._theme.widget_validation_error_margin)
++        assert isinstance(validation_error_margin, int) and validation_error_margin >= 0
++        attributes['validation_error_margin'] = validation_error_margin
++
++        # validators
++        validators = kwargs.pop('validators', None)
++        if validators is not None:
++            if not isinstance(validators, (list, tuple)):
++                validators = (validators,)
++            for v in validators:
++                assert callable(v), \
++                    f'validators must be callable, got {type(v).__name__}'
++            attributes['validators'] = tuple(validators)
++        else:
++            attributes['validators'] = ()
++
+         return attributes
+ 
+     def _configure_widget(self, widget: 'Widget', **kwargs) -> None:
+         assert isinstance(widget, Widget)
+         widget._verbose = self._verbose
+ 
+         widget.set_alignment(
+             align=kwargs['align']
+         )
+ 
+@@ -313,20 +360,32 @@ class WidgetManager(
+         )
+ 
+         widget.set_selection_effect(
+             selection=kwargs['selection_effect']
+         )
+ 
+         widget.set_tab_size(
+             tab_size=kwargs['tab_size']
+         )
+ 
++        widget.set_validation_error_style(
++            border_width=kwargs['validation_error_border_width'],
++            border_color=kwargs['validation_error_border_color'],
++            border_inflate=kwargs['validation_error_border_inflate'],
++            font_color=kwargs['validation_error_font_color'],
++            font_size=kwargs['validation_error_font_size'],
++            margin=kwargs['validation_error_margin']
++        )
++
++        if kwargs['validators']:
++            widget.add_validator(*kwargs['validators'])
++
+         widget.shadow(
+             aa_amount=kwargs['shadow_aa'],
+             color=kwargs['shadow_color'],
+             corner_radius=kwargs['shadow_radius'],
+             shadow_type=kwargs['shadow_type'],
+             shadow_width=kwargs['shadow_width']
+         )
+ 
+         if self._theme.widget_background_inflate_to_selection:
+             widget.background_inflate_to_selection_effect()
+diff --git a/pygame_menu/menu.py b/pygame_menu/menu.py
+index 4dcc083c..af9d4411 100644
+--- a/pygame_menu/menu.py
++++ b/pygame_menu/menu.py
+@@ -3041,20 +3041,85 @@ class Menu(Base):
+                 data_keys = data.keys()
+                 sub_data_keys = data_submenu.keys()
+                 for key in sub_data_keys:
+                     if key in data_keys:
+                         raise ValueError(f'collision between widget data ID="{key}" at depth={depth}')
+ 
+                 # Update data
+                 data.update(data_submenu)
+         return data
+ 
++    def validate(
++            self,
++            recursive: bool = False,
++            update_style: bool = True
++    ) -> 'pygame_menu.validation.MenuValidationResult':
++        """
++        Validate every Widget in this Menu that has at least one validator
++        attached (see :py:meth:`pygame_menu.widgets.core.widget.Widget.add_validator`).
++        Widgets without validators are skipped entirely.
++
++        The returned result is truthy only when **all** validated Widgets
++        passed::
++
++            result = menu.validate()
++            if result:
++                data = menu.get_input_data()
++            else:
++                for widget_id, errors in result.errors.items():
++                    print(widget_id, errors)
++
++        .. note::
++
++            This is applied only to the base Menu (not the currently displayed),
++            for such behaviour apply to :py:meth:`pygame_menu.menu.Menu.get_current` object.
++
++        :param recursive: If ``True`` also validate Widgets in sub-menus
++        :param update_style: If ``True`` apply/clear the visual error border on each Widget
++        :return: :py:class:`pygame_menu.validation.MenuValidationResult` keyed by Widget ID
++        """
++        from pygame_menu.validation import MenuValidationResult
++        assert isinstance(recursive, bool)
++        assert isinstance(update_style, bool)
++        return MenuValidationResult(self._validate(recursive, update_style, depth=0))
++
++    def _validate(
++            self,
++            recursive: bool,
++            update_style: bool,
++            depth: int
++    ) -> Dict[str, 'pygame_menu.validation.ValidationResult']:
++        """
++        Validate Widgets in this Menu and optionally sub-menus.
++
++        :param recursive: If ``True`` descend into sub-menus
++        :param update_style: Forwarded to each Widget's ``validate``
++        :param depth: Current recursion depth (for collision reporting)
++        :return: Mapping of Widget ID to per-widget result
++        """
++        results: Dict[str, Any] = {}
++        for widget in self._widgets:
++            if len(widget.get_validators()) == 0:
++                continue
++            results[widget.get_id()] = widget.validate(update_style=update_style)
++        if recursive:
++            depth += 1
++            for menu in self._submenus.keys():
++                # noinspection PyProtectedMember
++                sub_results = menu._validate(recursive, update_style, depth)
++                for key in sub_results.keys():
++                    if key in results:
++                        raise ValueError(
++                            f'collision between widget ID="{key}" at depth={depth}')
++                results.update(sub_results)
++        return results
++
+     def get_rect(self) -> 'pygame.Rect':
+         """
+         Return the :py:class:`pygame.Rect` object of the Menu.
+ 
+         .. note::
+ 
+             This is applied only to the base Menu (not the currently displayed,
+             stored in ``_current`` pointer); for such behaviour apply to
+             :py:meth:`pygame_menu.menu.Menu.get_current` object.
+ 
+diff --git a/pygame_menu/themes.py b/pygame_menu/themes.py
+index 680df55c..8eec3e10 100644
+--- a/pygame_menu/themes.py
++++ b/pygame_menu/themes.py
+@@ -174,20 +174,32 @@ class Theme(object):
+     :param widget_background_inflate_to_selection: If ``True`` widget will inflate to match selection effect margin and overrides ``widget_background_inflate``
+     :type widget_background_inflate_to_selection: bool
+     :param widget_border_color: Widget border color
+     :type widget_border_color: tuple, list, str, int, :py:class:`pygame.Color`
+     :param widget_border_inflate: Widget inflate size on x-axis and y-axis (x, y) in px. These values cannot be negative
+     :type widget_border_inflate: tuple, list
+     :param widget_border_position: Widget border positioning. It can be a single position, or a tuple/list of positions. Only are accepted: north, south, east, and west. See :py:mod:`pygame_menu.locals`
+     :type widget_border_position: str, tuple, list
+     :param widget_border_width: Widget border width in px. If ``0`` the border is disabled. Border width don't contribute to the widget width/height, it's visual-only
+     :type widget_border_width: int
++    :param widget_validation_error_border_color: Border color applied to a Widget when validation fails. See :py:meth:`pygame_menu.widgets.core.widget.Widget.validate`
++    :type widget_validation_error_border_color: tuple, list, str, int, :py:class:`pygame.Color`
++    :param widget_validation_error_border_inflate: Inflate on x-axis and y-axis (x, y) in px for the validation-error border. These values cannot be negative
++    :type widget_validation_error_border_inflate: tuple, list
++    :param widget_validation_error_border_width: Border width in px applied to a Widget when validation fails. If ``0`` the error border is disabled
++    :type widget_validation_error_border_width: int
++    :param widget_validation_error_font_color: Font color of the inline validation-error message drawn below the Widget
++    :type widget_validation_error_font_color: tuple, list, str, int, :py:class:`pygame.Color`
++    :param widget_validation_error_font_size: Font size of the inline validation-error message. If ``0`` the error message is not drawn
++    :type widget_validation_error_font_size: int
++    :param widget_validation_error_margin: Vertical spacing in px between the Widget bottom edge and the inline validation-error message
++    :type widget_validation_error_margin: int
+     :param widget_box_arrow_color: Widget box arrow color, used by some widgets such as DropSelect, Fancy Selector, etc.
+     :type widget_box_arrow_color: tuple, list, str, int, :py:class:`pygame.Color`
+     :param widget_box_arrow_margin: Widget box arrow margin (left, right, vertical) in px, used by some widgets such as DropSelect, Fancy Selector, etc.
+     :type widget_box_arrow_margin: tuple
+     :param widget_box_background_color: Widget box background color, used by some widgets such as DropSelect, Fancy Selector, etc.
+     :type widget_box_background_color: tuple, list, str, int, :py:class:`pygame.Color`
+     :param widget_box_border_color: Widget box border color, used by some widgets such as DropSelect, Fancy Selector, etc.
+     :type widget_box_border_color: tuple, list, str, int, :py:class:`pygame.Color`
+     :param widget_box_border_width: Widget box border width in px, used by some widgets such as DropSelect, Fancy Selector, etc.
+     :type widget_box_border_width: int
+@@ -284,20 +296,26 @@ class Theme(object):
+     title_offset: Tuple2NumberType
+     title_updates_pygame_display: bool
+     widget_alignment: str
+     widget_background_color: Optional[Union[ColorType, 'BaseImage']]
+     widget_background_inflate: Tuple2IntType
+     widget_background_inflate_to_selection: bool
+     widget_border_color: ColorType
+     widget_border_inflate: Tuple2IntType
+     widget_border_position: WidgetBorderPositionType
+     widget_border_width: int
++    widget_validation_error_border_color: ColorType
++    widget_validation_error_border_inflate: Tuple2IntType
++    widget_validation_error_border_width: int
++    widget_validation_error_font_color: ColorType
++    widget_validation_error_font_size: int
++    widget_validation_error_margin: int
+     widget_box_arrow_color: ColorType
+     widget_box_arrow_margin: Tuple3IntType
+     widget_box_background_color: ColorType
+     widget_box_border_color: ColorType
+     widget_box_border_width: int
+     widget_box_inflate: Tuple2IntType
+     widget_box_margin: Tuple2NumberType
+     widget_cursor: CursorType
+     widget_font: FontType
+     widget_font_antialias: str
+@@ -379,20 +397,26 @@ class Theme(object):
+         # Generic widget themes
+         self.widget_alignment = self._get(kwargs, 'widget_alignment', 'alignment', ALIGN_CENTER)
+         self.widget_background_color = self._get(kwargs, 'widget_background_color', 'color_image_none')
+         self.widget_background_inflate = self._get(kwargs, 'background_inflate', 'tuple2int', (0, 0))
+         self.widget_background_inflate_to_selection = self._get(kwargs, 'widget_background_inflate_to_selection', bool,
+                                                                 False)
+         self.widget_border_color = self._get(kwargs, 'widget_border_color', 'color', (0, 0, 0))
+         self.widget_border_inflate = self._get(kwargs, 'widget_border_inflate', 'tuple2int', (0, 0))
+         self.widget_border_position = self._get(kwargs, 'widget_border_position', 'position_vector', WIDGET_FULL_BORDER)
+         self.widget_border_width = self._get(kwargs, 'widget_border_width', int, 0)
++        self.widget_validation_error_border_color = self._get(kwargs, 'widget_validation_error_border_color', 'color', (255, 0, 0))
++        self.widget_validation_error_border_inflate = self._get(kwargs, 'widget_validation_error_border_inflate', 'tuple2int', (0, 0))
++        self.widget_validation_error_border_width = self._get(kwargs, 'widget_validation_error_border_width', int, 2)
++        self.widget_validation_error_font_color = self._get(kwargs, 'widget_validation_error_font_color', 'color', (255, 0, 0))
++        self.widget_validation_error_font_size = self._get(kwargs, 'widget_validation_error_font_size', int, 14)
++        self.widget_validation_error_margin = self._get(kwargs, 'widget_validation_error_margin', int, 2)
+         self.widget_box_arrow_color = self._get(kwargs, 'widget_box_arrow_color', 'color', (150, 150, 150))
+         self.widget_box_arrow_margin = self._get(kwargs, 'widget_box_arrow_margin', 'tuple3int', (5, 5, 0))
+         self.widget_box_background_color = self._get(kwargs, 'widget_box_background_color', 'color', (255, 255, 255))
+         self.widget_box_border_color = self._get(kwargs, 'widget_box_border_color', 'color', (0, 0, 0))
+         self.widget_box_border_width = self._get(kwargs, 'widget_box_border_width', int, 1)
+         self.widget_box_inflate = self._get(kwargs, 'widget_box_inflate', 'tuple2int', (0, 0))
+         self.widget_box_margin = self._get(kwargs, 'widget_box_margin', 'tuple2', (25, 0))
+         self.widget_cursor = self._get(kwargs, 'widget_cursor', 'cursor', CURSOR_ARROW)
+         self.widget_font = self._get(kwargs, 'widget_font', 'font', FONT_OPEN_SANS)
+         self.widget_font_antialias = self._get(kwargs, 'widget_font_antialias', bool, True)
+@@ -472,20 +496,23 @@ class Theme(object):
+         assert isinstance(self.scrollbar_slider_pad, NumberInstance)
+         assert isinstance(self.scrollbar_thick, int)
+         assert isinstance(self.title, bool)
+         assert isinstance(self.title_fixed, bool)
+         assert isinstance(self.title_floating, bool)
+         assert isinstance(self.title_font_shadow_offset, int)
+         assert isinstance(self.title_font_size, int)
+         assert isinstance(self.title_updates_pygame_display, bool)
+         assert isinstance(self.widget_background_inflate_to_selection, bool)
+         assert isinstance(self.widget_border_width, int)
++        assert isinstance(self.widget_validation_error_border_width, int)
++        assert isinstance(self.widget_validation_error_font_size, int)
++        assert isinstance(self.widget_validation_error_margin, int)
+         assert isinstance(self.widget_box_border_width, int)
+         assert isinstance(self.widget_font_shadow_offset, int)
+         assert isinstance(self.widget_font_size, int)
+         assert isinstance(self.widget_padding, PaddingInstance)
+         assert isinstance(self.widget_selection_effect, Selection)
+         assert isinstance(self.widget_shadow_aa, int)
+         assert isinstance(self.widget_shadow_radius, int)
+         assert isinstance(self.widget_shadow_width, int)
+         assert isinstance(self.widget_tab_size, int)
+ 
+@@ -503,34 +530,37 @@ class Theme(object):
+         self.scrollbar_slider_color = self._format_color_opacity(self.scrollbar_slider_color)
+         self.scrollbar_slider_hover_color = self._format_color_opacity(self.scrollbar_slider_hover_color)
+         self.selection_color = self._format_color_opacity(self.selection_color)
+         self.surface_clear_color = self._format_color_opacity(self.surface_clear_color)
+         self.title_background_color = self._format_color_opacity(self.title_background_color)
+         self.title_close_button_background_color = self._format_color_opacity(self.title_close_button_background_color)
+         self.title_font_color = self._format_color_opacity(self.title_font_color)
+         self.title_font_shadow_color = self._format_color_opacity(self.title_font_shadow_color)
+         self.widget_background_color = self._format_color_opacity(self.widget_background_color, none=True)
+         self.widget_border_color = self._format_color_opacity(self.widget_border_color)
++        self.widget_validation_error_border_color = self._format_color_opacity(self.widget_validation_error_border_color)
++        self.widget_validation_error_font_color = self._format_color_opacity(self.widget_validation_error_font_color)
+         self.widget_box_arrow_color = self._format_color_opacity(self.widget_box_arrow_color)
+         self.widget_box_background_color = self._format_color_opacity(self.widget_box_background_color)
+         self.widget_box_border_color = self._format_color_opacity(self.widget_box_border_color)
+         self.widget_font_background_color = self._format_color_opacity(self.widget_font_background_color, none=True)
+         self.widget_font_color = self._format_color_opacity(self.widget_font_color)
+         self.widget_font_shadow_color = self._format_color_opacity(self.widget_font_shadow_color)
+         self.widget_shadow_color = self._format_color_opacity(self.widget_shadow_color)
+         self.widget_url_color = self._format_color_opacity(self.widget_url_color)
+ 
+         # List to tuple
+         self.scrollarea_outer_margin = self._vec_to_tuple(self.scrollarea_outer_margin, 2, NumberInstance)
+         self.title_offset = self._vec_to_tuple(self.title_offset, 2, NumberInstance)
+         self.widget_background_inflate = self._vec_to_tuple(self.widget_background_inflate, 2, int)
+         self.widget_border_inflate = self._vec_to_tuple(self.widget_border_inflate, 2, int)
++        self.widget_validation_error_border_inflate = self._vec_to_tuple(self.widget_validation_error_border_inflate, 2, int)
+         self.widget_box_arrow_margin = self._vec_to_tuple(self.widget_box_arrow_margin, 3, int)
+         self.widget_box_inflate = self._vec_to_tuple(self.widget_box_inflate, 2, int)
+         self.widget_box_margin = self._vec_to_tuple(self.widget_box_margin, 2, NumberInstance)
+         self.widget_margin = self._vec_to_tuple(self.widget_margin, 2, NumberInstance)
+         if isinstance(self.widget_padding, VectorInstance):
+             self.widget_padding = self._vec_to_tuple(self.widget_padding)
+             assert 2 <= len(self.widget_padding) <= 4, \
+                 'widget padding tuple length must be 2, 3 or 4'
+             for p in self.widget_padding:
+                 assert isinstance(p, NumberInstance), \
+@@ -544,36 +574,41 @@ class Theme(object):
+         # Check sizes
+         assert self.border_width >= 0, 'border width must be equal or greater than zero'
+         assert self.scrollarea_outer_margin[0] >= 0 and self.scrollarea_outer_margin[1] >= 0, \
+             'scroll area outer margin must be equal or greater than zero on both axis'
+         assert self.widget_offset[0] >= 0 and self.widget_offset[1] >= 0, \
+             'widget offset must be equal or greater than zero'
+         assert self.widget_background_inflate[0] >= 0 and self.widget_background_inflate[1] >= 0, \
+             'widget background inflate must be equal or greater than zero on both axis'
+         assert self.widget_border_inflate[0] >= 0 and self.widget_border_inflate[1] >= 0, \
+             'widget border inflate must be equal or greater than zero on both axis'
++        assert self.widget_validation_error_border_inflate[0] >= 0 and self.widget_validation_error_border_inflate[1] >= 0, \
++            'widget validation error border inflate must be equal or greater than zero on both axis'
+         assert self.widget_box_inflate[0] >= 0 and self.widget_box_inflate[1] >= 0, \
+             'widget box inflate inflate must be equal or greater than zero on both axis'
+         assert self.widget_shadow_width >= 0 and self.widget_shadow_radius >= 0, \
+             'widget shadow width and radius must be equal or greater than zero'
+ 
+         # Check shadow type
+         assert self.widget_shadow_type in (WIDGET_SHADOW_TYPE_ELLIPSE, WIDGET_SHADOW_TYPE_RECTANGULAR), \
+             'widget shadow type must be ellipse or rectangular'
+ 
+         assert self.cursor_switch_ms > 0, 'cursor switch ms must be greater than zero'
+         assert self.fps >= 0, 'fps must be equal or greater than zero'
+         assert self.scrollbar_shadow_offset > 0, 'scrollbar shadow offset must be greater than zero'
+         assert self.scrollbar_slider_pad >= 0, 'slider pad must be equal or greater than zero'
+         assert self.scrollbar_thick > 0, 'scrollbar thickness must be greater than zero'
+         assert self.title_font_size > 0, 'title font size must be greater than zero'
+         assert self.widget_border_width >= 0, 'widget border width must be equal or greater than zero'
++        assert self.widget_validation_error_border_width >= 0, 'widget validation error border width must be equal or greater than zero'
++        assert self.widget_validation_error_font_size >= 0, 'widget validation error font size must be equal or greater than zero'
++        assert self.widget_validation_error_margin >= 0, 'widget validation error margin must be equal or greater than zero'
+         assert self.widget_box_border_width >= 0, 'widget border box width must be equal or greater than zero'
+         assert self.widget_font_shadow_offset > 0, 'widget font shadow offset must be greater than zero'
+         assert self.widget_font_size > 0, 'widget font size must be greater than zero'
+         assert self.widget_shadow_aa >= 1, 'widget shadow antialiasing must be equal or greater than one'
+         assert self.widget_tab_size >= 0, 'widget tab size must be equal or greater than zero'
+ 
+         # Color asserts
+         assert self.focus_background_color[3] != 0, \
+             'focus background color cannot be fully transparent, suggested opacity between 1 and 255'
+ 
+diff --git a/pygame_menu/validation.py b/pygame_menu/validation.py
+new file mode 100644
+index 00000000..1863e438
+--- /dev/null
++++ b/pygame_menu/validation.py
+@@ -0,0 +1,261 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++VALIDATION
++Per-widget validation rules and result containers. Developers attach
++``Validator`` instances to widgets via ``Widget.add_validator`` and then
++call ``Widget.validate()`` or ``Menu.validate()`` to check all rules and
++receive a structured result.
++"""
++
++__all__ = [
++
++    # Result containers
++    'ValidationResult',
++    'MenuValidationResult',
++
++    # Base class
++    'Validator',
++
++    # Built-in validators
++    'Required',
++    'MinLength',
++    'MaxLength',
++    'Regex',
++    'NumericRange',
++    'Custom'
++
++]
++
++import re
++
++from abc import ABC, abstractmethod
++
++from pygame_menu._types import Any, Callable, Dict, List, NumberType, Optional
++
++
++# noinspection PyMissingOrEmptyDocstring
++class Validator(ABC):
++    """
++    Base class for widget validators. A validator is a callable that takes the
++    widget's current value and returns ``None`` when the value is acceptable
++    or an error message string when it is not.
++
++    Subclass and implement :py:meth:`__call__`, or use :py:class:`Custom` to
++    wrap an arbitrary callable.
++    """
++
++    @abstractmethod
++    def __call__(self, value: Any) -> Optional[str]:
++        """
++        Validate the given value.
++
++        :param value: Widget value to check
++        :return: ``None`` if valid, otherwise an error message string
++        """
++        raise NotImplementedError
++
++
++class Required(Validator):
++    """
++    Fails when the value is ``None``, an empty or whitespace-only string, or an
++    empty collection.
++
++    :param message: Error message returned on failure
++    """
++
++    def __init__(self, message: str = 'This field is required') -> None:
++        assert isinstance(message, str)
++        self._message = message
++
++    def __call__(self, value: Any) -> Optional[str]:
++        if value is None:
++            return self._message
++        if isinstance(value, str) and value.strip() == '':
++            return self._message
++        if hasattr(value, '__len__') and len(value) == 0:
++            return self._message
++        return None
++
++
++class MinLength(Validator):
++    """
++    Fails when the string representation of the value is shorter than the given
++    length. ``None`` values always fail.
++
++    :param length: Minimum number of characters (inclusive)
++    :param message: Error message returned on failure; a default is generated if not given
++    """
++
++    def __init__(self, length: int, message: Optional[str] = None) -> None:
++        assert isinstance(length, int) and length >= 0
++        self._length = length
++        self._message = message if message is not None else f'Must be at least {length} characters'
++
++    def __call__(self, value: Any) -> Optional[str]:
++        if value is None or len(str(value)) < self._length:
++            return self._message
++        return None
++
++
++class MaxLength(Validator):
++    """
++    Fails when the string representation of the value is longer than the given
++    length. ``None`` values pass (combine with :py:class:`Required` if needed).
++
++    :param length: Maximum number of characters (inclusive)
++    :param message: Error message returned on failure; a default is generated if not given
++    """
++
++    def __init__(self, length: int, message: Optional[str] = None) -> None:
++        assert isinstance(length, int) and length >= 0
++        self._length = length
++        self._message = message if message is not None else f'Must be at most {length} characters'
++
++    def __call__(self, value: Any) -> Optional[str]:
++        if value is not None and len(str(value)) > self._length:
++            return self._message
++        return None
++
++
++class Regex(Validator):
++    """
++    Fails when the string representation of the value does not match the given
++    regular expression against the **entire** input (using
++    :py:func:`re.fullmatch`). ``None`` values always fail.
++
++    :param pattern: Regular expression pattern string
++    :param message: Error message returned on failure; a default is generated if not given
++    """
++
++    def __init__(self, pattern: str, message: Optional[str] = None) -> None:
++        assert isinstance(pattern, str)
++        self._pattern = re.compile(pattern)
++        self._message = message if message is not None else f'Must match pattern {pattern}'
++
++    def __call__(self, value: Any) -> Optional[str]:
++        if value is None or not self._pattern.fullmatch(str(value)):
++            return self._message
++        return None
++
++
++class NumericRange(Validator):
++    """
++    Fails when the value (coerced to ``float``) falls outside the given
++    inclusive bounds. At least one of ``min_value`` or ``max_value`` must be
++    provided. Values that cannot be coerced to a number also fail.
++
++    :param min_value: Lower bound (inclusive), or ``None`` for no lower bound
++    :param max_value: Upper bound (inclusive), or ``None`` for no upper bound
++    :param message: Error message returned on failure; a default is generated if not given
++    """
++
++    def __init__(
++            self,
++            min_value: Optional[NumberType] = None,
++            max_value: Optional[NumberType] = None,
++            message: Optional[str] = None
++    ) -> None:
++        assert min_value is not None or max_value is not None, \
++            'at least one of min_value or max_value must be provided'
++        self._min = min_value
++        self._max = max_value
++        if message is not None:
++            self._message = message
++        elif min_value is not None and max_value is not None:
++            self._message = f'Must be between {min_value} and {max_value}'
++        elif min_value is not None:
++            self._message = f'Must be at least {min_value}'
++        else:
++            self._message = f'Must be at most {max_value}'
++
++    def __call__(self, value: Any) -> Optional[str]:
++        try:
++            num = float(value)
++        except (TypeError, ValueError):
++            return self._message
++        if self._min is not None and num < self._min:
++            return self._message
++        if self._max is not None and num > self._max:
++            return self._message
++        return None
++
++
++class Custom(Validator):
++    """
++    Wraps an arbitrary callable as a validator. The callable receives the
++    widget value and must return ``None`` on success or an error message string
++    on failure.
++
++    Example::
++
++        widget.add_validator(Custom(lambda v: None if v != 'admin' else 'Reserved name'))
++
++    :param func: Callable taking a value and returning ``None`` or an error string
++    """
++
++    def __init__(self, func: Callable[[Any], Optional[str]]) -> None:
++        assert callable(func)
++        self._func = func
++
++    def __call__(self, value: Any) -> Optional[str]:
++        return self._func(value)
++
++
++class ValidationResult(object):
++    """
++    Result of validating a single widget. Truthy when valid.
++
++    :param widget: Widget that was validated
++    :param errors: List of error message strings (empty when valid)
++    """
++
++    def __init__(self, widget: Any, errors: List[str]) -> None:
++        self.widget = widget
++        self.errors: List[str] = errors
++        self.valid: bool = len(errors) == 0
++
++    def __bool__(self) -> bool:
++        return self.valid
++
++    def __repr__(self) -> str:
++        return f'ValidationResult(valid={self.valid}, errors={self.errors})'
++
++
++class MenuValidationResult(object):
++    """
++    Aggregate result of validating every widget in a menu. Truthy only when
++    **all** widgets passed. Individual results are accessible by widget ID.
++
++    Example::
++
++        result = menu.validate()
++        if not result:
++            for widget_id, errors in result.errors.items():
++                print(widget_id, errors)
++
++    :param results: Mapping of widget ID to per-widget :py:class:`ValidationResult`
++    """
++
++    def __init__(self, results: Dict[str, ValidationResult]) -> None:
++        self.results: Dict[str, ValidationResult] = results
++        self.valid: bool = all(r.valid for r in results.values())
++        self.errors: Dict[str, List[str]] = {
++            wid: r.errors for wid, r in results.items() if not r.valid
++        }
++
++    def __bool__(self) -> bool:
++        return self.valid
++
++    def __getitem__(self, widget_id: str) -> ValidationResult:
++        return self.results[widget_id]
++
++    def __iter__(self):
++        return iter(self.results.values())
++
++    def __len__(self) -> int:
++        return len(self.results)
++
++    def __repr__(self) -> str:
++        return f'MenuValidationResult(valid={self.valid}, failed={list(self.errors.keys())})'
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index 11c7972b..990a1cb9 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -288,20 +288,24 @@ class Widget(Base):
+     _selection_time: NumberType
+     _shadow: WidgetShadowType
+     _sound: 'Sound'
+     _surface: Optional['pygame.Surface']
+     _tab_size: int
+     _title: str
+     _touchscreen_enabled: bool
+     _translate: Tuple2IntType  # Translation made by user
+     _translate_virtual: Tuple2IntType  # Virtual translation applied by api
+     _update_callbacks: Dict[str, Callable[[EventListType, 'Widget', 'pygame_menu.Menu'], Any]]
++    _validators: List['pygame_menu.validation.Validator']
++    _validation_error_style: Dict[str, Any]
++    _validation_errors: List[str]
++    _validation_saved_border: Optional[Tuple[ColorType, int, Any, Tuple2IntType]]
+     _visible: bool
+     active: bool
+     configured: bool
+     force_menu_draw_focus: bool
+     is_scrollable: bool
+     is_selectable: bool
+     last_surface: Optional['pygame.Surface']
+     lock_position: bool
+     readonly: bool
+     selection_expand_background: bool
+@@ -422,20 +426,34 @@ class Widget(Base):
+             'rect': None,
+             'surface': None
+         }
+ 
+         # Border
+         self._border_color = (0, 0, 0)
+         self._border_inflate = (0, 0)
+         self._border_position = 'none'
+         self._border_width = 0
+ 
++        # Validation
++        self._validators = []
++        self._validation_errors = []  # current error messages; drawn under the widget when non-empty
++        self._validation_error_surface = None  # cached render of the inline error text
++        self._validation_saved_border = None  # holds original border while error style is active
++        self._validation_error_style = {
++            'border_width': 2,
++            'border_color': (255, 0, 0),
++            'border_inflate': (0, 0),
++            'font_color': (255, 0, 0),
++            'font_size': 14,
++            'margin': 2
++        }
++
+         # Rendering, this variable may be used by render() method. If the hash
+         # of the variables change respect to the last render hash (hash computed
+         # using self._hash_variables() method) then the widget should render and
+         # update the hash
+         self._last_render_hash = 0
+ 
+         # Selection effect, for avoiding exception while getting object rect,
+         # NullSelection was created. Initially it was None
+         self._selection_effect = pygame_menu.widgets.NoneSelection()
+         # If False, the selection effect is drawn previous the widget surface
+@@ -1355,21 +1373,22 @@ class Widget(Base):
+         Draw the Widget on a given surface.
+ 
+         .. note:: Widget drawing order:
+ 
+             1. Background color
+             2. ``prev`` decorator
+             3. Widget selection effect (if prev)
+             4. Widget surface
+             5. Widget selection effect (if post)
+             6. Widget border
+-            7. ``post`` decorator
++            7. Validation error message (if any)
++            8. ``post`` decorator
+ 
+         :param surface: Surface to draw
+         :return: Self reference
+         """
+         if not self.is_visible():
+             return self
+ 
+         # Check for consistency
+         if self.active and not self._selected:
+             self.active = False
+@@ -1378,20 +1397,21 @@ class Widget(Base):
+         self._render()
+ 
+         if self.is_selected() and not self._selection_effect_draw_post:
+             self._selection_effect.draw(surface, self)
+ 
+         self._draw_shadow(surface)
+         self._draw_background_color(surface)
+         self._decorator.draw_prev(surface)
+         self._draw(surface)
+         self._draw_border(surface)
++        self._draw_validation_error(surface)
+         self._decorator.draw_post(surface)
+ 
+         # Apply callbacks
+         self.apply_draw_callbacks()
+ 
+         # Store last surface
+         self.last_surface = surface
+ 
+         return self
+ 
+@@ -1573,20 +1593,214 @@ class Widget(Base):
+         will be passed to the callbacks.
+ 
+         .. warning::
+ 
+             Not all widgets return a value.
+ 
+         :return: Widget data value
+         """
+         raise ValueError(f'{self.get_class_id()} does not accept value')
+ 
++    def add_validator(self, *validators: 'pygame_menu.validation.Validator') -> 'Widget':
++        """
++        Attach one or more validators to this Widget. Validators are checked in
++        insertion order when :py:meth:`validate` is called.
++
++        Example::
++
++            from pygame_menu.validation import Required, MinLength, Regex
++            text_input.add_validator(Required(), MinLength(3))
++            text_input.add_validator(Regex(r'^[a-zA-Z]+$', 'Letters only'))
++
++        :param validators: One or more :py:class:`pygame_menu.validation.Validator`
++                           instances, or any callable taking the widget value
++                           and returning ``None`` on success or an error message
++                           string on failure
++        :return: Self reference
++        """
++        for v in validators:
++            assert callable(v), \
++                f'validator must be callable, got {type(v).__name__}'
++            self._validators.append(v)
++        return self
++
++    def clear_validators(self) -> 'Widget':
++        """
++        Remove every validator previously attached to this Widget and clear any
++        active validation-error border.
++
++        :return: Self reference
++        """
++        self._validators = []
++        self._clear_validation_error_style()
++        return self
++
++    def get_validators(self) -> Tuple['pygame_menu.validation.Validator', ...]:
++        """
++        Return the validators attached to this Widget.
++
++        :return: Tuple of validators in the order they will be checked
++        """
++        return tuple(self._validators)
++
++    def set_validation_error_style(
++            self,
++            border_width: int = 2,
++            border_color: ColorInputType = (255, 0, 0),
++            border_inflate: Tuple2IntType = (0, 0),
++            font_color: ColorInputType = (255, 0, 0),
++            font_size: int = 14,
++            margin: int = 2
++    ) -> 'Widget':
++        """
++        Configure how this Widget indicates a failed validation. The original
++        border is saved and restored automatically once the Widget passes
++        validation again. The inline error message is drawn below the Widget
++        using the Widget's own font family at the given ``font_size``.
++
++        .. note::
++
++            These values are normally populated from the Theme
++            (``widget_validation_error_*`` attributes) when the Widget is added
++            to a Menu; call this method only to override per-widget.
++
++        :param border_width: Error border width in px. ``0`` disables the error border
++        :param border_color: Error border color
++        :param border_inflate: Error border inflate (x, y) in px
++        :param font_color: Color of the inline error message text
++        :param font_size: Font size of the inline error message. ``0`` disables the message
++        :param margin: Vertical spacing in px between the Widget bottom edge and the error message
++        :return: Self reference
++        """
++        assert isinstance(border_width, int) and border_width >= 0
++        assert isinstance(font_size, int) and font_size >= 0
++        assert isinstance(margin, int) and margin >= 0
++        assert_vector(border_inflate, 2, int)
++        self._validation_error_style = {
++            'border_width': border_width,
++            'border_color': assert_color(border_color),
++            'border_inflate': border_inflate,
++            'font_color': assert_color(font_color),
++            'font_size': font_size,
++            'margin': margin
++        }
++        self._validation_error_surface = None
++        return self
++
++    def validate(self, update_style: bool = True) -> 'pygame_menu.validation.ValidationResult':
++        """
++        Run every attached validator against this Widget's current value and
++        return a structured result. All validators are checked (errors are
++        accumulated, not short-circuited).
++
++        If the Widget does not hold a value (:py:meth:`get_value` raises
++        ``ValueError``) validators receive ``None`` as the value.
++
++        When ``update_style`` is ``True`` (the default) a failing result
++        applies the validation-error border configured via
++        :py:meth:`set_validation_error_style`, and a passing result restores
++        the Widget's original border.
++
++        :param update_style: If ``True`` apply/clear the visual error border
++        :return: :py:class:`pygame_menu.validation.ValidationResult`
++        """
++        from pygame_menu.validation import ValidationResult
++
++        try:
++            value = self.get_value()
++        except ValueError:
++            value = None
++
++        errors: List[str] = []
++        for validator in self._validators:
++            msg = validator(value)
++            if msg is not None:
++                errors.append(msg)
++
++        result = ValidationResult(self, errors)
++
++        if update_style:
++            if result.valid:
++                self._clear_validation_error_style()
++            else:
++                self._apply_validation_error_style(errors)
++
++        return result
++
++    def _apply_validation_error_style(self, errors: List[str]) -> None:
++        """
++        Save the Widget's current border (once), apply the configured
++        validation-error border, and store the error messages so the inline
++        error text is drawn on subsequent :py:meth:`draw` calls.
++
++        :param errors: Error messages from the failed validation
++        """
++        if self._validation_saved_border is None:
++            self._validation_saved_border = (
++                self._border_color,
++                self._border_width,
++                self._border_position,
++                self._border_inflate
++            )
++        style = self._validation_error_style
++        if style['border_width'] > 0:
++            self.set_border(style['border_width'], style['border_color'], style['border_inflate'])
++        if errors != self._validation_errors:
++            self._validation_error_surface = None  # text changed; invalidate cache
++        self._validation_errors = list(errors)
++        self.force_menu_surface_cache_update()
++
++    def _clear_validation_error_style(self) -> None:
++        """
++        Restore the border that was active before the validation-error style
++        was applied and clear the inline error text. No-op if no error style is
++        currently active.
++        """
++        if self._validation_saved_border is None and not self._validation_errors:
++            return
++        if self._validation_saved_border is not None:
++            color, width, position, inflate = self._validation_saved_border
++            self._border_color = color
++            self._border_width = width
++            self._border_position = position
++            self._border_inflate = inflate
++            self._validation_saved_border = None
++        self._validation_errors = []
++        self._validation_error_surface = None
++        self.force_menu_surface_cache_update()
++
++    def _draw_validation_error(self, surface: 'pygame.Surface') -> None:
++        """
++        Draw the first validation-error message below the Widget. Called from
++        :py:meth:`draw` after the border is drawn. Uses the Widget's own font
++        family at the size configured via :py:meth:`set_validation_error_style`.
++
++        :param surface: Surface to draw on
++        """
++        if not self._validation_errors:
++            return
++        style = self._validation_error_style
++        if style['font_size'] == 0:
++            return
++        if self._validation_error_surface is None:
++            if not self._font_name:  # font not yet configured
++                return
++            err_font = pygame_menu.font.get_font(self._font_name, style['font_size'])
++            self._validation_error_surface = err_font.render(
++                self._validation_errors[0], self._font_antialias, style['font_color']
++            )
++        rect = self.get_rect()
++        surface.blit(
++            self._validation_error_surface,
++            (rect.x, rect.bottom + style['margin'])
++        )
++
+     def add_self_to_kwargs(self, key: str = 'widget') -> 'Widget':
+         """
+         Adds the Widget object to kwargs, it helps to get the Widget reference for
+         callbacks. It raises ``KeyError`` if key is duplicated.
+ 
+         :param key: Name of the parameter
+         :return: Self reference
+         """
+         assert isinstance(key, str)
+         if key in self._kwargs.keys():
+diff --git a/test/test_validation.py b/test/test_validation.py
+new file mode 100644
+index 00000000..ee998ea6
+--- /dev/null
++++ b/test/test_validation.py
+@@ -0,0 +1,817 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++TEST VALIDATION
++Test the per-widget validation system: validators, Widget.validate,
++Menu.validate, and visual error indication.
++"""
++
++__all__ = ['ValidationTest']
++
++from test._utils import MenuUtils, BaseTest, surface
++
++import pygame_menu
++
++from pygame_menu.validation import Required, MinLength, MaxLength, Regex, \
++    NumericRange, Custom, ValidationResult, MenuValidationResult, Validator
++
++
++class ValidationTest(BaseTest):
++
++    # --------------------------------------------------------------------- #
++    # Individual validator behaviour
++    # --------------------------------------------------------------------- #
++
++    def test_required(self) -> None:
++        """
++        Test Required validator.
++        """
++        v = Required()
++        self.assertIsNone(v('hello'))
++        self.assertIsNone(v('  x  '))
++        self.assertIsNone(v(0))
++        self.assertIsNone(v(False))  # False is not "empty"
++        self.assertIsNone(v([1, 2]))
++
++        self.assertEqual(v(None), 'This field is required')
++        self.assertEqual(v(''), 'This field is required')
++        self.assertEqual(v('   '), 'This field is required')
++        self.assertEqual(v([]), 'This field is required')
++        self.assertEqual(v(()), 'This field is required')
++
++        # Custom message
++        v2 = Required('Name cannot be empty')
++        self.assertEqual(v2(''), 'Name cannot be empty')
++
++    def test_min_length(self) -> None:
++        """
++        Test MinLength validator.
++        """
++        v = MinLength(3)
++        self.assertIsNone(v('abc'))
++        self.assertIsNone(v('abcd'))
++        self.assertIsNone(v(123))  # str(123) == '123', length 3
++
++        self.assertEqual(v('ab'), 'Must be at least 3 characters')
++        self.assertEqual(v(''), 'Must be at least 3 characters')
++        self.assertEqual(v(None), 'Must be at least 3 characters')
++
++        # Custom message
++        v2 = MinLength(5, 'Too short!')
++        self.assertEqual(v2('abc'), 'Too short!')
++
++        # Zero length always passes non-None
++        v3 = MinLength(0)
++        self.assertIsNone(v3(''))
++
++    def test_max_length(self) -> None:
++        """
++        Test MaxLength validator.
++        """
++        v = MaxLength(5)
++        self.assertIsNone(v('abcde'))
++        self.assertIsNone(v('abc'))
++        self.assertIsNone(v(''))
++        self.assertIsNone(v(None))  # None passes max-length
++
++        self.assertEqual(v('abcdef'), 'Must be at most 5 characters')
++        self.assertEqual(v(123456), 'Must be at most 5 characters')
++
++        # Custom message
++        v2 = MaxLength(2, 'Too long!')
++        self.assertEqual(v2('abc'), 'Too long!')
++
++    def test_regex(self) -> None:
++        """
++        Test Regex validator.
++        """
++        v = Regex(r'^\d+$')
++        self.assertIsNone(v('123'))
++        self.assertIsNone(v('0'))
++        self.assertIsNone(v(456))  # str(456) matches
++
++        self.assertIsNotNone(v('abc'))
++        self.assertIsNotNone(v('12a'))
++        self.assertIsNotNone(v(''))
++        self.assertIsNotNone(v(None))
++
++        # Email-ish pattern with custom message
++        v2 = Regex(r'^[^@]+@[^@]+\.[^@]+$', 'Invalid email')
++        self.assertIsNone(v2('user@example.com'))
++        self.assertEqual(v2('not-an-email'), 'Invalid email')
++
++        # fullmatch semantics: pattern must match entire input, not just prefix
++        v3 = Regex(r'\d+')
++        self.assertIsNone(v3('123'))
++        self.assertIsNotNone(v3('123abc'))  # would falsely pass with re.match
++        self.assertIsNotNone(v3('abc123'))
++
++        v4 = Regex(r'[A-Z]{3}')
++        self.assertIsNone(v4('ABC'))
++        self.assertIsNotNone(v4('ABCD'))  # prefix matches but full input doesn't
++
++    def test_numeric_range(self) -> None:
++        """
++        Test NumericRange validator.
++        """
++        # Both bounds
++        v = NumericRange(min_value=0, max_value=100)
++        self.assertIsNone(v(0))
++        self.assertIsNone(v(50))
++        self.assertIsNone(v(100))
++        self.assertIsNone(v('50'))  # String coercion
++        self.assertIsNone(v(99.5))
++
++        self.assertEqual(v(-1), 'Must be between 0 and 100')
++        self.assertEqual(v(101), 'Must be between 0 and 100')
++        self.assertEqual(v('abc'), 'Must be between 0 and 100')
++        self.assertEqual(v(None), 'Must be between 0 and 100')
++
++        # Min only
++        v_min = NumericRange(min_value=10)
++        self.assertIsNone(v_min(10))
++        self.assertIsNone(v_min(1000))
++        self.assertEqual(v_min(9), 'Must be at least 10')
++
++        # Max only
++        v_max = NumericRange(max_value=5)
++        self.assertIsNone(v_max(5))
++        self.assertIsNone(v_max(-100))
++        self.assertEqual(v_max(6), 'Must be at most 5')
++
++        # Custom message
++        v_custom = NumericRange(min_value=1, max_value=10, message='Out of range')
++        self.assertEqual(v_custom(0), 'Out of range')
++
++        # Must provide at least one bound
++        self.assertRaises(AssertionError, lambda: NumericRange())
++
++    def test_custom(self) -> None:
++        """
++        Test Custom validator wrapper.
++        """
++        v = Custom(lambda val: None if val != 'admin' else 'Reserved name')
++        self.assertIsNone(v('alice'))
++        self.assertIsNone(v('bob'))
++        self.assertEqual(v('admin'), 'Reserved name')
++
++        # Non-callable rejected
++        self.assertRaises(AssertionError, lambda: Custom('not callable'))
++
++    # --------------------------------------------------------------------- #
++    # Result containers
++    # --------------------------------------------------------------------- #
++
++    def test_validation_result(self) -> None:
++        """
++        Test ValidationResult container.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++
++        # Valid result
++        r_ok = ValidationResult(w, [])
++        self.assertTrue(r_ok.valid)
++        self.assertTrue(bool(r_ok))
++        self.assertTrue(r_ok)
++        self.assertEqual(r_ok.errors, [])
++        self.assertIs(r_ok.widget, w)
++        self.assertIn('valid=True', repr(r_ok))
++
++        # Invalid result
++        r_bad = ValidationResult(w, ['err1', 'err2'])
++        self.assertFalse(r_bad.valid)
++        self.assertFalse(bool(r_bad))
++        self.assertFalse(r_bad)
++        self.assertEqual(r_bad.errors, ['err1', 'err2'])
++        self.assertIn('valid=False', repr(r_bad))
++
++    def test_menu_validation_result(self) -> None:
++        """
++        Test MenuValidationResult container.
++        """
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input('A: ')
++        w2 = menu.add.text_input('B: ')
++
++        r1 = ValidationResult(w1, [])
++        r2 = ValidationResult(w2, ['bad'])
++
++        # All valid
++        m_ok = MenuValidationResult({'a': r1})
++        self.assertTrue(m_ok)
++        self.assertTrue(m_ok.valid)
++        self.assertEqual(m_ok.errors, {})
++        self.assertEqual(len(m_ok), 1)
++
++        # One invalid
++        m_bad = MenuValidationResult({'a': r1, 'b': r2})
++        self.assertFalse(m_bad)
++        self.assertFalse(m_bad.valid)
++        self.assertEqual(m_bad.errors, {'b': ['bad']})
++        self.assertEqual(len(m_bad), 2)
++        self.assertIs(m_bad['a'], r1)
++        self.assertIs(m_bad['b'], r2)
++        self.assertEqual(list(m_bad), [r1, r2])
++        self.assertIn('failed=', repr(m_bad))
++
++        # Empty result is valid
++        m_empty = MenuValidationResult({})
++        self.assertTrue(m_empty)
++
++    # --------------------------------------------------------------------- #
++    # Widget integration
++    # --------------------------------------------------------------------- #
++
++    def test_widget_add_clear_validators(self) -> None:
++        """
++        Test attaching and clearing validators on a widget.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++
++        # Starts empty
++        self.assertEqual(w.get_validators(), ())
++
++        # Single add, returns self (fluent)
++        req = Required()
++        self.assertIs(w.add_validator(req), w)
++        self.assertEqual(w.get_validators(), (req,))
++
++        # Variadic add
++        ml, mx = MinLength(2), MaxLength(10)
++        w.add_validator(ml, mx)
++        self.assertEqual(w.get_validators(), (req, ml, mx))
++
++        # Non-callable rejected
++        self.assertRaises(AssertionError, lambda: w.add_validator('not callable'))
++
++        # Clear
++        self.assertIs(w.clear_validators(), w)
++        self.assertEqual(w.get_validators(), ())
++
++    def test_widget_validate_textinput(self) -> None:
++        """
++        Test Widget.validate on a TextInput across several validators.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++        w.add_validator(Required(), MinLength(3))
++
++        # Empty -> both fail
++        r = w.validate()
++        self.assertFalse(r)
++        self.assertIn('This field is required', r.errors)
++        self.assertIn('Must be at least 3 characters', r.errors)
++        self.assertIs(r.widget, w)
++
++        # Too short -> only min-length fails
++        w.set_value('ab')
++        r = w.validate()
++        self.assertFalse(r)
++        self.assertEqual(r.errors, ['Must be at least 3 characters'])
++
++        # Valid
++        w.set_value('alice')
++        r = w.validate()
++        self.assertTrue(r)
++        self.assertEqual(r.errors, [])
++
++    def test_widget_validate_regex(self) -> None:
++        """
++        Test Widget.validate with a Regex validator.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Code: ')
++        w.add_validator(Regex(r'^[A-Z]{3}$', 'Must be 3 uppercase letters'))
++
++        w.set_value('abc')
++        self.assertFalse(w.validate())
++
++        w.set_value('ABCD')
++        self.assertFalse(w.validate())
++
++        w.set_value('ABC')
++        self.assertTrue(w.validate())
++
++    def test_widget_validate_numeric_range(self) -> None:
++        """
++        Test Widget.validate with a NumericRange validator on an integer input.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Age: ', input_type=pygame_menu.locals.INPUT_INT)
++        w.add_validator(NumericRange(min_value=1, max_value=120))
++
++        # INPUT_INT returns 0 for empty
++        r = w.validate()
++        self.assertFalse(r)  # 0 < min of 1
++
++        w.set_value(50)
++        self.assertTrue(w.validate())
++
++        w.set_value(121)
++        self.assertFalse(w.validate())
++
++        w.set_value(1)
++        self.assertTrue(w.validate())
++
++    def test_widget_validate_no_value(self) -> None:
++        """
++        Widgets whose get_value() raises ValueError pass None to validators.
++        """
++        menu = MenuUtils.generic_menu()
++        label = menu.add.label('Just a label')
++
++        # Without validators -> always valid
++        self.assertTrue(label.validate())
++
++        # With Required -> None fails
++        label.add_validator(Required())
++        r = label.validate()
++        self.assertFalse(r)
++        self.assertEqual(r.errors, ['This field is required'])
++
++    def test_widget_validate_custom_callable(self) -> None:
++        """
++        add_validator accepts any callable returning Optional[str].
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Username: ')
++
++        def no_spaces(value):
++            if value is not None and ' ' in str(value):
++                return 'No spaces allowed'
++            return None
++
++        w.add_validator(no_spaces)
++
++        w.set_value('hello world')
++        r = w.validate()
++        self.assertFalse(r)
++        self.assertEqual(r.errors, ['No spaces allowed'])
++
++        w.set_value('hello_world')
++        self.assertTrue(w.validate())
++
++    # --------------------------------------------------------------------- #
++    # Visual error indication
++    # --------------------------------------------------------------------- #
++
++    # noinspection PyTypeChecker
++    def test_widget_validate_visual_default(self) -> None:
++        """
++        Failing validation applies a red border; passing restores original.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++        w.add_validator(Required())
++
++        # Capture original border
++        orig = w.get_border()  # (color, width, position, inflate)
++        self.assertEqual(orig[1], 0)  # width starts at 0
++        self.assertIsNone(w._validation_saved_border)
++
++        # Fail -> red border applied, original saved
++        w.validate()
++        self.assertEqual(w._border_color, (255, 0, 0, 255))
++        self.assertEqual(w._border_width, 2)
++        self.assertIsNotNone(w._validation_saved_border)
++        self.assertEqual(w._validation_saved_border[1], 0)  # saved width
++
++        # Drawing shouldn't crash with error border active
++        w.draw(surface)
++
++        # Fail again -> saved border not overwritten
++        w.validate()
++        self.assertEqual(w._validation_saved_border[1], 0)
++
++        # Pass -> border restored
++        w.set_value('alice')
++        w.validate()
++        self.assertEqual(w._border_width, 0)
++        self.assertIsNone(w._validation_saved_border)
++
++    # noinspection PyTypeChecker
++    def test_widget_validate_visual_custom(self) -> None:
++        """
++        set_validation_error_style customises the error border.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++        w.add_validator(Required())
++        self.assertIs(
++            w.set_validation_error_style(border_width=4, border_color=(255, 165, 0), border_inflate=(2, 2)),
++            w
++        )
++
++        w.validate()
++        self.assertEqual(w._border_color, (255, 165, 0, 255))
++        self.assertEqual(w._border_width, 4)
++        self.assertEqual(w._border_inflate, (2, 2))
++
++    # noinspection PyTypeChecker
++    def test_widget_validate_no_style_update(self) -> None:
++        """
++        update_style=False leaves the border untouched.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++        w.add_validator(Required())
++
++        r = w.validate(update_style=False)
++        self.assertFalse(r)
++        self.assertEqual(w._border_width, 0)  # Untouched
++        self.assertIsNone(w._validation_saved_border)
++
++    # noinspection PyTypeChecker
++    def test_widget_validate_restores_custom_border(self) -> None:
++        """
++        A user-set border is correctly restored after a fail/pass cycle.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++        w.set_border(3, (0, 128, 255), (1, 1))
++        w.add_validator(Required())
++
++        # Fail
++        w.validate()
++        self.assertEqual(w._border_color, (255, 0, 0, 255))
++
++        # Pass -> original custom border comes back
++        w.set_value('ok')
++        w.validate()
++        self.assertEqual(w._border_color, (0, 128, 255, 255))
++        self.assertEqual(w._border_width, 3)
++        self.assertEqual(w._border_inflate, (1, 1))
++
++    # noinspection PyTypeChecker
++    def test_clear_validators_clears_error_style(self) -> None:
++        """
++        clear_validators also removes any active error border.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++        w.add_validator(Required())
++        w.validate()
++        self.assertEqual(w._border_width, 2)
++
++        w.clear_validators()
++        self.assertEqual(w._border_width, 0)
++        self.assertIsNone(w._validation_saved_border)
++
++    # --------------------------------------------------------------------- #
++    # Menu.validate aggregation
++    # --------------------------------------------------------------------- #
++
++    def test_menu_validate_empty(self) -> None:
++        """
++        A menu with no validated widgets returns a valid empty result.
++        """
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input('A: ')  # No validators
++        menu.add.label('Label')
++
++        r = menu.validate()
++        self.assertIsInstance(r, MenuValidationResult)
++        self.assertTrue(r)
++        self.assertEqual(len(r), 0)
++        self.assertEqual(r.errors, {})
++
++    # noinspection PyTypeChecker
++    def test_menu_validate_mixed(self) -> None:
++        """
++        Only widgets with validators participate; result aggregates correctly.
++        """
++        menu = MenuUtils.generic_menu()
++        w_name = menu.add.text_input('Name: ', textinput_id='name')
++        w_name.add_validator(Required())
++
++        w_age = menu.add.text_input('Age: ', textinput_id='age',
++                                    input_type=pygame_menu.locals.INPUT_INT)
++        w_age.add_validator(NumericRange(min_value=1, max_value=120))
++
++        menu.add.text_input('Optional: ', textinput_id='opt')  # No validators
++
++        # Both fail initially
++        r = menu.validate()
++        self.assertFalse(r)
++        self.assertEqual(len(r), 2)  # Only widgets with validators
++        self.assertIn('name', r.errors)
++        self.assertIn('age', r.errors)
++        self.assertNotIn('opt', r.results)
++
++        # Visual error applied to both
++        self.assertEqual(w_name._border_width, 2)
++        self.assertEqual(w_age._border_width, 2)
++
++        # Fix name only
++        w_name.set_value('Alice')
++        r = menu.validate()
++        self.assertFalse(r)
++        self.assertEqual(len(r.errors), 1)
++        self.assertIn('age', r.errors)
++        self.assertNotIn('name', r.errors)
++
++        # Name border cleared, age still red
++        self.assertEqual(w_name._border_width, 0)
++        self.assertEqual(w_age._border_width, 2)
++
++        # Fix age too
++        w_age.set_value(30)
++        r = menu.validate()
++        self.assertTrue(r)
++        self.assertEqual(r.errors, {})
++        self.assertTrue(r['name'])
++        self.assertTrue(r['age'])
++
++    # noinspection PyTypeChecker
++    def test_menu_validate_no_style_update(self) -> None:
++        """
++        Menu.validate(update_style=False) leaves widget borders alone.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ', textinput_id='name')
++        w.add_validator(Required())
++
++        r = menu.validate(update_style=False)
++        self.assertFalse(r)
++        self.assertEqual(w._border_width, 0)
++
++    def test_menu_validate_recursive(self) -> None:
++        """
++        recursive=True validates widgets in submenus.
++        """
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input('Main: ', textinput_id='main').add_validator(Required())
++
++        sub = MenuUtils.generic_menu()
++        sub.add.text_input('Sub: ', textinput_id='sub').add_validator(Required())
++        menu.add.button('go to sub', sub)
++
++        # Non-recursive: only main
++        r = menu.validate(recursive=False)
++        self.assertEqual(len(r), 1)
++        self.assertIn('main', r.results)
++        self.assertNotIn('sub', r.results)
++
++        # Recursive: both
++        r = menu.validate(recursive=True)
++        self.assertEqual(len(r), 2)
++        self.assertIn('main', r.results)
++        self.assertIn('sub', r.results)
++        self.assertFalse(r)  # Both empty -> both fail
++
++    def test_menu_validate_recursive_collision(self) -> None:
++        """
++        Duplicate widget IDs across submenus raise ValueError.
++        """
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input('A: ', textinput_id='dup').add_validator(Required())
++
++        sub = MenuUtils.generic_menu()
++        sub.add.text_input('B: ', textinput_id='dup').add_validator(Required())
++        menu.add.button('sub', sub)
++
++        self.assertRaises(ValueError, lambda: menu.validate(recursive=True))
++
++    # --------------------------------------------------------------------- #
++    # Inline error text rendering
++    # --------------------------------------------------------------------- #
++
++    # noinspection PyTypeChecker
++    def test_inline_error_text(self) -> None:
++        """
++        Failing validation stores error messages; draw() renders them below
++        the widget; passing validation clears them.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++        w.add_validator(Required('Name is required'))
++
++        # Before validate: no errors stored
++        self.assertEqual(w._validation_errors, [])
++        self.assertIsNone(w._validation_error_surface)
++
++        # Fail -> errors stored
++        w.validate()
++        self.assertEqual(w._validation_errors, ['Name is required'])
++
++        # Drawing should render the error surface and cache it
++        w.draw(surface)
++        self.assertIsNotNone(w._validation_error_surface)
++        self.assertGreater(w._validation_error_surface.get_width(), 0)
++        cached = w._validation_error_surface
++
++        # Re-draw reuses cache
++        w.draw(surface)
++        self.assertIs(w._validation_error_surface, cached)
++
++        # Error message changes -> cache invalidated
++        w.clear_validators()
++        w.add_validator(MinLength(5, 'Too short'))
++        w.set_value('ab')
++        w.validate()
++        self.assertEqual(w._validation_errors, ['Too short'])
++        self.assertIsNone(w._validation_error_surface)  # invalidated
++        w.draw(surface)
++        self.assertIsNot(w._validation_error_surface, cached)
++
++        # Pass -> errors + surface cleared
++        w.set_value('alice')
++        w.validate()
++        self.assertEqual(w._validation_errors, [])
++        self.assertIsNone(w._validation_error_surface)
++        w.draw(surface)  # no crash
++
++    # noinspection PyTypeChecker
++    def test_inline_error_text_disabled(self) -> None:
++        """
++        font_size=0 disables inline error text rendering.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++        w.add_validator(Required())
++        w.set_validation_error_style(font_size=0)
++
++        w.validate()
++        self.assertEqual(len(w._validation_errors), 1)  # errors still stored
++        w.draw(surface)
++        self.assertIsNone(w._validation_error_surface)  # but not rendered
++
++    # noinspection PyTypeChecker
++    def test_inline_error_text_multiple_errors(self) -> None:
++        """
++        Only the first error message is drawn.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++        w.add_validator(Required('err1'), MinLength(5, 'err2'))
++        w.validate()
++        self.assertEqual(w._validation_errors, ['err1', 'err2'])
++        w.draw(surface)
++        # Surface was rendered from 'err1' (first error); we can't inspect
++        # the pixels easily but we can confirm it was rendered
++        self.assertIsNotNone(w._validation_error_surface)
++
++    # --------------------------------------------------------------------- #
++    # Theme integration
++    # --------------------------------------------------------------------- #
++
++    # noinspection PyTypeChecker
++    def test_theme_defaults_applied(self) -> None:
++        """
++        Widgets added through the menu pick up validation-error style from the
++        default theme.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input('Name: ')
++
++        style = w._validation_error_style
++        self.assertEqual(style['border_width'], 2)
++        self.assertEqual(style['border_color'], (255, 0, 0, 255))
++        self.assertEqual(style['border_inflate'], (0, 0))
++        self.assertEqual(style['font_color'], (255, 0, 0, 255))
++        self.assertEqual(style['font_size'], 14)
++        self.assertEqual(style['margin'], 2)
++
++    # noinspection PyTypeChecker
++    def test_theme_custom_values(self) -> None:
++        """
++        Custom theme validation-error attributes flow through to widgets.
++        """
++        theme = pygame_menu.themes.THEME_DEFAULT.copy()
++        theme.widget_validation_error_border_color = (255, 165, 0)
++        theme.widget_validation_error_border_width = 4
++        theme.widget_validation_error_border_inflate = (3, 3)
++        theme.widget_validation_error_font_color = (200, 0, 0)
++        theme.widget_validation_error_font_size = 18
++        theme.widget_validation_error_margin = 5
++
++        menu = MenuUtils.generic_menu(theme=theme)
++        w = menu.add.text_input('Name: ')
++
++        style = w._validation_error_style
++        self.assertEqual(style['border_width'], 4)
++        self.assertEqual(style['border_color'], (255, 165, 0, 255))
++        self.assertEqual(style['border_inflate'], (3, 3))
++        self.assertEqual(style['font_color'], (200, 0, 0, 255))
++        self.assertEqual(style['font_size'], 18)
++        self.assertEqual(style['margin'], 5)
++
++        # Applying the error uses theme values
++        w.add_validator(Required())
++        w.validate()
++        self.assertEqual(w._border_width, 4)
++        self.assertEqual(w._border_color, (255, 165, 0, 255))
++        self.assertEqual(w._border_inflate, (3, 3))
++
++    def test_theme_validate(self) -> None:
++        """
++        Theme.validate() accepts the new validation-error attributes.
++        """
++        theme = pygame_menu.Theme(
++            widget_validation_error_border_color=(0, 128, 255),
++            widget_validation_error_border_width=3,
++            widget_validation_error_border_inflate=(1, 1),
++            widget_validation_error_font_color=(128, 0, 0),
++            widget_validation_error_font_size=12,
++            widget_validation_error_margin=4
++        )
++        theme.validate()
++        self.assertEqual(theme.widget_validation_error_border_width, 3)
++        self.assertEqual(theme.widget_validation_error_font_size, 12)
++        # Colors formatted to RGBA
++        self.assertEqual(theme.widget_validation_error_border_color, (0, 128, 255, 255))
++        self.assertEqual(theme.widget_validation_error_font_color, (128, 0, 0, 255))
++
++        # Negative width rejected
++        bad = pygame_menu.themes.THEME_DEFAULT.copy()
++        bad.widget_validation_error_border_width = -1
++        self.assertRaises(AssertionError, bad.validate)
++
++    # --------------------------------------------------------------------- #
++    # validators kwarg via widget manager
++    # --------------------------------------------------------------------- #
++
++    def test_validators_kwarg_list(self) -> None:
++        """
++        validators= kwarg attaches validators at widget-creation time.
++        """
++        menu = MenuUtils.generic_menu()
++        req = Required()
++        ml = MinLength(3)
++        w = menu.add.text_input('Name: ', validators=[req, ml])
++
++        self.assertEqual(w.get_validators(), (req, ml))
++
++        r = w.validate()
++        self.assertFalse(r)
++        self.assertEqual(len(r.errors), 2)
++
++        w.set_value('alice')
++        self.assertTrue(w.validate())
++
++    def test_validators_kwarg_single(self) -> None:
++        """
++        A single validator (not wrapped in a list) is accepted.
++        """
++        menu = MenuUtils.generic_menu()
++        req = Required()
++        w = menu.add.text_input('Name: ', validators=req)
++        self.assertEqual(w.get_validators(), (req,))
++
++    def test_validators_kwarg_tuple(self) -> None:
++        """
++        A tuple of validators is accepted.
++        """
++        menu = MenuUtils.generic_menu()
++        req = Required()
++        ml = MinLength(3)
++        w = menu.add.text_input('Name: ', validators=(req, ml))
++        self.assertEqual(w.get_validators(), (req, ml))
++
++    def test_validators_kwarg_none(self) -> None:
++        """
++        Omitting validators= (or passing None) attaches nothing.
++        """
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input('A: ')
++        self.assertEqual(w1.get_validators(), ())
++
++        w2 = menu.add.text_input('B: ', validators=None)
++        self.assertEqual(w2.get_validators(), ())
++
++    def test_validators_kwarg_rejects_non_callable(self) -> None:
++        """
++        Non-callable entries in validators= are rejected.
++        """
++        menu = MenuUtils.generic_menu()
++        self.assertRaises(
++            AssertionError,
++            lambda: menu.add.text_input('A: ', validators=['not callable'])
++        )
++
++    # noinspection PyTypeChecker
++    def test_validators_kwarg_with_style_override(self) -> None:
++        """
++        validators= kwarg combines with per-widget style override kwargs.
++        """
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input(
++            'Name: ',
++            validators=[Required()],
++            validation_error_border_color=(0, 255, 0),
++            validation_error_border_width=5,
++            validation_error_font_size=20
++        )
++        self.assertEqual(len(w.get_validators()), 1)
++        self.assertEqual(w._validation_error_style['border_color'], (0, 255, 0, 255))
++        self.assertEqual(w._validation_error_style['border_width'], 5)
++        self.assertEqual(w._validation_error_style['font_size'], 20)
++
++    def test_validator_abstract(self) -> None:
++        """
++        Validator base class cannot be instantiated directly.
++        """
++        self.assertRaises(TypeError, Validator)
