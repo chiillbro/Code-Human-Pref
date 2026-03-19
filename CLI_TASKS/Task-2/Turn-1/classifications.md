@@ -46,15 +46,15 @@
 
 ## 2. Axis Ratings & Preference
 
-| Axis                          | Rating |
-|-------------------------------|--------|
-| Logic and correctness         | 6 - Model B Slightly Preferred |
-| Naming and clarity            | 7 - Model B Medium Preferred |
+| Axis                          | Rating                          |
+| ----------------------------- | ------------------------------- |
+| Logic and correctness         | 6 - Model B Slightly Preferred  |
+| Naming and clarity            | 7 - Model B Medium Preferred    |
 | Organization and modularity   | 4 - Model A Minimally Preferred |
-| Interface design              | 6 - Model B Slightly Preferred |
+| Interface design              | 6 - Model B Slightly Preferred  |
 | Error handling and robustness | 5 - Model B Minimally Preferred |
-| Comments and documentation    | 6 - Model B Slightly Preferred |
-| Review/production readiness   | 7 - Model B Medium Preferred |
+| Comments and documentation    | 6 - Model B Slightly Preferred  |
+| Review/production readiness   | 7 - Model B Medium Preferred    |
 
 **Choose the final better answer:** **6 - Model B Slightly Preferred**
 
@@ -69,11 +69,8 @@ Model B is the better response here, primarily because it follows the codebase's
 ## 4. Next Step / Follow-Up Prompt (Turn 2)
 
 > A few things to address from the tooltip implementation:
-> 
+>
 > 1. **Surface caching**: You're rebuilding the tooltip surface every frame in `_draw_tooltip` — that's a `font.render()` call, a `Surface` create, a `fill`, multiple `blit`s, and a `draw.rect` call happening 30-60 times per second for a static text box. Cache the rendered tooltip surface on the widget or menu level and only invalidate it when the tooltip text changes.
-> 
 > 2. **Word-wrapping**: Long tooltip text currently renders as a single unwrapped line that can extend way past the window edge. Add word-wrapping logic that breaks text at word boundaries to fit within a `widget_tooltip_max_width` theme property (default something reasonable like 300px). The `\n` splitting you already have should still work for explicit line breaks.
-> 
 > 3. **Boundary positioning**: The horizontal overflow case just clamps to `sw - box_w`, which means the tooltip can sit right on top of the cursor. Flip it to the left of the cursor (like you do vertically) when it would overflow the right edge, and clamp to 0 as a fallback so it never goes off-screen on any edge.
-> 
 > 4. **Empty-string tooltip overhead**: Right now `_filter_widget_attributes` defaults `tooltip` to `''`, so `set_tooltip(text='', ...)` gets called for every single widget even when no tooltip is wanted. Change the default to `None` and skip the `set_tooltip` call in `_configure_widget` when it's `None` — no need to run that code path for widgets that don't use tooltips.
