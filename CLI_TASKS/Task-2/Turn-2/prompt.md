@@ -1,0 +1,7 @@
+hey good work there, few things to address, firstly, you're rebuilding the tooltip surface every frame in _draw_tooltip that's a font.render() call, a Surface create, a fill multiple
+  blit's and draw.rect call happening 30 to 60 times per second for a normal and static text box, so pleae cache the rendered tooltip surface on the widget or menu level and only
+  trigger it again when the tooltip text changes. there's no word wrapping logic implemented, please add this which will break text at word boundaries to fit in the limited
+  wiget_tooltip_max_width theme property (please have a default with some reasonable). next, right now, the horizontal overflow case just clamps to sw - box_w where the tooltip right
+  now can sit on top of the cursor. flipt it to the left of the cursor (like you do vertically) when it would overflow the right edge and clamp to 0 as a fallback so it never goes from
+  the screen on any edge. and lastly, right now _filter_widget_attributes defaults tooltip to '' empty string, so set_tooltip(text='', ...) is getting called for every single widget een
+  when no toolitp is wanted. change the default to None and skip the set_tooltip call in _configure_widget when it is None
