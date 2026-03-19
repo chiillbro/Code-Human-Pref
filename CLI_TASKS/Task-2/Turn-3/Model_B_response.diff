@@ -1,0 +1,1278 @@
+diff --git a/pygame_menu/_widgetmanager.py b/pygame_menu/_widgetmanager.py
+index 2c2df22f..9d52ac22 100644
+--- a/pygame_menu/_widgetmanager.py
++++ b/pygame_menu/_widgetmanager.py
+@@ -31,21 +31,21 @@ from pygame_menu.widgets.widget.none import NoneWidgetManager
+ from pygame_menu.widgets.widget.progressbar import ProgressBarManager
+ from pygame_menu.widgets.widget.rangeslider import RangeSliderManager
+ from pygame_menu.widgets.widget.selector import SelectorManager
+ from pygame_menu.widgets.widget.surface import SurfaceWidgetManager
+ from pygame_menu.widgets.widget.table import TableManager
+ from pygame_menu.widgets.widget.textinput import TextInputManager
+ from pygame_menu.widgets.widget.toggleswitch import ToggleSwitchManager
+ from pygame_menu.widgets.widget.vfill import VFillManager
+ from pygame_menu.widgets.widget.vmargin import VMarginManager
+ 
+-from pygame_menu._types import Any, Dict, PaddingInstance
++from pygame_menu._types import Any, Dict, NumberInstance, PaddingInstance
+ 
+ 
+ # noinspection PyProtectedMember
+ class WidgetManager(
+     Base,
+     ButtonManager,
+     ColorInputManager,
+     DropSelectManager,
+     DropSelectMultipleManager,
+     FrameManager,
+@@ -240,20 +240,31 @@ class WidgetManager(
+         # shadow
+         attributes['shadow_aa'] = kwargs.pop('shadow_aa', self._theme.widget_shadow_aa)
+         attributes['shadow_color'] = kwargs.pop('shadow_color', self._theme.widget_shadow_color)
+         attributes['shadow_radius'] = kwargs.pop('shadow_radius', self._theme.widget_shadow_radius)
+         attributes['shadow_type'] = kwargs.pop('shadow_type', self._theme.widget_shadow_type)
+         attributes['shadow_width'] = kwargs.pop('shadow_width', self._theme.widget_shadow_width)
+ 
+         # tab_size
+         attributes['tab_size'] = kwargs.pop('tab_size', self._theme.widget_tab_size)
+ 
++        # tooltip
++        tooltip = kwargs.pop('tooltip', None)
++        assert tooltip is None or isinstance(tooltip, str), \
++            'tooltip must be a string or None'
++        attributes['tooltip'] = tooltip
++        tooltip_delay_ms = kwargs.pop('tooltip_delay_ms', None)
++        assert tooltip_delay_ms is None or \
++            (isinstance(tooltip_delay_ms, NumberInstance) and tooltip_delay_ms >= 0), \
++            'tooltip_delay_ms must be a number equal or greater than zero'
++        attributes['tooltip_delay_ms'] = tooltip_delay_ms
++
+         return attributes
+ 
+     def _configure_widget(self, widget: 'Widget', **kwargs) -> None:
+         assert isinstance(widget, Widget)
+         widget._verbose = self._verbose
+ 
+         widget.set_alignment(
+             align=kwargs['align']
+         )
+ 
+@@ -313,20 +324,30 @@ class WidgetManager(
+         )
+ 
+         widget.set_selection_effect(
+             selection=kwargs['selection_effect']
+         )
+ 
+         widget.set_tab_size(
+             tab_size=kwargs['tab_size']
+         )
+ 
++        # Always route the delay through the public API so no direct attribute
++        # mutations happen here. Use the theme default when no per-widget
++        # override was requested.
++        widget.set_tooltip(
++            text=kwargs['tooltip'],
++            delay_ms=kwargs['tooltip_delay_ms']
++            if kwargs['tooltip_delay_ms'] is not None
++            else self._theme.widget_tooltip_delay_ms
++        )
++
+         widget.shadow(
+             aa_amount=kwargs['shadow_aa'],
+             color=kwargs['shadow_color'],
+             corner_radius=kwargs['shadow_radius'],
+             shadow_type=kwargs['shadow_type'],
+             shadow_width=kwargs['shadow_width']
+         )
+ 
+         if self._theme.widget_background_inflate_to_selection:
+             widget.background_inflate_to_selection_effect()
+diff --git a/pygame_menu/menu.py b/pygame_menu/menu.py
+index 4dcc083c..da887b83 100644
+--- a/pygame_menu/menu.py
++++ b/pygame_menu/menu.py
+@@ -18,34 +18,35 @@ import pygame
+ import pygame.gfxdraw as gfxdraw
+ import pygame_menu.events as _events
+ 
+ from pygame_menu._base import Base
+ from pygame_menu._decorator import Decorator
+ from pygame_menu._widgetmanager import WidgetManager
+ from pygame_menu.controls import Controller
+ from pygame_menu.locals import ALIGN_CENTER, ALIGN_LEFT, ALIGN_RIGHT, \
+     ORIENTATION_HORIZONTAL, ORIENTATION_VERTICAL, FINGERDOWN, FINGERUP, FINGERMOTION
+ from pygame_menu._scrollarea import ScrollArea, get_scrollbars_from_position
++from pygame_menu.font import get_font, FontType
+ from pygame_menu.sound import Sound
+ from pygame_menu.themes import Theme, THEME_DEFAULT
+ from pygame_menu.utils import assert_vector, make_surface, warn, \
+     check_key_pressed_valid, mouse_motion_current_mouse_position, get_finger_pos, \
+     print_menu_widget_structure
+ from pygame_menu.widgets import Frame, Widget, MenuBar
+ from pygame_menu.widgets.core.widget import check_widget_mouseleave, WIDGET_MOUSEOVER
+ 
+ # Import types
+ from pygame_menu._types import Callable, Any, Dict, NumberType, VectorType, \
+     Vector2NumberType, Union, Tuple, List, Vector2IntType, Vector2BoolType, \
+     Tuple4Tuple2IntType, Tuple2IntType, MenuColumnMaxWidthType, MenuColumnMinWidthType, \
+     MenuRowsType, Optional, Tuple2BoolType, NumberInstance, VectorInstance, EventType, \
+-    EventVectorType, EventListType, CallableNoArgsType
++    EventVectorType, EventListType, CallableNoArgsType, ColorType
+ 
+ # Joy events
+ JOY_EVENT_LEFT = 1
+ JOY_EVENT_RIGHT = 2
+ JOY_EVENT_UP = 4
+ JOY_EVENT_DOWN = 8
+ 
+ # Select types
+ SELECT_KEY = 'key'
+ SELECT_MOUSE_BUTTON_DOWN = 'mouse_button_down'
+@@ -150,20 +151,22 @@ class Menu(Base):
+     _position_default: Tuple2IntType
+     _position_relative: bool
+     _prev: Optional[List[Union['Menu', List['Menu']]]]
+     _runtime_errors: '_MenuRuntimeErrorConfig'
+     _scrollarea: 'ScrollArea'
+     _scrollarea_margin: List[int]
+     _sound: 'Sound'
+     _stats: '_MenuStats'
+     _submenus: Dict['Menu', List['Widget']]
+     _theme: 'Theme'
++    _tooltip_font: Optional['pygame.font.Font']
++    _tooltip_font_key: Optional[Tuple[FontType, int]]
+     _top: 'Menu'
+     _touchscreen: bool
+     _touchscreen_motion_selection: bool
+     _translate: Tuple2IntType
+     _update_frames: List['Frame']  # Stores the reference of scrollable frames to check inputs
+     _update_widgets: List['Widget']  # Stores widgets which should always update
+     _used_columns: int
+     _validate_frame_widgetmove: bool
+     _widget_columns: Dict[int, List['Widget']]
+     _widget_max_position: Tuple2IntType
+@@ -360,20 +363,22 @@ class Menu(Base):
+         self._index = -1  # Selected index, if -1 the widget does not have been selected yet
+         self._last_scroll_thickness = [(0, 0), 0]  # scroll and the number of recursive states
+         self._last_selected_type = ''  # Last type selection, used for test purposes
+         self._mainloop = False  # Menu is in mainloop state
+         self._onclose = None  # Function or event called on Menu close
+         self._render_enabled = True
+         self._sound = Sound()
+         self._stats = _MenuStats()
+         self._submenus = {}
+         self._theme = theme
++        self._tooltip_font = None
++        self._tooltip_font_key = None
+ 
+         # Set callbacks
+         self.set_onclose(onclose)
+         self.set_onreset(onreset)
+ 
+         self._onbeforeopen = None
+         self._onmouseleave = None
+         self._onmouseover = None
+         self._onupdate = None
+         self._onwidgetchange = None
+@@ -2083,20 +2088,24 @@ class Menu(Base):
+                 selected_widget_draw[0].draw_after_if_selected(selected_widget_draw[1])
+ 
+             self._current._stats.draw_update_cached += 1
+ 
+         self._current._scrollarea.draw(surface)
+         self._current._menubar.draw(surface)
+ 
+         # Draw focus on selected if the widget is active
+         self._current._draw_focus_widget(surface, self._current.get_selected_widget())
+         self._current._decorator.draw_post(surface)
++
++        # Draw tooltip of hovered widget on top of everything else
++        self._current._draw_tooltip(surface)
++
+         self._current._stats.draw += 1
+ 
+         # Update cursor if not mainloop
+         if self._current._mainloop:
+             check_widget_mouseleave()
+ 
+         return self._current
+ 
+     def _draw_focus_widget(
+             self,
+@@ -2161,20 +2170,218 @@ class Menu(Base):
+             # .------------------.
+             coords[1] = (0, 0), (window_width, 0), (window_width, y1 - 1), (0, y1 - 1)
+             coords[2] = (0, y1), (x1 - 1, y1), (x1 - 1, y2 - 1), (0, y2 - 1)
+             coords[3] = (x2, y1), (window_width, y1), (window_width, y2 - 1), (x2, y2 - 1)
+             coords[4] = (0, y2), (window_width, y2), (window_width, window_height), (0, window_height)
+ 
+         for area in coords:
+             gfxdraw.filled_polygon(surface, coords[area], self._theme.focus_background_color)
+         return coords
+ 
++    @staticmethod
++    def _wrap_tooltip_text(
++            font: 'pygame.font.Font',
++            text: str,
++            max_text_width: int
++    ) -> List[str]:
++        """
++        Split ``text`` into display lines.
++
++        Explicit newline characters always start a new line. Within each
++        paragraph, words are accumulated greedily until the next word would
++        exceed ``max_text_width`` pixels, at which point a new line begins.
++        A single word that is already wider than the limit is emitted on its
++        own line rather than being broken mid-word. If ``max_text_width``
++        is ``0`` or negative wrapping is disabled and each paragraph becomes
++        exactly one line.
++
++        :param font: Pygame font used to measure word widths
++        :param text: Raw tooltip text (may contain ``\\n``)
++        :param max_text_width: Maximum rendered line width in px; ``<= 0`` disables wrapping
++        :return: List of line strings ready for rendering
++        """
++        lines: List[str] = []
++        for paragraph in text.split('\n'):
++            if max_text_width <= 0:
++                lines.append(paragraph)
++                continue
++            words = paragraph.split(' ')
++            cur = ''
++            for word in words:
++                candidate = word if cur == '' else cur + ' ' + word
++                if font.size(candidate)[0] <= max_text_width:
++                    cur = candidate
++                else:
++                    if cur != '':
++                        lines.append(cur)
++                    cur = word  # Oversized word starts a new line alone
++            lines.append(cur)
++        return lines if lines else ['']
++
++    @staticmethod
++    def _build_tooltip_surface(
++            font: 'pygame.font.Font',
++            lines: List[str],
++            antialias: bool,
++            font_color: ColorType,
++            background_color: ColorType,
++            border_color: ColorType,
++            border_width: int,
++            pad_x: int,
++            pad_y: int
++    ) -> 'pygame.Surface':
++        """
++        Render ``lines`` of text into a single padded, optionally bordered
++        tooltip :py:class:`pygame.Surface`.
++
++        :param font: Pygame font for rendering
++        :param lines: Pre-wrapped lines from :py:meth:`_wrap_tooltip_text`
++        :param antialias: Whether to render with antialiasing
++        :param font_color: Text colour
++        :param background_color: Box fill colour
++        :param border_color: Border colour (ignored when ``border_width == 0``)
++        :param border_width: Border thickness in px; ``0`` disables the border
++        :param pad_x: Horizontal inner padding in px
++        :param pad_y: Vertical inner padding in px
++        :return: Composited tooltip surface
++        """
++        line_surfaces = [
++            font.render(line, antialias, font_color)
++            for line in lines
++        ]
++        text_w = max(s.get_width() for s in line_surfaces)
++        text_h = sum(s.get_height() for s in line_surfaces)
++        box = make_surface(max(1, text_w + 2 * pad_x), max(1, text_h + 2 * pad_y), alpha=True)
++        box.fill(background_color)
++        y = pad_y
++        for s in line_surfaces:
++            box.blit(s, (pad_x, y))
++            y += s.get_height()
++        if border_width > 0:
++            pygame.draw.rect(box, border_color, box.get_rect(), border_width)
++        return box
++
++    @staticmethod
++    def _position_tooltip(
++            box_w: int,
++            box_h: int,
++            mx: int,
++            my: int,
++            ox: int,
++            oy: int,
++            sw: int,
++            sh: int
++    ) -> Tuple[int, int]:
++        """
++        Compute the on-screen position for a tooltip box so it appears near
++        the mouse cursor without leaving the target surface.
++
++        The tooltip is placed to the right of and below the cursor by the
++        margin offset ``(ox, oy)``. When it would overflow the right edge it
++        is flipped to the left of the cursor; when it would overflow the
++        bottom edge it is flipped above. After flipping, a final clamp
++        guarantees the box stays fully on-screen even on very small surfaces.
++
++        :param box_w: Tooltip box width in px
++        :param box_h: Tooltip box height in px
++        :param mx: Mouse cursor x coordinate
++        :param my: Mouse cursor y coordinate
++        :param ox: Horizontal margin offset in px
++        :param oy: Vertical margin offset in px
++        :param sw: Target surface width in px
++        :param sh: Target surface height in px
++        :return: ``(tx, ty)`` top-left blit coordinates
++        """
++        tx = mx + ox
++        if tx + box_w > sw:
++            tx = mx - ox - box_w  # Flip: right of cursor → left of cursor
++        tx = max(0, min(tx, sw - box_w))
++
++        ty = my + oy
++        if ty + box_h > sh:
++            ty = my - oy - box_h  # Flip: below cursor → above cursor
++        ty = max(0, min(ty, sh - box_h))
++
++        return tx, ty
++
++    # noinspection PyProtectedMember
++    def _draw_tooltip(self, surface: 'pygame.Surface') -> None:
++        """
++        Draw the tooltip of the currently hovered widget (if any) near the
++        mouse cursor, on top of every other Menu element. Called as the last
++        step of :py:meth:`Menu.draw`.
++
++        :param surface: Pygame surface to draw on
++        """
++        widget: Optional['Widget'] = WIDGET_MOUSEOVER[0]
++        if widget is None or widget.get_menu() is not self:
++            return
++        tooltip = widget.get_tooltip()
++        if tooltip == '':
++            return
++        if widget.get_mouseover_time() < widget._tooltip_delay_ms:
++            return
++
++        theme = self._theme
++
++        # Cache key: any change to text or a rendering-relevant theme attr
++        # causes the surface to be rebuilt on the next draw call.
++        cache_key = (
++            tooltip,
++            theme.widget_tooltip_font,
++            theme.widget_tooltip_font_size,
++            theme.widget_tooltip_font_antialias,
++            theme.widget_tooltip_font_color,
++            theme.widget_tooltip_background_color,
++            theme.widget_tooltip_border_color,
++            theme.widget_tooltip_border_width,
++            theme.widget_tooltip_padding,
++            theme.widget_tooltip_max_width
++        )
++
++        if widget._tooltip_surface is None or widget._tooltip_surface_key != cache_key:
++            # Lazily (re)build the shared tooltip font when font settings change.
++            font_key = (theme.widget_tooltip_font, theme.widget_tooltip_font_size)
++            if self._tooltip_font is None or self._tooltip_font_key != font_key:
++                self._tooltip_font = get_font(
++                    theme.widget_tooltip_font,
++                    theme.widget_tooltip_font_size
++                )
++                self._tooltip_font_key = font_key
++
++            pad_x, pad_y = theme.widget_tooltip_padding
++            max_text_w = (theme.widget_tooltip_max_width - 2 * pad_x
++                          if theme.widget_tooltip_max_width > 0 else 0)
++
++            lines = self._wrap_tooltip_text(self._tooltip_font, tooltip, max_text_w)
++            widget._tooltip_surface = self._build_tooltip_surface(
++                font=self._tooltip_font,
++                lines=lines,
++                antialias=theme.widget_tooltip_font_antialias,
++                font_color=theme.widget_tooltip_font_color,
++                background_color=theme.widget_tooltip_background_color,
++                border_color=theme.widget_tooltip_border_color,
++                border_width=theme.widget_tooltip_border_width,
++                pad_x=pad_x,
++                pad_y=pad_y
++            )
++            widget._tooltip_surface_key = cache_key
++
++        box = widget._tooltip_surface
++        box_w, box_h = box.get_size()
++        mx, my = pygame.mouse.get_pos()
++        ox, oy = theme.widget_tooltip_margin
++        sw, sh = surface.get_width(), surface.get_height()
++
++        tx, ty = self._position_tooltip(box_w, box_h, mx, my, ox, oy, sw, sh)
++        surface.blit(box, (tx, ty))
++
+     def set_controller(self, controller: 'Controller', apply_to_widgets: bool = False) -> 'Menu':
+         """
+         Set a new controller object.
+ 
+         .. note::
+ 
+             This is applied only to the base Menu (not the currently displayed,
+             stored in ``_current`` pointer); for such behaviour apply to
+             :py:meth:`pygame_menu.menu.Menu.get_current` object.
+ 
+diff --git a/pygame_menu/themes.py b/pygame_menu/themes.py
+index 680df55c..33538d81 100644
+--- a/pygame_menu/themes.py
++++ b/pygame_menu/themes.py
+@@ -230,20 +230,42 @@ class Theme(object):
+     :param widget_shadow_color: The color of the widget shadow
+     :type widget_shadow_color: tuple, list, str, int, :py:class:`pygame.Color`
+     :param widget_shadow_radius: The border radius of the widget shadow
+     :type widget_shadow_radius: int
+     :param widget_shadow_type: The shadow type, it can be 'rectangular' or 'ellipse'
+     :type widget_shadow_type: str
+     :param widget_shadow_width: The width of the shadow in px
+     :type widget_shadow_width: int
+     :param widget_tab_size: Widget tab size
+     :type widget_tab_size: int
++    :param widget_tooltip_background_color: Background color of widget tooltip box
++    :type widget_tooltip_background_color: tuple, list, str, int, :py:class:`pygame.Color`
++    :param widget_tooltip_border_color: Border color of widget tooltip box
++    :type widget_tooltip_border_color: tuple, list, str, int, :py:class:`pygame.Color`
++    :param widget_tooltip_border_width: Border width of widget tooltip box in px. If ``0`` the border is disabled
++    :type widget_tooltip_border_width: int
++    :param widget_tooltip_delay_ms: Hover delay in milliseconds before widget tooltip is displayed
++    :type widget_tooltip_delay_ms: int, float
++    :param widget_tooltip_font: Widget tooltip font path or name
++    :type widget_tooltip_font: str, :py:class:`pathlib.Path`, :py:class:`pygame.font.Font`
++    :param widget_tooltip_font_antialias: Widget tooltip font renders with antialiasing
++    :type widget_tooltip_font_antialias: bool
++    :param widget_tooltip_font_color: Color of the tooltip font
++    :type widget_tooltip_font_color: tuple, list, str, int, :py:class:`pygame.Color`
++    :param widget_tooltip_font_size: Font size of widget tooltip in px
++    :type widget_tooltip_font_size: int
++    :param widget_tooltip_margin: Offset in px of tooltip box relative to mouse cursor in x/y axis
++    :type widget_tooltip_margin: tuple, list
++    :param widget_tooltip_max_width: Maximum width in px of tooltip box before text is wrapped at word boundaries. If ``0`` word-wrapping is disabled
++    :type widget_tooltip_max_width: int
++    :param widget_tooltip_padding: Inner padding in px of tooltip box in x/y axis
++    :type widget_tooltip_padding: tuple, list
+     :param widget_url_color: Color of url text links
+     :type widget_url_color: tuple, list, str, int, :py:class:`pygame.Color`
+     """
+     _disable_validation: bool
+     background_color: Union[ColorType, 'BaseImage']
+     border_color: Union[ColorType, 'BaseImage']
+     cursor_color: ColorType
+     cursor_selection_color: ColorType
+     cursor_switch_ms: NumberType
+     focus_background_color: ColorType
+@@ -312,20 +334,31 @@ class Theme(object):
+     widget_margin: Tuple2NumberType
+     widget_offset: Tuple2NumberType
+     widget_padding: PaddingType
+     widget_selection_effect: 'pygame_menu.widgets.core.Selection'
+     widget_shadow_aa: int
+     widget_shadow_color: ColorType
+     widget_shadow_radius: int
+     widget_shadow_type: str
+     widget_shadow_width: int
+     widget_tab_size: int
++    widget_tooltip_background_color: ColorType
++    widget_tooltip_border_color: ColorType
++    widget_tooltip_border_width: int
++    widget_tooltip_delay_ms: NumberType
++    widget_tooltip_font: FontType
++    widget_tooltip_font_antialias: bool
++    widget_tooltip_font_color: ColorType
++    widget_tooltip_font_size: int
++    widget_tooltip_margin: Tuple2IntType
++    widget_tooltip_max_width: int
++    widget_tooltip_padding: Tuple2IntType
+     widget_url_color: ColorType
+ 
+     def __init__(self, **kwargs) -> None:
+ 
+         # Menu general
+         self.background_color = self._get(kwargs, 'background_color', 'color_image', (220, 220, 220))
+         self.border_color = self._get(kwargs, 'border_color', 'color_image_none')
+         self.border_width = self._get(kwargs, 'border_width', int, 0)
+         self.focus_background_color = self._get(kwargs, 'focus_background_color', 'color', (0, 0, 0, 180))
+         self.fps = self._get(kwargs, 'fps', NumberInstance, 30)
+@@ -407,20 +440,31 @@ class Theme(object):
+         self.widget_margin = self._get(kwargs, 'widget_margin', 'tuple2', (0, 0))
+         self.widget_offset = self._get(kwargs, 'widget_offset', 'tuple2', (0, 0))
+         self.widget_padding = self._get(kwargs, 'widget_padding', PaddingInstance, (4, 8))
+         self.widget_selection_effect = self._get(kwargs, 'widget_selection_effect', Selection, HighlightSelection(margin_x=0, margin_y=0))
+         self.widget_shadow_aa = self._get(kwargs, 'widget_shadow_aa', int, 4)
+         self.widget_shadow_color = self._get(kwargs, 'widget_shadow_color', 'color', (0, 0, 0))
+         self.widget_shadow_radius = self._get(kwargs, 'widget_shadow_radius', int, 0)
+         self.widget_shadow_type = self._get(kwargs, 'widget_shadow_type', str, WIDGET_SHADOW_TYPE_RECTANGULAR)
+         self.widget_shadow_width = self._get(kwargs, 'widget_shadow_width', int, 0)
+         self.widget_tab_size = self._get(kwargs, 'widget_tab_size', int, 4)
++        self.widget_tooltip_background_color = self._get(kwargs, 'widget_tooltip_background_color', 'color', (255, 255, 230))
++        self.widget_tooltip_border_color = self._get(kwargs, 'widget_tooltip_border_color', 'color', (40, 40, 40))
++        self.widget_tooltip_border_width = self._get(kwargs, 'widget_tooltip_border_width', int, 1)
++        self.widget_tooltip_delay_ms = self._get(kwargs, 'widget_tooltip_delay_ms', NumberInstance, 500)
++        self.widget_tooltip_font = self._get(kwargs, 'widget_tooltip_font', 'font', FONT_OPEN_SANS)
++        self.widget_tooltip_font_antialias = self._get(kwargs, 'widget_tooltip_font_antialias', bool, True)
++        self.widget_tooltip_font_color = self._get(kwargs, 'widget_tooltip_font_color', 'color', (20, 20, 20))
++        self.widget_tooltip_font_size = self._get(kwargs, 'widget_tooltip_font_size', int, 16)
++        self.widget_tooltip_margin = self._get(kwargs, 'widget_tooltip_margin', 'tuple2int', (16, 16))
++        self.widget_tooltip_max_width = self._get(kwargs, 'widget_tooltip_max_width', int, 300)
++        self.widget_tooltip_padding = self._get(kwargs, 'widget_tooltip_padding', 'tuple2int', (6, 3))
+         self.widget_url_color = self._get(kwargs, 'widget_url_color', 'color', (6, 69, 173))
+ 
+         # Upon this, no more kwargs should exist, raise exception if there's more
+         for invalid_keyword in kwargs.keys():
+             raise ValueError(f'parameter Theme.{invalid_keyword} does not exist')
+ 
+         # Test purpose only, if True disables any validation
+         self._disable_validation = False
+ 
+     def validate(self) -> 'Theme':
+@@ -438,28 +482,30 @@ class Theme(object):
+ 
+         # Boolean asserts
+         assert isinstance(self.scrollbar_shadow, bool)
+         assert isinstance(self.title_bar_modify_scrollarea, bool)
+         assert isinstance(self.title_close_button, bool)
+         assert isinstance(self.title_font_antialias, bool)
+         assert isinstance(self.title_font_shadow, bool)
+         assert isinstance(self.widget_font_antialias, bool)
+         assert isinstance(self.widget_font_background_color_from_menu, bool)
+         assert isinstance(self.widget_font_shadow, bool)
++        assert isinstance(self.widget_tooltip_font_antialias, bool)
+ 
+         # Value type checks
+         assert_alignment(self.widget_alignment)
+         assert_cursor(self.scrollbar_cursor)
+         assert_cursor(self.title_close_button_cursor)
+         assert_cursor(self.widget_cursor)
+         assert_font(self.title_font)
+         assert_font(self.widget_font)
++        assert_font(self.widget_tooltip_font)
+         assert_position(self.scrollbar_shadow_position)
+         assert_position(self.title_font_shadow_position)
+         assert_position(self.widget_font_shadow_position)
+         assert_position_vector(self.widget_border_position)
+ 
+         assert _check_menubar_style(self.title_bar_style)
+         assert get_scrollbars_from_position(self.scrollarea_position) is not None
+ 
+         # Check selection effect if None
+         if self.widget_selection_effect is None:
+@@ -481,20 +527,24 @@ class Theme(object):
+         assert isinstance(self.widget_border_width, int)
+         assert isinstance(self.widget_box_border_width, int)
+         assert isinstance(self.widget_font_shadow_offset, int)
+         assert isinstance(self.widget_font_size, int)
+         assert isinstance(self.widget_padding, PaddingInstance)
+         assert isinstance(self.widget_selection_effect, Selection)
+         assert isinstance(self.widget_shadow_aa, int)
+         assert isinstance(self.widget_shadow_radius, int)
+         assert isinstance(self.widget_shadow_width, int)
+         assert isinstance(self.widget_tab_size, int)
++        assert isinstance(self.widget_tooltip_border_width, int)
++        assert isinstance(self.widget_tooltip_delay_ms, NumberInstance)
++        assert isinstance(self.widget_tooltip_font_size, int)
++        assert isinstance(self.widget_tooltip_max_width, int)
+ 
+         # Format colors, this converts all color lists to tuples automatically,
+         # if it is an image, return the same object
+         self.background_color = self._format_color_opacity(self.background_color)
+         self.border_color = self._format_color_opacity(self.border_color, none=True)
+         self.cursor_color = self._format_color_opacity(self.cursor_color)
+         self.cursor_selection_color = self._format_color_opacity(self.cursor_selection_color)
+         self.focus_background_color = self._format_color_opacity(self.focus_background_color)
+         self.readonly_color = self._format_color_opacity(self.readonly_color)
+         self.readonly_selected_color = self._format_color_opacity(self.readonly_selected_color)
+@@ -510,20 +560,23 @@ class Theme(object):
+         self.title_font_shadow_color = self._format_color_opacity(self.title_font_shadow_color)
+         self.widget_background_color = self._format_color_opacity(self.widget_background_color, none=True)
+         self.widget_border_color = self._format_color_opacity(self.widget_border_color)
+         self.widget_box_arrow_color = self._format_color_opacity(self.widget_box_arrow_color)
+         self.widget_box_background_color = self._format_color_opacity(self.widget_box_background_color)
+         self.widget_box_border_color = self._format_color_opacity(self.widget_box_border_color)
+         self.widget_font_background_color = self._format_color_opacity(self.widget_font_background_color, none=True)
+         self.widget_font_color = self._format_color_opacity(self.widget_font_color)
+         self.widget_font_shadow_color = self._format_color_opacity(self.widget_font_shadow_color)
+         self.widget_shadow_color = self._format_color_opacity(self.widget_shadow_color)
++        self.widget_tooltip_background_color = self._format_color_opacity(self.widget_tooltip_background_color)
++        self.widget_tooltip_border_color = self._format_color_opacity(self.widget_tooltip_border_color)
++        self.widget_tooltip_font_color = self._format_color_opacity(self.widget_tooltip_font_color)
+         self.widget_url_color = self._format_color_opacity(self.widget_url_color)
+ 
+         # List to tuple
+         self.scrollarea_outer_margin = self._vec_to_tuple(self.scrollarea_outer_margin, 2, NumberInstance)
+         self.title_offset = self._vec_to_tuple(self.title_offset, 2, NumberInstance)
+         self.widget_background_inflate = self._vec_to_tuple(self.widget_background_inflate, 2, int)
+         self.widget_border_inflate = self._vec_to_tuple(self.widget_border_inflate, 2, int)
+         self.widget_box_arrow_margin = self._vec_to_tuple(self.widget_box_arrow_margin, 3, int)
+         self.widget_box_inflate = self._vec_to_tuple(self.widget_box_inflate, 2, int)
+         self.widget_box_margin = self._vec_to_tuple(self.widget_box_margin, 2, NumberInstance)
+@@ -533,20 +586,22 @@ class Theme(object):
+             assert 2 <= len(self.widget_padding) <= 4, \
+                 'widget padding tuple length must be 2, 3 or 4'
+             for p in self.widget_padding:
+                 assert isinstance(p, NumberInstance), \
+                     'each padding element must be numeric (integer or float)'
+                 assert p >= 0, \
+                     'all padding elements must be equal or greater than zero'
+         else:
+             assert self.widget_padding >= 0, 'padding cannot be a negative number'
+         self.widget_offset = self._vec_to_tuple(self.widget_offset, 2, NumberInstance)
++        self.widget_tooltip_margin = self._vec_to_tuple(self.widget_tooltip_margin, 2, int)
++        self.widget_tooltip_padding = self._vec_to_tuple(self.widget_tooltip_padding, 2, int)
+ 
+         # Check sizes
+         assert self.border_width >= 0, 'border width must be equal or greater than zero'
+         assert self.scrollarea_outer_margin[0] >= 0 and self.scrollarea_outer_margin[1] >= 0, \
+             'scroll area outer margin must be equal or greater than zero on both axis'
+         assert self.widget_offset[0] >= 0 and self.widget_offset[1] >= 0, \
+             'widget offset must be equal or greater than zero'
+         assert self.widget_background_inflate[0] >= 0 and self.widget_background_inflate[1] >= 0, \
+             'widget background inflate must be equal or greater than zero on both axis'
+         assert self.widget_border_inflate[0] >= 0 and self.widget_border_inflate[1] >= 0, \
+@@ -565,20 +620,28 @@ class Theme(object):
+         assert self.scrollbar_shadow_offset > 0, 'scrollbar shadow offset must be greater than zero'
+         assert self.scrollbar_slider_pad >= 0, 'slider pad must be equal or greater than zero'
+         assert self.scrollbar_thick > 0, 'scrollbar thickness must be greater than zero'
+         assert self.title_font_size > 0, 'title font size must be greater than zero'
+         assert self.widget_border_width >= 0, 'widget border width must be equal or greater than zero'
+         assert self.widget_box_border_width >= 0, 'widget border box width must be equal or greater than zero'
+         assert self.widget_font_shadow_offset > 0, 'widget font shadow offset must be greater than zero'
+         assert self.widget_font_size > 0, 'widget font size must be greater than zero'
+         assert self.widget_shadow_aa >= 1, 'widget shadow antialiasing must be equal or greater than one'
+         assert self.widget_tab_size >= 0, 'widget tab size must be equal or greater than zero'
++        assert self.widget_tooltip_border_width >= 0, 'widget tooltip border width must be equal or greater than zero'
++        assert self.widget_tooltip_delay_ms >= 0, 'widget tooltip delay must be equal or greater than zero'
++        assert self.widget_tooltip_font_size > 0, 'widget tooltip font size must be greater than zero'
++        assert self.widget_tooltip_margin[0] >= 0 and self.widget_tooltip_margin[1] >= 0, \
++            'widget tooltip margin must be equal or greater than zero on both axis'
++        assert self.widget_tooltip_max_width >= 0, 'widget tooltip max width must be equal or greater than zero'
++        assert self.widget_tooltip_padding[0] >= 0 and self.widget_tooltip_padding[1] >= 0, \
++            'widget tooltip padding must be equal or greater than zero on both axis'
+ 
+         # Color asserts
+         assert self.focus_background_color[3] != 0, \
+             'focus background color cannot be fully transparent, suggested opacity between 1 and 255'
+ 
+         return self
+ 
+     def set_background_color_opacity(self, opacity: float) -> 'Theme':
+         """
+         Modify the Menu background color with given opacity.
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index 11c7972b..239afe21 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -263,20 +263,21 @@ class Widget(Base):
+     _margin: Tuple2IntType
+     _max_height: List[Optional[bool]]
+     _max_width: List[Optional[bool]]
+     _menu: Optional['pygame_menu.Menu']  # Menu which contains the Widget
+     _menu_hook: Optional['pygame_menu.Menu']  # Menu the Widget points to (submenu)
+     _mouse_enabled: bool
+     _mouseleave_called: bool
+     _mouseover: bool  # Check if mouse is over
+     _mouseover_called: Optional[bool]  # Check if the mouseover/mouseleave callbacks were called
+     _mouseover_check_rect: Callable[[], 'pygame.Rect']
++    _mouseover_time: NumberType  # Time at which the mouse entered the widget
+     _onchange: CallbackType
+     _onmouseleave: CallbackMouseType
+     _onmouseover: CallbackMouseType
+     _onreturn: CallbackType
+     _onselect: CallbackSelectType
+     _padding: Tuple4IntType
+     _padding_transform: Tuple4IntType
+     _position: Tuple2IntType
+     _rect: 'pygame.Rect'
+     _rect_size_delta: Tuple2IntType
+@@ -284,20 +285,24 @@ class Widget(Base):
+     _scrollarea: Optional['pygame_menu._scrollarea.ScrollArea']  # Parent scrollarea
+     _selected: bool
+     _selection_effect: 'Selection'
+     _selection_effect_draw_post: bool
+     _selection_time: NumberType
+     _shadow: WidgetShadowType
+     _sound: 'Sound'
+     _surface: Optional['pygame.Surface']
+     _tab_size: int
+     _title: str
++    _tooltip: str
++    _tooltip_delay_ms: NumberType
++    _tooltip_surface: Optional['pygame.Surface']
++    _tooltip_surface_key: Optional[Tuple[Any, ...]]
+     _touchscreen_enabled: bool
+     _translate: Tuple2IntType  # Translation made by user
+     _translate_virtual: Tuple2IntType  # Virtual translation applied by api
+     _update_callbacks: Dict[str, Callable[[EventListType, 'Widget', 'pygame_menu.Menu'], Any]]
+     _visible: bool
+     active: bool
+     configured: bool
+     force_menu_draw_focus: bool
+     is_scrollable: bool
+     is_selectable: bool
+@@ -331,29 +336,34 @@ class Widget(Base):
+         self._decorator = Decorator(self)
+         self._default_value = _WidgetNoValue()
+         self._events = []
+         self._frame = None
+         self._margin = (0, 0)
+         self._max_height = [None, False, True]  # size, width_scale, smooth
+         self._max_width = [None, False, True]  # size, height_scale, smooth
+         self._mouseleave_called = False
+         self._mouseover = False
+         self._mouseover_called = None
++        self._mouseover_time = 0
+         self._padding = (0, 0, 0, 0)  # top, right, bottom, left
+         self._padding_transform = (0, 0, 0, 0)
+         self._position = (0, 0)
+         self._scrollarea = None  # Widget scrollarea container
+         self._selected = False  # Use select() to modify this status
+         self._selection_time = 0
+         self._sound = Sound()
+         self._tab_size = 0  # Tab spaces
+         self._title = str(title)
++        self._tooltip = ''
++        self._tooltip_delay_ms = 500
++        self._tooltip_surface = None
++        self._tooltip_surface_key = None
+         self._visible = True  # Use show() or hide() to modify this status
+ 
+         # If True, the widget don't contribute width/height to the Menu widget
+         # positioning computation. Use .set_float() to modify this status
+         self._floating = False
+         self._floating_origin_position = False
+ 
+         # Which function is used to get the rect which checks if the widget is
+         # active or not
+         self._mouseover_check_rect = lambda: self.get_rect(to_real_position=True)
+@@ -701,26 +711,28 @@ class Widget(Base):
+         # Check if menu is active
+         menu_enabled = True if self._menu is None else self._menu.is_enabled()
+ 
+         # Check if mouse is over the widget, the widget must be visible
+         if self.is_visible() and \
+                 self._mouse_enabled and \
+                 hasattr(event, 'pos') and rect.collidepoint(*event.pos) and \
+                 menu_enabled:
+             if not self._mouseover:
+                 self._mouseover = True
++                self._mouseover_time = time.time()
+                 self.mouseover(event, check_all_widget_mouseleave)
+                 updated = True
+ 
+         else:
+             if self._mouseover:
+                 self._mouseover = False
++                self._mouseover_time = 0
+                 self.mouseleave(event, check_all_widget_mouseleave)
+                 updated = True
+ 
+         if updated and self._check_mouseleave_call_render:
+             self._render()
+ 
+         return updated
+ 
+     def set_cursor(self, cursor: CursorInputType) -> 'Widget':
+         """
+@@ -957,20 +969,69 @@ class Widget(Base):
+         .. note::
+ 
+             Not all widgets implements this method, for example, images don't
+             accept a title, and such widget would return an empty string if this
+             method is called.
+ 
+         :return: Widget title
+         """
+         return self._title
+ 
++    def set_tooltip(
++            self,
++            text: Optional[str],
++            delay_ms: Optional[NumberType] = None
++    ) -> 'Widget':
++        """
++        Set the tooltip text displayed when the mouse hovers the Widget for at
++        least ``delay_ms`` milliseconds. The tooltip is rendered by the Menu on
++        top of every other element. Pass an empty string or ``None`` as
++        ``text`` to disable the tooltip.
++
++        :param text: Tooltip text. Empty string or ``None`` disables the tooltip
++        :param delay_ms: Optional hover delay override in milliseconds. If
++            ``None`` the current Widget delay (inherited from the Menu theme)
++            is kept
++        :return: Self reference
++        """
++        new_text = '' if text is None else str(text)
++        if new_text != self._tooltip:
++            self._tooltip = new_text
++            self._tooltip_surface = None
++            self._tooltip_surface_key = None
++        if delay_ms is not None:
++            assert isinstance(delay_ms, NumberInstance) and delay_ms >= 0, \
++                'delay_ms must be a number equal or greater than zero'
++            self._tooltip_delay_ms = delay_ms
++        return self
++
++    def get_tooltip(self) -> str:
++        """
++        Return the Widget tooltip text. Returns an empty string if the Widget
++        has no tooltip configured.
++
++        :return: Tooltip text
++        """
++        return self._tooltip
++
++    def get_mouseover_time(self) -> NumberType:
++        """
++        Return the time in milliseconds that the mouse has been continuously
++        hovering the Widget. If the mouse is not currently over the Widget,
++        return ``0``.
++
++        :return: Time in milliseconds
++        """
++        if not self._mouseover:
++            return 0
++        return (time.time() - self._mouseover_time) * 1000
++
+     def set_background_color(
+             self,
+             color: Optional[Union[ColorInputType, 'pygame_menu.BaseImage']],
+             inflate: Optional[Tuple2IntType] = (0, 0)
+     ) -> 'Widget':
+         """
+         Set the Widget background color.
+ 
+         :param color: Widget background color
+         :param inflate: Inflate background on x-axis and y-axis (x, y). If ``None``, the widget value is not updated
+diff --git a/test/test_tooltip.py b/test/test_tooltip.py
+new file mode 100644
+index 00000000..52a722b4
+--- /dev/null
++++ b/test/test_tooltip.py
+@@ -0,0 +1,423 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++TEST TOOLTIP
++Test widget tooltip system.
++"""
++
++__all__ = ['TooltipTest']
++
++import time
++
++from test._utils import BaseTest, MenuUtils, WIDGET_MOUSEOVER, \
++    reset_widgets_over, surface
++
++import pygame_menu
++
++
++# noinspection PyProtectedMember
++class TooltipTest(BaseTest):
++
++    def setUp(self) -> None:
++        reset_widgets_over()
++
++    def tearDown(self) -> None:
++        reset_widgets_over()
++
++    def test_widget_tooltip_api(self) -> None:
++        """
++        Test set_tooltip / get_tooltip / get_mouseover_time on the base
++        Widget class.
++        """
++        menu = MenuUtils.generic_menu()
++        btn = menu.add.button('Button')
++
++        # Default: no tooltip
++        self.assertEqual(btn.get_tooltip(), '')
++
++        # Set tooltip text
++        self.assertEqual(btn.set_tooltip('Hello'), btn)
++        self.assertEqual(btn.get_tooltip(), 'Hello')
++
++        # Clear tooltip with None
++        btn.set_tooltip(None)
++        self.assertEqual(btn.get_tooltip(), '')
++
++        # Set tooltip with custom delay
++        btn.set_tooltip('World', delay_ms=1000)
++        self.assertEqual(btn.get_tooltip(), 'World')
++        self.assertEqual(btn._tooltip_delay_ms, 1000)
++
++        # Invalid delay raises
++        self.assertRaises(AssertionError, lambda: btn.set_tooltip('x', delay_ms=-1))
++        self.assertRaises(AssertionError, lambda: btn.set_tooltip('x', delay_ms='bad'))
++
++        # get_mouseover_time returns 0 when not hovered
++        self.assertEqual(btn.get_mouseover_time(), 0)
++
++        # Simulate hover
++        btn._mouseover = True
++        btn._mouseover_time = time.time() - 0.05
++        self.assertGreater(btn.get_mouseover_time(), 0)
++
++        # Clear hover
++        btn._mouseover = False
++        btn._mouseover_time = 0
++        self.assertEqual(btn.get_mouseover_time(), 0)
++
++    def test_widget_tooltip_kwargs(self) -> None:
++        """
++        Test that tooltip/tooltip_delay_ms can be passed as kwargs when adding
++        a widget via the WidgetManager and that the theme default delay is
++        inherited otherwise.
++        """
++        theme = pygame_menu.themes.THEME_DEFAULT.copy()
++        theme.widget_tooltip_delay_ms = 750
++        menu = MenuUtils.generic_menu(theme=theme)
++
++        # Tooltip passed as kwarg
++        btn = menu.add.button('With tooltip', tooltip='Click me!')
++        self.assertEqual(btn.get_tooltip(), 'Click me!')
++        self.assertEqual(btn._tooltip_delay_ms, 750)
++
++        # Override delay per-widget via kwarg
++        btn2 = menu.add.button('Fast tooltip', tooltip='Quick', tooltip_delay_ms=100)
++        self.assertEqual(btn2.get_tooltip(), 'Quick')
++        self.assertEqual(btn2._tooltip_delay_ms, 100)
++
++        # No tooltip kwarg → empty tooltip, theme delay
++        btn3 = menu.add.button('No tooltip')
++        self.assertEqual(btn3.get_tooltip(), '')
++        self.assertEqual(btn3._tooltip_delay_ms, 750)
++
++    def test_theme_tooltip_attributes(self) -> None:
++        """
++        Test tooltip theme attribute defaults and validation.
++        """
++        t = pygame_menu.themes.Theme()
++        self.assertEqual(t.widget_tooltip_background_color, (255, 255, 230, 255))
++        self.assertEqual(t.widget_tooltip_border_color, (40, 40, 40, 255))
++        self.assertEqual(t.widget_tooltip_border_width, 1)
++        self.assertEqual(t.widget_tooltip_delay_ms, 500)
++        self.assertEqual(t.widget_tooltip_font_color, (20, 20, 20, 255))
++        self.assertEqual(t.widget_tooltip_font_size, 16)
++        self.assertEqual(t.widget_tooltip_margin, (16, 16))
++        self.assertEqual(t.widget_tooltip_max_width, 300)
++        self.assertEqual(t.widget_tooltip_padding, (6, 3))
++        self.assertTrue(t.widget_tooltip_font_antialias)
++        self.assertEqual(t.validate(), t)
++
++        # Custom tooltip theme via kwargs
++        t2 = pygame_menu.themes.Theme(
++            widget_tooltip_delay_ms=1000,
++            widget_tooltip_font_size=20,
++            widget_tooltip_max_width=400,
++            widget_tooltip_padding=(10, 5)
++        )
++        self.assertEqual(t2.widget_tooltip_delay_ms, 1000)
++        self.assertEqual(t2.widget_tooltip_font_size, 20)
++        self.assertEqual(t2.widget_tooltip_max_width, 400)
++        self.assertEqual(t2.widget_tooltip_padding, (10, 5))
++        self.assertEqual(t2.validate(), t2)
++
++        # Invalid values fail validation
++        t3 = pygame_menu.themes.Theme()
++        t3.widget_tooltip_delay_ms = -1
++        self.assertRaises(AssertionError, lambda: t3.validate())
++        t3.widget_tooltip_delay_ms = 500
++        t3.widget_tooltip_font_size = 0
++        self.assertRaises(AssertionError, lambda: t3.validate())
++        t3.widget_tooltip_font_size = 16
++        t3.widget_tooltip_max_width = -1
++        self.assertRaises(AssertionError, lambda: t3.validate())
++
++    def test_menu_draw_tooltip(self) -> None:
++        """
++        Test that Menu._draw_tooltip renders without errors and that the
++        tooltip is actually blitted onto the target surface.
++        """
++        menu = MenuUtils.generic_menu()
++        btn = menu.add.button('Button')
++        btn.set_tooltip('Hello, world!', delay_ms=0)
++
++        # Initial draw: nothing is hovered, tooltip must not render. The menu
++        # draw pass itself must still succeed.
++        menu.draw(surface)
++
++        # Simulate hover directly – this bypasses the event pipeline but
++        # exercises the tooltip draw path.
++        btn._mouseover = True
++        btn._mouseover_time = time.time() - 1  # Been hovering for 1 s
++        WIDGET_MOUSEOVER[0] = btn
++        WIDGET_MOUSEOVER[1] = [btn, None, []]
++
++        # Draw directly on a fresh surface and check that pixels changed
++        probe = pygame_menu.utils.make_surface(600, 600, alpha=True)
++        probe.fill((0, 0, 0, 0))
++        before = probe.copy()
++        menu._draw_tooltip(probe)
++        self.assertNotEqual(
++            probe.get_buffer().raw,
++            before.get_buffer().raw,
++            'tooltip was not drawn onto the surface'
++        )
++
++        # Full menu draw with tooltip active must not raise
++        menu.draw(surface)
++
++        # Multi-line tooltip also works
++        btn.set_tooltip('Line 1\nLine 2\nLine 3', delay_ms=0)
++        menu.draw(surface)
++
++        # Tooltip not yet elapsed → nothing drawn
++        btn.set_tooltip('Delayed', delay_ms=10000)
++        btn._mouseover_time = time.time()  # Just started hovering
++        probe2 = pygame_menu.utils.make_surface(600, 600, alpha=True)
++        probe2.fill((0, 0, 0, 0))
++        before2 = probe2.copy()
++        menu._draw_tooltip(probe2)
++        self.assertEqual(
++            probe2.get_buffer().raw,
++            before2.get_buffer().raw,
++            'tooltip was drawn before the configured delay elapsed'
++        )
++
++        # Clean up the global mouseover state
++        btn._mouseover = False
++        btn._mouseover_time = 0
++        WIDGET_MOUSEOVER[0] = None
++        WIDGET_MOUSEOVER[1] = []
++
++    def test_menu_draw_tooltip_skips_other_menu(self) -> None:
++        """
++        If the hovered widget belongs to a different Menu instance the tooltip
++        must not be drawn by this Menu.
++        """
++        menu_a = MenuUtils.generic_menu()
++        menu_b = MenuUtils.generic_menu()
++        btn_b = menu_b.add.button('Foreign')
++        btn_b.set_tooltip('Not mine', delay_ms=0)
++
++        btn_b._mouseover = True
++        btn_b._mouseover_time = time.time() - 1
++        WIDGET_MOUSEOVER[0] = btn_b
++        WIDGET_MOUSEOVER[1] = [btn_b, None, []]
++
++        probe = pygame_menu.utils.make_surface(600, 600, alpha=True)
++        probe.fill((0, 0, 0, 0))
++        before = probe.copy()
++        menu_a._draw_tooltip(probe)
++        self.assertEqual(
++            probe.get_buffer().raw,
++            before.get_buffer().raw,
++            'menu_a drew a tooltip for a widget belonging to menu_b'
++        )
++
++        # Clean up
++        btn_b._mouseover = False
++        btn_b._mouseover_time = 0
++        WIDGET_MOUSEOVER[0] = None
++        WIDGET_MOUSEOVER[1] = []
++
++    def test_tooltip_surface_cache(self) -> None:
++        """
++        Test that the tooltip surface is rendered once and cached, then
++        reused on subsequent draws, and invalidated when the tooltip text or
++        any relevant theme attribute changes.
++        """
++        theme = pygame_menu.themes.THEME_DEFAULT.copy()
++        menu = MenuUtils.generic_menu(theme=theme)
++        btn = menu.add.button('Button')
++        btn.set_tooltip('Cached text', delay_ms=0)
++
++        btn._mouseover = True
++        btn._mouseover_time = time.time() - 1
++        WIDGET_MOUSEOVER[0] = btn
++        WIDGET_MOUSEOVER[1] = [btn, None, []]
++
++        probe = pygame_menu.utils.make_surface(600, 600, alpha=True)
++
++        # First draw → surface is built
++        self.assertIsNone(btn._tooltip_surface)
++        menu._draw_tooltip(probe)
++        first_surface = btn._tooltip_surface
++        self.assertIsNotNone(first_surface)
++
++        # Second draw → same surface object is reused
++        menu._draw_tooltip(probe)
++        self.assertIs(btn._tooltip_surface, first_surface)
++
++        # set_tooltip with same text does not invalidate the cache
++        btn.set_tooltip('Cached text')
++        self.assertIs(btn._tooltip_surface, first_surface)
++
++        # set_tooltip with different text invalidates the cache
++        btn.set_tooltip('New text', delay_ms=0)
++        self.assertIsNone(btn._tooltip_surface)
++        menu._draw_tooltip(probe)
++        second_surface = btn._tooltip_surface
++        self.assertIsNotNone(second_surface)
++        self.assertIsNot(second_surface, first_surface)
++
++        # Theme attribute change invalidates the cache on the next draw
++        theme.widget_tooltip_font_size = 24
++        menu._draw_tooltip(probe)
++        third_surface = btn._tooltip_surface
++        self.assertIsNot(third_surface, second_surface)
++
++        # Clean up
++        btn._mouseover = False
++        btn._mouseover_time = 0
++        WIDGET_MOUSEOVER[0] = None
++        WIDGET_MOUSEOVER[1] = []
++
++    def test_tooltip_word_wrap(self) -> None:
++        """
++        Long tooltip text is wrapped at word boundaries to fit within
++        ``widget_tooltip_max_width``; setting it to ``0`` disables wrapping.
++        """
++        theme = pygame_menu.themes.THEME_DEFAULT.copy()
++        theme.widget_tooltip_max_width = 120
++        menu = MenuUtils.generic_menu(theme=theme)
++        btn = menu.add.button('Button')
++        long_text = ('lorem ipsum dolor sit amet consectetur adipiscing elit '
++                     'sed do eiusmod tempor incididunt ut labore et dolore')
++        btn.set_tooltip(long_text, delay_ms=0)
++
++        btn._mouseover = True
++        btn._mouseover_time = time.time() - 1
++        WIDGET_MOUSEOVER[0] = btn
++        WIDGET_MOUSEOVER[1] = [btn, None, []]
++
++        probe = pygame_menu.utils.make_surface(600, 600, alpha=True)
++        menu._draw_tooltip(probe)
++        wrapped_surface = btn._tooltip_surface
++        self.assertIsNotNone(wrapped_surface)
++        self.assertLessEqual(wrapped_surface.get_width(), 120)
++
++        # Disable wrapping → single-line box should be much wider
++        theme.widget_tooltip_max_width = 0
++        menu._draw_tooltip(probe)
++        unwrapped_surface = btn._tooltip_surface
++        self.assertGreater(unwrapped_surface.get_width(), 120)
++        self.assertGreater(unwrapped_surface.get_width(), wrapped_surface.get_width())
++        self.assertLess(unwrapped_surface.get_height(), wrapped_surface.get_height())
++
++        # Clean up
++        btn._mouseover = False
++        btn._mouseover_time = 0
++        WIDGET_MOUSEOVER[0] = None
++        WIDGET_MOUSEOVER[1] = []
++
++    def test_position_tooltip_normal(self) -> None:
++        """
++        When the cursor is far from every edge the tooltip appears to the
++        right of and below the cursor by the margin offset.
++        """
++        from pygame_menu.menu import Menu
++        tx, ty = Menu._position_tooltip(
++            box_w=100, box_h=40,
++            mx=200, my=200,
++            ox=16, oy=16,
++            sw=600, sh=600
++        )
++        self.assertEqual(tx, 216)   # mx + ox
++        self.assertEqual(ty, 216)   # my + oy
++
++    def test_position_tooltip_flip_right_edge(self) -> None:
++        """
++        When the tooltip would overflow the right edge it is flipped to the
++        left of the cursor instead.
++        """
++        from pygame_menu.menu import Menu
++        # mx + ox + box_w = 540 + 16 + 120 = 676 > 600
++        tx, ty = Menu._position_tooltip(
++            box_w=120, box_h=40,
++            mx=540, my=200,
++            ox=16, oy=16,
++            sw=600, sh=600
++        )
++        # Flipped: mx - ox - box_w = 540 - 16 - 120 = 404
++        self.assertEqual(tx, 404)
++        self.assertEqual(ty, 216)
++
++    def test_position_tooltip_flip_bottom_edge(self) -> None:
++        """
++        When the tooltip would overflow the bottom edge it is flipped above
++        the cursor instead.
++        """
++        from pygame_menu.menu import Menu
++        # my + oy + box_h = 560 + 16 + 60 = 636 > 600
++        tx, ty = Menu._position_tooltip(
++            box_w=100, box_h=60,
++            mx=200, my=560,
++            ox=16, oy=16,
++            sw=600, sh=600
++        )
++        self.assertEqual(tx, 216)
++        # Flipped: my - oy - box_h = 560 - 16 - 60 = 484
++        self.assertEqual(ty, 484)
++
++    def test_position_tooltip_flip_both_edges(self) -> None:
++        """
++        When the tooltip would overflow both the right and bottom edges it
++        is flipped left AND above the cursor simultaneously.
++        """
++        from pygame_menu.menu import Menu
++        tx, ty = Menu._position_tooltip(
++            box_w=120, box_h=60,
++            mx=550, my=560,
++            ox=16, oy=16,
++            sw=600, sh=600
++        )
++        self.assertEqual(tx, 550 - 16 - 120)   # 414
++        self.assertEqual(ty, 560 - 16 - 60)    # 484
++
++    def test_position_tooltip_clamp_extreme_cases(self) -> None:
++        """
++        After a flip, if the tooltip still overflows (e.g. the box is wider
++        than the surface), the clamp keeps it at 0 rather than going negative.
++        """
++        from pygame_menu.menu import Menu
++        # Box wider than surface → clamped to x=0
++        tx, _ = Menu._position_tooltip(
++            box_w=700, box_h=40,
++            mx=300, my=200,
++            ox=16, oy=16,
++            sw=600, sh=600
++        )
++        self.assertEqual(tx, 0)
++
++        # Small surface, cursor near bottom: flip above gives negative y → clamped to 0.
++        # sh=50, my=30: ty=30+16=46, 46+60=106>50 → flip → 30-16-60=-46 → clamp to 0
++        _, ty = Menu._position_tooltip(
++            box_w=100, box_h=60,
++            mx=200, my=30,
++            ox=16, oy=16,
++            sw=600, sh=50
++        )
++        self.assertEqual(ty, 0)
++
++    def test_position_tooltip_always_on_screen(self) -> None:
++        """
++        Property-style check: for a range of cursor positions that exercise
++        all edges and corners, the tooltip box must always remain fully within
++        the surface bounds.
++        """
++        from pygame_menu.menu import Menu
++        sw, sh = 400, 300
++        box_w, box_h = 80, 30
++        ox, oy = 12, 12
++        positions = [
++            (0, 0), (sw - 1, 0), (0, sh - 1), (sw - 1, sh - 1),
++            (sw // 2, sh // 2),
++            (sw - 5, sh // 2), (5, sh // 2),
++            (sw // 2, sh - 5), (sw // 2, 5),
++        ]
++        for mx, my in positions:
++            tx, ty = Menu._position_tooltip(box_w, box_h, mx, my, ox, oy, sw, sh)
++            self.assertGreaterEqual(tx, 0, f'tx<0 at cursor ({mx},{my})')
++            self.assertGreaterEqual(ty, 0, f'ty<0 at cursor ({mx},{my})')
++            self.assertLessEqual(tx + box_w, sw, f'tx+box_w>sw at cursor ({mx},{my})')
++            self.assertLessEqual(ty + box_h, sh, f'ty+box_h>sh at cursor ({mx},{my})')
