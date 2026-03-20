@@ -1,0 +1,202 @@
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index ade7022f..04e630ab 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -262,6 +262,96 @@ WidgetShadowType = dict[
+ ]
+ 
+ 
++class _OffsetSurface:
++    """
++    Lightweight proxy that wraps a :py:class:`pygame.Surface` off-screen buffer
++    and transparently remaps every ``blit()`` destination so that widgets can
++    draw using their real absolute-coordinate positions while the pixels land
++    in the correct location inside a smaller local buffer.
++
++    For example, if a widget sits at ``(ox, oy)`` on the shared widgets surface
++    and the buffer represents only the widget's bounding rect, constructing
++    ``_OffsetSurface(buffer, ox, oy)`` means that a blit to ``(ox + dx, oy + dy)``
++    on this proxy will land at ``(dx, dy)`` in the real buffer.
++
++    The raw inner surface is exposed via :py:attr:`surface` for the rare cases
++    where a real :py:class:`pygame.Surface` is required (e.g. ``pygame.draw.*``
++    C-level functions).  Callers that use the inner surface directly are
++    responsible for shifting their own coordinates.
++    """
++
++    __slots__ = ("_surface", "_ox", "_oy")
++
++    def __init__(self, surface: pygame.Surface, ox: int, oy: int) -> None:
++        self._surface = surface
++        self._ox = ox
++        self._oy = oy
++
++    # ------------------------------------------------------------------
++    # Surface-like interface used by _draw_* methods and decorators
++    # ------------------------------------------------------------------
++
++    def blit(
++        self,
++        source: pygame.Surface,
++        dest: tuple | pygame.Rect,
++        area: pygame.Rect | None = None,
++        special_flags: int = 0,
++    ) -> pygame.Rect:
++        """Blit ``source`` onto the inner buffer, offsetting ``dest`` by ``(-ox, -oy)``."""
++        if isinstance(dest, pygame.Rect):
++            shifted = pygame.Rect(dest.x - self._ox, dest.y - self._oy, dest.w, dest.h)
++        else:
++            shifted = (dest[0] - self._ox, dest[1] - self._oy)
++        if area is not None:
++            return self._surface.blit(source, shifted, area, special_flags)
++        return self._surface.blit(source, shifted, special_flags=special_flags)
++
++    def fill(
++        self,
++        color: tuple,
++        rect: pygame.Rect | None = None,
++        special_flags: int = 0,
++    ) -> pygame.Rect:
++        """Fill the inner buffer, shifting ``rect`` if provided."""
++        if rect is not None:
++            shifted = pygame.Rect(
++                rect.x - self._ox, rect.y - self._oy, rect.w, rect.h
++            )
++            return self._surface.fill(color, shifted, special_flags)
++        return self._surface.fill(color, special_flags=special_flags)
++
++    def get_rect(self, **kwargs) -> pygame.Rect:
++        """Return the rect of the inner buffer, offset to the proxy's origin."""
++        r = self._surface.get_rect(**kwargs)
++        r.x += self._ox
++        r.y += self._oy
++        return r
++
++    def get_width(self) -> int:
++        return self._surface.get_width()
++
++    def get_height(self) -> int:
++        return self._surface.get_height()
++
++    def get_size(self) -> tuple[int, int]:
++        return self._surface.get_size()
++
++    def get_flags(self) -> int:
++        return self._surface.get_flags()
++
++    def set_alpha(self, value: int, flags: int = 0) -> None:
++        self._surface.set_alpha(value, flags)
++
++    def get_alpha(self) -> int | None:
++        return self._surface.get_alpha()
++
++    @property
++    def surface(self) -> pygame.Surface:
++        """The underlying real :py:class:`pygame.Surface` buffer."""
++        return self._surface
++
++
+ # noinspection PyProtectedMember
+ class Widget(Base):
+     """
+@@ -1196,11 +1286,11 @@ class Widget(Base):
+             self._border_inflate,
+         )
+ 
+-    def _draw_border(self, surface: pygame.Surface) -> None:
++    def _draw_border(self, surface: pygame.Surface | _OffsetSurface) -> None:
+         """
+         Draw Widget border in the surface.
+ 
+-        :param surface: Surface to draw the border
++        :param surface: Surface to draw the border (may be an :py:class:`_OffsetSurface` proxy)
+         """
+         if self._border_width == 0 or self._border_color is None:
+             return
+@@ -1214,8 +1304,19 @@ class Widget(Base):
+         if self._border_position == WIDGET_BORDER_POSITION_NONE:
+             return
+ 
+-        elif self._border_position == WIDGET_BORDER_POSITION_FULL:
+-            pygame.draw.rect(surface, self._border_color, rect, self._border_width)
++        # pygame.draw.* functions require a real pygame.Surface.
++        # When drawing through an _OffsetSurface proxy, extract the inner buffer
++        # and shift all coordinates by the proxy's origin offset.
++        if isinstance(surface, _OffsetSurface):
++            draw_surface = surface.surface
++            ox, oy = surface._ox, surface._oy
++            rect = pygame.Rect(rect.x - ox, rect.y - oy, rect.w, rect.h)
++        else:
++            draw_surface = surface
++            ox = oy = 0
++
++        if self._border_position == WIDGET_BORDER_POSITION_FULL:
++            pygame.draw.rect(draw_surface, self._border_color, rect, self._border_width)
+ 
+         else:
+             for pos in self._border_position:
+@@ -1230,7 +1331,7 @@ class Widget(Base):
+                 else:
+                     raise RuntimeError("invalid border position")
+                 pygame.draw.line(
+-                    surface, self._border_color, start, end, self._border_width
++                    draw_surface, self._border_color, start, end, self._border_width
+                 )
+ 
+     def set_border(
+@@ -1538,12 +1639,17 @@ class Widget(Base):
+             # Fast path: draw directly onto the target surface
+             self._draw_all_elements(surface)
+         elif self._opacity > 0:
+-            # Off-screen proxy pass: draw once to a local surface, blit once
+-            # with the desired opacity. Only a single draw pass plus one blit.
++            # Off-screen proxy pass.
++            # 1. Compute the bounding rect in absolute surface coordinates.
++            # 2. Wrap a cached local buffer in an _OffsetSurface proxy so that
++            #    every blit() call the widget makes with its real absolute
++            #    positions is transparently remapped to the buffer's local space.
++            # 3. Draw once to the proxy (single draw pass, no state mutation).
++            # 4. Set alpha on the buffer and blit once to the real surface.
+             draw_rect = self._get_draw_bounding_rect()
+             clamped = draw_rect.clip(surface.get_rect())
+             if clamped.width > 0 and clamped.height > 0:
+-                # Reuse or (re)create the cached off-screen buffer
++                # Reuse the cached off-screen buffer when the size is unchanged
+                 if (
+                     self._opacity_surface is None
+                     or self._opacity_surface.get_width() != draw_rect.width
+@@ -1555,30 +1661,11 @@ class Widget(Base):
+                 else:
+                     self._opacity_surface.fill((0, 0, 0, 0))
+ 
+-                # Temporarily shift the widget so that its absolute coordinates
+-                # become relative to the top-left of the off-screen buffer.
+-                ox, oy = draw_rect.x, draw_rect.y
+-                orig_vt = self._translate_virtual
+-                self._translate_virtual = (
+-                    orig_vt[0] - ox,
+-                    orig_vt[1] - oy,
+-                )
+-                # Shift cached rect to match
+-                orig_pos = self._position
+-                self._position = (orig_pos[0] - ox, orig_pos[1] - oy)
+-                self._rect.x -= ox
+-                self._rect.y -= oy
++                # Proxy: widget uses real absolute coords; proxy subtracts origin
++                proxy = _OffsetSurface(self._opacity_surface, draw_rect.x, draw_rect.y)
++                self._draw_all_elements(proxy)  # type: ignore[arg-type]
+ 
+-                try:
+-                    self._draw_all_elements(self._opacity_surface)
+-                finally:
+-                    # Always restore position, even if drawing raises
+-                    self._translate_virtual = orig_vt
+-                    self._position = orig_pos
+-                    self._rect.x += ox
+-                    self._rect.y += oy
+-
+-                # Single blit onto the real surface with opacity
++                # Blit the composited buffer onto the real surface with opacity
+                 self._opacity_surface.set_alpha(self._opacity)
+                 surface.blit(self._opacity_surface, (clamped.x, clamped.y))
+ 

@@ -1,0 +1,74 @@
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index ade7022f..2e7fe1f8 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -262,6 +262,39 @@ WidgetShadowType = dict[
+ ]
+ 
+ 
++class _OffsetSurface(pygame.Surface):
++    """
++    A lightweight :py:class:`pygame.Surface` subclass that transparently
++    remaps ``blit`` destination coordinates by a fixed offset.
++
++    Because it inherits from the real C-level ``Surface``, instances are
++    accepted by ``pygame.draw.*`` functions.  Those functions write to the
++    underlying pixel buffer using the coordinates they receive directly
++    (typically via the widget's :py:meth:`get_rect`, which already applies
++    ``Widget._draw_offset``).  ``blit()`` calls, on the other hand, receive
++    their destination from the caller, so this subclass subtracts the offset
++    before delegating to the parent implementation.
++    """
++
++    __slots__ = ("_ox", "_oy")
++
++    def __init__(self, width: int, height: int, ox: int, oy: int) -> None:
++        super().__init__((width, height), pygame.SRCALPHA, 32)
++        self._ox = ox
++        self._oy = oy
++
++    # noinspection PyMethodOverriding
++    def blit(self, source: pygame.Surface, dest, *args, **kwargs):  # type: ignore
++        if isinstance(dest, pygame.Rect):
++            dest = pygame.Rect(
++                dest.x - self._ox, dest.y - self._oy,
++                dest.width, dest.height,
++            )
++        elif isinstance(dest, (tuple, list)):
++            dest = (dest[0] - self._ox, dest[1] - self._oy)
++        return super().blit(source, dest, *args, **kwargs)
++
++
+ # noinspection PyProtectedMember
+ class Widget(Base):
+     """
+@@ -329,8 +362,9 @@ class Widget(Base):
+     _mouse_enabled: bool
+     _mouseleave_called: bool
+     _mouseover: bool  # Check if mouse is over
++    _draw_offset: Tuple2IntType
+     _opacity: int
+-    _opacity_surface: pygame.Surface | None
++    _opacity_surface: _OffsetSurface | None
+     _mouseover_called: (
+         bool | None
+     )  # Check if the mouseover/mouseleave callbacks were called
+@@ -420,6 +454,7 @@ class Widget(Base):
+         self._tab_size = 0  # Tab spaces
+         self._title = str(title)
+         self._visible = visible  # Use show() or hide() to modify this status
++        self._draw_offset = (0, 0)  # Coordinate offset applied during opacity draw
+         self._opacity = 255  # Widget opacity (0=transparent, 255=opaque)
+         self._opacity_surface = None  # Off-screen buffer for opacity compositing
+ 
+@@ -1759,8 +1794,8 @@ class Widget(Base):
+         pad_left = padding[3] * apply_padding + inflate[0] / 2
+ 
+         rect = pygame.Rect(
+-            int(self._rect.x - pad_left),
+-            int(self._rect.y - pad_top),
++            int(self._rect.x - pad_left + self._draw_offset[0]),
++            int(self._rect.y - pad_top + self._draw_offset[1]),
+             int(self._rect.width + pad_left + pad_right + self._rect_size_delta[0]),
+             int(self._rect.height + pad_bottom + pad_top + self._rect_size_delta[1]),
+         )
