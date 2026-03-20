@@ -1,0 +1,1519 @@
+diff --git a/pygame_menu/__init__.py b/pygame_menu/__init__.py
+index 52e84a1d..77802d64 100644
+--- a/pygame_menu/__init__.py
++++ b/pygame_menu/__init__.py
+@@ -83,6 +83,7 @@ except (ModuleNotFoundError, ImportError):
+ if __pygame_version__ is not None:
+     from pygame_menu import (
+         _scrollarea,  # type: ignore
++        animation,  # type: ignore
+         baseimage,
+         controls,  # type: ignore
+         events,  # type: ignore
+@@ -91,6 +92,7 @@ if __pygame_version__ is not None:
+         menu,
+         sound,
+         themes,
++        transitions,  # type: ignore
+         version,  # type: ignore
+         widgets,  # type: ignore
+     )
+diff --git a/pygame_menu/animation.py b/pygame_menu/animation.py
+new file mode 100644
+index 00000000..2c94c564
+--- /dev/null
++++ b/pygame_menu/animation.py
+@@ -0,0 +1,289 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++ANIMATION
++Animation engine for widget transitions and tweening.
++"""
++
++from __future__ import annotations
++
++__all__ = [
++    "Animation",
++    "AnimationManager",
++    # Easing functions
++    "linear",
++    "ease_in_quad",
++    "ease_out_quad",
++    "ease_in_out_quad",
++    "ease_in_cubic",
++    "ease_out_back",
++    "EASING_FUNCTIONS",
++]
++
++import math
++from collections.abc import Callable
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    from pygame_menu.widgets.core.widget import Widget
++
++
++# ---------------------------------------------------------------------------
++# Easing functions
++# ---------------------------------------------------------------------------
++# Each takes t in [0, 1] and returns the eased value.
++
++def linear(t: float) -> float:
++    """Linear easing (no acceleration)."""
++    return t
++
++
++def ease_in_quad(t: float) -> float:
++    """Quadratic ease-in (accelerating from zero)."""
++    return t * t
++
++
++def ease_out_quad(t: float) -> float:
++    """Quadratic ease-out (decelerating to zero)."""
++    return t * (2 - t)
++
++
++def ease_in_out_quad(t: float) -> float:
++    """Quadratic ease-in-out (accelerate then decelerate)."""
++    if t < 0.5:
++        return 2 * t * t
++    return -1 + (4 - 2 * t) * t
++
++
++def ease_in_cubic(t: float) -> float:
++    """Cubic ease-in (accelerating from zero)."""
++    return t * t * t
++
++
++def ease_out_back(t: float) -> float:
++    """Ease-out with overshoot (back effect)."""
++    c1 = 1.70158
++    c3 = c1 + 1
++    return 1 + c3 * math.pow(t - 1, 3) + c1 * math.pow(t - 1, 2)
++
++
++EASING_FUNCTIONS: dict[str, Callable[[float], float]] = {
++    "linear": linear,
++    "ease_in_quad": ease_in_quad,
++    "ease_out_quad": ease_out_quad,
++    "ease_in_out_quad": ease_in_out_quad,
++    "ease_in_cubic": ease_in_cubic,
++    "ease_out_back": ease_out_back,
++}
++
++
++# ---------------------------------------------------------------------------
++# Animation
++# ---------------------------------------------------------------------------
++
++class Animation:
++    """
++    Represents a single tween/transition that interpolates a numeric value
++    over time using an easing function.
++
++    :param start_value: Starting value
++    :param end_value: Ending value
++    :param duration: Duration in milliseconds
++    :param easing: Easing function ``f(t) -> float`` where ``t`` is in [0, 1]
++    :param on_update: Called each tick with the current interpolated value
++    :param on_complete: Called once when the animation finishes
++    :param loop: If ``True`` the animation restarts from the beginning on completion
++    :param bounce: If ``True`` the animation reverses direction on completion
++    :param delay: Delay in milliseconds before the animation starts
++    :param value_min: If set, clamp the interpolated value to at least this minimum.
++        Useful when an easing function (e.g. ``ease_out_back``) can produce values
++        below the expected range.
++    :param value_max: If set, clamp the interpolated value to at most this maximum.
++        Useful when an easing (e.g. ``ease_out_back``) overshoots above the expected range.
++    """
++
++    _completed: bool
++    _delay: float
++    _elapsed: float
++    _forward: bool
++    _value: float
++    _value_max: float | None
++    _value_min: float | None
++    _widget: Widget | None
++
++    def __init__(
++        self,
++        start_value: float,
++        end_value: float,
++        duration: float,
++        easing: Callable[[float], float] = linear,
++        on_update: Callable[[float], Any] | None = None,
++        on_complete: Callable[[], Any] | None = None,
++        loop: bool = False,
++        bounce: bool = False,
++        delay: float = 0,
++        value_min: float | None = None,
++        value_max: float | None = None,
++    ) -> None:
++        assert duration > 0, "duration must be positive"
++        assert delay >= 0, "delay cannot be negative"
++        assert callable(easing), "easing must be callable"
++        if value_min is not None and value_max is not None:
++            assert value_min <= value_max, "value_min must be <= value_max"
++
++        self._start_value = start_value
++        self._end_value = end_value
++        self._duration = float(duration)
++        self._easing = easing
++        self._on_update = on_update
++        self._on_complete = on_complete
++        self._loop = loop
++        self._bounce = bounce
++        self._delay = float(delay)
++        self._value_min = float(value_min) if value_min is not None else None
++        self._value_max = float(value_max) if value_max is not None else None
++
++        self._elapsed = 0.0
++        self._delay_elapsed = 0.0
++        self._completed = False
++        self._forward = True
++        self._value = start_value
++        self._widget = None  # Set externally for cleanup tracking
++
++    def tick(self, dt: float) -> bool:
++        """
++        Advance the animation by ``dt`` milliseconds.
++
++        :param dt: Delta time in milliseconds
++        :return: ``True`` if the animation has completed (not looping/bouncing)
++        """
++        if self._completed:
++            return True
++
++        # Handle delay
++        if self._delay_elapsed < self._delay:
++            self._delay_elapsed += dt
++            if self._delay_elapsed < self._delay:
++                return False
++            # Carry over extra time past delay
++            dt = self._delay_elapsed - self._delay
++
++        self._elapsed += dt
++
++        # Compute progress [0, 1]
++        t = min(self._elapsed / self._duration, 1.0)
++
++        # Apply direction for bounce
++        if not self._forward:
++            t = 1.0 - t
++
++        # Apply easing
++        eased_t = self._easing(t)
++
++        # Interpolate value
++        self._value = self._start_value + (self._end_value - self._start_value) * eased_t
++
++        # Clamp value to declared bounds (guards against easing overshoot)
++        if self._value_min is not None and self._value < self._value_min:
++            self._value = self._value_min
++        if self._value_max is not None and self._value > self._value_max:
++            self._value = self._value_max
++
++        # Notify listener
++        if self._on_update is not None:
++            self._on_update(self._value)
++
++        # Check completion
++        if self._elapsed >= self._duration:
++            if self._bounce:
++                self._elapsed = 0.0
++                self._forward = not self._forward
++            elif self._loop:
++                self._elapsed = 0.0
++            else:
++                self._completed = True
++                if self._on_complete is not None:
++                    self._on_complete()
++                return True
++
++        return False
++
++    def cancel(self) -> None:
++        """Cancel the animation immediately."""
++        self._completed = True
++
++    def is_completed(self) -> bool:
++        """Return ``True`` if the animation has finished."""
++        return self._completed
++
++    def get_current_value(self) -> float:
++        """Return the current interpolated value."""
++        return self._value
++
++
++# ---------------------------------------------------------------------------
++# AnimationManager
++# ---------------------------------------------------------------------------
++
++class AnimationManager:
++    """
++    Tracks and ticks active animations each frame. Automatically removes
++    completed animations.
++    """
++
++    _animations: list[Animation]
++
++    def __init__(self) -> None:
++        self._animations = []
++
++    def add(self, animation: Animation) -> Animation:
++        """
++        Add an animation to be managed.
++
++        :param animation: Animation instance
++        :return: The same animation (for chaining)
++        """
++        assert isinstance(animation, Animation)
++        self._animations.append(animation)
++        return animation
++
++    def tick(self, dt: float) -> None:
++        """
++        Advance all active animations by ``dt`` milliseconds and remove
++        completed ones.
++
++        :param dt: Delta time in milliseconds
++        """
++        if not self._animations:
++            return
++        # Iterate on a copy so removals during tick are safe
++        still_active: list[Animation] = []
++        for anim in self._animations:
++            if not anim.tick(dt):
++                still_active.append(anim)
++        self._animations = still_active
++
++    def remove_for_widget(self, widget: Widget) -> None:
++        """
++        Cancel and remove all animations associated with the given widget.
++
++        :param widget: Widget whose animations should be removed
++        """
++        remaining: list[Animation] = []
++        for anim in self._animations:
++            if anim._widget is widget:
++                anim.cancel()
++            else:
++                remaining.append(anim)
++        self._animations = remaining
++
++    def cancel_all(self) -> None:
++        """Cancel all active animations."""
++        for anim in self._animations:
++            anim.cancel()
++        self._animations.clear()
++
++    def is_empty(self) -> bool:
++        """Return ``True`` if there are no active animations."""
++        return len(self._animations) == 0
+diff --git a/pygame_menu/menu.py b/pygame_menu/menu.py
+index 1777f1a4..70097dd8 100644
+--- a/pygame_menu/menu.py
++++ b/pygame_menu/menu.py
+@@ -23,6 +23,7 @@ import pygame.gfxdraw as gfxdraw
+ import pygame_menu.events as _events
+ from pygame_menu._base import Base
+ from pygame_menu._decorator import Decorator
++from pygame_menu.animation import AnimationManager
+ from pygame_menu._scrollarea import ScrollArea, get_scrollbars_from_position
+ 
+ # Import types
+@@ -140,6 +141,7 @@ class Menu(Base):
+     :param verbose: Enable/disable verbose mode (warnings/errors). Propagates to all widgets
+     """
+ 
++    _animation_manager: AnimationManager
+     _auto_centering: bool
+     _background_function: tuple[bool, Callable[[Menu], Any] | CallableNoArgsType | None]
+     _clock: pygame.time.Clock
+@@ -439,6 +441,7 @@ class Menu(Base):
+             None,
+         )  # Accept menu as argument, callable object
+         self._clock = pygame.time.Clock()
++        self._animation_manager = AnimationManager()
+         self._decorator = Decorator(self, verbose=verbose)  # type: ignore
+         self._enabled = (
+             enabled  # Menu is enabled or not. If disabled menu can't update or draw
+@@ -1256,6 +1259,7 @@ class Menu(Base):
+                 "with menu.get_current().remove_widget(widget)"
+             )
+         self._widgets.pop(index)
++        self._animation_manager.remove_for_widget(widget)
+         self._update_after_remove_or_hidden(index)  # Forces surface update
+         self._stats.removed_widgets += 1
+ 
+@@ -3322,7 +3326,10 @@ class Menu(Base):
+         # Start loop
+         while True:
+             self._current._stats.loop += 1
+-            self._current._clock.tick(fps_limit)
++            dt = self._current._clock.tick(fps_limit)
++
++            # Tick animations
++            self._current._animation_manager.tick(dt)
+ 
+             # Draw the menu
+             self.draw(surface=surface, clear_surface=clear_surface)
+@@ -4003,6 +4010,20 @@ class Menu(Base):
+         """
+         return self._theme
+ 
++    def get_animation_manager(self) -> AnimationManager:
++        """
++        Return the Menu's :py:class:`pygame_menu.animation.AnimationManager`.
++
++        .. note::
++
++            This is applied only to the base Menu (not the currently displayed,
++            stored in ``_current`` pointer); for such behavior apply to
++            :py:meth:`pygame_menu.menu.Menu.get_current` object.
++
++        :return: AnimationManager instance
++        """
++        return self._animation_manager
++
+     def get_clock(self) -> pygame.time.Clock:
+         """
+         Return the pygame Menu timer.
+diff --git a/pygame_menu/themes.py b/pygame_menu/themes.py
+index b828f5a0..0fa00971 100644
+--- a/pygame_menu/themes.py
++++ b/pygame_menu/themes.py
+@@ -362,6 +362,9 @@ class Theme:
+     widget_shadow_radius: int
+     widget_shadow_type: str
+     widget_shadow_width: int
++    widget_open_animation: str | None
++    widget_open_animation_delay_per_widget: NumberType
++    widget_open_animation_duration: NumberType
+     widget_tab_size: int
+     widget_url_color: ColorType
+ 
+@@ -575,6 +578,17 @@ class Theme:
+             kwargs, "widget_url_color", "color", (6, 69, 173)
+         )
+ 
++        # Animation
++        self.widget_open_animation = self._get(
++            kwargs, "widget_open_animation", None, None
++        )
++        self.widget_open_animation_duration = self._get(
++            kwargs, "widget_open_animation_duration", NumberInstance, 300
++        )
++        self.widget_open_animation_delay_per_widget = self._get(
++            kwargs, "widget_open_animation_delay_per_widget", NumberInstance, 50
++        )
++
+         # Upon this, no more kwargs should exist, raise exception if there's more
+         for invalid_keyword in kwargs.keys():
+             raise ValueError(f"parameter Theme.{invalid_keyword} does not exist")
+@@ -648,6 +662,26 @@ class Theme:
+         assert isinstance(self.widget_shadow_width, int)
+         assert isinstance(self.widget_tab_size, int)
+ 
++        # Animation attributes
++        assert isinstance(self.widget_open_animation_duration, NumberInstance)
++        assert isinstance(self.widget_open_animation_delay_per_widget, NumberInstance)
++        if self.widget_open_animation is not None:
++            assert isinstance(self.widget_open_animation, str), (
++                "widget_open_animation must be a string or None"
++            )
++            _valid_animations = (
++                "fade_in",
++                "slide_in_left",
++                "slide_in_right",
++                "slide_in_up",
++                "slide_in_down",
++                "scale_in",
++            )
++            assert self.widget_open_animation in _valid_animations, (
++                f"widget_open_animation must be one of {_valid_animations}, "
++                f"but received '{self.widget_open_animation}'"
++            )
++
+         # Format colors, this converts all color lists to tuples automatically,
+         # if it is an image, return the same object
+         self.background_color = self._format_color_opacity(self.background_color)
+diff --git a/pygame_menu/transitions.py b/pygame_menu/transitions.py
+new file mode 100644
+index 00000000..4574b613
+--- /dev/null
++++ b/pygame_menu/transitions.py
+@@ -0,0 +1,314 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++TRANSITIONS
++Pre-built animation transition helpers for common widget effects.
++"""
++
++from __future__ import annotations
++
++__all__ = [
++    "fade_in",
++    "fade_out",
++    "slide_in",
++    "slide_out",
++    "scale_in",
++    "TRANSITION_FUNCTIONS",
++]
++
++from collections.abc import Callable
++from typing import TYPE_CHECKING, Any
++
++from pygame_menu.animation import (
++    Animation,
++    ease_in_quad,
++    ease_out_back,
++    ease_out_quad,
++)
++
++if TYPE_CHECKING:
++    from pygame_menu.widgets.core.widget import Widget
++
++
++def _register(anim: Animation, widget: Widget) -> Animation:
++    """
++    Set the widget reference on the animation and, if the widget belongs to a
++    menu, add the animation to that menu's :py:class:`~pygame_menu.animation.AnimationManager`
++    so it is ticked automatically each frame.
++
++    :param anim: Animation to register
++    :param widget: Owner widget
++    :return: The same animation (for chaining)
++    """
++    anim._widget = widget
++    if widget._menu is not None:
++        widget._menu.get_animation_manager().add(anim)
++    return anim
++
++
++def fade_in(
++    widget: Widget,
++    duration: float = 300,
++    easing: Callable[[float], float] = ease_out_quad,
++    delay: float = 0,
++    on_complete: Callable[[], Any] | None = None,
++) -> Animation:
++    """
++    Create a fade-in animation (opacity 0 -> 255).
++    Sets the widget opacity to 0 and makes it visible before starting.
++
++    :param widget: Target widget
++    :param duration: Duration in milliseconds
++    :param easing: Easing function
++    :param delay: Delay before starting in milliseconds
++    :param on_complete: Called when animation finishes
++    :return: Animation instance
++    """
++    widget.set_opacity(0)
++    widget.show()
++    anim = Animation(
++        start_value=0,
++        end_value=255,
++        duration=duration,
++        easing=easing,
++        on_update=lambda v: widget.set_opacity(v),
++        on_complete=on_complete,
++        delay=delay,
++        value_min=0,
++        value_max=255,
++    )
++    return _register(anim, widget)
++
++
++def fade_out(
++    widget: Widget,
++    duration: float = 300,
++    easing: Callable[[float], float] = ease_in_quad,
++    delay: float = 0,
++    on_complete: Callable[[], Any] | None = None,
++) -> Animation:
++    """
++    Create a fade-out animation (current opacity -> 0).
++    Hides the widget when the animation completes.
++
++    :param widget: Target widget
++    :param duration: Duration in milliseconds
++    :param easing: Easing function
++    :param delay: Delay before starting in milliseconds
++    :param on_complete: Called when animation finishes
++    :return: Animation instance
++    """
++    start = widget.get_opacity()
++
++    def _on_complete() -> None:
++        widget.hide()
++        if on_complete is not None:
++            on_complete()
++
++    anim = Animation(
++        start_value=start,
++        end_value=0,
++        duration=duration,
++        easing=easing,
++        on_update=lambda v: widget.set_opacity(v),
++        on_complete=_on_complete,
++        delay=delay,
++        value_min=0,
++        value_max=255,
++    )
++    return _register(anim, widget)
++
++
++def slide_in(
++    widget: Widget,
++    direction: str = "left",
++    distance: float = 50,
++    duration: float = 400,
++    easing: Callable[[float], float] = ease_out_quad,
++    delay: float = 0,
++    on_complete: Callable[[], Any] | None = None,
++) -> Animation:
++    """
++    Create a slide-in animation. The widget slides from an offset position
++    to its current position.
++
++    :param widget: Target widget
++    :param direction: Direction to slide from: ``'left'``, ``'right'``, ``'up'``, ``'down'``
++    :param distance: Slide distance in pixels
++    :param duration: Duration in milliseconds
++    :param easing: Easing function
++    :param delay: Delay before starting in milliseconds
++    :param on_complete: Called when animation finishes
++    :return: Animation instance
++    """
++    tx, ty = widget._translate
++
++    if direction == "left":
++        widget.translate(-distance, ty)
++        anim = Animation(
++            start_value=-distance,
++            end_value=tx,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: widget.translate(int(v), ty),
++            on_complete=on_complete,
++            delay=delay,
++        )
++    elif direction == "right":
++        widget.translate(distance, ty)
++        anim = Animation(
++            start_value=distance,
++            end_value=tx,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: widget.translate(int(v), ty),
++            on_complete=on_complete,
++            delay=delay,
++        )
++    elif direction == "up":
++        widget.translate(tx, -distance)
++        anim = Animation(
++            start_value=-distance,
++            end_value=ty,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: widget.translate(tx, int(v)),
++            on_complete=on_complete,
++            delay=delay,
++        )
++    elif direction == "down":
++        widget.translate(tx, distance)
++        anim = Animation(
++            start_value=distance,
++            end_value=ty,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: widget.translate(tx, int(v)),
++            on_complete=on_complete,
++            delay=delay,
++        )
++    else:
++        raise ValueError(
++            f"invalid direction '{direction}', expected 'left', 'right', 'up', or 'down'"
++        )
++
++    return _register(anim, widget)
++
++
++def slide_out(
++    widget: Widget,
++    direction: str = "left",
++    distance: float = 50,
++    duration: float = 400,
++    easing: Callable[[float], float] = ease_in_quad,
++    delay: float = 0,
++    on_complete: Callable[[], Any] | None = None,
++) -> Animation:
++    """
++    Create a slide-out animation. The widget slides from its current position
++    to an offset position.
++
++    :param widget: Target widget
++    :param direction: Direction to slide to: ``'left'``, ``'right'``, ``'up'``, ``'down'``
++    :param distance: Slide distance in pixels
++    :param duration: Duration in milliseconds
++    :param easing: Easing function
++    :param delay: Delay before starting in milliseconds
++    :param on_complete: Called when animation finishes
++    :return: Animation instance
++    """
++    tx, ty = widget._translate
++
++    if direction == "left":
++        end_val = tx - distance
++        anim = Animation(
++            start_value=tx,
++            end_value=end_val,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: widget.translate(int(v), ty),
++            on_complete=on_complete,
++            delay=delay,
++        )
++    elif direction == "right":
++        end_val = tx + distance
++        anim = Animation(
++            start_value=tx,
++            end_value=end_val,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: widget.translate(int(v), ty),
++            on_complete=on_complete,
++            delay=delay,
++        )
++    elif direction == "up":
++        end_val = ty - distance
++        anim = Animation(
++            start_value=ty,
++            end_value=end_val,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: widget.translate(tx, int(v)),
++            on_complete=on_complete,
++            delay=delay,
++        )
++    elif direction == "down":
++        end_val = ty + distance
++        anim = Animation(
++            start_value=ty,
++            end_value=end_val,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: widget.translate(tx, int(v)),
++            on_complete=on_complete,
++            delay=delay,
++        )
++    else:
++        raise ValueError(
++            f"invalid direction '{direction}', expected 'left', 'right', 'up', or 'down'"
++        )
++
++    return _register(anim, widget)
++
++
++def scale_in(
++    widget: Widget,
++    duration: float = 300,
++    easing: Callable[[float], float] = ease_out_back,
++    delay: float = 0,
++    on_complete: Callable[[], Any] | None = None,
++) -> Animation:
++    """
++    Create a scale-in animation. The widget scales from near-zero to its
++    full size.
++
++    :param widget: Target widget
++    :param duration: Duration in milliseconds
++    :param easing: Easing function
++    :param delay: Delay before starting in milliseconds
++    :param on_complete: Called when animation finishes
++    :return: Animation instance
++    """
++    widget.scale(0.01, 0.01, smooth=True)
++    anim = Animation(
++        start_value=0.01,
++        end_value=1.0,
++        duration=duration,
++        easing=easing,
++        on_update=lambda v: widget.scale(max(0.01, v), max(0.01, v), smooth=True),
++        on_complete=on_complete,
++        delay=delay,
++    )
++    return _register(anim, widget)
++
++
++# Mapping of transition names (used by theme) to factory functions
++TRANSITION_FUNCTIONS: dict[str, Callable[..., Animation]] = {
++    "fade_in": fade_in,
++    "slide_in_left": lambda w, **kw: slide_in(w, direction="left", **kw),
++    "slide_in_right": lambda w, **kw: slide_in(w, direction="right", **kw),
++    "slide_in_up": lambda w, **kw: slide_in(w, direction="up", **kw),
++    "slide_in_down": lambda w, **kw: slide_in(w, direction="down", **kw),
++    "scale_in": scale_in,
++}
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index 1eeef5ed..ade7022f 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -329,6 +329,8 @@ class Widget(Base):
+     _mouse_enabled: bool
+     _mouseleave_called: bool
+     _mouseover: bool  # Check if mouse is over
++    _opacity: int
++    _opacity_surface: pygame.Surface | None
+     _mouseover_called: (
+         bool | None
+     )  # Check if the mouseover/mouseleave callbacks were called
+@@ -418,6 +420,8 @@ class Widget(Base):
+         self._tab_size = 0  # Tab spaces
+         self._title = str(title)
+         self._visible = visible  # Use show() or hide() to modify this status
++        self._opacity = 255  # Widget opacity (0=transparent, 255=opaque)
++        self._opacity_surface = None  # Off-screen buffer for opacity compositing
+ 
+         # If True, the widget don't contribute width/height to the Menu widget
+         # positioning computation. Use .set_float() to modify this status
+@@ -1462,6 +1466,40 @@ class Widget(Base):
+             w = self._shadow["properties"][1]
+             surface.blit(self._shadow["surface"], (rect.x - w, rect.y - w))
+ 
++    def _get_draw_bounding_rect(self) -> pygame.Rect:
++        """
++        Return the bounding rectangle covering the full draw area of the widget,
++        including shadow and background inflate.
++
++        :return: Bounding rect
++        """
++        inflate = self._get_background_inflate()
++        rect = self.get_rect(inflate=inflate)
++        # Expand for shadow
++        if self._shadow.get("enabled", False) and self._shadow.get("properties"):
++            shadow_w = self._shadow["properties"][1]
++            rect = rect.inflate(shadow_w * 2, shadow_w * 2)
++            rect.x -= shadow_w
++            rect.y -= shadow_w
++        return rect
++
++    def _draw_all_elements(self, surface: pygame.Surface) -> None:
++        """
++        Draw all visual elements of the widget (shadow, background, decorators,
++        content, border) onto the given surface.
++
++        :param surface: Surface to draw on
++        """
++        if self.is_selected() and not self._selection_effect_draw_post:
++            self._selection_effect.draw(surface, self)
++
++        self._draw_shadow(surface)
++        self._draw_background_color(surface)
++        self._decorator.draw_prev(surface)
++        self._draw(surface)
++        self._draw_border(surface)
++        self._decorator.draw_post(surface)
++
+     def draw(self, surface: pygame.Surface) -> Widget:
+         """
+         Draw the Widget on a given surface.
+@@ -1476,6 +1514,13 @@ class Widget(Base):
+             6. Widget border
+             7. ``post`` decorator
+ 
++        When the widget opacity is less than 255, all visual elements are
++        first rendered into a temporary off-screen surface via a single draw
++        pass, the surface's alpha is set to ``_opacity``, and then it is
++        blitted once onto the target surface. This avoids the two surface
++        copies required by a snapshot-blend approach while still handling
++        shadow, background, decorators, content, and border uniformly.
++
+         :param surface: Surface to draw
+         :return: Self reference
+         """
+@@ -1489,15 +1534,53 @@ class Widget(Base):
+         # Force rendering
+         self._render()
+ 
+-        if self.is_selected() and not self._selection_effect_draw_post:
+-            self._selection_effect.draw(surface, self)
++        if self._opacity >= 255:
++            # Fast path: draw directly onto the target surface
++            self._draw_all_elements(surface)
++        elif self._opacity > 0:
++            # Off-screen proxy pass: draw once to a local surface, blit once
++            # with the desired opacity. Only a single draw pass plus one blit.
++            draw_rect = self._get_draw_bounding_rect()
++            clamped = draw_rect.clip(surface.get_rect())
++            if clamped.width > 0 and clamped.height > 0:
++                # Reuse or (re)create the cached off-screen buffer
++                if (
++                    self._opacity_surface is None
++                    or self._opacity_surface.get_width() != draw_rect.width
++                    or self._opacity_surface.get_height() != draw_rect.height
++                ):
++                    self._opacity_surface = make_surface(
++                        draw_rect.width, draw_rect.height, alpha=True
++                    )
++                else:
++                    self._opacity_surface.fill((0, 0, 0, 0))
++
++                # Temporarily shift the widget so that its absolute coordinates
++                # become relative to the top-left of the off-screen buffer.
++                ox, oy = draw_rect.x, draw_rect.y
++                orig_vt = self._translate_virtual
++                self._translate_virtual = (
++                    orig_vt[0] - ox,
++                    orig_vt[1] - oy,
++                )
++                # Shift cached rect to match
++                orig_pos = self._position
++                self._position = (orig_pos[0] - ox, orig_pos[1] - oy)
++                self._rect.x -= ox
++                self._rect.y -= oy
+ 
+-        self._draw_shadow(surface)
+-        self._draw_background_color(surface)
+-        self._decorator.draw_prev(surface)
+-        self._draw(surface)
+-        self._draw_border(surface)
+-        self._decorator.draw_post(surface)
++                try:
++                    self._draw_all_elements(self._opacity_surface)
++                finally:
++                    # Always restore position, even if drawing raises
++                    self._translate_virtual = orig_vt
++                    self._position = orig_pos
++                    self._rect.x += ox
++                    self._rect.y += oy
++
++                # Single blit onto the real surface with opacity
++                self._opacity_surface.set_alpha(self._opacity)
++                surface.blit(self._opacity_surface, (clamped.x, clamped.y))
+ 
+         # Apply callbacks
+         self.apply_draw_callbacks()
+@@ -3182,6 +3265,101 @@ class Widget(Base):
+         self.active = False
+         return self.__update_menu_after_toggle(prev_visible)
+ 
++    def set_opacity(self, opacity: int | float) -> Widget:
++        """
++        Set the Widget opacity. ``0`` means fully transparent, ``255`` means
++        fully opaque. Values are clamped to the [0, 255] range.
++
++        :param opacity: Opacity value
++        :return: Self reference
++        """
++        self._opacity = max(0, min(255, int(opacity)))
++        return self
++
++    def get_opacity(self) -> int:
++        """
++        Return the current Widget opacity (0-255).
++
++        :return: Opacity value
++        """
++        return self._opacity
++
++    def animate_opacity(
++        self,
++        target: int,
++        duration: float = 300,
++        easing: Any = None,
++        on_complete: Any = None,
++    ) -> Any:
++        """
++        Animate the widget opacity to the target value.
++
++        :param target: Target opacity (0-255)
++        :param duration: Duration in milliseconds
++        :param easing: Easing function, defaults to ``ease_out_quad``
++        :param on_complete: Called when animation finishes
++        :return: Animation instance
++        """
++        from pygame_menu.animation import Animation, ease_out_quad
++
++        if easing is None:
++            easing = ease_out_quad
++        anim = Animation(
++            start_value=self._opacity,
++            end_value=target,
++            duration=duration,
++            easing=easing,
++            on_update=lambda v: self.set_opacity(v),
++            on_complete=on_complete,
++            value_min=0,
++            value_max=255,
++        )
++        anim._widget = self
++        if self._menu is not None:
++            self._menu.get_animation_manager().add(anim)
++        return anim
++
++    def fade_in(
++        self,
++        duration: float = 300,
++        easing: Any = None,
++        on_complete: Any = None,
++    ) -> Any:
++        """
++        Fade the widget from transparent to fully opaque.
++        Makes the widget visible and starts at opacity 0.
++
++        :param duration: Duration in milliseconds
++        :param easing: Easing function
++        :param on_complete: Called when animation finishes
++        :return: Animation instance
++        """
++        self.set_opacity(0)
++        self.show()
++        return self.animate_opacity(255, duration, easing, on_complete)
++
++    def fade_out(
++        self,
++        duration: float = 300,
++        easing: Any = None,
++        on_complete: Any = None,
++    ) -> Any:
++        """
++        Fade the widget from current opacity to transparent, then hide it.
++
++        :param duration: Duration in milliseconds
++        :param easing: Easing function
++        :param on_complete: Called when animation finishes
++        :return: Animation instance
++        """
++
++        def _on_complete() -> None:
++            self.hide()
++            if on_complete is not None:
++                on_complete()
++
++        return self.animate_opacity(0, duration, easing, _on_complete)
++
+     def set_col_row_index(self, col: int, row: int, index: int) -> Widget:
+         """
+         Set the (column, row, index) position. If the column or row is ``-1`` then
+diff --git a/test/test_animation.py b/test/test_animation.py
+new file mode 100644
+index 00000000..45b83717
+--- /dev/null
++++ b/test/test_animation.py
+@@ -0,0 +1,509 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++TEST ANIMATION
++Unit tests for the animation engine, AnimationManager, and transitions.
++"""
++
++import pytest
++
++import pygame_menu
++from pygame_menu.animation import (
++    Animation,
++    AnimationManager,
++    EASING_FUNCTIONS,
++    ease_in_cubic,
++    ease_in_out_quad,
++    ease_in_quad,
++    ease_out_back,
++    ease_out_quad,
++    linear,
++)
++from test._utils import MenuUtils, surface
++
++
++# ---------------------------------------------------------------------------
++# Easing function boundary tests
++# ---------------------------------------------------------------------------
++
++class TestEasingFunctions:
++    """Each easing must satisfy f(0) == 0 and f(1) == 1 (except ease_out_back
++    which is allowed to overshoot above 1 for t near 1)."""
++
++    def test_linear_boundaries(self):
++        assert linear(0) == pytest.approx(0.0)
++        assert linear(1) == pytest.approx(1.0)
++        assert linear(0.5) == pytest.approx(0.5)
++
++    def test_ease_in_quad_boundaries(self):
++        assert ease_in_quad(0) == pytest.approx(0.0)
++        assert ease_in_quad(1) == pytest.approx(1.0)
++        # Accelerating: output at 0.5 should be less than 0.5
++        assert ease_in_quad(0.5) < 0.5
++
++    def test_ease_out_quad_boundaries(self):
++        assert ease_out_quad(0) == pytest.approx(0.0)
++        assert ease_out_quad(1) == pytest.approx(1.0)
++        # Decelerating: output at 0.5 should be greater than 0.5
++        assert ease_out_quad(0.5) > 0.5
++
++    def test_ease_in_out_quad_boundaries(self):
++        assert ease_in_out_quad(0) == pytest.approx(0.0)
++        assert ease_in_out_quad(1) == pytest.approx(1.0)
++        # Symmetric: midpoint maps to exactly 0.5
++        assert ease_in_out_quad(0.5) == pytest.approx(0.5)
++
++    def test_ease_in_cubic_boundaries(self):
++        assert ease_in_cubic(0) == pytest.approx(0.0)
++        assert ease_in_cubic(1) == pytest.approx(1.0)
++        # More aggressive than quad
++        assert ease_in_cubic(0.5) < ease_in_quad(0.5)
++
++    def test_ease_out_back_boundaries(self):
++        assert ease_out_back(0) == pytest.approx(0.0)
++        assert ease_out_back(1) == pytest.approx(1.0)
++        # Must overshoot: maximum in (0, 1) must exceed 1.0
++        samples = [ease_out_back(t / 100) for t in range(1, 100)]
++        assert max(samples) > 1.0, "ease_out_back must overshoot above 1.0"
++
++    def test_all_easings_in_dict(self):
++        expected = {
++            "linear",
++            "ease_in_quad",
++            "ease_out_quad",
++            "ease_in_out_quad",
++            "ease_in_cubic",
++            "ease_out_back",
++        }
++        assert expected <= set(EASING_FUNCTIONS.keys())
++
++
++# ---------------------------------------------------------------------------
++# Animation lifecycle tests
++# ---------------------------------------------------------------------------
++
++class TestAnimation:
++
++    def test_basic_interpolation_linear(self):
++        """Halfway through should give halfway value with linear easing."""
++        values = []
++        anim = Animation(
++            start_value=0,
++            end_value=100,
++            duration=1000,
++            easing=linear,
++            on_update=values.append,
++        )
++        anim.tick(500)
++        assert values[-1] == pytest.approx(50.0)
++        assert not anim.is_completed()
++
++    def test_completes_at_duration(self):
++        """Animation should complete when elapsed >= duration."""
++        complete_called = [False]
++        anim = Animation(
++            start_value=0,
++            end_value=100,
++            duration=500,
++            on_complete=lambda: complete_called.__setitem__(0, True),
++        )
++        done = anim.tick(500)
++        assert done is True
++        assert anim.is_completed()
++        assert complete_called[0]
++
++    def test_final_value_is_end_value(self):
++        """on_update receives end_value on the completing tick."""
++        values = []
++        anim = Animation(
++            start_value=0,
++            end_value=100,
++            duration=200,
++            easing=linear,
++            on_update=values.append,
++        )
++        anim.tick(200)
++        assert values[-1] == pytest.approx(100.0)
++
++    def test_loop_resets_elapsed(self):
++        """A looping animation never completes and resets elapsed."""
++        tick_count = [0]
++
++        def counter(v):
++            tick_count[0] += 1
++
++        anim = Animation(
++            start_value=0,
++            end_value=10,
++            duration=100,
++            loop=True,
++            on_update=counter,
++        )
++        # Tick past 3 full cycles
++        for _ in range(5):
++            anim.tick(100)
++        assert not anim.is_completed()
++        assert tick_count[0] == 5
++
++    def test_bounce_reverses_direction(self):
++        """Bounce animation should reverse: value decreases after first cycle."""
++        values = []
++        anim = Animation(
++            start_value=0,
++            end_value=100,
++            duration=200,
++            easing=linear,
++            bounce=True,
++            on_update=values.append,
++        )
++        # End of first cycle -> value should be 100
++        anim.tick(200)
++        assert values[-1] == pytest.approx(100.0)
++        # Into second cycle (reversed) -> value should drop
++        anim.tick(100)
++        assert values[-1] < 100.0
++        assert not anim.is_completed()
++
++    def test_delay_holds_start(self):
++        """No update should fire before the delay expires."""
++        values = []
++        anim = Animation(
++            start_value=0,
++            end_value=100,
++            duration=500,
++            delay=200,
++            easing=linear,
++            on_update=values.append,
++        )
++        anim.tick(100)  # still in delay
++        assert len(values) == 0
++
++        anim.tick(100)  # delay exactly consumed (total 200ms), 0ms carry-over
++        # When delay is exactly consumed, dt carry-over is 0, so on_update fires
++        # with value == start_value (t=0).
++        assert len(values) == 1
++        assert values[0] == pytest.approx(0.0)
++
++        anim.tick(250)  # halfway through actual animation
++        assert values[-1] == pytest.approx(50.0, abs=1.0)
++
++    def test_cancel(self):
++        """Cancelled animation is immediately marked complete."""
++        anim = Animation(start_value=0, end_value=100, duration=500)
++        anim.cancel()
++        assert anim.is_completed()
++        # Ticking a cancelled animation returns True immediately
++        assert anim.tick(100) is True
++
++    def test_get_current_value(self):
++        """get_current_value returns most recently computed value."""
++        anim = Animation(start_value=10, end_value=20, duration=1000, easing=linear)
++        assert anim.get_current_value() == pytest.approx(10.0)
++        anim.tick(500)
++        assert anim.get_current_value() == pytest.approx(15.0)
++
++    def test_value_min_clamp(self):
++        """value_min clamps interpolated values that go below the bound."""
++        values = []
++        # Use an easing that could go below 0 is impossible here, but we can
++        # artificially test by setting value_min above the interpolated midpoint.
++        anim = Animation(
++            start_value=0,
++            end_value=100,
++            duration=1000,
++            easing=linear,
++            value_min=40,
++            on_update=values.append,
++        )
++        anim.tick(200)  # raw interpolated value = 20, clamped to 40
++        assert values[-1] == pytest.approx(40.0)
++
++    def test_value_max_clamp_for_ease_out_back(self):
++        """value_max prevents ease_out_back overshoot from exceeding the cap."""
++        max_seen = [0.0]
++
++        def track(v):
++            if v > max_seen[0]:
++                max_seen[0] = v
++
++        anim = Animation(
++            start_value=0,
++            end_value=100,
++            duration=500,
++            easing=ease_out_back,
++            on_update=track,
++            value_max=100.0,
++        )
++        # Tick in small steps to capture the peak
++        for _ in range(50):
++            anim.tick(10)
++        assert max_seen[0] == pytest.approx(100.0)
++
++    def test_invalid_duration(self):
++        with pytest.raises(AssertionError):
++            Animation(start_value=0, end_value=1, duration=0)
++
++    def test_invalid_delay(self):
++        with pytest.raises(AssertionError):
++            Animation(start_value=0, end_value=1, duration=100, delay=-1)
++
++    def test_invalid_value_bounds(self):
++        with pytest.raises(AssertionError):
++            Animation(start_value=0, end_value=1, duration=100, value_min=10, value_max=5)
++
++
++# ---------------------------------------------------------------------------
++# AnimationManager lifecycle tests
++# ---------------------------------------------------------------------------
++
++class TestAnimationManager:
++
++    def test_add_and_is_empty(self):
++        mgr = AnimationManager()
++        assert mgr.is_empty()
++        anim = Animation(start_value=0, end_value=10, duration=100)
++        mgr.add(anim)
++        assert not mgr.is_empty()
++
++    def test_add_returns_animation(self):
++        mgr = AnimationManager()
++        anim = Animation(start_value=0, end_value=10, duration=100)
++        returned = mgr.add(anim)
++        assert returned is anim
++
++    def test_tick_advances_and_removes_completed(self):
++        mgr = AnimationManager()
++        done = [False]
++        anim = Animation(
++            start_value=0,
++            end_value=10,
++            duration=100,
++            on_complete=lambda: done.__setitem__(0, True),
++        )
++        mgr.add(anim)
++        mgr.tick(100)
++        assert done[0]
++        assert mgr.is_empty()
++
++    def test_tick_keeps_active(self):
++        mgr = AnimationManager()
++        anim = Animation(start_value=0, end_value=100, duration=500)
++        mgr.add(anim)
++        mgr.tick(100)  # only 100ms of 500ms elapsed
++        assert not mgr.is_empty()
++
++    def test_cancel_all(self):
++        mgr = AnimationManager()
++        for _ in range(3):
++            mgr.add(Animation(start_value=0, end_value=1, duration=1000))
++        mgr.cancel_all()
++        assert mgr.is_empty()
++
++    def test_remove_for_widget(self):
++        """remove_for_widget cancels and removes only matching animations."""
++        mgr = AnimationManager()
++
++        # Create a fake widget sentinel
++        class FakeWidget:
++            pass
++
++        w1, w2 = FakeWidget(), FakeWidget()
++
++        anim_w1 = Animation(start_value=0, end_value=1, duration=500)
++        anim_w1._widget = w1
++
++        anim_w2 = Animation(start_value=0, end_value=1, duration=500)
++        anim_w2._widget = w2
++
++        mgr.add(anim_w1)
++        mgr.add(anim_w2)
++
++        mgr.remove_for_widget(w1)
++
++        # w1 animation removed, w2 still active
++        assert len(mgr._animations) == 1
++        assert mgr._animations[0]._widget is w2
++        assert anim_w1.is_completed()
++        assert not anim_w2.is_completed()
++
++    def test_multiple_animations_tick_independently(self):
++        """Each animation in the manager ticks with the same dt."""
++        values_a, values_b = [], []
++        mgr = AnimationManager()
++        mgr.add(
++            Animation(
++                start_value=0,
++                end_value=100,
++                duration=1000,
++                easing=linear,
++                on_update=values_a.append,
++            )
++        )
++        mgr.add(
++            Animation(
++                start_value=200,
++                end_value=300,
++                duration=500,
++                easing=linear,
++                on_update=values_b.append,
++            )
++        )
++        mgr.tick(500)
++        # First animation: 500/1000 = 0.5 → value 50
++        assert values_a[-1] == pytest.approx(50.0)
++        # Second animation: 500/500 = 1.0 → value 300 (completed)
++        assert values_b[-1] == pytest.approx(300.0)
++        # Second animation removed from manager
++        assert len(mgr._animations) == 1
++
++
++# ---------------------------------------------------------------------------
++# Widget opacity tests
++# ---------------------------------------------------------------------------
++
++class TestWidgetOpacity:
++
++    def _make_label(self):
++        menu = MenuUtils.generic_menu(title="Test")
++        label = menu.add.label("test")
++        return menu, label
++
++    def test_default_opacity(self):
++        _, label = self._make_label()
++        assert label.get_opacity() == 255
++
++    def test_set_and_get_opacity(self):
++        _, label = self._make_label()
++        label.set_opacity(128)
++        assert label.get_opacity() == 128
++
++    def test_opacity_clamp_low(self):
++        _, label = self._make_label()
++        label.set_opacity(-50)
++        assert label.get_opacity() == 0
++
++    def test_opacity_clamp_high(self):
++        _, label = self._make_label()
++        label.set_opacity(300)
++        assert label.get_opacity() == 255
++
++    def test_set_opacity_returns_self(self):
++        _, label = self._make_label()
++        assert label.set_opacity(100) is label
++
++    def test_draw_with_full_opacity(self):
++        """draw() at opacity=255 should work without error."""
++        menu, label = self._make_label()
++        menu.draw(surface)
++
++    def test_draw_with_partial_opacity(self):
++        """draw() at opacity=128 should not raise and uses proxy surface."""
++        menu, label = self._make_label()
++        label.set_opacity(128)
++        menu.draw(surface)
++        # After drawing, the off-screen buffer should be allocated
++        assert label._opacity_surface is not None
++
++    def test_draw_at_zero_opacity(self):
++        """draw() at opacity=0 should skip drawing entirely (no proxy alloc)."""
++        menu, label = self._make_label()
++        label.set_opacity(0)
++        menu.draw(surface)
++        # No buffer allocated for completely transparent widgets
++        assert label._opacity_surface is None
++
++    def test_animate_opacity_registers_with_manager(self):
++        """animate_opacity() must register the animation with the menu manager."""
++        menu, label = self._make_label()
++        assert menu.get_animation_manager().is_empty()
++        label.animate_opacity(0, duration=200)
++        assert not menu.get_animation_manager().is_empty()
++
++    def test_animate_opacity_value_clamped(self):
++        """animate_opacity respects value_min/value_max even with overshooting easings."""
++        menu, label = self._make_label()
++        label.set_opacity(0)
++        # Use ease_out_back which overshoots; clamp should keep opacity in [0, 255]
++        anim = label.animate_opacity(255, duration=300, easing=ease_out_back)
++        # Tick to the overshoot region
++        menu.get_animation_manager().tick(280)
++        # Clamping must have kept opacity at most 255
++        assert label.get_opacity() <= 255
++        assert label.get_opacity() >= 0
++
++
++# ---------------------------------------------------------------------------
++# fade_in integration test (transitions module)
++# ---------------------------------------------------------------------------
++
++class TestFadeInIntegration:
++
++    def test_fade_in_registered_and_ticks(self):
++        """transitions.fade_in() must add to menu manager and animate opacity."""
++        from pygame_menu import transitions
++
++        menu = MenuUtils.generic_menu(title="Fade")
++        label = menu.add.label("hello")
++
++        # fade_in sets opacity to 0, makes visible, and registers animation
++        anim = transitions.fade_in(label, duration=300)
++
++        assert label.get_opacity() == 0
++        assert label.is_visible()
++        assert not menu.get_animation_manager().is_empty()
++        assert anim._widget is label
++
++        # Tick halfway through. ease_out_quad(0.5) = 0.5*(2-0.5) = 0.75,
++        # so expected opacity = 0.75 * 255 ≈ 191.
++        menu.get_animation_manager().tick(150)
++        assert label.get_opacity() == pytest.approx(191, abs=5)
++
++        # Tick to completion
++        menu.get_animation_manager().tick(150)
++        assert label.get_opacity() == 255
++        assert menu.get_animation_manager().is_empty()
++
++    def test_fade_in_without_menu_still_returns_animation(self):
++        """fade_in on a widget with no menu returns an Animation, just not registered."""
++        from pygame_menu import transitions
++        from pygame_menu.widgets.widget.label import Label
++
++        # Create a label not attached to any menu
++        label = Label(title="orphan")
++        anim = transitions.fade_in(label, duration=200)
++
++        assert isinstance(anim, Animation)
++        assert anim._widget is label
++        # No menu → manager not available; animation must still tick manually
++        anim.tick(200)
++        assert label.get_opacity() == 255
++
++    def test_fade_out_hides_widget_on_complete(self):
++        """transitions.fade_out() hides the widget when done."""
++        from pygame_menu import transitions
++
++        menu = MenuUtils.generic_menu(title="FadeOut")
++        label = menu.add.label("bye")
++        label.set_opacity(255)
++
++        transitions.fade_out(label, duration=200)
++
++        # Run the animation to completion
++        menu.get_animation_manager().tick(200)
++        assert label.get_opacity() == 0
++        assert not label.is_visible(check_frame=False)
++
++    def test_animation_cleanup_on_widget_removal(self):
++        """Removing a widget mid-animation cancels and removes its animations."""
++        from pygame_menu import transitions
++
++        menu = MenuUtils.generic_menu(title="Cleanup")
++        label = menu.add.label("remove me")
++        transitions.fade_in(label, duration=1000)
++
++        assert not menu.get_animation_manager().is_empty()
++
++        menu.remove_widget(label)
++
++        assert menu.get_animation_manager().is_empty()
