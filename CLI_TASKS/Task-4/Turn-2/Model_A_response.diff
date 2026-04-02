@@ -1,0 +1,605 @@
+diff --git a/pygame_menu/_widgetmanager.py b/pygame_menu/_widgetmanager.py
+index 52b6b8e3..d7ec3372 100644
+--- a/pygame_menu/_widgetmanager.py
++++ b/pygame_menu/_widgetmanager.py
+@@ -309,6 +309,11 @@ class WidgetManager(
+         assert isinstance(invalid_border_width, int) and invalid_border_width >= 0
+         attributes["invalid_border_width"] = invalid_border_width
+ 
++        validation_success_color = kwargs.pop(
++            "validation_success_color", self._theme.widget_validation_success_color
++        )
++        attributes["validation_success_color"] = assert_color(validation_success_color)
++
+         return attributes
+ 
+     def _configure_widget(self, widget: Widget, **kwargs) -> None:
+@@ -371,6 +376,7 @@ class WidgetManager(
+         widget.set_invalid_style(
+             border_color=kwargs["invalid_border_color"],
+             border_width=kwargs["invalid_border_width"],
++            success_color=kwargs["validation_success_color"],
+         )
+         if kwargs["validators"] is not None:
+             widget.set_validators(kwargs["validators"])
+diff --git a/pygame_menu/themes.py b/pygame_menu/themes.py
+index c4957b23..e1b246d4 100644
+--- a/pygame_menu/themes.py
++++ b/pygame_menu/themes.py
+@@ -263,6 +263,8 @@ class Theme:
+     :type widget_invalid_border_color: tuple, list, str, int, :py:class:`pygame.Color`
+     :param widget_invalid_border_width: Border width in px drawn around a widget while its validation state is invalid. If ``0`` the invalid border is disabled
+     :type widget_invalid_border_width: int
++    :param widget_validation_success_color: Border color briefly shown on a widget right after it transitions from invalid to valid
++    :type widget_validation_success_color: tuple, list, str, int, :py:class:`pygame.Color`
+     :param widget_margin: Horizontal and vertical margin of each element in Menu in px
+     :type widget_margin: tuple, list
+     :param widget_padding: Padding of the widget according to CSS rules. It can be a single digit, or a tuple of 2, 3, or 4 elements. Padding modifies widget width/height
+@@ -359,6 +361,7 @@ class Theme:
+     widget_font_size: int
+     widget_invalid_border_color: ColorType
+     widget_invalid_border_width: int
++    widget_validation_success_color: ColorType
+     widget_margin: Tuple2NumberType
+     widget_offset: Tuple2NumberType
+     widget_padding: PaddingType
+@@ -562,6 +565,9 @@ class Theme:
+         self.widget_invalid_border_width = self._get(
+             kwargs, "widget_invalid_border_width", int, 2
+         )
++        self.widget_validation_success_color = self._get(
++            kwargs, "widget_validation_success_color", "color", (40, 167, 69)
++        )
+         self.widget_margin = self._get(kwargs, "widget_margin", "tuple2", (0, 0))
+         self.widget_offset = self._get(kwargs, "widget_offset", "tuple2", (0, 0))
+         self.widget_padding = self._get(
+@@ -721,6 +727,9 @@ class Theme:
+         self.widget_invalid_border_color = self._format_color_opacity(
+             self.widget_invalid_border_color
+         )
++        self.widget_validation_success_color = self._format_color_opacity(
++            self.widget_validation_success_color
++        )
+         self.widget_shadow_color = self._format_color_opacity(self.widget_shadow_color)
+         self.widget_url_color = self._format_color_opacity(self.widget_url_color)
+ 
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index 646f6e01..4c3a135d 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -521,6 +521,13 @@ class Widget(Base):
+         self._validation_errors = []  # Cached error strings for quick lookup
+         self._validation_invalid_border_color = (255, 0, 0)
+         self._validation_invalid_border_width = 2
++        self._validation_success_color = (40, 167, 69)
++        self._validation_show_success = False  # One-shot flag after invalid→valid
++        self._validation_success_armed = False  # Protects the very first render
++        self._validation_error_surface: pygame.Surface | None = None
++        self._validation_error_font_size = 14
++        self._validation_rect_delta = 0  # y-delta contributed by the error label
++        self._auto_validate_on_blur = True
+ 
+         # Rendering, this variable may be used by render() method. If the hash
+         # of the variables change respect to the last render hash (hash computed
+@@ -927,6 +934,13 @@ class Widget(Base):
+ 
+         :return: Render return value
+         """
++        # Success border is a one-shot: the render that arms it keeps it,
++        # the *next* force-render reverts to the normal border
++        if self._validation_show_success:
++            if self._validation_success_armed:
++                self._validation_success_armed = False
++            else:
++                self._validation_show_success = False
+         self._last_render_hash = 0
+         return self._render()
+ 
+@@ -1219,21 +1233,30 @@ class Widget(Base):
+ 
+         :param surface: Surface to draw the border
+         """
+-        # Invalid-state override: draw a full border regardless of normal
+-        # border settings so the user always sees which field failed
+-        if self._validation_errors and self._validation_invalid_border_width > 0:
+-            rect = self.get_rect(
+-                inflate=(
+-                    self._border_inflate[0] + self._background_inflate[0],
+-                    self._border_inflate[1] + self._background_inflate[1],
++        # Validation-state border override: draw a full border regardless of
++        # normal border settings so the user always sees which field failed
++        # (or just passed). The rect height is compensated so the border wraps
++        # only the widget body, not the error label reserved below it.
++        if self._validation_errors or self._validation_show_success:
++            if self._validation_invalid_border_width > 0:
++                rect = self.get_rect(
++                    inflate=(
++                        self._border_inflate[0] + self._background_inflate[0],
++                        self._border_inflate[1] + self._background_inflate[1],
++                    )
++                )
++                rect.height -= self._validation_rect_delta
++                border_color = (
++                    self._validation_invalid_border_color
++                    if self._validation_errors
++                    else self._validation_success_color
++                )
++                pygame.draw.rect(
++                    surface,
++                    border_color,
++                    rect,
++                    self._validation_invalid_border_width,
+                 )
+-            )
+-            pygame.draw.rect(
+-                surface,
+-                self._validation_invalid_border_color,
+-                rect,
+-                self._validation_invalid_border_width,
+-            )
+             return
+ 
+         if self._border_width == 0 or self._border_color is None:
+@@ -1267,6 +1290,67 @@ class Widget(Base):
+                     surface, self._border_color, start, end, self._border_width
+                 )
+ 
++    def _draw_validation_errors(self, surface: pygame.Surface) -> None:
++        """
++        Blit the cached validation-error label just below the widget body.
++        The label surface is built in :py:meth:`_build_validation_error_surface`
++        when the validation state flips; this method only draws.
++
++        :param surface: Surface to draw the error label on
++        """
++        if self._validation_error_surface is None:
++            return
++        rect = self.get_rect()
++        # Compensate for the height we added via _rect_size_delta so the
++        # label sits right under the widget body, not under the extended rect
++        y = rect.y + rect.height - self._validation_rect_delta + 2
++        surface.blit(self._validation_error_surface, (rect.x, y))
++
++    def _build_validation_error_surface(self) -> None:
++        """
++        Render the first error message into a small text surface, grow the
++        widget's reported height via ``_rect_size_delta`` so the next widget
++        does not overlap, and invalidate the menu surface so positioning is
++        recomputed.
++        """
++        if not self._validation_errors or self._font_name == "":
++            self._validation_error_surface = None
++            return
++
++        msg = self._validation_errors[0]
++        err_font = pygame_menu.font.get_font(
++            self._font_name, self._validation_error_font_size
++        )
++        self._validation_error_surface = err_font.render(
++            msg, self._font_antialias, self._validation_invalid_border_color
++        )
++
++        err_h = self._validation_error_surface.get_height() + 2
++        self._validation_rect_delta = err_h
++        self._rect_size_delta = (
++            self._rect_size_delta[0],
++            self._rect_size_delta[1] + err_h,
++        )
++        if self._menu is not None:
++            self._menu._widgets_surface = None
++
++    def _teardown_validation_error_surface(self) -> None:
++        """
++        Drop the error label surface and give back the height borrowed via
++        ``_rect_size_delta``. Invalidates the menu surface so layout shrinks
++        back.
++        """
++        if self._validation_error_surface is None and self._validation_rect_delta == 0:
++            return
++        self._validation_error_surface = None
++        self._rect_size_delta = (
++            self._rect_size_delta[0],
++            self._rect_size_delta[1] - self._validation_rect_delta,
++        )
++        self._validation_rect_delta = 0
++        if self._menu is not None:
++            self._menu._widgets_surface = None
++
+     def set_border(
+         self,
+         width: int,
+@@ -1535,6 +1619,7 @@ class Widget(Base):
+         self._decorator.draw_prev(surface)
+         self._draw(surface)
+         self._draw_border(surface)
++        self._draw_validation_errors(surface)
+         self._decorator.draw_post(surface)
+ 
+         # Apply callbacks
+@@ -1894,6 +1979,8 @@ class Widget(Base):
+         self,
+         border_color: ColorInputType = (255, 0, 0),
+         border_width: int = 2,
++        success_color: ColorInputType = (40, 167, 69),
++        error_font_size: int = 14,
+     ) -> Widget:
+         """
+         Configure how the Widget looks while in the invalid state. The invalid
+@@ -1902,29 +1989,73 @@ class Widget(Base):
+ 
+         :param border_color: Border color drawn while invalid
+         :param border_width: Border width in px drawn while invalid
++        :param success_color: Border color shown briefly after an invalid→valid transition
++        :param error_font_size: Font size of the error label rendered below the widget
+         :return: Self reference
+         """
+         assert isinstance(border_width, int) and border_width >= 0
++        assert isinstance(error_font_size, int) and error_font_size > 0
+         self._validation_invalid_border_color = assert_color(border_color)
+         self._validation_invalid_border_width = border_width
++        self._validation_success_color = assert_color(success_color)
++        self._validation_error_font_size = error_font_size
++        return self
++
++    def set_auto_validate_on_blur(self, auto: bool) -> Widget:
++        """
++        Enable/disable automatic validation when the Widget loses focus.
++
++        :param auto: If ``True`` (default) run :py:meth:`validate` on blur
++        :return: Self reference
++        """
++        assert isinstance(auto, bool)
++        self._auto_validate_on_blur = auto
+         return self
+ 
+     def _set_validation_result(self, result: ValidationResult) -> None:
+         prev_errors = self._validation_errors
+         self._validation_result = result
+         self._validation_errors = list(result.errors)
+-        # Re-render only when visual state actually flips
+-        if bool(prev_errors) != bool(self._validation_errors):
+-            self._force_render()
++
++        was_invalid = bool(prev_errors)
++        now_invalid = bool(self._validation_errors)
++
++        if was_invalid == now_invalid:
++            # Same overall state. If the error text changed rebuild the label
++            # but skip the full layout churn of teardown+build.
++            if now_invalid and prev_errors[0] != self._validation_errors[0]:
++                self._teardown_validation_error_surface()
++                self._build_validation_error_surface()
++            return
++
++        if now_invalid:
++            # valid → invalid
++            self._validation_show_success = False
++            self._validation_success_armed = False
++            self._build_validation_error_surface()
++        else:
++            # invalid → valid: one-shot success border, dropped by next
++            # _force_render() (e.g. next interaction / selection change)
++            self._teardown_validation_error_surface()
++            self._validation_show_success = True
++            self._validation_success_armed = True
++
++        self._force_render()
+ 
+     def _clear_validation_state(self) -> None:
+-        if self._validation_result is not None or self._validation_errors:
+-            self._validation_result = None
+-            self._validation_errors = []
++        had_visuals = (
++            self._validation_result is not None
++            or self._validation_errors
++            or self._validation_show_success
++            or self._validation_error_surface is not None
++        )
++        self._validation_result = None
++        self._validation_errors = []
++        self._validation_show_success = False
++        self._validation_success_armed = False
++        self._teardown_validation_error_surface()
++        if had_visuals:
+             self._force_render()
+-        else:
+-            self._validation_result = None
+-            self._validation_errors = []
+ 
+     # -------------------------------------------------------------------------
+ 
+@@ -3017,13 +3148,25 @@ class Widget(Base):
+         Function that is executed when the Widget receives the user focus (is
+         selected).
+         """
+-        pass
++        self.set_attribute("__touched__", True)
+ 
+     def _blur(self) -> None:
+         """
+         Function that is executed when the Widget loses the focus.
++
++        Subclasses overriding this method **must** call ``super()._blur()``
++        so that auto-validation-on-blur keeps working.
+         """
+-        pass
++        # Only auto-validate if the user actually focused this widget first.
++        # _append_widget() calls select(False) on creation which would
++        # otherwise flag every required field as invalid before the user
++        # ever touched it.
++        if (
++            self._auto_validate_on_blur
++            and self._validators
++            and self.get_attribute("__touched__", False)
++        ):
++            self.validate()
+ 
+     def _configure(self) -> None:
+         """
+diff --git a/pygame_menu/widgets/widget/rangeslider.py b/pygame_menu/widgets/widget/rangeslider.py
+index a983d707..7c1eb7fb 100644
+--- a/pygame_menu/widgets/widget/rangeslider.py
++++ b/pygame_menu/widgets/widget/rangeslider.py
+@@ -1083,9 +1083,11 @@ class RangeSlider(Widget):
+         return changed
+ 
+     def _blur(self) -> None:
++        super()._blur()
+         self._selected_mouse = False
+ 
+     def _focus(self) -> None:
++        super()._focus()
+         self._selected_mouse = False
+ 
+     def _left_right(self, event, left: bool) -> bool:
+diff --git a/pygame_menu/widgets/widget/textinput.py b/pygame_menu/widgets/widget/textinput.py
+index a886b5d1..8a431141 100644
+--- a/pygame_menu/widgets/widget/textinput.py
++++ b/pygame_menu/widgets/widget/textinput.py
+@@ -1308,6 +1308,7 @@ class TextInput(Widget):
+         self._update_renderbox(right=1)
+ 
+     def _blur(self) -> None:
++        super()._blur()
+         # self._key_is_pressed = False
+         self._mouse_is_pressed = False
+         self._keyrepeat_mouse_ms = 0
+@@ -1317,6 +1318,7 @@ class TextInput(Widget):
+         # self._history_index = len(self._history) - 1
+ 
+     def _focus(self) -> None:
++        super()._focus()
+         self._cursor_ms_counter = 0
+         self._cursor_visible = True
+         self._cursor_render = True
+diff --git a/test/test_validation.py b/test/test_validation.py
+index 765e8170..a326c8a7 100644
+--- a/test/test_validation.py
++++ b/test/test_validation.py
+@@ -393,9 +393,215 @@ def test_clear_validation_removes_visual_state():
+ 
+     ti.clear_validation()
+     assert ti._validation_errors == []
++    assert ti._validation_error_surface is None
++    assert ti._validation_show_success is False
+     ti.draw(surface)  # should not crash and normal border path taken
+ 
+ 
++def test_error_label_surface_built_and_drawn():
++    """Invalid state must render an error label below the widget body."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("Email: ", validators=[Email()], required=True)
++    ti.set_value("bad")
++    ti.validate()
++
++    assert ti._validation_error_surface is not None
++    assert ti._validation_error_surface.get_height() > 0
++    # draw() must blit it without crashing
++    menu.draw(surface)
++
++
++def test_error_label_grows_widget_height():
++    """Error label must extend reported rect so next widget doesn't overlap."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ", required=True)
++    ti.set_value("filled")
++    h_clean = ti.get_height()
++    base_delta = ti._rect_size_delta
++
++    ti.set_value("")
++    ti.validate()  # → invalid, builds error surface, grows delta
++    err_h = ti._validation_error_surface.get_height() + 2
++    assert ti._validation_rect_delta == err_h
++    assert ti._rect_size_delta[1] == base_delta[1] + err_h
++    assert ti.get_height() == h_clean + err_h
++
++    # Menu surface must have been invalidated so layout recomputes
++    assert menu._widgets_surface is None
++
++    # Fix the value → teardown gives the height back
++    ti.set_value("filled")
++    ti.validate()
++    assert ti._validation_error_surface is None
++    assert ti._validation_rect_delta == 0
++    assert ti._rect_size_delta == base_delta
++    assert ti.get_height() == h_clean
++
++
++def test_error_label_no_overlap_in_layout():
++    """End-to-end: widget below an invalid field must be pushed down."""
++    menu = MenuUtils.generic_menu()
++    top = menu.add.text_input("Top: ", required=True)
++    bottom = menu.add.text_input("Bottom: ")
++    menu.render()
++    y_before = bottom.get_rect().y
++
++    top.set_value("")
++    top.validate()
++    menu.render()
++    y_after = bottom.get_rect().y
++
++    assert y_after > y_before
++    assert top.get_rect().bottom <= bottom.get_rect().top  # no overlap
++
++
++def test_error_label_rebuilt_on_message_change():
++    """If error text changes (still invalid), the label surface is rebuilt."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ", validators=[MinLength(10), Email()])
++
++    ti.set_value("abc")  # fails MinLength first
++    ti.validate()
++    surf1 = ti._validation_error_surface
++
++    ti.set_value("abcdefghijk")  # passes MinLength, fails Email
++    ti.validate()
++    surf2 = ti._validation_error_surface
++
++    assert surf1 is not surf2
++    assert surf2 is not None
++
++
++def test_success_border_one_shot():
++    """invalid→valid shows success border, next _force_render reverts."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ", required=True)
++
++    ti.set_value("")
++    ti.validate()
++    assert ti._validation_show_success is False  # currently invalid
++
++    ti.set_value("filled")
++    ti.validate()  # invalid → valid
++    assert ti._validation_show_success is True
++    assert ti._validation_errors == []
++    ti.draw(surface)  # draws the success border
++
++    # Next interaction (any _force_render) reverts to normal border
++    ti._force_render()
++    assert ti._validation_show_success is False
++
++
++def test_success_border_skipped_on_clean_first_pass():
++    """No success flash if the widget was never invalid."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ", required=True)
++    ti.set_value("filled")
++    ti.validate()
++    assert ti._validation_show_success is False
++
++
++def test_success_color_from_theme():
++    theme = pygame_menu.themes.THEME_DEFAULT.copy()
++    theme.widget_validation_success_color = (1, 2, 3)
++    menu = MenuUtils.generic_menu(theme=theme)
++    ti = menu.add.text_input("X: ")
++    assert ti._validation_success_color[:3] == (1, 2, 3)
++
++
++def test_clear_validators_tears_down_error_surface():
++    """clear_validators() must also restore border & drop the error label."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ", required=True)
++    base_delta = ti._rect_size_delta
++
++    ti.set_value("")
++    ti.validate()
++    assert ti._validation_error_surface is not None
++    assert ti._rect_size_delta[1] > base_delta[1]
++
++    ti.clear_validators()
++
++    assert ti.get_validators() == ()
++    assert ti._validation_errors == []
++    assert ti._validation_error_surface is None
++    assert ti._validation_show_success is False
++    assert ti._rect_size_delta == base_delta
++    ti.draw(surface)  # normal border path, no red
++
++
++# ---------------------------------------------------------------------------
++# Auto-validate on blur
++# ---------------------------------------------------------------------------
++
++def test_auto_validate_on_blur_default():
++    """Losing focus runs validate() automatically when validators are attached."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ", required=True)
++
++    assert ti._auto_validate_on_blur is True
++    ti.set_value("")
++    # Widget was auto-selected on append (first selectable widget) → touched.
++    # It has not been validated yet because it never blurred.
++    assert ti._validation_result is None
++
++    ti.select(False)  # → _blur() → auto validate
++    assert ti._validation_result is not None
++    assert not ti._validation_result.valid
++    assert ti._validation_error_surface is not None
++
++
++def test_auto_validate_untouched_widget_skipped():
++    """A widget never focused by the user must NOT validate on creation blur."""
++    menu = MenuUtils.generic_menu()
++    menu.add.text_input("First: ")  # takes auto-selection
++    second = menu.add.text_input("Second: ", required=True)  # never focused
++    # _append_widget called select(False) on `second` but it was never touched
++    assert second._validation_result is None
++    assert second._validation_error_surface is None
++
++
++def test_auto_validate_on_blur_can_be_disabled():
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ", required=True)
++    ti.set_auto_validate_on_blur(False)
++
++    ti.set_value("")
++    ti.select(False)  # blur, but flag disabled
++    assert ti._validation_result is None
++
++
++def test_auto_validate_on_blur_skipped_without_validators():
++    """Widgets with no validators don't validate on blur (avoids pointless work)."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ")  # no validators, auto-selected
++    ti.select(False)
++    assert ti._validation_result is None
++
++
++def test_rangeslider_blur_calls_super():
++    """RangeSlider overrides _blur() — must still trigger auto-validate."""
++    menu = MenuUtils.generic_menu()
++    rs = menu.add.range_slider(
++        "Val: ", 50, (0, 100), 1,
++        validators=[Custom(lambda v: v > 75 or "Too low")],
++    )
++    # rs is the first selectable → auto-focused → touched
++    rs.select(False)  # blur → auto validate
++    assert rs._validation_result is not None
++    assert not rs._validation_result.valid
++
++
++def test_textinput_blur_calls_super():
++    """TextInput overrides _blur() — must still trigger auto-validate."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input("X: ", validators=[MinLength(5)])
++    ti.set_value("ab")
++    ti.select(False)  # blur → auto validate
++    assert ti._validation_result is not None
++    assert ti.get_validation_errors()
++
++
+ # ---------------------------------------------------------------------------
+ # Widget addition API (validators=, required=)
+ # ---------------------------------------------------------------------------
+@@ -624,8 +830,10 @@ def test_theme_has_validation_defaults():
+     theme = pygame_menu.themes.THEME_DEFAULT.copy()
+     assert hasattr(theme, "widget_invalid_border_color")
+     assert hasattr(theme, "widget_invalid_border_width")
++    assert hasattr(theme, "widget_validation_success_color")
+     assert theme.widget_invalid_border_color == (255, 0, 0, 255)
+     assert theme.widget_invalid_border_width == 2
++    assert theme.widget_validation_success_color == (40, 167, 69, 255)
+     theme.validate()  # should not raise
+ 
+ 
