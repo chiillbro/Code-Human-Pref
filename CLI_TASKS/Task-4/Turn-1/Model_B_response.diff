@@ -1,0 +1,1295 @@
+diff --git a/pygame_menu/__init__.py b/pygame_menu/__init__.py
+index 52e84a1d..b1fb6eaa 100644
+--- a/pygame_menu/__init__.py
++++ b/pygame_menu/__init__.py
+@@ -91,6 +91,7 @@ if __pygame_version__ is not None:
+         menu,
+         sound,
+         themes,
++        validation,  # type: ignore
+         version,  # type: ignore
+         widgets,  # type: ignore
+     )
+diff --git a/pygame_menu/_widgetmanager.py b/pygame_menu/_widgetmanager.py
+index 18d7bace..60243c59 100644
+--- a/pygame_menu/_widgetmanager.py
++++ b/pygame_menu/_widgetmanager.py
+@@ -283,6 +283,15 @@ class WidgetManager(
+         # tab_size
+         attributes["tab_size"] = kwargs.pop("tab_size", self._theme.widget_tab_size)
+ 
++        # validators
++        validators = kwargs.pop("validators", None)
++        attributes["validators"] = validators if validators else []
++
++        # required
++        required = kwargs.pop("required", False)
++        assert isinstance(required, bool)
++        attributes["required"] = required
++
+         return attributes
+ 
+     def _configure_widget(self, widget: Widget, **kwargs) -> None:
+@@ -353,6 +362,13 @@ class WidgetManager(
+         if self._theme.widget_background_inflate_to_selection:
+             widget.background_inflate_to_selection_effect()
+ 
++        # Apply validators
++        if kwargs.get("required", False):
++            from pygame_menu.validation import Required
++            widget.add_validator(Required())
++        for v in kwargs.get("validators", []):
++            widget.add_validator(v)
++
+         widget._update__repr___(self)
+         widget._keyboard_ignore_nonphysical = self._menu._keyboard_ignore_nonphysical
+ 
+diff --git a/pygame_menu/menu.py b/pygame_menu/menu.py
+index 1777f1a4..cf9aaf92 100644
+--- a/pygame_menu/menu.py
++++ b/pygame_menu/menu.py
+@@ -3933,6 +3933,83 @@ class Menu(Base):
+                 sm.reset_value(recursive)
+         return self
+ 
++    def validate_form(
++        self, collect_all: bool = False
++    ) -> tuple[bool, dict[str, list[str]]]:
++        """
++        Validate all widgets in the Menu that have validators attached.
++        Also runs any cross-validators registered on this Menu.
++
++        :param collect_all: If ``True``, collect all errors from all widgets instead of stopping at first invalid widget
++        :return: Tuple of (is_valid, errors_dict) where errors_dict maps widget IDs to lists of error messages
++        """
++        from pygame_menu.validation import (
++            ValidationResult,
++            VALIDATION_MODE_COLLECT_ALL,
++            VALIDATION_MODE_FAIL_FAST,
++        )
++        errors: dict[str, list[str]] = {}
++        all_valid = True
++
++        for widget in self._widgets:
++            if not widget._validators:
++                continue
++            old_mode = widget._validation_mode
++            if collect_all:
++                widget._validation_mode = VALIDATION_MODE_COLLECT_ALL
++            result = widget.validate()
++            widget._validation_mode = old_mode
++            if not result.valid:
++                all_valid = False
++                errors[widget.get_id()] = result.errors
++                if not collect_all:
++                    break
++
++        # Run cross-validators
++        if hasattr(self, "_cross_validators") and self._cross_validators:
++            widget_map = {w.get_id(): w for w in self._widgets}
++            for cv in self._cross_validators:
++                cv_errors = cv(widget_map)
++                for wid, msg in cv_errors:
++                    all_valid = False
++                    if wid not in errors:
++                        errors[wid] = []
++                    errors[wid].append(msg)
++                    # Also set the error on the widget for visual feedback
++                    w = widget_map.get(wid)
++                    if w is not None:
++                        w._validation_errors.append(msg)
++
++        return all_valid, errors
++
++    def add_cross_validator(self, *validators: 'CrossValidator') -> Menu:
++        """
++        Add one or more cross-validators that check relationships between
++        multiple widgets in this Menu.
++
++        :param validators: CrossValidator instances
++        :return: Self reference
++        """
++        from pygame_menu.validation import CrossValidator
++        if not hasattr(self, "_cross_validators"):
++            self._cross_validators = []
++        for v in validators:
++            assert isinstance(v, CrossValidator), (
++                f"expected CrossValidator instance, got {type(v)}"
++            )
++            self._cross_validators.append(v)
++        return self
++
++    def clear_validation_errors(self) -> Menu:
++        """
++        Clear validation errors on all widgets in the Menu.
++
++        :return: Self reference
++        """
++        for widget in self._widgets:
++            widget.clear_validation_errors()
++        return self
++
+     def in_submenu(self, menu: Menu, recursive: bool = False) -> bool:
+         """
+         Return ``True`` if ``menu`` is a submenu of the Menu.
+diff --git a/pygame_menu/themes.py b/pygame_menu/themes.py
+index b828f5a0..bccea352 100644
+--- a/pygame_menu/themes.py
++++ b/pygame_menu/themes.py
+@@ -364,6 +364,8 @@ class Theme:
+     widget_shadow_width: int
+     widget_tab_size: int
+     widget_url_color: ColorType
++    widget_validation_border_color: ColorType
++    widget_validation_font_color: ColorType
+ 
+     def __init__(self, **kwargs) -> None:
+ 
+@@ -575,6 +577,14 @@ class Theme:
+             kwargs, "widget_url_color", "color", (6, 69, 173)
+         )
+ 
++        # Validation error theme
++        self.widget_validation_border_color = self._get(
++            kwargs, "widget_validation_border_color", "color", (255, 50, 50)
++        )
++        self.widget_validation_font_color = self._get(
++            kwargs, "widget_validation_font_color", "color", (255, 50, 50)
++        )
++
+         # Upon this, no more kwargs should exist, raise exception if there's more
+         for invalid_keyword in kwargs.keys():
+             raise ValueError(f"parameter Theme.{invalid_keyword} does not exist")
+@@ -707,6 +717,12 @@ class Theme:
+         )
+         self.widget_shadow_color = self._format_color_opacity(self.widget_shadow_color)
+         self.widget_url_color = self._format_color_opacity(self.widget_url_color)
++        self.widget_validation_border_color = self._format_color_opacity(
++            self.widget_validation_border_color
++        )
++        self.widget_validation_font_color = self._format_color_opacity(
++            self.widget_validation_font_color
++        )
+ 
+         # List to tuple
+         self.scrollarea_outer_margin = self._vec_to_tuple(  # type: ignore
+diff --git a/pygame_menu/validation.py b/pygame_menu/validation.py
+new file mode 100644
+index 00000000..3a1325c0
+--- /dev/null
++++ b/pygame_menu/validation.py
+@@ -0,0 +1,338 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++VALIDATION
++Widget validation system with composable validator primitives.
++"""
++
++from __future__ import annotations
++
++__all__ = [
++    # Result
++    "ValidationResult",
++    # Base
++    "Validator",
++    # Primitives
++    "Required",
++    "MinLength",
++    "MaxLength",
++    "Pattern",
++    "Email",
++    "Range",
++    "OneOf",
++    "NoneOf",
++    "Custom",
++    # Cross-widget
++    "CrossValidator",
++    "MatchField",
++    # Constants
++    "VALIDATION_MODE_FAIL_FAST",
++    "VALIDATION_MODE_COLLECT_ALL",
++]
++
++import re
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    from pygame_menu.widgets.core.widget import Widget
++
++VALIDATION_MODE_FAIL_FAST = "fail_fast"
++VALIDATION_MODE_COLLECT_ALL = "collect_all"
++
++
++class ValidationResult:
++    """
++    Holds the result of running validators on a widget.
++
++    :param valid: Whether validation passed
++    :param errors: List of error message strings
++    :param widget: The widget that was validated
++    """
++
++    def __init__(
++        self,
++        valid: bool,
++        errors: list[str] | None = None,
++        widget: Widget | None = None,
++    ) -> None:
++        self.valid = valid
++        self.errors = errors or []
++        self.widget = widget
++
++    def __bool__(self) -> bool:
++        return self.valid
++
++    def __repr__(self) -> str:
++        return f"ValidationResult(valid={self.valid}, errors={self.errors})"
++
++
++class Validator:
++    """
++    Base validator class. Subclasses must implement ``__call__``.
++    """
++
++    message: str
++
++    def __init__(self, message: str = "") -> None:
++        self.message = message
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        """
++        Validate the value. Return ``None`` if valid, or an error message string
++        if invalid.
++
++        :param value: The value to validate
++        :param widget: The widget being validated (optional)
++        :return: None if valid, error message if invalid
++        """
++        raise NotImplementedError("subclasses must implement __call__")
++
++    def __repr__(self) -> str:
++        return f"{self.__class__.__name__}()"
++
++
++class Required(Validator):
++    """
++    Validates that the value is not empty/None.
++    """
++
++    def __init__(self, message: str = "This field is required") -> None:
++        super().__init__(message)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        if value is None or (isinstance(value, str) and value.strip() == ""):
++            return self.message
++        return None
++
++
++class MinLength(Validator):
++    """
++    Validates that the string value has at least ``length`` characters.
++    """
++
++    def __init__(self, length: int, message: str = "") -> None:
++        self.length = length
++        default_msg = f"Must be at least {length} characters"
++        super().__init__(message or default_msg)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        if value is not None and len(str(value)) < self.length:
++            return self.message
++        return None
++
++    def __repr__(self) -> str:
++        return f"MinLength({self.length})"
++
++
++class MaxLength(Validator):
++    """
++    Validates that the string value has at most ``length`` characters.
++    """
++
++    def __init__(self, length: int, message: str = "") -> None:
++        self.length = length
++        default_msg = f"Must be at most {length} characters"
++        super().__init__(message or default_msg)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        if value is not None and len(str(value)) > self.length:
++            return self.message
++        return None
++
++    def __repr__(self) -> str:
++        return f"MaxLength({self.length})"
++
++
++class Pattern(Validator):
++    """
++    Validates that the string value matches the given regex pattern.
++    """
++
++    def __init__(self, pattern: str, message: str = "") -> None:
++        self.pattern = re.compile(pattern)
++        default_msg = f"Does not match required pattern"
++        super().__init__(message or default_msg)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        if value is not None and not self.pattern.search(str(value)):
++            return self.message
++        return None
++
++    def __repr__(self) -> str:
++        return f"Pattern({self.pattern.pattern!r})"
++
++
++class Email(Validator):
++    """
++    Validates that the value is a valid email address format.
++    """
++
++    _EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
++
++    def __init__(self, message: str = "Invalid email address") -> None:
++        super().__init__(message)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        if value is not None and isinstance(value, str) and value.strip() != "":
++            if not self._EMAIL_RE.match(str(value)):
++                return self.message
++        return None
++
++
++class Range(Validator):
++    """
++    Validates that a numeric value falls within [min_val, max_val].
++    """
++
++    def __init__(
++        self,
++        min_val: float | None = None,
++        max_val: float | None = None,
++        message: str = "",
++    ) -> None:
++        self.min_val = min_val
++        self.max_val = max_val
++        if not message:
++            if min_val is not None and max_val is not None:
++                message = f"Must be between {min_val} and {max_val}"
++            elif min_val is not None:
++                message = f"Must be at least {min_val}"
++            elif max_val is not None:
++                message = f"Must be at most {max_val}"
++            else:
++                message = "Invalid value"
++        super().__init__(message)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        if value is None:
++            return None
++        try:
++            num = float(value)
++        except (TypeError, ValueError):
++            return self.message
++        if self.min_val is not None and num < self.min_val:
++            return self.message
++        if self.max_val is not None and num > self.max_val:
++            return self.message
++        return None
++
++    def __repr__(self) -> str:
++        return f"Range(min={self.min_val}, max={self.max_val})"
++
++
++class OneOf(Validator):
++    """
++    Validates that the value is one of the allowed choices.
++    """
++
++    def __init__(self, choices: list | tuple, message: str = "") -> None:
++        self.choices = choices
++        default_msg = f"Must be one of: {', '.join(str(c) for c in choices)}"
++        super().__init__(message or default_msg)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        if value is not None and value not in self.choices:
++            return self.message
++        return None
++
++    def __repr__(self) -> str:
++        return f"OneOf({self.choices!r})"
++
++
++class NoneOf(Validator):
++    """
++    Validates that the value is not one of the disallowed choices.
++    """
++
++    def __init__(self, choices: list | tuple, message: str = "") -> None:
++        self.choices = choices
++        default_msg = f"Must not be one of: {', '.join(str(c) for c in choices)}"
++        super().__init__(message or default_msg)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        if value is not None and value in self.choices:
++            return self.message
++        return None
++
++    def __repr__(self) -> str:
++        return f"NoneOf({self.choices!r})"
++
++
++class Custom(Validator):
++    """
++    Wraps a user-provided callable as a validator. The callable should accept
++    a value and return ``None`` if valid or an error message string if invalid.
++    """
++
++    def __init__(self, func: Any, message: str = "Validation failed") -> None:
++        self._func = func
++        super().__init__(message)
++
++    def __call__(self, value: Any, widget: Widget | None = None) -> str | None:
++        result = self._func(value)
++        if result is None or result is True:
++            return None
++        if isinstance(result, str):
++            return result
++        return self.message
++
++    def __repr__(self) -> str:
++        return f"Custom({self._func!r})"
++
++
++class CrossValidator:
++    """
++    Base class for validators that check relationships between multiple widgets.
++    """
++
++    message: str
++
++    def __init__(self, message: str = "") -> None:
++        self.message = message
++
++    def __call__(self, widgets: dict[str, Widget]) -> list[tuple[str, str]]:
++        """
++        Validate across multiple widgets. Return a list of (widget_id, error_message)
++        tuples for any failures, or an empty list if valid.
++
++        :param widgets: Dict mapping widget IDs to widget objects
++        :return: List of (widget_id, error_message) tuples
++        """
++        raise NotImplementedError("subclasses must implement __call__")
++
++
++class MatchField(CrossValidator):
++    """
++    Validates that two widgets have the same value.
++    For example, "confirm password matches password".
++    """
++
++    def __init__(
++        self,
++        field_id: str,
++        match_field_id: str,
++        message: str = "",
++    ) -> None:
++        self.field_id = field_id
++        self.match_field_id = match_field_id
++        default_msg = f"Field does not match"
++        super().__init__(message or default_msg)
++
++    def __call__(self, widgets: dict[str, Widget]) -> list[tuple[str, str]]:
++        errors = []
++        w1 = widgets.get(self.field_id)
++        w2 = widgets.get(self.match_field_id)
++        if w1 is None or w2 is None:
++            return errors
++        try:
++            v1 = w1.get_value()
++            v2 = w2.get_value()
++        except ValueError:
++            return errors
++        if v1 != v2:
++            errors.append((self.field_id, self.message))
++        return errors
++
++    def __repr__(self) -> str:
++        return f"MatchField({self.field_id!r}, {self.match_field_id!r})"
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index 1eeef5ed..9ab29a24 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -538,6 +538,109 @@ class Widget(Base):
+         self.receive_menu_update_events = True  # If False, the widget does not receive events from Menu.update(events)
+         self.selection_expand_background = False  # If True, the widget background will inflate to match selection margin if selected
+ 
++        # Validation
++        self._validators: list[Any] = []
++        self._validation_errors: list[str] = []
++        self._validation_mode: str = "fail_fast"  # "fail_fast" or "collect_all"
++
++    def add_validator(self, *validators: Any) -> Widget:
++        """
++        Add one or more validators to this widget. Validators are run in order
++        when :py:meth:`validate` is called.
++
++        :param validators: Validator instances
++        :return: Self reference
++        """
++        from pygame_menu.validation import Validator
++        for v in validators:
++            assert isinstance(v, Validator), f"expected Validator instance, got {type(v)}"
++            self._validators.append(v)
++        return self
++
++    def remove_validator(self, validator: Any) -> Widget:
++        """
++        Remove a validator from this widget.
++
++        :param validator: Validator instance to remove
++        :return: Self reference
++        """
++        self._validators.remove(validator)
++        return self
++
++    def clear_validators(self) -> Widget:
++        """
++        Remove all validators from this widget.
++
++        :return: Self reference
++        """
++        self._validators.clear()
++        self._validation_errors.clear()
++        return self
++
++    def set_validation_mode(self, mode: str) -> Widget:
++        """
++        Set the validation mode.
++
++        :param mode: ``"fail_fast"`` to stop at first error, ``"collect_all"`` to gather all errors
++        :return: Self reference
++        """
++        from pygame_menu.validation import VALIDATION_MODE_FAIL_FAST, VALIDATION_MODE_COLLECT_ALL
++        assert mode in (VALIDATION_MODE_FAIL_FAST, VALIDATION_MODE_COLLECT_ALL), (
++            f"mode must be '{VALIDATION_MODE_FAIL_FAST}' or '{VALIDATION_MODE_COLLECT_ALL}'"
++        )
++        self._validation_mode = mode
++        return self
++
++    def validate(self) -> 'ValidationResult':
++        """
++        Run all validators on the current widget value. Returns a
++        :py:class:`pygame_menu.validation.ValidationResult`.
++
++        :return: Validation result
++        """
++        from pygame_menu.validation import ValidationResult, VALIDATION_MODE_FAIL_FAST
++        errors: list[str] = []
++        try:
++            value = self.get_value()
++        except ValueError:
++            value = None
++
++        for v in self._validators:
++            error = v(value, self)
++            if error is not None:
++                errors.append(error)
++                if self._validation_mode == VALIDATION_MODE_FAIL_FAST:
++                    break
++
++        self._validation_errors = errors
++        return ValidationResult(valid=len(errors) == 0, errors=errors, widget=self)
++
++    def is_valid(self) -> bool:
++        """
++        Quick check: run validators and return ``True`` if the widget value is valid.
++
++        :return: True if valid
++        """
++        return bool(self.validate())
++
++    def get_validation_errors(self) -> list[str]:
++        """
++        Return the current list of validation error messages from the last
++        :py:meth:`validate` call.
++
++        :return: List of error strings
++        """
++        return list(self._validation_errors)
++
++    def clear_validation_errors(self) -> Widget:
++        """
++        Clear any stored validation errors and reset the visual error state.
++
++        :return: Self reference
++        """
++        self._validation_errors.clear()
++        return self
++
+     def _ignores_keyboard_nonphysical(self) -> bool:
+         """
+         Ignores the keyboard non-physical button events.
+@@ -1229,6 +1332,45 @@ class Widget(Base):
+                     surface, self._border_color, start, end, self._border_width
+                 )
+ 
++    def _draw_validation_errors(self, surface: pygame.Surface) -> None:
++        """
++        Draw validation error indicators and error text below the widget.
++
++        :param surface: Surface to draw on
++        """
++        if not self._validation_errors:
++            return
++
++        # Get error styling from theme if available
++        error_color = (255, 50, 50)  # default red
++        error_font_size = max(self._font_size - 6, 10) if self._font_size else 14
++        error_border_color = (255, 50, 50)
++
++        if self._menu is not None:
++            theme = self._menu.get_theme()
++            if hasattr(theme, "widget_validation_error_color"):
++                error_color = theme.widget_validation_error_color
++            if hasattr(theme, "widget_validation_font_color"):
++                error_color = theme.widget_validation_font_color
++            if hasattr(theme, "widget_validation_border_color"):
++                error_border_color = theme.widget_validation_border_color
++
++        # Draw error border around widget
++        rect = self.get_rect(inflate=self._get_background_inflate())
++        pygame.draw.rect(surface, error_border_color, rect, 2)
++
++        # Draw first error message below the widget
++        if self._font is not None:
++            try:
++                err_font = pygame.font.Font(None, error_font_size)
++            except Exception:
++                return
++            err_text = self._validation_errors[0]
++            err_surface = err_font.render(err_text, True, error_color)
++            err_x = rect.x
++            err_y = rect.y + rect.height + 2
++            surface.blit(err_surface, (err_x, err_y))
++
+     def set_border(
+         self,
+         width: int,
+@@ -1499,6 +1641,9 @@ class Widget(Base):
+         self._draw_border(surface)
+         self._decorator.draw_post(surface)
+ 
++        # Draw validation error feedback
++        self._draw_validation_errors(surface)
++
+         # Apply callbacks
+         self.apply_draw_callbacks()
+ 
+diff --git a/test/test_validation.py b/test/test_validation.py
+new file mode 100644
+index 00000000..295936e7
+--- /dev/null
++++ b/test/test_validation.py
+@@ -0,0 +1,600 @@
++"""
++pygame-menu
++https://github.com/ppizarror/pygame-menu
++
++TEST VALIDATION
++Tests for the widget validation system.
++"""
++
++from test._utils import MenuUtils, surface
++
++import pygame_menu
++from pygame_menu.validation import (
++    Required,
++    MinLength,
++    MaxLength,
++    Pattern,
++    Email,
++    Range,
++    OneOf,
++    NoneOf,
++    Custom,
++    CrossValidator,
++    MatchField,
++    ValidationResult,
++    VALIDATION_MODE_FAIL_FAST,
++    VALIDATION_MODE_COLLECT_ALL,
++)
++
++
++# =============================================================================
++# Validator primitives
++# =============================================================================
++
++
++class TestValidatorPrimitives:
++    """Tests for individual validator classes."""
++
++    def test_required_empty_string(self):
++        v = Required()
++        assert v("", None) is not None
++
++    def test_required_whitespace(self):
++        v = Required()
++        assert v("   ", None) is not None
++
++    def test_required_none(self):
++        v = Required()
++        assert v(None, None) is not None
++
++    def test_required_valid(self):
++        v = Required()
++        assert v("hello", None) is None
++
++    def test_required_custom_message(self):
++        v = Required(message="Please fill this in")
++        assert v("", None) == "Please fill this in"
++
++    def test_minlength_too_short(self):
++        v = MinLength(5)
++        assert v("abc", None) is not None
++
++    def test_minlength_exact(self):
++        v = MinLength(3)
++        assert v("abc", None) is None
++
++    def test_minlength_long_enough(self):
++        v = MinLength(3)
++        assert v("abcdef", None) is None
++
++    def test_minlength_none(self):
++        v = MinLength(3)
++        assert v(None, None) is None
++
++    def test_maxlength_too_long(self):
++        v = MaxLength(5)
++        assert v("abcdef", None) is not None
++
++    def test_maxlength_exact(self):
++        v = MaxLength(5)
++        assert v("abcde", None) is None
++
++    def test_maxlength_short(self):
++        v = MaxLength(5)
++        assert v("ab", None) is None
++
++    def test_maxlength_none(self):
++        v = MaxLength(5)
++        assert v(None, None) is None
++
++    def test_pattern_match(self):
++        v = Pattern(r"^\d{3}-\d{4}$")
++        assert v("123-4567", None) is None
++
++    def test_pattern_no_match(self):
++        v = Pattern(r"^\d{3}-\d{4}$")
++        assert v("abc", None) is not None
++
++    def test_pattern_none(self):
++        v = Pattern(r"^\d+$")
++        assert v(None, None) is None
++
++    def test_email_valid(self):
++        v = Email()
++        assert v("user@example.com", None) is None
++
++    def test_email_invalid(self):
++        v = Email()
++        assert v("not-an-email", None) is not None
++
++    def test_email_empty(self):
++        v = Email()
++        # Empty string should pass (use Required for mandatory)
++        assert v("", None) is None
++
++    def test_email_none(self):
++        v = Email()
++        assert v(None, None) is None
++
++    def test_range_in_range(self):
++        v = Range(min_val=1, max_val=10)
++        assert v(5, None) is None
++
++    def test_range_below(self):
++        v = Range(min_val=1, max_val=10)
++        assert v(0, None) is not None
++
++    def test_range_above(self):
++        v = Range(min_val=1, max_val=10)
++        assert v(11, None) is not None
++
++    def test_range_min_only(self):
++        v = Range(min_val=5)
++        assert v(3, None) is not None
++        assert v(5, None) is None
++        assert v(100, None) is None
++
++    def test_range_max_only(self):
++        v = Range(max_val=10)
++        assert v(5, None) is None
++        assert v(11, None) is not None
++
++    def test_range_none(self):
++        v = Range(min_val=1, max_val=10)
++        assert v(None, None) is None
++
++    def test_range_non_numeric(self):
++        v = Range(min_val=1, max_val=10)
++        assert v("abc", None) is not None
++
++    def test_oneof_valid(self):
++        v = OneOf(["a", "b", "c"])
++        assert v("a", None) is None
++
++    def test_oneof_invalid(self):
++        v = OneOf(["a", "b", "c"])
++        assert v("d", None) is not None
++
++    def test_oneof_none(self):
++        v = OneOf(["a", "b"])
++        assert v(None, None) is None
++
++    def test_noneof_valid(self):
++        v = NoneOf(["bad", "worse"])
++        assert v("good", None) is None
++
++    def test_noneof_invalid(self):
++        v = NoneOf(["bad", "worse"])
++        assert v("bad", None) is not None
++
++    def test_custom_func_returns_none(self):
++        v = Custom(lambda x: None)
++        assert v("anything", None) is None
++
++    def test_custom_func_returns_true(self):
++        v = Custom(lambda x: True)
++        assert v("anything", None) is None
++
++    def test_custom_func_returns_string(self):
++        v = Custom(lambda x: "bad value")
++        assert v("anything", None) == "bad value"
++
++    def test_custom_func_returns_false(self):
++        v = Custom(lambda x: False, message="custom fail")
++        assert v("anything", None) == "custom fail"
++
++    def test_validator_repr(self):
++        assert "Required" in repr(Required())
++        assert "MinLength" in repr(MinLength(3))
++        assert "MaxLength" in repr(MaxLength(5))
++        assert "Pattern" in repr(Pattern(r"\d+"))
++        assert "Email" in repr(Email())
++        assert "Range" in repr(Range(1, 10))
++        assert "OneOf" in repr(OneOf([1, 2]))
++        assert "NoneOf" in repr(NoneOf([1, 2]))
++        assert "Custom" in repr(Custom(lambda x: None))
++
++
++# =============================================================================
++# Widget-level validation
++# =============================================================================
++
++
++class TestWidgetValidation:
++    """Tests for widget validation methods."""
++
++    def test_add_validator_to_widget(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:")
++        w.add_validator(Required())
++        assert len(w._validators) == 1
++
++    def test_add_multiple_validators(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:")
++        w.add_validator(Required(), MinLength(3), MaxLength(20))
++        assert len(w._validators) == 3
++
++    def test_remove_validator(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:")
++        v = Required()
++        w.add_validator(v)
++        w.remove_validator(v)
++        assert len(w._validators) == 0
++
++    def test_clear_validators(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:")
++        w.add_validator(Required(), MinLength(3))
++        w.clear_validators()
++        assert len(w._validators) == 0
++
++    def test_validate_returns_result(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="hello")
++        w.add_validator(Required())
++        result = w.validate()
++        assert isinstance(result, ValidationResult)
++        assert result.valid is True
++        assert len(result.errors) == 0
++
++    def test_validate_invalid_returns_errors(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="")
++        w.add_validator(Required())
++        result = w.validate()
++        assert result.valid is False
++        assert len(result.errors) > 0
++
++    def test_is_valid_shortcut(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="hello")
++        w.add_validator(Required())
++        assert w.is_valid() is True
++
++    def test_is_valid_false(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="")
++        w.add_validator(Required())
++        assert w.is_valid() is False
++
++    def test_fail_fast_mode(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="")
++        w.add_validator(Required(), MinLength(5))
++        w.set_validation_mode(VALIDATION_MODE_FAIL_FAST)
++        result = w.validate()
++        # Should stop at first error (Required)
++        assert len(result.errors) == 1
++
++    def test_collect_all_mode(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="ab")
++        w.add_validator(MinLength(5), MaxLength(1))
++        w.set_validation_mode(VALIDATION_MODE_COLLECT_ALL)
++        result = w.validate()
++        assert len(result.errors) == 2
++
++    def test_get_validation_errors(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="")
++        w.add_validator(Required())
++        w.validate()
++        errors = w.get_validation_errors()
++        assert len(errors) == 1
++        assert "required" in errors[0].lower()
++
++    def test_clear_validation_errors(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="")
++        w.add_validator(Required())
++        w.validate()
++        assert len(w._validation_errors) > 0
++        w.clear_validation_errors()
++        assert len(w._validation_errors) == 0
++
++    def test_validation_result_bool(self):
++        r_valid = ValidationResult(valid=True)
++        r_invalid = ValidationResult(valid=False, errors=["error"])
++        assert bool(r_valid) is True
++        assert bool(r_invalid) is False
++
++    def test_validation_result_repr(self):
++        r = ValidationResult(valid=True)
++        assert "ValidationResult" in repr(r)
++
++    def test_add_invalid_validator_raises(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:")
++        try:
++            w.add_validator("not a validator")
++            assert False, "should have raised"
++        except AssertionError:
++            pass
++
++    def test_invalid_validation_mode_raises(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:")
++        try:
++            w.set_validation_mode("invalid_mode")
++            assert False, "should have raised"
++        except AssertionError:
++            pass
++
++
++# =============================================================================
++# Widget addition API extension
++# =============================================================================
++
++
++class TestWidgetAdditionAPI:
++    """Tests for validators=[] and required=True in widget addition."""
++
++    def test_text_input_with_validators(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input(
++            "Email:",
++            validators=[Email()],
++        )
++        assert len(w._validators) == 1
++
++    def test_text_input_with_required(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", required=True)
++        # Required should be added as first validator
++        assert len(w._validators) == 1
++        assert isinstance(w._validators[0], Required)
++
++    def test_text_input_required_and_validators(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input(
++            "Email:",
++            required=True,
++            validators=[Email(), MaxLength(100)],
++        )
++        # Required first, then Email, then MaxLength
++        assert len(w._validators) == 3
++        assert isinstance(w._validators[0], Required)
++        assert isinstance(w._validators[1], Email)
++        assert isinstance(w._validators[2], MaxLength)
++
++    def test_selector_with_validators(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.selector(
++            "Choice:",
++            items=[("A", 1), ("B", 2)],
++            validators=[Custom(lambda x: None)],
++        )
++        assert len(w._validators) == 1
++
++
++# =============================================================================
++# Visual error feedback
++# =============================================================================
++
++
++class TestVisualErrorFeedback:
++    """Tests for validation error drawing."""
++
++    def test_draw_with_validation_errors(self):
++        """Widget should draw without errors when validation errors exist."""
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="")
++        w.add_validator(Required())
++        w.validate()
++        assert len(w._validation_errors) > 0
++        # Should not raise during draw
++        menu.draw(surface)
++
++    def test_draw_without_validation_errors(self):
++        """Widget should draw normally with no validation errors."""
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="valid")
++        w.add_validator(Required())
++        w.validate()
++        menu.draw(surface)
++
++    def test_draw_no_validators(self):
++        """Widget with no validators should draw normally."""
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input("Name:", default="hello")
++        menu.draw(surface)
++
++
++# =============================================================================
++# Cross-widget validation
++# =============================================================================
++
++
++class TestCrossWidgetValidation:
++    """Tests for cross-widget validation."""
++
++    def test_match_field_valid(self):
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input("Password:", default="secret", textinput_id="pw")
++        w2 = menu.add.text_input(
++            "Confirm:", default="secret", textinput_id="pw_confirm"
++        )
++        cv = MatchField("pw", "pw_confirm")
++        errors = cv({w1.get_id(): w1, w2.get_id(): w2})
++        assert len(errors) == 0
++
++    def test_match_field_invalid(self):
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input("Password:", default="secret", textinput_id="pw")
++        w2 = menu.add.text_input(
++            "Confirm:", default="different", textinput_id="pw_confirm"
++        )
++        cv = MatchField("pw", "pw_confirm")
++        errors = cv({"pw": w1, "pw_confirm": w2})
++        assert len(errors) == 1
++
++    def test_match_field_missing_widget(self):
++        menu = MenuUtils.generic_menu()
++        w1 = menu.add.text_input("Password:", default="secret", textinput_id="pw")
++        cv = MatchField("pw", "pw_confirm")
++        errors = cv({"pw": w1})
++        assert len(errors) == 0
++
++    def test_match_field_repr(self):
++        cv = MatchField("a", "b")
++        assert "MatchField" in repr(cv)
++
++    def test_menu_add_cross_validator(self):
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input("Password:", default="secret", textinput_id="pw")
++        menu.add.text_input(
++            "Confirm:", default="secret", textinput_id="pw_confirm"
++        )
++        cv = MatchField("pw", "pw_confirm")
++        menu.add_cross_validator(cv)
++        assert len(menu._cross_validators) == 1
++
++    def test_menu_add_invalid_cross_validator_raises(self):
++        menu = MenuUtils.generic_menu()
++        try:
++            menu.add_cross_validator("not a cross validator")
++            assert False, "should have raised"
++        except AssertionError:
++            pass
++
++
++# =============================================================================
++# Menu-level form validation
++# =============================================================================
++
++
++class TestMenuFormValidation:
++    """Tests for menu-level validate_form."""
++
++    def test_validate_form_all_valid(self):
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input("Name:", default="John", required=True)
++        menu.add.text_input(
++            "Email:", default="john@test.com", validators=[Email()]
++        )
++        valid, errors = menu.validate_form()
++        assert valid is True
++        assert len(errors) == 0
++
++    def test_validate_form_with_errors(self):
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input(
++            "Name:", default="", textinput_id="name", required=True
++        )
++        menu.add.text_input(
++            "Email:", default="john@test.com", textinput_id="email", validators=[Email()]
++        )
++        valid, errors = menu.validate_form()
++        assert valid is False
++        assert "name" in errors
++
++    def test_validate_form_collect_all(self):
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input(
++            "Name:", default="", textinput_id="name", required=True
++        )
++        menu.add.text_input(
++            "Email:", default="bad", textinput_id="email", validators=[Email()]
++        )
++        valid, errors = menu.validate_form(collect_all=True)
++        assert valid is False
++        assert "name" in errors
++        assert "email" in errors
++
++    def test_validate_form_fail_fast(self):
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input(
++            "Name:", default="", textinput_id="name", required=True
++        )
++        menu.add.text_input(
++            "Email:", default="bad", textinput_id="email", validators=[Email()]
++        )
++        valid, errors = menu.validate_form(collect_all=False)
++        assert valid is False
++        # Only first invalid widget's errors
++        assert len(errors) == 1
++
++    def test_validate_form_with_cross_validator(self):
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input(
++            "Password:", default="abc", textinput_id="pw"
++        )
++        menu.add.text_input(
++            "Confirm:", default="xyz", textinput_id="pw_confirm"
++        )
++        menu.add_cross_validator(MatchField("pw", "pw_confirm"))
++        valid, errors = menu.validate_form()
++        assert valid is False
++        assert "pw" in errors
++
++    def test_validate_form_cross_validator_valid(self):
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input(
++            "Password:", default="abc", textinput_id="pw"
++        )
++        menu.add.text_input(
++            "Confirm:", default="abc", textinput_id="pw_confirm"
++        )
++        menu.add_cross_validator(MatchField("pw", "pw_confirm"))
++        valid, errors = menu.validate_form()
++        assert valid is True
++
++    def test_clear_validation_errors_menu(self):
++        menu = MenuUtils.generic_menu()
++        w = menu.add.text_input("Name:", default="", required=True)
++        menu.validate_form()
++        assert len(w._validation_errors) > 0
++        menu.clear_validation_errors()
++        assert len(w._validation_errors) == 0
++
++    def test_no_validators_skips_widgets(self):
++        menu = MenuUtils.generic_menu()
++        menu.add.text_input("Name:", default="")
++        menu.add.label("Info")
++        valid, errors = menu.validate_form()
++        assert valid is True
++        assert len(errors) == 0
++
++
++# =============================================================================
++# Theme integration
++# =============================================================================
++
++
++class TestThemeIntegration:
++    """Tests for validation theme properties."""
++
++    def test_default_theme_has_validation_colors(self):
++        theme = pygame_menu.themes.THEME_DEFAULT
++        assert hasattr(theme, "widget_validation_border_color")
++        assert hasattr(theme, "widget_validation_font_color")
++
++    def test_custom_validation_colors(self):
++        theme = pygame_menu.Theme(
++            widget_validation_border_color=(255, 0, 0),
++            widget_validation_font_color=(200, 0, 0),
++        )
++        # Colors get alpha channel added by theme processing
++        assert theme.widget_validation_border_color[:3] == (255, 0, 0)
++        assert theme.widget_validation_font_color[:3] == (200, 0, 0)
++
++    def test_theme_validation_colors_validate(self):
++        theme = pygame_menu.Theme(
++            widget_validation_border_color=(255, 0, 0),
++            widget_validation_font_color=(200, 0, 0),
++        )
++        theme.validate()  # Should not raise
++
++    def test_draw_uses_theme_colors(self):
++        """Widget draws validation errors using theme colors."""
++        theme = pygame_menu.Theme(
++            widget_validation_border_color=(0, 255, 0),
++            widget_validation_font_color=(0, 200, 0),
++        )
++        menu = MenuUtils.generic_menu(theme=theme)
++        w = menu.add.text_input("Name:", default="")
++        w.add_validator(Required())
++        w.validate()
++        menu.draw(surface)  # Should not raise
