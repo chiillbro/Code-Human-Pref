@@ -1,0 +1,201 @@
+diff --git a/tests/tuxemon/test_ai_position_evaluator.py b/tests/tuxemon/test_ai_position_evaluator.py
+index a09ba1624..2aa722083 100644
+--- a/tests/tuxemon/test_ai_position_evaluator.py
++++ b/tests/tuxemon/test_ai_position_evaluator.py
+@@ -80,6 +80,7 @@ def test_evaluate_position_breakdown(mock_matchup, config):
+     assert result.breakdown["type_matchup"] == pytest.approx(1.5)
+     assert result.breakdown["bench_depth"] == pytest.approx(0.25)
+     assert result.breakdown["status"] == pytest.approx(-0.5)
++    assert result.raw_type_matchup == pytest.approx(1.5)
+     assert result.total == pytest.approx(0.85)
+ 
+ 
+@@ -107,7 +108,9 @@ def test_select_best_replacement_empty(config):
+ @patch("tuxemon.ai.position_evaluator.best_matchup_against")
+ def test_should_switch_respects_threshold(mock_matchup, config):
+     evaluator = PositionEvaluator(config)
+-    position = PositionScore(total=0.0, breakdown={"type_matchup": 0.0})
++    position = PositionScore(
++        total=0.0, breakdown={"type_matchup": 0.0}, raw_type_matchup=0.0
++    )
+     mock_matchup.return_value = 2.0
+     # position.total >= threshold (-0.5) -> no switch
+     assert not evaluator.should_switch(
+@@ -119,7 +122,7 @@ def test_should_switch_respects_threshold(mock_matchup, config):
+ def test_should_switch_requires_min_gain(mock_matchup, config):
+     evaluator = PositionEvaluator(config)
+     position = PositionScore(
+-        total=-1.0, breakdown={"type_matchup": -1.0}
++        total=-1.0, breakdown={"type_matchup": -1.0}, raw_type_matchup=-1.0
+     )
+     mock_matchup.return_value = -0.5  # gain = 0.5 < min 1.0
+     assert not evaluator.should_switch(
+@@ -133,7 +136,7 @@ def test_should_switch_triggers_when_bad_position_and_big_gain(
+ ):
+     evaluator = PositionEvaluator(config)
+     position = PositionScore(
+-        total=-1.5, breakdown={"type_matchup": -1.0}
++        total=-1.5, breakdown={"type_matchup": -1.0}, raw_type_matchup=-1.0
+     )
+     mock_matchup.return_value = 1.5  # gain = 2.5 >= 1.0
+     assert evaluator.should_switch(
+@@ -141,6 +144,32 @@ def test_should_switch_triggers_when_bad_position_and_big_gain(
+     )
+ 
+ 
++@patch("tuxemon.ai.position_evaluator.best_matchup_against")
++def test_should_switch_false_when_all_candidates_worse(mock_matchup, config):
++    """Bench is non-empty but every candidate has a worse matchup than
++    the active monster: stay in even though position is below threshold."""
++    evaluator = PositionEvaluator(config)
++    position = PositionScore(
++        total=-2.0, breakdown={"type_matchup": 0.5}, raw_type_matchup=0.5
++    )
++    # best bench candidate still worse than active (0.5)
++    mock_matchup.return_value = 0.0  # gain = -0.5 < min 1.0
++    assert not evaluator.should_switch(
++        position, make_monster("b"), [make_monster("fire")]
++    )
++
++
++@patch("tuxemon.ai.position_evaluator.simple_damage_multiplier")
++def test_same_type_matchup_is_neutral(mock_mult):
++    """Fire vs fire: offensive == defensive, so matchup total is 0."""
++    mock_mult.return_value = 1.0
++    fire_a = make_monster("fire")
++    fire_b = make_monster("fire")
++    score = evaluate_type_matchup(fire_a, fire_b)
++    assert score.offensive == score.defensive
++    assert score.total == 0.0
++
++
+ @patch("tuxemon.ai.position_evaluator.best_matchup_against")
+ def test_difficulty_controls_aggressiveness(mock_matchup):
+     """Hard should switch where easy stays in, given identical state."""
+@@ -158,7 +187,9 @@ def test_difficulty_controls_aggressiveness(mock_matchup):
+             type_matchup_weight=1.0,
+         )
+     )
+-    position = PositionScore(total=-0.6, breakdown={"type_matchup": -0.5})
++    position = PositionScore(
++        total=-0.6, breakdown={"type_matchup": -0.5}, raw_type_matchup=-0.5
++    )
+     mock_matchup.return_value = 0.5  # gain = 1.0
+     replacement = make_monster("b")
+     opponents = [make_monster("fire")]
+diff --git a/tuxemon/ai/decision_strategy.py b/tuxemon/ai/decision_strategy.py
+index bd95bb554..f7c939b2f 100644
+--- a/tuxemon/ai/decision_strategy.py
++++ b/tuxemon/ai/decision_strategy.py
+@@ -185,7 +185,7 @@ class TrainerAIDecisionStrategy(AIDecisionStrategy):
+             if ai.character == combat_session.left_player
+             else combat_session.left_player
+         )
+-        opponent_bench = combat_session.get_bench(opponent_player)
++        opponent_bench = list(combat_session.get_bench(opponent_player))
+ 
+         position = ai.position_evaluator.evaluate(
+             ai.monster, ai.opponents, own_bench, opponent_bench
+diff --git a/tuxemon/ai/manager.py b/tuxemon/ai/manager.py
+index 657727c99..74b8fba1a 100644
+--- a/tuxemon/ai/manager.py
++++ b/tuxemon/ai/manager.py
+@@ -22,6 +22,22 @@ class AIManager:
+     def __init__(self, session: Session) -> None:
+         self.session = session
+         self.active_ais: dict[Monster, AI] = {}
++        self.position_evaluators: dict[NPC, PositionEvaluator] = {}
++
++    def get_position_evaluator(self, character: NPC) -> PositionEvaluator:
++        """Return a cached PositionEvaluator for this character."""
++        if character not in self.position_evaluators:
++            ai_difficulty = AIConfigLoader.get_ai_difficulty(
++                "ai_difficulty.yaml"
++            )
++            difficulty_key = character.combat.ai_difficulty or "default"
++            difficulty = ai_difficulty.difficulties.get(
++                difficulty_key, ai_difficulty.difficulties["default"]
++            )
++            self.position_evaluators[character] = PositionEvaluator(
++                difficulty
++            )
++        return self.position_evaluators[character]
+ 
+     def process_ai_turn(self, monster: Monster, character: NPC) -> None:
+         """
+@@ -46,6 +62,7 @@ class AIManager:
+         """Removes all tracked AI instances from the manager."""
+         logger.debug("Clearing all AI instances.")
+         self.active_ais.clear()
++        self.position_evaluators.clear()
+ 
+     def choose_replacement_monster(self, character: NPC) -> Monster | None:
+         """
+@@ -108,14 +125,7 @@ class AIManager:
+             opponents = combat_session.field_monsters.get_monsters(
+                 opponent_player
+             )
+-            ai_difficulty = AIConfigLoader.get_ai_difficulty(
+-                "ai_difficulty.yaml"
+-            )
+-            difficulty_key = character.combat.ai_difficulty or "default"
+-            difficulty = ai_difficulty.difficulties.get(
+-                difficulty_key, ai_difficulty.difficulties["default"]
+-            )
+-            evaluator = PositionEvaluator(difficulty)
++            evaluator = self.get_position_evaluator(character)
+             chosen = evaluator.select_best_replacement(
+                 available_monsters, opponents
+             )
+diff --git a/tuxemon/ai/position_evaluator.py b/tuxemon/ai/position_evaluator.py
+index c5943386e..bcf77b3b3 100644
+--- a/tuxemon/ai/position_evaluator.py
++++ b/tuxemon/ai/position_evaluator.py
+@@ -34,6 +34,7 @@ class PositionScore:
+ 
+     total: float
+     breakdown: dict[str, float]
++    raw_type_matchup: float = 0.0
+ 
+ 
+ def evaluate_type_matchup(monster: Monster, opponent: Monster) -> MatchupScore:
+@@ -95,9 +96,9 @@ class PositionEvaluator:
+             monster.hp_ratio - opponent_hp
+         ) * self.config.hp_weight
+ 
++        raw_type_matchup = best_matchup_against(monster, opponents)
+         breakdown["type_matchup"] = (
+-            best_matchup_against(monster, opponents)
+-            * self.config.type_matchup_weight
++            raw_type_matchup * self.config.type_matchup_weight
+         )
+ 
+         breakdown["bench_depth"] = (
+@@ -113,7 +114,11 @@ class PositionEvaluator:
+         logger.debug(
+             f"Position for {monster.slug}: {breakdown} -> {total:.2f}"
+         )
+-        return PositionScore(total=total, breakdown=breakdown)
++        return PositionScore(
++            total=total,
++            breakdown=breakdown,
++            raw_type_matchup=raw_type_matchup,
++        )
+ 
+     def select_best_replacement(
+         self,
+@@ -150,13 +155,8 @@ class PositionEvaluator:
+         if current.total >= self.config.switch_threshold:
+             return False
+ 
+-        current_matchup = (
+-            current.breakdown["type_matchup"] / self.config.type_matchup_weight
+-            if self.config.type_matchup_weight
+-            else 0.0
+-        )
+         replacement_matchup = best_matchup_against(replacement, opponents)
+-        gain = replacement_matchup - current_matchup
++        gain = replacement_matchup - current.raw_type_matchup
+ 
+         logger.debug(
+             f"Switch check: current={current.total:.2f} "
