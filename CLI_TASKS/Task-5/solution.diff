@@ -1,0 +1,2801 @@
+diff --git a/mods/tuxemon/ai_difficulty.yaml b/mods/tuxemon/ai_difficulty.yaml
+new file mode 100644
+index 000000000..61ba6d4da
+--- /dev/null
++++ b/mods/tuxemon/ai_difficulty.yaml
+@@ -0,0 +1,20 @@
++# AI Difficulty Settings
++# Controls the Minimax search depth and mistake rate for AI opponents.
++# search_depth: Number of full turns the AI looks ahead.
++# mistake_rate: Probability (0.0-1.0) of the AI picking a sub-optimal move.
++#   Uses softmax over top-K moves, so mistakes tend toward the 2nd/3rd
++#   best option rather than a completely random action.
++
++difficulties:
++  easy:
++    search_depth: 1
++    mistake_rate: 0.3
++    description: "AI looks 1 turn ahead, makes mistakes 30% of the time"
++  medium:
++    search_depth: 2
++    mistake_rate: 0.1
++    description: "AI looks 2 turns ahead, makes mistakes 10% of the time"
++  hard:
++    search_depth: 3
++    mistake_rate: 0.0
++    description: "AI looks 3 turns ahead, plays optimally"
+diff --git a/tests/tuxemon/test_ai_battle_evaluator.py b/tests/tuxemon/test_ai_battle_evaluator.py
+new file mode 100644
+index 000000000..8f3054b2e
+--- /dev/null
++++ b/tests/tuxemon/test_ai_battle_evaluator.py
+@@ -0,0 +1,247 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from tuxemon.ai.battle_evaluator import (
++    BattleSnapshot,
++    BattleStateEvaluator,
++    EvalResult,
++    EvalWeights,
++    MonsterSnapshot,
++)
++
++
++def _make_snapshot(
++    slug: str = "rockitten",
++    current_hp: int = 50,
++    max_hp: int = 100,
++    level: int = 10,
++    speed: int = 20,
++    melee: int = 30,
++    ranged: int = 25,
++    armour: int = 20,
++    dodge: int = 15,
++    type_slugs: tuple[str, ...] = ("fire",),
++    status_slugs: tuple[str, ...] = (),
++    is_fainted: bool = False,
++    move_slugs: tuple[str, ...] = ("tackle",),
++    has_healing_moves: bool = False,
++    has_status_moves: bool = False,
++    has_stat_boost_moves: bool = False,
++) -> MonsterSnapshot:
++    return MonsterSnapshot(
++        slug=slug,
++        current_hp=current_hp,
++        max_hp=max_hp,
++        level=level,
++        speed=speed,
++        melee=melee,
++        ranged=ranged,
++        armour=armour,
++        dodge=dodge,
++        type_slugs=type_slugs,
++        status_slugs=status_slugs,
++        is_fainted=is_fainted,
++        move_slugs=move_slugs,
++        has_healing_moves=has_healing_moves,
++        has_status_moves=has_status_moves,
++        has_stat_boost_moves=has_stat_boost_moves,
++    )
++
++
++def _make_battle_snapshot(
++    ai_hp: int = 80,
++    opp_hp: int = 60,
++    ai_bench_count: int = 1,
++    opp_bench_count: int = 1,
++    turn: int = 1,
++) -> BattleSnapshot:
++    ai_active = _make_snapshot(slug="ai_mon", current_hp=ai_hp)
++    opp_active = _make_snapshot(slug="opp_mon", current_hp=opp_hp)
++    ai_bench = tuple(
++        _make_snapshot(slug=f"ai_bench_{i}")
++        for i in range(ai_bench_count)
++    )
++    opp_bench = tuple(
++        _make_snapshot(slug=f"opp_bench_{i}")
++        for i in range(opp_bench_count)
++    )
++    return BattleSnapshot(
++        ai_active=ai_active,
++        opponent_active=opp_active,
++        ai_bench=ai_bench,
++        opponent_bench=opp_bench,
++        turn=turn,
++    )
++
++
++class TestMonsterSnapshot:
++    def test_hp_ratio_normal(self):
++        snap = _make_snapshot(current_hp=50, max_hp=100)
++        assert snap.hp_ratio == pytest.approx(0.5)
++
++    def test_hp_ratio_full(self):
++        snap = _make_snapshot(current_hp=100, max_hp=100)
++        assert snap.hp_ratio == pytest.approx(1.0)
++
++    def test_hp_ratio_zero_max_hp(self):
++        snap = _make_snapshot(current_hp=0, max_hp=0)
++        assert snap.hp_ratio == pytest.approx(0.0)
++
++    def test_hp_ratio_clamped_above_one(self):
++        snap = _make_snapshot(current_hp=120, max_hp=100)
++        assert snap.hp_ratio == pytest.approx(1.0)
++
++    def test_fainted_state(self):
++        snap = _make_snapshot(is_fainted=True, current_hp=0)
++        assert snap.is_fainted is True
++
++    def test_frozen_nature(self):
++        snap = _make_snapshot()
++        with pytest.raises(AttributeError):
++            snap.slug = "modified"  # type: ignore[misc]
++
++
++class TestBattleSnapshot:
++    def test_ai_healthy_bench_count(self):
++        snap = _make_battle_snapshot(ai_bench_count=3)
++        assert snap.ai_healthy_bench_count == 3
++
++    def test_ai_healthy_bench_count_with_fainted(self):
++        ai_active = _make_snapshot(slug="ai_mon")
++        opp_active = _make_snapshot(slug="opp_mon")
++        fainted = _make_snapshot(slug="fainted", is_fainted=True, current_hp=0)
++        healthy = _make_snapshot(slug="healthy")
++        snap = BattleSnapshot(
++            ai_active=ai_active,
++            opponent_active=opp_active,
++            ai_bench=(fainted, healthy),
++            opponent_bench=(),
++            turn=1,
++        )
++        assert snap.ai_healthy_bench_count == 1
++
++    def test_is_ai_defeated(self):
++        snap = BattleSnapshot(
++            ai_active=_make_snapshot(is_fainted=True, current_hp=0),
++            opponent_active=_make_snapshot(),
++            ai_bench=(),
++            opponent_bench=(),
++            turn=1,
++        )
++        assert snap.is_ai_defeated is True
++        assert snap.is_terminal is True
++
++    def test_is_opponent_defeated(self):
++        snap = BattleSnapshot(
++            ai_active=_make_snapshot(),
++            opponent_active=_make_snapshot(is_fainted=True, current_hp=0),
++            ai_bench=(),
++            opponent_bench=(),
++            turn=1,
++        )
++        assert snap.is_opponent_defeated is True
++        assert snap.is_terminal is True
++
++    def test_not_terminal(self):
++        snap = _make_battle_snapshot()
++        assert snap.is_terminal is False
++
++    def test_frozen_nature(self):
++        snap = _make_battle_snapshot()
++        with pytest.raises(AttributeError):
++            snap.turn = 99  # type: ignore[misc]
++
++
++class TestEvalWeights:
++    def test_default_weights(self):
++        w = EvalWeights()
++        assert w.hp_ratio == 30.0
++        assert w.type_advantage == 20.0
++
++    def test_copy_produces_independent_instance(self):
++        w = EvalWeights(hp_ratio=50.0)
++        w2 = w.copy()
++        w2.hp_ratio = 10.0
++        assert w.hp_ratio == 50.0
++        assert w2.hp_ratio == 10.0
++
++
++class TestBattleStateEvaluator:
++    def test_evaluate_symmetric_state_is_near_zero(self):
++        snap = BattleSnapshot(
++            ai_active=_make_snapshot(slug="a", current_hp=50, max_hp=100),
++            opponent_active=_make_snapshot(slug="b", current_hp=50, max_hp=100),
++            ai_bench=(),
++            opponent_bench=(),
++            turn=1,
++        )
++        evaluator = BattleStateEvaluator()
++        result = evaluator.evaluate(snap)
++        # Same HP, same types, same everything -> hp/bench/fainted near 0
++        # Type advantage with same types may not be exactly 0
++        assert isinstance(result, EvalResult)
++        assert isinstance(result.total, float)
++
++    def test_ai_advantage_is_positive(self):
++        snap = BattleSnapshot(
++            ai_active=_make_snapshot(slug="a", current_hp=100, max_hp=100, level=20),
++            opponent_active=_make_snapshot(slug="b", current_hp=20, max_hp=100, level=5),
++            ai_bench=(_make_snapshot(slug="bench"),),
++            opponent_bench=(),
++            turn=1,
++        )
++        evaluator = BattleStateEvaluator()
++        result = evaluator.evaluate(snap)
++        assert result.total > 0
++
++    def test_ai_disadvantage_is_negative(self):
++        snap = BattleSnapshot(
++            ai_active=_make_snapshot(slug="a", current_hp=10, max_hp=100, level=5),
++            opponent_active=_make_snapshot(slug="b", current_hp=100, max_hp=100, level=20),
++            ai_bench=(),
++            opponent_bench=(_make_snapshot(slug="bench"),),
++            turn=1,
++        )
++        evaluator = BattleStateEvaluator()
++        result = evaluator.evaluate(snap)
++        assert result.total < 0
++
++    def test_custom_weights_applied(self):
++        weights = EvalWeights(
++            hp_ratio=100.0,
++            type_advantage=0.0,
++            status_effects=0.0,
++            bench_depth=0.0,
++            level_diff=0.0,
++            fainted_penalty=0.0,
++        )
++        snap = BattleSnapshot(
++            ai_active=_make_snapshot(slug="a", current_hp=100, max_hp=100),
++            opponent_active=_make_snapshot(slug="b", current_hp=50, max_hp=100),
++            ai_bench=(),
++            opponent_bench=(),
++            turn=1,
++        )
++        evaluator = BattleStateEvaluator(weights)
++        result = evaluator.evaluate(snap)
++        # (1.0 - 0.5) * 100 = 50
++        assert result.breakdown["hp_ratio"] == pytest.approx(50.0)
++
++    def test_breakdown_keys(self):
++        snap = _make_battle_snapshot()
++        evaluator = BattleStateEvaluator()
++        result = evaluator.evaluate(snap)
++        expected_keys = {
++            "hp_ratio",
++            "type_advantage",
++            "status_effects",
++            "bench_depth",
++            "level_diff",
++            "fainted_penalty",
++        }
++        assert set(result.breakdown.keys()) == expected_keys
+diff --git a/tests/tuxemon/test_ai_minimax.py b/tests/tuxemon/test_ai_minimax.py
+new file mode 100644
+index 000000000..457660e99
+--- /dev/null
++++ b/tests/tuxemon/test_ai_minimax.py
+@@ -0,0 +1,333 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++import math
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from tuxemon.ai.battle_evaluator import (
++    BattleSnapshot,
++    BattleStateEvaluator,
++    EvalWeights,
++    MonsterSnapshot,
++)
++from tuxemon.ai.minimax import (
++    AIAction,
++    ActionType,
++    MinimaxEngine,
++    MinimaxResult,
++    _apply_action,
++    _generate_actions,
++    _simulate_attack,
++    _simulate_switch,
++    _simulate_technique_damage,
++    apply_mistake_rate,
++)
++
++
++def _snap(
++    slug: str = "mon",
++    current_hp: int = 50,
++    max_hp: int = 100,
++    level: int = 10,
++    speed: int = 20,
++    melee: int = 30,
++    ranged: int = 25,
++    armour: int = 20,
++    dodge: int = 15,
++    type_slugs: tuple[str, ...] = ("fire",),
++    status_slugs: tuple[str, ...] = (),
++    is_fainted: bool = False,
++    move_slugs: tuple[str, ...] = ("tackle",),
++    has_healing_moves: bool = False,
++    has_status_moves: bool = False,
++    has_stat_boost_moves: bool = False,
++) -> MonsterSnapshot:
++    return MonsterSnapshot(
++        slug=slug,
++        current_hp=current_hp,
++        max_hp=max_hp,
++        level=level,
++        speed=speed,
++        melee=melee,
++        ranged=ranged,
++        armour=armour,
++        dodge=dodge,
++        type_slugs=type_slugs,
++        status_slugs=status_slugs,
++        is_fainted=is_fainted,
++        move_slugs=move_slugs,
++        has_healing_moves=has_healing_moves,
++        has_status_moves=has_status_moves,
++        has_stat_boost_moves=has_stat_boost_moves,
++    )
++
++
++def _battle_snap(
++    ai_hp: int = 80,
++    opp_hp: int = 60,
++    ai_bench: tuple[MonsterSnapshot, ...] = (),
++    opp_bench: tuple[MonsterSnapshot, ...] = (),
++    turn: int = 1,
++) -> BattleSnapshot:
++    return BattleSnapshot(
++        ai_active=_snap(slug="ai_mon", current_hp=ai_hp),
++        opponent_active=_snap(slug="opp_mon", current_hp=opp_hp),
++        ai_bench=ai_bench,
++        opponent_bench=opp_bench,
++        turn=turn,
++    )
++
++
++class TestActionType:
++    def test_technique_action(self):
++        action = AIAction(
++            action_type=ActionType.TECHNIQUE,
++            technique_slug="tackle",
++            target_slug="enemy",
++        )
++        assert action.is_technique is True
++        assert action.is_switch is False
++
++    def test_switch_action(self):
++        action = AIAction(
++            action_type=ActionType.SWITCH,
++            switch_to_slug="bench_mon",
++        )
++        assert action.is_switch is True
++        assert action.is_technique is False
++
++
++class TestSimulateTechniqueDamage:
++    @patch("tuxemon.ai.minimax.Element")
++    @patch("tuxemon.ai.minimax.ElementTypesHandler")
++    def test_returns_positive_damage(
++        self, mock_handler, mock_element
++    ):
++        mock_element.get.return_value = MagicMock()
++        mock_handler.calculate_affinity_score.return_value = 1.0
++
++        attacker = _snap(melee=30, ranged=25, level=10)
++        defender = _snap(armour=20)
++
++        dmg = _simulate_technique_damage(attacker, defender, "tackle")
++        assert dmg >= 1
++
++    @patch("tuxemon.ai.minimax.Element")
++    @patch("tuxemon.ai.minimax.ElementTypesHandler")
++    def test_minimum_damage_is_one(
++        self, mock_handler, mock_element
++    ):
++        mock_element.get.return_value = MagicMock()
++        mock_handler.calculate_affinity_score.return_value = 0.01
++
++        attacker = _snap(melee=1, ranged=1, level=1)
++        defender = _snap(armour=999)
++
++        dmg = _simulate_technique_damage(attacker, defender, "tackle")
++        assert dmg == 1
++
++
++class TestSimulateSwitch:
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=10)
++    def test_switch_moves_bench_to_active_ai(self, mock_dmg):
++        bench_mon = _snap(slug="bench_1", current_hp=80)
++        snap = _battle_snap(ai_bench=(bench_mon,))
++
++        new_snap = _simulate_switch(snap, "ai", "bench_1")
++        assert new_snap.ai_active.slug == "bench_1"
++        # Old active should be in bench now
++        assert any(m.slug == "ai_mon" for m in new_snap.ai_bench)
++
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=10)
++    def test_switch_applies_free_attack(self, mock_dmg):
++        bench_mon = _snap(slug="bench_1", current_hp=80)
++        snap = _battle_snap(ai_bench=(bench_mon,))
++
++        new_snap = _simulate_switch(snap, "ai", "bench_1")
++        # Free attack should reduce HP
++        assert new_snap.ai_active.current_hp == 70
++
++    def test_switch_with_invalid_slug_returns_same(self):
++        snap = _battle_snap()
++        new_snap = _simulate_switch(snap, "ai", "nonexistent")
++        assert new_snap is snap
++
++
++class TestSimulateAttack:
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=20)
++    def test_ai_attack_reduces_opponent_hp(self, mock_dmg):
++        snap = _battle_snap(opp_hp=60)
++        new_snap = _simulate_attack(snap, "ai", "tackle")
++        assert new_snap.opponent_active.current_hp == 40
++
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=20)
++    def test_opponent_attack_reduces_ai_hp(self, mock_dmg):
++        snap = _battle_snap(ai_hp=80)
++        new_snap = _simulate_attack(snap, "opponent", "tackle")
++        assert new_snap.ai_active.current_hp == 60
++
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=999)
++    def test_hp_does_not_go_below_zero(self, mock_dmg):
++        snap = _battle_snap(opp_hp=10)
++        new_snap = _simulate_attack(snap, "ai", "tackle")
++        assert new_snap.opponent_active.current_hp == 0
++        assert new_snap.opponent_active.is_fainted is True
++
++
++class TestGenerateActions:
++    def test_generates_technique_actions(self):
++        snap = _battle_snap()
++        actions = _generate_actions(snap, "ai")
++        tech_actions = [a for a in actions if a.is_technique]
++        assert len(tech_actions) >= 1
++
++    def test_generates_switch_actions_when_bench_exists(self):
++        bench = (_snap(slug="bench_1"),)
++        snap = _battle_snap(ai_bench=bench)
++        actions = _generate_actions(snap, "ai")
++        switch_actions = [a for a in actions if a.is_switch]
++        assert len(switch_actions) == 1
++
++    def test_fainted_active_only_generates_switches(self):
++        fainted = _snap(slug="ai_mon", is_fainted=True, current_hp=0)
++        bench = (_snap(slug="bench_1"),)
++        snap = BattleSnapshot(
++            ai_active=fainted,
++            opponent_active=_snap(slug="opp_mon"),
++            ai_bench=bench,
++            opponent_bench=(),
++            turn=1,
++        )
++        actions = _generate_actions(snap, "ai")
++        assert all(a.is_switch for a in actions)
++
++    def test_no_actions_when_fainted_and_no_bench(self):
++        fainted = _snap(slug="ai_mon", is_fainted=True, current_hp=0)
++        snap = BattleSnapshot(
++            ai_active=fainted,
++            opponent_active=_snap(slug="opp_mon"),
++            ai_bench=(),
++            opponent_bench=(),
++            turn=1,
++        )
++        actions = _generate_actions(snap, "ai")
++        assert actions == []
++
++
++class TestApplyAction:
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=10)
++    def test_apply_technique_action(self, mock_dmg):
++        snap = _battle_snap(opp_hp=50)
++        action = AIAction(
++            action_type=ActionType.TECHNIQUE,
++            technique_slug="tackle",
++            target_slug="opp_mon",
++        )
++        new_snap = _apply_action(snap, action, "ai")
++        assert new_snap.opponent_active.current_hp == 40
++
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=5)
++    def test_apply_switch_action(self, mock_dmg):
++        bench = (_snap(slug="bench_1", current_hp=80),)
++        snap = _battle_snap(ai_bench=bench)
++        action = AIAction(
++            action_type=ActionType.SWITCH,
++            switch_to_slug="bench_1",
++        )
++        new_snap = _apply_action(snap, action, "ai")
++        assert new_snap.ai_active.slug == "bench_1"
++
++
++class TestMinimaxEngine:
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=10)
++    def test_finds_action_for_simple_state(self, mock_dmg):
++        evaluator = BattleStateEvaluator()
++        engine = MinimaxEngine(evaluator, search_depth=1)
++
++        snap = _battle_snap()
++        result = engine.find_best_action(snap)
++
++        assert isinstance(result, MinimaxResult)
++        assert result.best_action is not None
++        assert result.nodes_evaluated >= 1
++
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=10)
++    def test_returns_none_when_no_actions(self, mock_dmg):
++        evaluator = BattleStateEvaluator()
++        engine = MinimaxEngine(evaluator, search_depth=1)
++
++        fainted = _snap(slug="ai_mon", is_fainted=True, current_hp=0)
++        snap = BattleSnapshot(
++            ai_active=fainted,
++            opponent_active=_snap(slug="opp_mon"),
++            ai_bench=(),
++            opponent_bench=(),
++            turn=1,
++        )
++        result = engine.find_best_action(snap)
++        assert result.best_action is None
++
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=10)
++    def test_single_action_returns_immediately(self, mock_dmg):
++        evaluator = BattleStateEvaluator()
++        engine = MinimaxEngine(evaluator, search_depth=2)
++
++        snap = BattleSnapshot(
++            ai_active=_snap(
++                slug="ai_mon", move_slugs=("tackle",)
++            ),
++            opponent_active=_snap(slug="opp_mon"),
++            ai_bench=(),
++            opponent_bench=(),
++            turn=1,
++        )
++        result = engine.find_best_action(snap)
++        assert result.best_action is not None
++        assert result.nodes_evaluated == 1
++
++    @patch("tuxemon.ai.minimax._simulate_technique_damage", return_value=10)
++    def test_wild_battle_flag(self, mock_dmg):
++        evaluator = BattleStateEvaluator()
++        engine = MinimaxEngine(
++            evaluator, search_depth=1, is_wild_battle=True
++        )
++        snap = _battle_snap()
++        result = engine.find_best_action(snap)
++        assert result.best_action is not None
++
++
++class TestApplyMistakeRate:
++    def test_no_mistake_picks_best(self):
++        actions = [
++            AIAction(action_type=ActionType.TECHNIQUE, technique_slug="a"),
++            AIAction(action_type=ActionType.TECHNIQUE, technique_slug="b"),
++        ]
++        scores = [10.0, 5.0]
++
++        result = apply_mistake_rate(actions, scores, 0.0)
++        assert result.technique_slug == "a"
++
++    def test_single_action_returns_it(self):
++        action = AIAction(
++            action_type=ActionType.TECHNIQUE, technique_slug="only"
++        )
++        result = apply_mistake_rate([action], [10.0], 0.5)
++        assert result.technique_slug == "only"
++
++    def test_raises_on_empty_actions(self):
++        with pytest.raises(ValueError, match="No actions"):
++            apply_mistake_rate([], [], 0.5)
++
++    def test_high_mistake_rate_still_returns_valid_action(self):
++        actions = [
++            AIAction(action_type=ActionType.TECHNIQUE, technique_slug="a"),
++            AIAction(action_type=ActionType.TECHNIQUE, technique_slug="b"),
++            AIAction(action_type=ActionType.TECHNIQUE, technique_slug="c"),
++        ]
++        scores = [10.0, 5.0, 1.0]
++
++        result = apply_mistake_rate(actions, scores, 1.0)
++        assert result.technique_slug in {"a", "b", "c"}
+diff --git a/tests/tuxemon/test_ai_strategy_controller.py b/tests/tuxemon/test_ai_strategy_controller.py
+new file mode 100644
+index 000000000..af3ea530f
+--- /dev/null
++++ b/tests/tuxemon/test_ai_strategy_controller.py
+@@ -0,0 +1,202 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from tuxemon.ai.battle_evaluator import (
++    BattleSnapshot,
++    EvalWeights,
++    MonsterSnapshot,
++)
++from tuxemon.ai.strategy_controller import (
++    BattlePhase,
++    StrategyController,
++    _get_type_multiplier,
++)
++
++
++def _snap(
++    slug: str = "mon",
++    current_hp: int = 50,
++    max_hp: int = 100,
++    level: int = 10,
++    speed: int = 20,
++    melee: int = 30,
++    ranged: int = 25,
++    armour: int = 20,
++    dodge: int = 15,
++    type_slugs: tuple[str, ...] = ("fire",),
++    status_slugs: tuple[str, ...] = (),
++    is_fainted: bool = False,
++    move_slugs: tuple[str, ...] = ("tackle",),
++    has_healing_moves: bool = False,
++    has_status_moves: bool = False,
++    has_stat_boost_moves: bool = False,
++) -> MonsterSnapshot:
++    return MonsterSnapshot(
++        slug=slug,
++        current_hp=current_hp,
++        max_hp=max_hp,
++        level=level,
++        speed=speed,
++        melee=melee,
++        ranged=ranged,
++        armour=armour,
++        dodge=dodge,
++        type_slugs=type_slugs,
++        status_slugs=status_slugs,
++        is_fainted=is_fainted,
++        move_slugs=move_slugs,
++        has_healing_moves=has_healing_moves,
++        has_status_moves=has_status_moves,
++        has_stat_boost_moves=has_stat_boost_moves,
++    )
++
++
++def _make_snapshot(
++    ai_hp: int = 50,
++    ai_max_hp: int = 100,
++    ai_bench_count: int = 0,
++    ai_types: tuple[str, ...] = ("fire",),
++    opp_types: tuple[str, ...] = ("fire",),
++    turn: int = 1,
++    has_healing: bool = False,
++    has_status: bool = False,
++    has_stat_boost: bool = False,
++    ai_melee: int = 30,
++    opp_armour: int = 20,
++) -> BattleSnapshot:
++    ai_active = _snap(
++        slug="ai_mon",
++        current_hp=ai_hp,
++        max_hp=ai_max_hp,
++        type_slugs=ai_types,
++        has_healing_moves=has_healing,
++        has_status_moves=has_status,
++        has_stat_boost_moves=has_stat_boost,
++        melee=ai_melee,
++    )
++    opp_active = _snap(
++        slug="opp_mon",
++        type_slugs=opp_types,
++        armour=opp_armour,
++    )
++    ai_bench = tuple(
++        _snap(slug=f"bench_{i}") for i in range(ai_bench_count)
++    )
++    return BattleSnapshot(
++        ai_active=ai_active,
++        opponent_active=opp_active,
++        ai_bench=ai_bench,
++        opponent_bench=(),
++        turn=turn,
++    )
++
++
++class TestBattlePhaseEnum:
++    def test_all_phases_exist(self):
++        assert BattlePhase.SETUP.value == "setup"
++        assert BattlePhase.SWEEP.value == "sweep"
++        assert BattlePhase.STALL.value == "stall"
++        assert BattlePhase.DESPERATION.value == "desperation"
++        assert BattlePhase.SWITCH.value == "switch"
++
++
++class TestStrategyController:
++    def setup_method(self):
++        self.controller = StrategyController()
++
++    def test_desperation_low_hp_no_bench(self):
++        snap = _make_snapshot(ai_hp=10, ai_max_hp=100, ai_bench_count=0)
++        phase = self.controller.detect_phase(snap)
++        assert phase == BattlePhase.DESPERATION
++
++    def test_not_desperate_with_bench(self):
++        snap = _make_snapshot(ai_hp=10, ai_max_hp=100, ai_bench_count=1)
++        phase = self.controller.detect_phase(snap)
++        assert phase != BattlePhase.DESPERATION
++
++    def test_not_desperate_high_hp(self):
++        snap = _make_snapshot(ai_hp=90, ai_max_hp=100, ai_bench_count=0)
++        phase = self.controller.detect_phase(snap)
++        assert phase != BattlePhase.DESPERATION
++
++    @patch(
++        "tuxemon.ai.strategy_controller._get_type_multiplier",
++        return_value=1.0,
++    )
++    def test_setup_early_turn_with_stat_boost(self, mock_mult):
++        snap = _make_snapshot(
++            turn=1,
++            has_stat_boost=True,
++            ai_hp=80,
++            ai_bench_count=1,
++        )
++        phase = self.controller.detect_phase(snap)
++        assert phase == BattlePhase.SETUP
++
++    @patch(
++        "tuxemon.ai.strategy_controller._get_type_multiplier",
++        return_value=1.0,
++    )
++    def test_no_setup_after_max_turn(self, mock_mult):
++        snap = _make_snapshot(
++            turn=5,
++            has_stat_boost=True,
++            ai_hp=80,
++            ai_bench_count=1,
++        )
++        phase = self.controller.detect_phase(snap)
++        assert phase != BattlePhase.SETUP
++
++    def test_get_weights_returns_eval_weights(self):
++        for phase in BattlePhase:
++            weights = self.controller.get_weights(phase)
++            assert isinstance(weights, EvalWeights)
++
++    def test_get_weights_for_snapshot_returns_eval_weights(self):
++        snap = _make_snapshot(ai_hp=90, ai_bench_count=1)
++        weights = self.controller.get_weights_for_snapshot(snap)
++        assert isinstance(weights, EvalWeights)
++
++    def test_get_weights_copies(self):
++        w1 = self.controller.get_weights(BattlePhase.SWEEP)
++        w2 = self.controller.get_weights(BattlePhase.SWEEP)
++        w1.hp_ratio = 999.0
++        assert w2.hp_ratio != 999.0
++
++    @patch(
++        "tuxemon.ai.strategy_controller._get_type_multiplier",
++        return_value=0.4,
++    )
++    def test_stall_with_healing_at_disadvantage(self, mock_mult):
++        snap = _make_snapshot(
++            ai_hp=80,
++            ai_bench_count=0,
++            has_healing=True,
++        )
++        phase = self.controller.detect_phase(snap)
++        assert phase == BattlePhase.STALL
++
++    @patch(
++        "tuxemon.ai.strategy_controller._get_type_multiplier",
++        return_value=1.5,
++    )
++    def test_sweep_with_type_advantage(self, mock_mult):
++        snap = _make_snapshot(
++            ai_hp=80,
++            ai_bench_count=1,
++            turn=5,
++        )
++        phase = self.controller.detect_phase(snap)
++        assert phase == BattlePhase.SWEEP
++
++    def test_default_to_sweep(self):
++        """When no special condition is met, default is SWEEP."""
++        snap = _make_snapshot(ai_hp=80, ai_bench_count=1, turn=5)
++        phase = self.controller.detect_phase(snap)
++        # Could be SWEEP directly or by default
++        assert phase in (BattlePhase.SWEEP, BattlePhase.STALL, BattlePhase.SWITCH)
+diff --git a/tests/tuxemon/test_ai_switch_evaluator.py b/tests/tuxemon/test_ai_switch_evaluator.py
+new file mode 100644
+index 000000000..355afc86b
+--- /dev/null
++++ b/tests/tuxemon/test_ai_switch_evaluator.py
+@@ -0,0 +1,208 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from tuxemon.ai.battle_evaluator import MonsterSnapshot
++from tuxemon.ai.switch_evaluator import (
++    SwitchEvaluator,
++    SwitchScore,
++)
++
++
++def _snap(
++    slug: str = "mon",
++    current_hp: int = 50,
++    max_hp: int = 100,
++    level: int = 10,
++    speed: int = 20,
++    melee: int = 30,
++    ranged: int = 25,
++    armour: int = 20,
++    dodge: int = 15,
++    type_slugs: tuple[str, ...] = ("fire",),
++    status_slugs: tuple[str, ...] = (),
++    is_fainted: bool = False,
++    move_slugs: tuple[str, ...] = ("tackle",),
++    has_healing_moves: bool = False,
++    has_status_moves: bool = False,
++    has_stat_boost_moves: bool = False,
++) -> MonsterSnapshot:
++    return MonsterSnapshot(
++        slug=slug,
++        current_hp=current_hp,
++        max_hp=max_hp,
++        level=level,
++        speed=speed,
++        melee=melee,
++        ranged=ranged,
++        armour=armour,
++        dodge=dodge,
++        type_slugs=type_slugs,
++        status_slugs=status_slugs,
++        is_fainted=is_fainted,
++        move_slugs=move_slugs,
++        has_healing_moves=has_healing_moves,
++        has_status_moves=has_status_moves,
++        has_stat_boost_moves=has_stat_boost_moves,
++    )
++
++
++class TestSwitchEvaluator:
++    def setup_method(self):
++        self.evaluator = SwitchEvaluator()
++
++    @patch(
++        "tuxemon.ai.switch_evaluator._type_multiplier",
++        return_value=1.0,
++    )
++    @patch(
++        "tuxemon.ai.switch_evaluator._defensive_multiplier",
++        return_value=1.0,
++    )
++    def test_evaluate_switches_returns_scores(
++        self, mock_def, mock_type
++    ):
++        ai_active = _snap(slug="current")
++        opponent = _snap(slug="enemy")
++        bench = (
++            _snap(slug="bench_1", current_hp=80),
++            _snap(slug="bench_2", current_hp=60),
++        )
++
++        results = self.evaluator.evaluate_switches(
++            ai_active, opponent, bench
++        )
++        assert len(results) == 2
++        assert all(isinstance(r, SwitchScore) for r in results)
++
++    @patch(
++        "tuxemon.ai.switch_evaluator._type_multiplier",
++        return_value=1.0,
++    )
++    @patch(
++        "tuxemon.ai.switch_evaluator._defensive_multiplier",
++        return_value=1.0,
++    )
++    def test_evaluate_switches_sorted_descending(
++        self, mock_def, mock_type
++    ):
++        ai_active = _snap(slug="current")
++        opponent = _snap(slug="enemy")
++        bench = (
++            _snap(slug="bench_1", current_hp=30),
++            _snap(slug="bench_2", current_hp=90),
++        )
++
++        results = self.evaluator.evaluate_switches(
++            ai_active, opponent, bench
++        )
++        # Higher HP should score higher (all else equal)
++        assert results[0].total >= results[1].total
++
++    @patch(
++        "tuxemon.ai.switch_evaluator._type_multiplier",
++        return_value=1.0,
++    )
++    def test_evaluate_switches_skips_fainted(self, mock_type):
++        ai_active = _snap(slug="current")
++        opponent = _snap(slug="enemy")
++        fainted = _snap(slug="fainted", is_fainted=True, current_hp=0)
++        healthy = _snap(slug="healthy", current_hp=80)
++
++        results = self.evaluator.evaluate_switches(
++            ai_active, opponent, (fainted, healthy)
++        )
++        assert len(results) == 1
++        assert results[0].monster_slug == "healthy"
++
++    @patch(
++        "tuxemon.ai.switch_evaluator._type_multiplier",
++        return_value=1.2,
++    )
++    def test_should_force_switch_low_hp_with_bench(self, mock_type):
++        ai_active = _snap(slug="current", current_hp=10, max_hp=100)
++        opponent = _snap(slug="enemy")
++        bench = (_snap(slug="bench_1", current_hp=80, max_hp=100),)
++
++        result = self.evaluator.should_force_switch(
++            ai_active, opponent, bench
++        )
++        assert result is True
++
++    @patch(
++        "tuxemon.ai.switch_evaluator._type_multiplier",
++        return_value=1.0,
++    )
++    def test_should_not_force_switch_high_hp(self, mock_type):
++        ai_active = _snap(slug="current", current_hp=80, max_hp=100)
++        opponent = _snap(slug="enemy")
++        bench = (_snap(slug="bench_1"),)
++
++        result = self.evaluator.should_force_switch(
++            ai_active, opponent, bench
++        )
++        assert result is False
++
++    def test_should_not_force_switch_empty_bench(self):
++        ai_active = _snap(slug="current", current_hp=10, max_hp=100)
++        opponent = _snap(slug="enemy")
++
++        result = self.evaluator.should_force_switch(
++            ai_active, opponent, ()
++        )
++        assert result is False
++
++    @patch(
++        "tuxemon.ai.switch_evaluator._type_multiplier",
++        return_value=1.5,
++    )
++    @patch(
++        "tuxemon.ai.switch_evaluator._defensive_multiplier",
++        return_value=0.5,
++    )
++    def test_get_best_switch_returns_slug(
++        self, mock_def, mock_type
++    ):
++        ai_active = _snap(slug="current")
++        opponent = _snap(slug="enemy")
++        bench = (_snap(slug="bench_1", current_hp=80),)
++
++        result = self.evaluator.get_best_switch(
++            ai_active, opponent, bench
++        )
++        assert result == "bench_1"
++
++    @patch(
++        "tuxemon.ai.switch_evaluator._type_multiplier",
++        return_value=1.0,
++    )
++    @patch(
++        "tuxemon.ai.switch_evaluator._defensive_multiplier",
++        return_value=1.0,
++    )
++    def test_get_best_switch_none_for_empty_bench(
++        self, mock_def, mock_type
++    ):
++        ai_active = _snap(slug="current")
++        opponent = _snap(slug="enemy")
++
++        result = self.evaluator.get_best_switch(
++            ai_active, opponent, ()
++        )
++        assert result is None
++
++
++class TestSwitchScore:
++    def test_dataclass_fields(self):
++        score = SwitchScore(
++            monster_slug="test",
++            total=5.0,
++            breakdown={"hp": 3.0, "type": 2.0},
++        )
++        assert score.monster_slug == "test"
++        assert score.total == 5.0
++        assert score.breakdown["hp"] == 3.0
+diff --git a/tuxemon/ai/ai.py b/tuxemon/ai/ai.py
+index c9e9b506c..676ed70ce 100644
+--- a/tuxemon/ai/ai.py
++++ b/tuxemon/ai/ai.py
+@@ -7,6 +7,7 @@ from dataclasses import dataclass
+ from typing import TYPE_CHECKING
+ 
+ from tuxemon.ai.decision_strategy import (
++    AdvancedTrainerAIDecisionStrategy,
+     TrainerAIDecisionStrategy,
+     WildAIDecisionStrategy,
+ )
+@@ -112,11 +113,20 @@ class AITechniques:
+     techniques: dict[str, SingleTechnique]
+ 
+ 
++@dataclass
++class AIDifficultyConfig:
++    """Configuration for AI difficulty settings."""
++
++    search_depth: int = 2
++    mistake_rate: float = 0.1
++
++
+ class AIConfigLoader:
+     _ai_techniques: AITechniques | None = None
+     _ai_items: AIItems | None = None
+     _ai_opponent: AIOpponent | None = None
+     _ai_character: AITrainers | None = None
++    _ai_difficulty: AIDifficultyConfig | None = None
+ 
+     @classmethod
+     def get_ai_opponent(cls, filename: str) -> AIOpponent:
+@@ -195,6 +205,46 @@ class AIConfigLoader:
+             cls._ai_techniques = AITechniques(techniques=techniques)
+         return cls._ai_techniques
+ 
++    @classmethod
++    def get_ai_difficulty(
++        cls, filename: str = "ai_difficulty.yaml", level: str = "medium"
++    ) -> AIDifficultyConfig:
++        """
++        Load AI difficulty from YAML file. Falls back to medium defaults
++        if file is missing or level is not found.
++        """
++        if cls._ai_difficulty is not None:
++            return cls._ai_difficulty
++
++        yaml_path = paths.mods_folder / filename
++        try:
++            raw_map = load_yaml(yaml_path)
++            difficulties = raw_map.get("difficulties", raw_map)
++            if level in difficulties:
++                entry = difficulties[level]
++                cls._ai_difficulty = AIDifficultyConfig(
++                    search_depth=int(entry.get("depth", 2)),
++                    mistake_rate=float(entry.get("mistake_rate", 0.1)),
++                )
++            else:
++                logger.warning(
++                    f"Difficulty level '{level}' not found in "
++                    f"{filename}. Using defaults."
++                )
++                cls._ai_difficulty = AIDifficultyConfig()
++        except FileNotFoundError:
++            logger.warning(
++                f"{filename} not found. Using default difficulty."
++            )
++            cls._ai_difficulty = AIDifficultyConfig()
++        except Exception:
++            logger.warning(
++                f"Could not load {filename}. Using default difficulty."
++            )
++            cls._ai_difficulty = AIDifficultyConfig()
++
++        return cls._ai_difficulty
++
+ 
+ class AI:
+     def __init__(
+@@ -229,22 +279,62 @@ class AI:
+         self.ai_items = AIConfigLoader.get_ai_items("ai_items.yaml")
+         self.ai_techs = AIConfigLoader.get_ai_techniques("ai_techniques.yaml")
+ 
+-        self.decision_strategy = (
+-            TrainerAIDecisionStrategy(
++        self.decision_strategy = self._create_strategy()
++
++    def _create_strategy(
++        self,
++    ) -> (
++        TrainerAIDecisionStrategy
++        | WildAIDecisionStrategy
++        | AdvancedTrainerAIDecisionStrategy
++    ):
++        """
++        Select the appropriate decision strategy based on battle type
++        and difficulty config.
++        """
++        if not self.combat_session.is_trainer_battle:
++            return WildAIDecisionStrategy(
+                 self.evaluator,
+                 self.tracker,
+                 self.ai_trainers,
+                 self.ai_items,
+                 self.ai_techs,
+             )
+-            if self.combat_session.is_trainer_battle
+-            else WildAIDecisionStrategy(
+-                self.evaluator,
+-                self.tracker,
+-                self.ai_trainers,
+-                self.ai_items,
+-                self.ai_techs,
++
++        difficulty = AIConfigLoader.get_ai_difficulty()
++        if difficulty.search_depth > 0:
++            from tuxemon.ai.battle_evaluator import BattleStateEvaluator
++            from tuxemon.ai.minimax import MinimaxEngine
++            from tuxemon.ai.strategy_controller import StrategyController
++            from tuxemon.ai.switch_evaluator import SwitchEvaluator
++
++            evaluator = BattleStateEvaluator()
++            minimax_engine = MinimaxEngine(
++                evaluator=evaluator,
++                search_depth=difficulty.search_depth,
++                is_wild_battle=False,
++            )
++            strategy_controller = StrategyController()
++            switch_evaluator = SwitchEvaluator()
++
++            return AdvancedTrainerAIDecisionStrategy(
++                evaluator=self.evaluator,
++                tracker=self.tracker,
++                ai_trainers=self.ai_trainers,
++                ai_items=self.ai_items,
++                ai_techs=self.ai_techs,
++                minimax_engine=minimax_engine,
++                strategy_controller=strategy_controller,
++                switch_evaluator=switch_evaluator,
++                mistake_rate=difficulty.mistake_rate,
+             )
++
++        return TrainerAIDecisionStrategy(
++            self.evaluator,
++            self.tracker,
++            self.ai_trainers,
++            self.ai_items,
++            self.ai_techs,
+         )
+ 
+     def take_turn(self) -> None:
+diff --git a/tuxemon/ai/battle_evaluator.py b/tuxemon/ai/battle_evaluator.py
+new file mode 100644
+index 000000000..87c33ca82
+--- /dev/null
++++ b/tuxemon/ai/battle_evaluator.py
+@@ -0,0 +1,244 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass, field
++from typing import TYPE_CHECKING
++
++from tuxemon.element import ElementTypesHandler
++
++if TYPE_CHECKING:
++    from tuxemon.monster.monster import Monster
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass(frozen=True)
++class MonsterSnapshot:
++    """
++    Lightweight, immutable snapshot of a monster's battle-relevant state.
++    Used by the Minimax engine to avoid cloning live game objects.
++    """
++
++    slug: str
++    current_hp: int
++    max_hp: int
++    level: int
++    speed: int
++    melee: int
++    ranged: int
++    armour: int
++    dodge: int
++    type_slugs: tuple[str, ...]
++    status_slugs: tuple[str, ...]
++    is_fainted: bool
++    move_slugs: tuple[str, ...]
++    has_healing_moves: bool
++    has_status_moves: bool
++    has_stat_boost_moves: bool
++
++    @property
++    def hp_ratio(self) -> float:
++        if self.max_hp <= 0:
++            return 0.0
++        return min(self.current_hp / self.max_hp, 1.0)
++
++    @classmethod
++    def from_monster(cls, monster: Monster) -> MonsterSnapshot:
++        moves = monster.moves.get_moves()
++        has_healing = any(t.healing_power > 0 for t in moves)
++        has_status = any(
++            t.power == 0 and t.healing_power == 0 for t in moves
++        )
++        has_stat_boost = any(
++            bool(t.stat_modifiers) for t in moves
++        )
++
++        return cls(
++            slug=monster.slug,
++            current_hp=monster.current_hp,
++            max_hp=monster.hp,
++            level=monster.level,
++            speed=monster.speed,
++            melee=monster.melee,
++            ranged=monster.ranged,
++            armour=monster.armour,
++            dodge=monster.dodge,
++            type_slugs=tuple(monster.types.get_type_slugs()),
++            status_slugs=tuple(
++                s.slug for s in monster.status.get_statuses()
++            ),
++            is_fainted=monster.is_fainted,
++            move_slugs=tuple(t.slug for t in moves),
++            has_healing_moves=has_healing,
++            has_status_moves=has_status,
++            has_stat_boost_moves=has_stat_boost,
++        )
++
++
++@dataclass(frozen=True)
++class BattleSnapshot:
++    """
++    Complete snapshot of a battle state for stateless evaluation.
++    """
++
++    ai_active: MonsterSnapshot
++    opponent_active: MonsterSnapshot
++    ai_bench: tuple[MonsterSnapshot, ...]
++    opponent_bench: tuple[MonsterSnapshot, ...]
++    turn: int
++
++    @property
++    def ai_healthy_bench_count(self) -> int:
++        return sum(1 for m in self.ai_bench if not m.is_fainted)
++
++    @property
++    def opponent_healthy_bench_count(self) -> int:
++        return sum(1 for m in self.opponent_bench if not m.is_fainted)
++
++    @property
++    def ai_total_fainted(self) -> int:
++        fainted = int(self.ai_active.is_fainted)
++        fainted += sum(1 for m in self.ai_bench if m.is_fainted)
++        return fainted
++
++    @property
++    def opponent_total_fainted(self) -> int:
++        fainted = int(self.opponent_active.is_fainted)
++        fainted += sum(1 for m in self.opponent_bench if m.is_fainted)
++        return fainted
++
++    @property
++    def is_ai_defeated(self) -> bool:
++        if self.ai_active.is_fainted and self.ai_healthy_bench_count == 0:
++            return True
++        return False
++
++    @property
++    def is_opponent_defeated(self) -> bool:
++        if (
++            self.opponent_active.is_fainted
++            and self.opponent_healthy_bench_count == 0
++        ):
++            return True
++        return False
++
++    @property
++    def is_terminal(self) -> bool:
++        return self.is_ai_defeated or self.is_opponent_defeated
++
++
++@dataclass
++class EvalWeights:
++    """
++    Scoring weights for the battle state evaluator.
++    Strategy controller adjusts these per battle phase.
++    """
++
++    hp_ratio: float = 30.0
++    type_advantage: float = 20.0
++    status_effects: float = 10.0
++    bench_depth: float = 8.0
++    level_diff: float = 5.0
++    fainted_penalty: float = 25.0
++
++    def copy(self) -> EvalWeights:
++        return EvalWeights(
++            hp_ratio=self.hp_ratio,
++            type_advantage=self.type_advantage,
++            status_effects=self.status_effects,
++            bench_depth=self.bench_depth,
++            level_diff=self.level_diff,
++            fainted_penalty=self.fainted_penalty,
++        )
++
++
++@dataclass
++class EvalResult:
++    """Evaluation result with score breakdown."""
++
++    total: float
++    breakdown: dict[str, float] = field(default_factory=dict)
++
++
++class BattleStateEvaluator:
++    """
++    Stateless evaluator that scores a BattleSnapshot from the AI's
++    perspective. Positive scores favor the AI; negative favor the
++    opponent.
++    """
++
++    def __init__(self, weights: EvalWeights | None = None) -> None:
++        self.weights = weights or EvalWeights()
++
++    def evaluate(self, snapshot: BattleSnapshot) -> EvalResult:
++        breakdown: dict[str, float] = {}
++
++        # HP ratio differential
++        ai_hp = snapshot.ai_active.hp_ratio
++        opp_hp = snapshot.opponent_active.hp_ratio
++        breakdown["hp_ratio"] = (ai_hp - opp_hp) * self.weights.hp_ratio
++
++        # Type advantage (AI attacking opponent)
++        type_mult = self._type_advantage_score(
++            snapshot.ai_active.type_slugs,
++            snapshot.opponent_active.type_slugs,
++        )
++        breakdown["type_advantage"] = type_mult * self.weights.type_advantage
++
++        # Status effects: negative statuses on opponent are good for AI
++        opp_status_count = len(snapshot.opponent_active.status_slugs)
++        ai_status_count = len(snapshot.ai_active.status_slugs)
++        breakdown["status_effects"] = (
++            (opp_status_count - ai_status_count) * self.weights.status_effects
++        )
++
++        # Bench depth
++        ai_bench = snapshot.ai_healthy_bench_count
++        opp_bench = snapshot.opponent_healthy_bench_count
++        breakdown["bench_depth"] = (
++            (ai_bench - opp_bench) * self.weights.bench_depth
++        )
++
++        # Level differential
++        level_diff = (
++            snapshot.ai_active.level - snapshot.opponent_active.level
++        )
++        breakdown["level_diff"] = level_diff * self.weights.level_diff
++
++        # Fainted penalty
++        ai_fainted = snapshot.ai_total_fainted
++        opp_fainted = snapshot.opponent_total_fainted
++        breakdown["fainted_penalty"] = (
++            (opp_fainted - ai_fainted) * self.weights.fainted_penalty
++        )
++
++        total = sum(breakdown.values())
++
++        logger.debug(f"Evaluation breakdown: {breakdown}, total: {total}")
++        return EvalResult(total=total, breakdown=breakdown)
++
++    @staticmethod
++    def _type_advantage_score(
++        attacker_types: tuple[str, ...],
++        defender_types: tuple[str, ...],
++    ) -> float:
++        """
++        Compute type advantage score using element multiplier.
++        Returns a value centered around 0 (advantage positive,
++        disadvantage negative).
++        """
++        from tuxemon.element import Element
++
++        attack_elements = [Element.get(s) for s in attacker_types if s]
++        defend_elements = [Element.get(s) for s in defender_types if s]
++
++        if not attack_elements or not defend_elements:
++            return 0.0
++
++        multiplier = ElementTypesHandler.calculate_affinity_score(
++            attack_elements, defend_elements
++        )
++        # Center around 0: multiplier of 1.0 = neutral = 0
++        return multiplier - 1.0
+diff --git a/tuxemon/ai/decision_strategy.py b/tuxemon/ai/decision_strategy.py
+index 1a6b0c547..bec967d41 100644
+--- a/tuxemon/ai/decision_strategy.py
++++ b/tuxemon/ai/decision_strategy.py
+@@ -20,7 +20,15 @@ if TYPE_CHECKING:
+         SingleTechnique,
+         TechniqueCondition,
+     )
++    from tuxemon.ai.battle_evaluator import (
++        BattleSnapshot,
++        BattleStateEvaluator,
++        MonsterSnapshot,
++    )
++    from tuxemon.ai.minimax import AIAction, MinimaxEngine
+     from tuxemon.ai.opponent_evaluator import OpponentEvaluator
++    from tuxemon.ai.strategy_controller import StrategyController
++    from tuxemon.ai.switch_evaluator import SwitchEvaluator
+     from tuxemon.ai.technique_tracker import TechniqueTracker
+     from tuxemon.item.item import Item
+     from tuxemon.monster.monster import Monster
+@@ -215,6 +223,220 @@ class WildAIDecisionStrategy(AIDecisionStrategy):
+         return self.choose_action(ai, valid_actions)
+ 
+ 
++class AdvancedTrainerAIDecisionStrategy(AIDecisionStrategy):
++    """
++    Minimax-powered trainer AI that uses a strategy controller to
++    detect battle phases and adjusts its evaluation weights accordingly.
++    Falls back to the legacy TrainerAIDecisionStrategy behavior when
++    search_depth is 0, preserving backward compatibility.
++    """
++
++    def __init__(
++        self,
++        evaluator: OpponentEvaluator,
++        tracker: TechniqueTracker,
++        ai_trainers: AITrainers,
++        ai_items: AIItems,
++        ai_techs: AITechniques,
++        minimax_engine: MinimaxEngine,
++        strategy_controller: StrategyController,
++        switch_evaluator: SwitchEvaluator,
++        mistake_rate: float = 0.0,
++    ):
++        super().__init__(
++            evaluator, tracker, ai_trainers, ai_items, ai_techs
++        )
++        self.minimax_engine = minimax_engine
++        self.strategy_controller = strategy_controller
++        self.switch_evaluator = switch_evaluator
++        self.mistake_rate = mistake_rate
++        self._legacy_fallback = TrainerAIDecisionStrategy(
++            evaluator, tracker, ai_trainers, ai_items, ai_techs
++        )
++
++    def make_decision(self, ai: AI) -> None:
++        """
++        Advanced trainer battle decision-making using Minimax.
++        Falls back to legacy logic when search_depth is 0.
++        """
++        # Depth 0 = use legacy logic for backward compatibility
++        if self.minimax_engine.search_depth <= 0:
++            self._legacy_fallback.make_decision(ai)
++            return
++
++        # Healing item check (same as legacy)
++        items = ai.character.items
++        if items:
++            for item in items:
++                if self._legacy_fallback.need_healing(ai, item):
++                    ai.action_item(item)
++                    return
++
++        snapshot = self._build_snapshot(ai)
++
++        # Update evaluator weights based on detected battle phase
++        weights = self.strategy_controller.get_weights_for_snapshot(
++            snapshot
++        )
++        self.minimax_engine.evaluator.weights = weights
++
++        result = self.minimax_engine.find_best_action(snapshot)
++
++        if result.best_action is None:
++            self._legacy_fallback.make_decision(ai)
++            return
++
++        # Apply mistake rate if configured
++        if self.mistake_rate > 0.0:
++            action = self._apply_mistake(ai, snapshot)
++            if action is not None:
++                self._execute_action(ai, action)
++                return
++
++        self._execute_action(ai, result.best_action)
++
++    def _apply_mistake(
++        self, ai: AI, snapshot: BattleSnapshot
++    ) -> AIAction | None:
++        """
++        Evaluate all top-level actions and pick one using
++        softmax-weighted mistake logic.
++        """
++        from tuxemon.ai.minimax import (
++            _apply_action,
++            _generate_actions,
++            apply_mistake_rate,
++        )
++
++        actions = _generate_actions(snapshot, "ai")
++        if not actions:
++            return None
++
++        scores = []
++        for action in actions:
++            new_snap = _apply_action(snapshot, action, "ai")
++            score = self.minimax_engine.evaluator.evaluate(
++                new_snap
++            ).total
++            scores.append(score)
++
++        return apply_mistake_rate(actions, scores, self.mistake_rate)
++
++    def _build_snapshot(self, ai: AI) -> BattleSnapshot:
++        """
++        Build a BattleSnapshot from the live combat session state.
++        """
++        from tuxemon.ai.battle_evaluator import (
++            BattleSnapshot,
++            MonsterSnapshot,
++        )
++
++        combat = ai.session.client.combat_session
++        character = ai.character
++
++        # Determine which side is AI
++        is_left = character == combat.left_player
++        opponent = (
++            combat.right_player if is_left else combat.left_player
++        )
++
++        # Active monsters
++        ai_active_monsters = combat.field_monsters.get_monsters(
++            character
++        )
++        opp_active_monsters = combat.field_monsters.get_monsters(
++            opponent
++        )
++
++        ai_active = MonsterSnapshot.from_monster(
++            ai_active_monsters[0]
++            if ai_active_monsters
++            else ai.monster
++        )
++        opp_active = MonsterSnapshot.from_monster(
++            opp_active_monsters[0]
++            if opp_active_monsters
++            else ai.opponents[0]
++        )
++
++        # Bench (non-active, non-fainted)
++        ai_bench = tuple(
++            MonsterSnapshot.from_monster(m)
++            for m in combat.get_bench(character)
++        )
++        opp_bench = tuple(
++            MonsterSnapshot.from_monster(m)
++            for m in combat.get_bench(opponent)
++        )
++
++        return BattleSnapshot(
++            ai_active=ai_active,
++            opponent_active=opp_active,
++            ai_bench=ai_bench,
++            opponent_bench=opp_bench,
++            turn=combat.turn,
++        )
++
++    def _execute_action(self, ai: AI, action: AIAction) -> None:
++        """
++        Translate a minimax AIAction into a game action.
++        """
++        from tuxemon.ai.minimax import ActionType
++
++        if action.action_type is ActionType.SWITCH:
++            switch_slug = action.switch_to_slug
++            if switch_slug:
++                self._do_switch(ai, switch_slug)
++                return
++            # Fallback if switch slug is invalid
++            self._legacy_fallback.make_decision(ai)
++            return
++
++        # Technique action: find the matching technique and target
++        valid_actions = ai.get_available_moves()
++        tech_slug = action.technique_slug
++
++        for technique, target in valid_actions:
++            if technique.slug == tech_slug:
++                ai.action_tech(technique, target)
++                return
++
++        # If the chosen tech isn't in valid moves, fall back
++        if valid_actions:
++            technique, target = valid_actions[0]
++            ai.action_tech(technique, target)
++        else:
++            self._legacy_fallback.make_decision(ai)
++
++    def _do_switch(self, ai: AI, switch_slug: str) -> None:
++        """
++        Request a monster switch via the combat session.
++        Uses the standard ``swap`` technique, matching the player-side pattern.
++        Falls back to a technique if the switch target is invalid.
++        """
++        combat = ai.session.client.combat_session
++        bench = combat.get_bench(ai.character)
++
++        for bench_mon in bench:
++            if bench_mon.slug == switch_slug and not bench_mon.is_fainted:
++                swap = Technique.create("swap")
++                combat.enqueue_action(ai.monster, swap, bench_mon)
++                return
++
++        # Switch target not found; fall back to legacy
++        self._legacy_fallback.make_decision(ai)
++
++    def select_move(
++        self,
++        ai: AI,
++        target: Monster,
++        valid_actions: list[tuple[Technique, Monster]],
++    ) -> tuple[Technique, Monster]:
++        if not valid_actions:
++            return self.get_fallback_action(ai, target)
++        return self.choose_action(ai, valid_actions)
++
++
+ def check_item_conditions(item_entry: ItemEntry, ai: AI) -> bool:
+     """
+     Check if all conditions for a technique are met.
+diff --git a/tuxemon/ai/manager.py b/tuxemon/ai/manager.py
+index da85ffd76..90c2cef7d 100644
+--- a/tuxemon/ai/manager.py
++++ b/tuxemon/ai/manager.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import logging
+ import random
++from collections.abc import Sequence
+ from typing import TYPE_CHECKING
+ 
+ from tuxemon.ai.ai import AI
+@@ -97,6 +98,9 @@ class AIManager:
+             logger.debug(f"Random strategy selected: {chosen.name}")
+             return chosen
+ 
++        if strategy == "smart":
++            return self._smart_replacement(character, available_monsters)
++
+         if strategy in methods:
+             attr, func = methods[strategy]
+             chosen = func(available_monsters, key=lambda m: getattr(m, attr))
+@@ -109,3 +113,73 @@ class AIManager:
+             f"Unrecognized strategy '{strategy}'. Defaulting to first available: {available_monsters[0].name}"
+         )
+         return available_monsters[0]
++
++    def _smart_replacement(
++        self,
++        character: NPC,
++        available_monsters: Sequence[Monster],
++    ) -> Monster:
++        """
++        Use the SwitchEvaluator to pick the best replacement based on
++        type matchup and HP. Falls back to healthiest if evaluation fails.
++        """
++        combat = self.session.client.combat_session
++        opponent_player = (
++            combat.right_player
++            if character == combat.left_player
++            else combat.left_player
++        )
++        opp_active = combat.field_monsters.get_monsters(opponent_player)
++
++        if not opp_active:
++            chosen = max(
++                available_monsters, key=lambda m: m.current_hp
++            )
++            logger.debug(
++                f"Smart strategy (no opponent): {chosen.name}"
++            )
++            return chosen
++
++        try:
++            from tuxemon.ai.battle_evaluator import MonsterSnapshot
++            from tuxemon.ai.switch_evaluator import SwitchEvaluator
++
++            opp_snap = MonsterSnapshot.from_monster(opp_active[0])
++
++            # We need a "current active" for relative scoring.
++            # Use a dummy fainted monster so any candidate scores well.
++            ai_active_list = combat.field_monsters.get_monsters(character)
++            if ai_active_list:
++                ai_snap = MonsterSnapshot.from_monster(ai_active_list[0])
++            else:
++                # Active just fainted; use first candidate as baseline
++                ai_snap = MonsterSnapshot.from_monster(
++                    available_monsters[0]
++                )
++
++            candidates = tuple(
++                MonsterSnapshot.from_monster(m)
++                for m in available_monsters
++            )
++            se = SwitchEvaluator()
++            best_slug = se.get_best_switch(
++                ai_snap, opp_snap, candidates
++            )
++
++            if best_slug is not None:
++                # Map back to the live monster
++                for m in available_monsters:
++                    if m.slug == best_slug:
++                        logger.debug(
++                            f"Smart strategy selected: {m.name}"
++                        )
++                        return m
++
++        except Exception:
++            logger.warning(
++                "Smart replacement failed, falling back to healthiest."
++            )
++
++        chosen = max(available_monsters, key=lambda m: m.current_hp)
++        logger.debug(f"Smart strategy fallback: {chosen.name}")
++        return chosen
+diff --git a/tuxemon/ai/minimax.py b/tuxemon/ai/minimax.py
+new file mode 100644
+index 000000000..c0de3f229
+--- /dev/null
++++ b/tuxemon/ai/minimax.py
+@@ -0,0 +1,512 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++import logging
++import math
++import random
++from dataclasses import dataclass
++from enum import Enum
++
++from tuxemon.ai.battle_evaluator import (
++    BattleSnapshot,
++    BattleStateEvaluator,
++    MonsterSnapshot,
++)
++
++logger = logging.getLogger(__name__)
++
++# Sentinel scores for terminal states
++WIN_SCORE = 1_000_000.0
++LOSS_SCORE = -1_000_000.0
++
++# Maximum turn horizon to prevent infinite loops
++MAX_TURN_HORIZON = 20
++
++
++class ActionType(Enum):
++    TECHNIQUE = "technique"
++    SWITCH = "switch"
++
++
++@dataclass
++class AIAction:
++    """
++    Represents an action the AI or opponent can take.
++    Either using a technique on a target, or switching to a bench monster.
++    """
++
++    action_type: ActionType
++    technique_slug: str | None = None
++    target_slug: str | None = None
++    switch_to_slug: str | None = None
++
++    @property
++    def is_switch(self) -> bool:
++        return self.action_type is ActionType.SWITCH
++
++    @property
++    def is_technique(self) -> bool:
++        return self.action_type is ActionType.TECHNIQUE
++
++
++@dataclass
++class MinimaxResult:
++    """Result of a minimax search."""
++
++    best_action: AIAction | None
++    score: float
++    nodes_evaluated: int
++
++
++def _simulate_technique_damage(
++    attacker: MonsterSnapshot,
++    defender: MonsterSnapshot,
++    tech_slug: str,
++) -> int:
++    """
++    Estimate damage for minimax simulation. This is a lightweight heuristic
++    based on stat differentials and type advantage, not the full formula.py
++    pipeline (which requires live objects). Provides a reasonable approximation
++    for tree search.
++    """
++    from tuxemon.element import Element, ElementTypesHandler
++
++    # Estimate base damage from attacker stats
++    attack_power = max(attacker.melee, attacker.ranged)
++    defense = max(defender.armour, 1)
++
++    # Type multiplier
++    attack_types = [Element.get(s) for s in attacker.type_slugs if s]
++    defend_types = [Element.get(s) for s in defender.type_slugs if s]
++
++    type_mult = 1.0
++    if attack_types and defend_types:
++        type_mult = ElementTypesHandler.calculate_affinity_score(
++            attack_types, defend_types
++        )
++
++    # Heuristic: approximate damage = (attack * level_factor * type_mult) / defense
++    level_factor = 5 + attacker.level
++    raw_damage = int(
++        (attack_power * level_factor * type_mult) / (defense * 2)
++    )
++    return max(raw_damage, 1)
++
++
++def _simulate_switch(
++    snapshot: BattleSnapshot,
++    side: str,
++    switch_to_slug: str,
++) -> BattleSnapshot:
++    """
++    Create a new BattleSnapshot with a switch applied.
++    The switched-in monster becomes active; the old active goes to bench.
++    The opponent gets a free attack (estimated damage applied).
++    """
++    if side == "ai":
++        new_bench = []
++        switched_in = None
++        for m in snapshot.ai_bench:
++            if m.slug == switch_to_slug and switched_in is None:
++                switched_in = m
++            else:
++                new_bench.append(m)
++
++        if switched_in is None:
++            return snapshot
++
++        # Old active goes to bench (if not fainted)
++        old_active = snapshot.ai_active
++        if not old_active.is_fainted:
++            new_bench.append(old_active)
++
++        # Opponent gets a free attack on the switching monster
++        free_attack_dmg = _simulate_technique_damage(
++            snapshot.opponent_active, switched_in, ""
++        )
++        new_hp = max(switched_in.current_hp - free_attack_dmg, 0)
++        switched_in = MonsterSnapshot(
++            slug=switched_in.slug,
++            current_hp=new_hp,
++            max_hp=switched_in.max_hp,
++            level=switched_in.level,
++            speed=switched_in.speed,
++            melee=switched_in.melee,
++            ranged=switched_in.ranged,
++            armour=switched_in.armour,
++            dodge=switched_in.dodge,
++            type_slugs=switched_in.type_slugs,
++            status_slugs=switched_in.status_slugs,
++            is_fainted=new_hp <= 0,
++            move_slugs=switched_in.move_slugs,
++            has_healing_moves=switched_in.has_healing_moves,
++            has_status_moves=switched_in.has_status_moves,
++            has_stat_boost_moves=switched_in.has_stat_boost_moves,
++        )
++
++        return BattleSnapshot(
++            ai_active=switched_in,
++            opponent_active=snapshot.opponent_active,
++            ai_bench=tuple(new_bench),
++            opponent_bench=snapshot.opponent_bench,
++            turn=snapshot.turn,
++        )
++    else:
++        new_bench = []
++        switched_in = None
++        for m in snapshot.opponent_bench:
++            if m.slug == switch_to_slug and switched_in is None:
++                switched_in = m
++            else:
++                new_bench.append(m)
++
++        if switched_in is None:
++            return snapshot
++
++        old_active = snapshot.opponent_active
++        if not old_active.is_fainted:
++            new_bench.append(old_active)
++
++        return BattleSnapshot(
++            ai_active=snapshot.ai_active,
++            opponent_active=switched_in,
++            ai_bench=snapshot.ai_bench,
++            opponent_bench=tuple(new_bench),
++            turn=snapshot.turn,
++        )
++
++
++def _simulate_attack(
++    snapshot: BattleSnapshot,
++    attacker_side: str,
++    tech_slug: str,
++) -> BattleSnapshot:
++    """
++    Simulate an attack and return a new BattleSnapshot with updated HP.
++    """
++    if attacker_side == "ai":
++        attacker = snapshot.ai_active
++        defender = snapshot.opponent_active
++    else:
++        attacker = snapshot.opponent_active
++        defender = snapshot.ai_active
++
++    damage = _simulate_technique_damage(attacker, defender, tech_slug)
++    new_hp = max(defender.current_hp - damage, 0)
++    new_defender = MonsterSnapshot(
++        slug=defender.slug,
++        current_hp=new_hp,
++        max_hp=defender.max_hp,
++        level=defender.level,
++        speed=defender.speed,
++        melee=defender.melee,
++        ranged=defender.ranged,
++        armour=defender.armour,
++        dodge=defender.dodge,
++        type_slugs=defender.type_slugs,
++        status_slugs=defender.status_slugs,
++        is_fainted=new_hp <= 0,
++        move_slugs=defender.move_slugs,
++        has_healing_moves=defender.has_healing_moves,
++        has_status_moves=defender.has_status_moves,
++        has_stat_boost_moves=defender.has_stat_boost_moves,
++    )
++
++    if attacker_side == "ai":
++        return BattleSnapshot(
++            ai_active=snapshot.ai_active,
++            opponent_active=new_defender,
++            ai_bench=snapshot.ai_bench,
++            opponent_bench=snapshot.opponent_bench,
++            turn=snapshot.turn + 1,
++        )
++    else:
++        return BattleSnapshot(
++            ai_active=new_defender,
++            opponent_active=snapshot.opponent_active,
++            ai_bench=snapshot.ai_bench,
++            opponent_bench=snapshot.opponent_bench,
++            turn=snapshot.turn + 1,
++        )
++
++
++def _generate_actions(
++    snapshot: BattleSnapshot,
++    side: str,
++) -> list[AIAction]:
++    """
++    Generate all legal actions for the given side.
++    """
++    actions: list[AIAction] = []
++
++    if side == "ai":
++        active = snapshot.ai_active
++        bench = snapshot.ai_bench
++    else:
++        active = snapshot.opponent_active
++        bench = snapshot.opponent_bench
++
++    if active.is_fainted:
++        # Must switch if active is fainted
++        for m in bench:
++            if not m.is_fainted:
++                actions.append(
++                    AIAction(
++                        action_type=ActionType.SWITCH,
++                        switch_to_slug=m.slug,
++                    )
++                )
++        return actions
++
++    # Technique actions
++    for move_slug in active.move_slugs:
++        target_slug = (
++            snapshot.opponent_active.slug
++            if side == "ai"
++            else snapshot.ai_active.slug
++        )
++        actions.append(
++            AIAction(
++                action_type=ActionType.TECHNIQUE,
++                technique_slug=move_slug,
++                target_slug=target_slug,
++            )
++        )
++
++    # Switch actions
++    for m in bench:
++        if not m.is_fainted:
++            actions.append(
++                AIAction(
++                    action_type=ActionType.SWITCH,
++                    switch_to_slug=m.slug,
++                )
++            )
++
++    return actions
++
++
++def _apply_action(
++    snapshot: BattleSnapshot,
++    action: AIAction,
++    side: str,
++) -> BattleSnapshot:
++    """Apply an action to the snapshot, returning a new snapshot."""
++    if action.is_switch:
++        return _simulate_switch(snapshot, side, action.switch_to_slug or "")
++    else:
++        return _simulate_attack(
++            snapshot, side, action.technique_slug or ""
++        )
++
++
++class MinimaxEngine:
++    """
++    Minimax decision engine with alpha-beta pruning for AI combat
++    decisions. Operates on lightweight BattleSnapshot instances
++    to avoid coupling to live game objects.
++    """
++
++    def __init__(
++        self,
++        evaluator: BattleStateEvaluator,
++        search_depth: int = 2,
++        is_wild_battle: bool = False,
++    ) -> None:
++        self.evaluator = evaluator
++        self.search_depth = search_depth
++        self.is_wild_battle = is_wild_battle
++        self._nodes_evaluated = 0
++
++    def find_best_action(
++        self,
++        snapshot: BattleSnapshot,
++    ) -> MinimaxResult:
++        """
++        Run minimax search and return the best action for the AI.
++        """
++        self._nodes_evaluated = 0
++
++        actions = _generate_actions(snapshot, "ai")
++        if not actions:
++            return MinimaxResult(
++                best_action=None, score=0.0, nodes_evaluated=0
++            )
++
++        if len(actions) == 1:
++            self._nodes_evaluated = 1
++            result_snapshot = _apply_action(snapshot, actions[0], "ai")
++            score = self.evaluator.evaluate(result_snapshot).total
++            return MinimaxResult(
++                best_action=actions[0],
++                score=score,
++                nodes_evaluated=1,
++            )
++
++        best_score = -math.inf
++        best_action = actions[0]
++        alpha = -math.inf
++        beta = math.inf
++
++        for action in actions:
++            new_snapshot = _apply_action(snapshot, action, "ai")
++            score = self._minimax(
++                new_snapshot,
++                depth=self.search_depth - 1,
++                is_maximizing=False,
++                alpha=alpha,
++                beta=beta,
++            )
++
++            if score > best_score:
++                best_score = score
++                best_action = action
++
++            alpha = max(alpha, best_score)
++
++        logger.debug(
++            f"Minimax result: action={best_action}, "
++            f"score={best_score:.2f}, "
++            f"nodes={self._nodes_evaluated}"
++        )
++
++        return MinimaxResult(
++            best_action=best_action,
++            score=best_score,
++            nodes_evaluated=self._nodes_evaluated,
++        )
++
++    def _minimax(
++        self,
++        snapshot: BattleSnapshot,
++        depth: int,
++        is_maximizing: bool,
++        alpha: float,
++        beta: float,
++    ) -> float:
++        self._nodes_evaluated += 1
++
++        # Terminal state checks
++        if snapshot.is_terminal:
++            if snapshot.is_opponent_defeated:
++                return WIN_SCORE
++            return LOSS_SCORE
++
++        # Depth limit or turn horizon
++        if depth <= 0 or snapshot.turn >= MAX_TURN_HORIZON:
++            return self.evaluator.evaluate(snapshot).total
++
++        side = "ai" if is_maximizing else "opponent"
++        actions = _generate_actions(snapshot, side)
++
++        if not actions:
++            return self.evaluator.evaluate(snapshot).total
++
++        # For wild battles, opponent picks randomly instead of optimally
++        if not is_maximizing and self.is_wild_battle:
++            return self._simulate_random_opponent(
++                snapshot, actions, depth, alpha, beta
++            )
++
++        if is_maximizing:
++            max_eval = -math.inf
++            for action in actions:
++                new_snapshot = _apply_action(snapshot, action, side)
++                eval_score = self._minimax(
++                    new_snapshot, depth - 1, False, alpha, beta
++                )
++                max_eval = max(max_eval, eval_score)
++                alpha = max(alpha, eval_score)
++                if beta <= alpha:
++                    break  # Beta cutoff
++            return max_eval
++        else:
++            min_eval = math.inf
++            for action in actions:
++                new_snapshot = _apply_action(snapshot, action, side)
++                eval_score = self._minimax(
++                    new_snapshot, depth - 1, True, alpha, beta
++                )
++                min_eval = min(min_eval, eval_score)
++                beta = min(beta, eval_score)
++                if beta <= alpha:
++                    break  # Alpha cutoff
++            return min_eval
++
++    def _simulate_random_opponent(
++        self,
++        snapshot: BattleSnapshot,
++        actions: list[AIAction],
++        depth: int,
++        alpha: float,
++        beta: float,
++    ) -> float:
++        """
++        For wild battles: average over all opponent actions (random play).
++        """
++        total_score = 0.0
++        for action in actions:
++            new_snapshot = _apply_action(snapshot, action, "opponent")
++            score = self._minimax(
++                new_snapshot, depth - 1, True, alpha, beta
++            )
++            total_score += score
++        return total_score / len(actions)
++
++
++def apply_mistake_rate(
++    actions: list[AIAction],
++    scores: list[float],
++    mistake_rate: float,
++) -> AIAction:
++    """
++    Select an action with a softmax-over-top-K approach for mistakes.
++    With probability (1 - mistake_rate), pick the best action.
++    With probability mistake_rate, sample from the top actions
++    weighted by their relative scores (softmax).
++
++    This produces more realistic "mistakes" than uniform random: the AI
++    tends to pick the 2nd or 3rd best move rather than a completely
++    terrible one.
++    """
++    if not actions:
++        raise ValueError("No actions to select from.")
++
++    if len(actions) == 1:
++        return actions[0]
++
++    # Sort by score descending
++    paired = sorted(zip(scores, actions), key=lambda x: x[0], reverse=True)
++    sorted_scores = [s for s, _ in paired]
++    sorted_actions = [a for _, a in paired]
++
++    # With probability (1 - mistake_rate), play optimally
++    if random.random() >= mistake_rate:
++        return sorted_actions[0]
++
++    # Softmax over all actions for mistake selection
++    # Shift scores for numerical stability
++    max_score = sorted_scores[0]
++    shifted = [s - max_score for s in sorted_scores]
++
++    # Temperature scales how "random" mistakes are
++    # Lower temperature = mistakes are closer to optimal
++    temperature = 2.0
++    exp_scores = [math.exp(s / temperature) for s in shifted]
++    total = sum(exp_scores)
++
++    if total <= 0:
++        return random.choice(sorted_actions)
++
++    probabilities = [e / total for e in exp_scores]
++
++    # Weighted random selection
++    r = random.random()
++    cumulative = 0.0
++    for i, prob in enumerate(probabilities):
++        cumulative += prob
++        if r <= cumulative:
++            return sorted_actions[i]
++
++    return sorted_actions[-1]
+diff --git a/tuxemon/ai/strategy_controller.py b/tuxemon/ai/strategy_controller.py
+new file mode 100644
+index 000000000..1f1b22159
+--- /dev/null
++++ b/tuxemon/ai/strategy_controller.py
+@@ -0,0 +1,248 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++import logging
++from enum import Enum
++
++from tuxemon.ai.battle_evaluator import (
++    BattleSnapshot,
++    EvalWeights,
++)
++
++logger = logging.getLogger(__name__)
++
++
++class BattlePhase(Enum):
++    """
++    Represents the strategic phase of a battle from the AI's perspective.
++    """
++
++    SETUP = "setup"
++    SWEEP = "sweep"
++    STALL = "stall"
++    DESPERATION = "desperation"
++    SWITCH = "switch"
++
++
++# Weight profiles per battle phase
++_PHASE_WEIGHTS: dict[BattlePhase, EvalWeights] = {
++    BattlePhase.SETUP: EvalWeights(
++        hp_ratio=25.0,
++        type_advantage=15.0,
++        status_effects=20.0,  # Boost status moves value
++        bench_depth=8.0,
++        level_diff=5.0,
++        fainted_penalty=20.0,
++    ),
++    BattlePhase.SWEEP: EvalWeights(
++        hp_ratio=35.0,
++        type_advantage=30.0,  # Maximize damage
++        status_effects=5.0,
++        bench_depth=5.0,
++        level_diff=8.0,
++        fainted_penalty=20.0,
++    ),
++    BattlePhase.STALL: EvalWeights(
++        hp_ratio=40.0,  # Survive longer
++        type_advantage=10.0,
++        status_effects=20.0,  # Healing/status preferred
++        bench_depth=10.0,
++        level_diff=3.0,
++        fainted_penalty=25.0,
++    ),
++    BattlePhase.DESPERATION: EvalWeights(
++        hp_ratio=20.0,
++        type_advantage=35.0,  # Max damage, go all-out
++        status_effects=2.0,
++        bench_depth=2.0,
++        level_diff=5.0,
++        fainted_penalty=40.0,
++    ),
++    BattlePhase.SWITCH: EvalWeights(
++        hp_ratio=30.0,
++        type_advantage=25.0,
++        status_effects=10.0,
++        bench_depth=12.0,  # Bench matters more when switching
++        level_diff=5.0,
++        fainted_penalty=25.0,
++    ),
++}
++
++# Thresholds
++_DESPERATION_HP_THRESHOLD = 0.25
++_TYPE_DISADVANTAGE_THRESHOLD = 0.7
++_TYPE_ADVANTAGE_THRESHOLD = 1.3
++_SETUP_MAX_TURN = 2
++
++
++class StrategyController:
++    """
++    Detects the current battle phase by analyzing the battle state
++    and the AI monster's move pool. Returns per-phase weight profiles
++    for the BattleStateEvaluator.
++    """
++
++    def detect_phase(self, snapshot: BattleSnapshot) -> BattlePhase:
++        """
++        Classify the current battle into a strategic phase.
++        Checks are ordered by priority (most urgent first).
++        """
++        ai = snapshot.ai_active
++        opponent = snapshot.opponent_active
++
++        # DESPERATION: last monster, low HP
++        if self._is_desperate(snapshot):
++            logger.debug("Phase detected: DESPERATION")
++            return BattlePhase.DESPERATION
++
++        # SWITCH: severe type disadvantage with a better option on bench
++        if self._should_switch(snapshot):
++            logger.debug("Phase detected: SWITCH")
++            return BattlePhase.SWITCH
++
++        # STALL: at a type disadvantage but has healing/status moves
++        if self._should_stall(snapshot):
++            logger.debug("Phase detected: STALL")
++            return BattlePhase.STALL
++
++        # SETUP: early turns with stat-boost moves available
++        if self._should_setup(snapshot):
++            logger.debug("Phase detected: SETUP")
++            return BattlePhase.SETUP
++
++        # SWEEP: type advantage or strong offensive position
++        if self._should_sweep(snapshot):
++            logger.debug("Phase detected: SWEEP")
++            return BattlePhase.SWEEP
++
++        # Default to SWEEP
++        logger.debug("Phase detected: SWEEP (default)")
++        return BattlePhase.SWEEP
++
++    def get_weights(self, phase: BattlePhase) -> EvalWeights:
++        """Get the evaluation weight profile for a given phase."""
++        return _PHASE_WEIGHTS[phase].copy()
++
++    def get_weights_for_snapshot(
++        self, snapshot: BattleSnapshot
++    ) -> EvalWeights:
++        """Detect phase and return corresponding weights."""
++        phase = self.detect_phase(snapshot)
++        return self.get_weights(phase)
++
++    @staticmethod
++    def _is_desperate(snapshot: BattleSnapshot) -> bool:
++        """
++        True if AI has only one monster left (active) with low HP.
++        """
++        ai = snapshot.ai_active
++        has_bench = snapshot.ai_healthy_bench_count > 0
++
++        if has_bench:
++            return False
++
++        return ai.hp_ratio < _DESPERATION_HP_THRESHOLD
++
++    @staticmethod
++    def _should_switch(snapshot: BattleSnapshot) -> bool:
++        """
++        True if the AI's active monster is at a severe type disadvantage
++        and there's a better matchup available on the bench.
++        """
++        ai = snapshot.ai_active
++        opponent = snapshot.opponent_active
++
++        if snapshot.ai_healthy_bench_count == 0:
++            return False
++
++        # Check if current active is at a type disadvantage
++        type_mult = _get_type_multiplier(
++            ai.type_slugs, opponent.type_slugs
++        )
++        if type_mult >= _TYPE_DISADVANTAGE_THRESHOLD:
++            return False  # Not at a significant disadvantage
++
++        # Check if any bench monster has a better matchup
++        for bench_mon in snapshot.ai_bench:
++            if bench_mon.is_fainted:
++                continue
++            bench_mult = _get_type_multiplier(
++                bench_mon.type_slugs, opponent.type_slugs
++            )
++            if bench_mult > type_mult + 0.3:
++                return True
++
++        return False
++
++    @staticmethod
++    def _should_stall(snapshot: BattleSnapshot) -> bool:
++        """
++        True if at a type disadvantage but has healing or status moves.
++        """
++        ai = snapshot.ai_active
++        opponent = snapshot.opponent_active
++
++        type_mult = _get_type_multiplier(
++            ai.type_slugs, opponent.type_slugs
++        )
++        if type_mult >= 1.0:
++            return False  # Not disadvantaged
++
++        return ai.has_healing_moves or ai.has_status_moves
++
++    @staticmethod
++    def _should_setup(snapshot: BattleSnapshot) -> bool:
++        """
++        True if early in the battle and the AI monster has stat-boost moves.
++        Inspects the actual move pool, not just HP thresholds.
++        """
++        ai = snapshot.ai_active
++
++        if snapshot.turn > _SETUP_MAX_TURN:
++            return False
++
++        return ai.has_stat_boost_moves
++
++    @staticmethod
++    def _should_sweep(snapshot: BattleSnapshot) -> bool:
++        """
++        True if the AI has a significant stat or type advantage.
++        """
++        ai = snapshot.ai_active
++        opponent = snapshot.opponent_active
++
++        type_mult = _get_type_multiplier(
++            ai.type_slugs, opponent.type_slugs
++        )
++        if type_mult >= _TYPE_ADVANTAGE_THRESHOLD:
++            return True
++
++        # Stat advantage: if AI's attack stats are significantly higher
++        ai_power = max(ai.melee, ai.ranged)
++        opp_defense = max(opponent.armour, 1)
++        if ai_power > opp_defense * 1.3:
++            return True
++
++        return False
++
++
++def _get_type_multiplier(
++    attacker_types: tuple[str, ...],
++    defender_types: tuple[str, ...],
++) -> float:
++    """
++    Compute the type multiplier for attacker vs defender.
++    Returns 1.0 for neutral, >1.0 for advantage, <1.0 for disadvantage.
++    """
++    from tuxemon.element import Element, ElementTypesHandler
++
++    attack_elements = [Element.get(s) for s in attacker_types if s]
++    defend_elements = [Element.get(s) for s in defender_types if s]
++
++    if not attack_elements or not defend_elements:
++        return 1.0
++
++    return ElementTypesHandler.calculate_affinity_score(
++        attack_elements, defend_elements
++    )
+diff --git a/tuxemon/ai/switch_evaluator.py b/tuxemon/ai/switch_evaluator.py
+new file mode 100644
+index 000000000..1eb0cc124
+--- /dev/null
++++ b/tuxemon/ai/switch_evaluator.py
+@@ -0,0 +1,244 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++import logging
++from dataclasses import dataclass
++
++from tuxemon.ai.battle_evaluator import MonsterSnapshot
++
++logger = logging.getLogger(__name__)
++
++# Default thresholds
++_LOW_HP_THRESHOLD = 0.20
++_BENCH_MIN_HP_RATIO = 0.50
++_SPEED_BONUS = 2.0
++_RESIST_BONUS = 3.0
++_SWITCH_COST_WEIGHT = 0.6
++
++
++@dataclass
++class SwitchScore:
++    """Scoring result for a potential switch-in."""
++
++    monster_slug: str
++    total: float
++    breakdown: dict[str, float]
++
++
++class SwitchEvaluator:
++    """
++    Evaluates whether the AI should switch its active monster for a
++    bench monster, considering type matchups, HP, speed, and the
++    cost of losing a turn to the opponent's free attack.
++    """
++
++    def __init__(
++        self,
++        low_hp_threshold: float = _LOW_HP_THRESHOLD,
++        bench_min_hp_ratio: float = _BENCH_MIN_HP_RATIO,
++    ) -> None:
++        self.low_hp_threshold = low_hp_threshold
++        self.bench_min_hp_ratio = bench_min_hp_ratio
++
++    def evaluate_switches(
++        self,
++        ai_active: MonsterSnapshot,
++        opponent_active: MonsterSnapshot,
++        bench: tuple[MonsterSnapshot, ...],
++        opponent_last_move_types: tuple[str, ...] | None = None,
++    ) -> list[SwitchScore]:
++        """
++        Score all healthy bench monsters as potential switch-ins.
++        Higher score = better switch candidate.
++        """
++        results: list[SwitchScore] = []
++
++        for bench_mon in bench:
++            if bench_mon.is_fainted:
++                continue
++
++            score = self._score_switch_in(
++                bench_mon,
++                opponent_active,
++                ai_active,
++                opponent_last_move_types,
++            )
++            results.append(score)
++
++        results.sort(key=lambda s: s.total, reverse=True)
++        return results
++
++    def should_force_switch(
++        self,
++        ai_active: MonsterSnapshot,
++        opponent_active: MonsterSnapshot,
++        bench: tuple[MonsterSnapshot, ...],
++    ) -> bool:
++        """
++        Determine if the AI should strongly prefer switching based
++        on HP threshold and bench availability.
++        """
++        if ai_active.hp_ratio >= self.low_hp_threshold:
++            return False
++
++        for bench_mon in bench:
++            if bench_mon.is_fainted:
++                continue
++            if bench_mon.hp_ratio < self.bench_min_hp_ratio:
++                continue
++            # Check the bench monster has at least neutral matchup
++            mult = _type_multiplier(
++                bench_mon.type_slugs, opponent_active.type_slugs
++            )
++            if mult >= 1.0:
++                return True
++
++        return False
++
++    def get_best_switch(
++        self,
++        ai_active: MonsterSnapshot,
++        opponent_active: MonsterSnapshot,
++        bench: tuple[MonsterSnapshot, ...],
++        opponent_last_move_types: tuple[str, ...] | None = None,
++    ) -> str | None:
++        """
++        Return the slug of the best switch-in, or None if no
++        viable candidate exists.
++        """
++        scores = self.evaluate_switches(
++            ai_active, opponent_active, bench, opponent_last_move_types
++        )
++        if not scores:
++            return None
++        if scores[0].total <= 0:
++            return None
++        return scores[0].monster_slug
++
++    def _score_switch_in(
++        self,
++        candidate: MonsterSnapshot,
++        opponent: MonsterSnapshot,
++        current_active: MonsterSnapshot,
++        opponent_last_move_types: tuple[str, ...] | None,
++    ) -> SwitchScore:
++        """
++        Score a single bench monster as a switch-in candidate.
++        Accounts for the cost of losing a turn.
++        """
++        breakdown: dict[str, float] = {}
++
++        # Type advantage vs opponent
++        type_mult = _type_multiplier(
++            candidate.type_slugs, opponent.type_slugs
++        )
++        # Score relative to current active's matchup
++        current_mult = _type_multiplier(
++            current_active.type_slugs, opponent.type_slugs
++        )
++        type_improvement = type_mult - current_mult
++        breakdown["type_advantage"] = type_improvement * 10.0
++
++        # HP ratio of the candidate
++        breakdown["hp_ratio"] = candidate.hp_ratio * 5.0
++
++        # Speed comparison: can it outspeed the opponent?
++        if candidate.speed > opponent.speed:
++            breakdown["speed_advantage"] = _SPEED_BONUS
++        else:
++            breakdown["speed_advantage"] = 0.0
++
++        # Resistance to opponent's last move type
++        resist_score = 0.0
++        if opponent_last_move_types:
++            resist_mult = _defensive_multiplier(
++                candidate.type_slugs, opponent_last_move_types
++            )
++            if resist_mult < 1.0:
++                resist_score = _RESIST_BONUS * (1.0 - resist_mult)
++        breakdown["resistance"] = resist_score
++
++        # Switch cost: estimate damage opponent deals during the switch turn
++        switch_cost = self._estimate_switch_cost(candidate, opponent)
++        breakdown["switch_cost"] = -switch_cost * _SWITCH_COST_WEIGHT
++
++        total = sum(breakdown.values())
++
++        logger.debug(
++            f"Switch score for {candidate.slug}: "
++            f"breakdown={breakdown}, total={total:.2f}"
++        )
++
++        return SwitchScore(
++            monster_slug=candidate.slug,
++            total=total,
++            breakdown=breakdown,
++        )
++
++    @staticmethod
++    def _estimate_switch_cost(
++        candidate: MonsterSnapshot,
++        opponent: MonsterSnapshot,
++    ) -> float:
++        """
++        Estimate the damage the opponent will deal during the switch turn
++        as a fraction of the candidate's max HP. This discounts the
++        switch-in score so the AI doesn't switch frivolously.
++        """
++        attack_power = max(opponent.melee, opponent.ranged)
++        defense = max(candidate.armour, 1)
++
++        type_mult = _type_multiplier(
++            opponent.type_slugs, candidate.type_slugs
++        )
++
++        level_factor = 5 + opponent.level
++        estimated_damage = (
++            attack_power * level_factor * type_mult
++        ) / (defense * 2)
++
++        # Normalize as fraction of candidate's max HP
++        if candidate.max_hp <= 0:
++            return 0.0
++
++        return min(estimated_damage / candidate.max_hp, 1.0)
++
++
++def _type_multiplier(
++    attacker_types: tuple[str, ...],
++    defender_types: tuple[str, ...],
++) -> float:
++    """Compute offensive type multiplier."""
++    from tuxemon.element import Element, ElementTypesHandler
++
++    attack_elements = [Element.get(s) for s in attacker_types if s]
++    defend_elements = [Element.get(s) for s in defender_types if s]
++
++    if not attack_elements or not defend_elements:
++        return 1.0
++
++    return ElementTypesHandler.calculate_affinity_score(
++        attack_elements, defend_elements
++    )
++
++
++def _defensive_multiplier(
++    defender_types: tuple[str, ...],
++    attacking_type_slugs: tuple[str, ...],
++) -> float:
++    """
++    Compute how much damage the defender takes from the attacker's types.
++    Lower = more resistant.
++    """
++    from tuxemon.element import Element, ElementTypesHandler
++
++    attack_elements = [Element.get(s) for s in attacking_type_slugs if s]
++    defend_elements = [Element.get(s) for s in defender_types if s]
++
++    if not attack_elements or not defend_elements:
++        return 1.0
++
++    return ElementTypesHandler.calculate_affinity_score(
++        attack_elements, defend_elements
++    )
