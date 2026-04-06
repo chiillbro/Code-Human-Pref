@@ -1,0 +1,107 @@
+diff --git a/tests/tuxemon/test_ai_position_evaluator.py b/tests/tuxemon/test_ai_position_evaluator.py
+index b1084ae92..d78d23b42 100644
+--- a/tests/tuxemon/test_ai_position_evaluator.py
++++ b/tests/tuxemon/test_ai_position_evaluator.py
+@@ -196,3 +196,35 @@ def test_evaluate_type_matchup_same_type_is_neutral(mock_mult):
+     assert score.offensive == 1.0
+     assert score.defensive == 1.0
+     assert score.total == 0.0
++
++
++@patch("tuxemon.ai.manager.AIConfigLoader.get_ai_difficulty")
++def test_ai_manager_caches_position_evaluator(mock_get_difficulty):
++    """
++    AIManager.get_position_evaluator() must return the same instance for
++    repeated calls with the same character, and clear_ai() must invalidate
++    the cache.
++    """
++    from tuxemon.ai.ai import AIDifficulty
++    from tuxemon.ai.manager import AIManager
++
++    mock_get_difficulty.return_value = AIDifficulty(
++        difficulties={"default": DifficultyEntry()}
++    )
++
++    manager = AIManager(session=MagicMock())
++    character = MagicMock()
++    character.combat.ai_difficulty = None
++
++    first = manager.get_position_evaluator(character)
++    second = manager.get_position_evaluator(character)
++    assert first is second
++    assert isinstance(first, PositionEvaluator)
++
++    other = MagicMock()
++    other.combat.ai_difficulty = None
++    assert manager.get_position_evaluator(other) is not first
++
++    manager.clear_ai()
++    third = manager.get_position_evaluator(character)
++    assert third is not first
+diff --git a/tuxemon/ai/ai.py b/tuxemon/ai/ai.py
+index 215626682..fece22948 100644
+--- a/tuxemon/ai/ai.py
++++ b/tuxemon/ai/ai.py
+@@ -11,13 +11,13 @@ from tuxemon.ai.decision_strategy import (
+     WildAIDecisionStrategy,
+ )
+ from tuxemon.ai.opponent_evaluator import OpponentEvaluator
+-from tuxemon.ai.position_evaluator import PositionEvaluator
+ from tuxemon.ai.technique_tracker import TechniqueTracker
+ from tuxemon.constants import paths
+ from tuxemon.database.yaml_utils import load_yaml
+ from tuxemon.technique.technique import Technique
+ 
+ if TYPE_CHECKING:
++    from tuxemon.ai.position_evaluator import PositionEvaluator
+     from tuxemon.entity.npc import NPC
+     from tuxemon.item.item import Item
+     from tuxemon.monster.monster import Monster
+@@ -236,11 +236,13 @@ class AI:
+         session: Session,
+         monster: Monster,
+         character: NPC,
++        position_evaluator: PositionEvaluator,
+     ) -> None:
+         self.session = session
+         self.combat_session = session.client.combat_session
+         self.character = character
+         self.monster = monster
++        self.position_evaluator = position_evaluator
+         self.opponents: list[Monster] = (
+             self.combat_session.field_monsters.get_monsters(
+                 self.combat_session.right_player
+@@ -262,15 +264,6 @@ class AI:
+         self.ai_trainers = AIConfigLoader.get_ai_character("ai_trainers.yaml")
+         self.ai_items = AIConfigLoader.get_ai_items("ai_items.yaml")
+         self.ai_techs = AIConfigLoader.get_ai_techniques("ai_techniques.yaml")
+-        self.ai_difficulty = AIConfigLoader.get_ai_difficulty(
+-            "ai_difficulty.yaml"
+-        )
+-
+-        difficulty_key = character.combat.ai_difficulty or "default"
+-        difficulty = self.ai_difficulty.difficulties.get(
+-            difficulty_key, self.ai_difficulty.difficulties["default"]
+-        )
+-        self.position_evaluator = PositionEvaluator(difficulty)
+ 
+         self.decision_strategy = (
+             TrainerAIDecisionStrategy(
+diff --git a/tuxemon/ai/manager.py b/tuxemon/ai/manager.py
+index a83b698c9..a747e1cf5 100644
+--- a/tuxemon/ai/manager.py
++++ b/tuxemon/ai/manager.py
+@@ -46,7 +46,12 @@ class AIManager:
+         """
+         if monster not in self.active_ais:
+             logger.debug(f"New AI instance for monster: {monster}")
+-            self.active_ais[monster] = AI(self.session, monster, character)
++            self.active_ais[monster] = AI(
++                self.session,
++                monster,
++                character,
++                self.get_position_evaluator(character),
++            )
+ 
+         ai_instance = self.active_ais[monster]
+         logger.debug(f"AI turn for monster: {monster}")
