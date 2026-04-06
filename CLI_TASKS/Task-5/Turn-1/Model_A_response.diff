@@ -1,0 +1,382 @@
+diff --git a/mods/ai_difficulty.yaml b/mods/ai_difficulty.yaml
+new file mode 100644
+index 000000000..fe4e732c8
+--- /dev/null
++++ b/mods/ai_difficulty.yaml
+@@ -0,0 +1,39 @@
++# AI difficulty profiles controlling strategic switching behaviour.
++#
++# switch_threshold:
++#   Battle-position score below which the AI considers the current
++#   matchup unfavorable enough to voluntarily switch out. Lower values
++#   mean the AI tolerates worse positions before switching (less
++#   aggressive switching).
++#
++# min_switch_advantage:
++#   Minimum improvement in type-matchup score that a bench monster must
++#   offer over the active monster before the AI will swap to it. Higher
++#   values mean the AI only switches when the replacement is clearly
++#   better.
++#
++# type_weight / hp_weight / bench_weight / status_weight:
++#   Weights applied when computing the battle-position score. See
++#   tuxemon/ai/battle_analyzer.py:evaluate_battle_position.
++difficulties:
++  easy:
++    switch_threshold: -1.5
++    min_switch_advantage: 1.5
++    type_weight: 0.5
++    hp_weight: 1.0
++    bench_weight: 0.1
++    status_weight: 0.3
++  medium:
++    switch_threshold: -0.6
++    min_switch_advantage: 0.8
++    type_weight: 1.0
++    hp_weight: 1.0
++    bench_weight: 0.2
++    status_weight: 0.5
++  hard:
++    switch_threshold: -0.2
++    min_switch_advantage: 0.4
++    type_weight: 1.5
++    hp_weight: 1.0
++    bench_weight: 0.3
++    status_weight: 0.7
+diff --git a/tuxemon/ai/ai.py b/tuxemon/ai/ai.py
+index c9e9b506c..84f0ac413 100644
+--- a/tuxemon/ai/ai.py
++++ b/tuxemon/ai/ai.py
+@@ -112,11 +112,27 @@ class AITechniques:
+     techniques: dict[str, SingleTechnique]
+ 
+ 
++@dataclass
++class DifficultyEntry:
++    switch_threshold: float = -0.6
++    min_switch_advantage: float = 0.8
++    type_weight: float = 1.0
++    hp_weight: float = 1.0
++    bench_weight: float = 0.2
++    status_weight: float = 0.5
++
++
++@dataclass
++class AIDifficulty:
++    difficulties: dict[str, DifficultyEntry]
++
++
+ class AIConfigLoader:
+     _ai_techniques: AITechniques | None = None
+     _ai_items: AIItems | None = None
+     _ai_opponent: AIOpponent | None = None
+     _ai_character: AITrainers | None = None
++    _ai_difficulty: AIDifficulty | None = None
+ 
+     @classmethod
+     def get_ai_opponent(cls, filename: str) -> AIOpponent:
+@@ -195,6 +211,20 @@ class AIConfigLoader:
+             cls._ai_techniques = AITechniques(techniques=techniques)
+         return cls._ai_techniques
+ 
++    @classmethod
++    def get_ai_difficulty(cls, filename: str) -> AIDifficulty:
++        yaml_path = paths.mods_folder / filename
++        if cls._ai_difficulty is None:
++            raw_map = load_yaml(yaml_path)
++
++            difficulties = {
++                key: DifficultyEntry(**value)
++                for key, value in raw_map["difficulties"].items()
++            }
++
++            cls._ai_difficulty = AIDifficulty(difficulties=difficulties)
++        return cls._ai_difficulty
++
+ 
+ class AI:
+     def __init__(
+@@ -229,6 +259,12 @@ class AI:
+         self.ai_items = AIConfigLoader.get_ai_items("ai_items.yaml")
+         self.ai_techs = AIConfigLoader.get_ai_techniques("ai_techniques.yaml")
+ 
++        ai_difficulty = AIConfigLoader.get_ai_difficulty("ai_difficulty.yaml")
++        level = character.combat.difficulty or "medium"
++        self.difficulty = ai_difficulty.difficulties.get(
++            level, DifficultyEntry()
++        )
++
+         self.decision_strategy = (
+             TrainerAIDecisionStrategy(
+                 self.evaluator,
+@@ -276,3 +312,12 @@ class AI:
+         Send action item.
+         """
+         self.combat_session.enqueue_action(self.character, item, self.monster)
++
++    def action_swap(self, replacement: Monster) -> None:
++        """
++        Send action swap (voluntarily switch the active monster out for
++        ``replacement`` from the bench).
++        """
++        swap = Technique.create("swap")
++        self.combat_session.swap_tracker.register(replacement)
++        self.combat_session.enqueue_action(self.monster, swap, replacement)
+diff --git a/tuxemon/ai/battle_analyzer.py b/tuxemon/ai/battle_analyzer.py
+new file mode 100644
+index 000000000..c1f266ee3
+--- /dev/null
++++ b/tuxemon/ai/battle_analyzer.py
+@@ -0,0 +1,109 @@
++# SPDX-License-Identifier: GPL-3.0
++# Copyright (c) 2014-2026 William Edwards <shadowapex@gmail.com>, Benjamin Bean <superman2k5@gmail.com>
++from __future__ import annotations
++
++import logging
++from collections.abc import Sequence
++from dataclasses import dataclass
++from typing import TYPE_CHECKING
++
++from tuxemon.element import ElementTypesHandler
++
++if TYPE_CHECKING:
++    from tuxemon.ai.ai import DifficultyEntry
++    from tuxemon.monster.monster import Monster
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass
++class PositionScore:
++    total: float
++    breakdown: dict[str, float]
++
++
++def type_matchup_score(
++    candidate: Monster, opponents: Sequence[Monster]
++) -> float:
++    """
++    Returns a score describing how favorable the type matchup is for
++    ``candidate`` against the given opponents.
++
++    The score is the average of (offensive multiplier / defensive multiplier)
++    across all opponents. A value > 1.0 means the candidate has a net type
++    advantage (e.g. water vs fire), < 1.0 means a net disadvantage.
++    """
++    if not opponents:
++        return 1.0
++
++    total = 0.0
++    for opponent in opponents:
++        offense = ElementTypesHandler.calculate_affinity_score(
++            candidate.types.current, opponent.types.current
++        )
++        defense = ElementTypesHandler.calculate_affinity_score(
++            opponent.types.current, candidate.types.current
++        )
++        defense = defense or 1.0
++        total += offense / defense
++
++    return total / len(opponents)
++
++
++def select_best_type_matchup(
++    candidates: Sequence[Monster], opponents: Sequence[Monster]
++) -> Monster:
++    """
++    From a list of candidate monsters, return the one with the most
++    favorable type matchup against the active opponents. Ties are broken
++    by remaining HP ratio.
++    """
++    return max(
++        candidates,
++        key=lambda m: (type_matchup_score(m, opponents), m.hp_ratio),
++    )
++
++
++def evaluate_battle_position(
++    user: Monster,
++    opponents: Sequence[Monster],
++    own_bench: Sequence[Monster],
++    opponent_bench: Sequence[Monster],
++    config: DifficultyEntry,
++) -> PositionScore:
++    """
++    Produces a signed score describing how favorable the current battle
++    position is for ``user``. Positive values are favorable, negative
++    values are unfavorable. The magnitude is roughly normalised so that
++    the ``switch_threshold`` values in the difficulty config are sensible
++    in the [-2.0, 2.0] range.
++
++    Factors considered:
++      * HP ratio difference between the user and the average opponent.
++      * Type matchup (offense vs defense multipliers).
++      * Bench depth difference (remaining healthy reserves on each side).
++      * Negative status effects currently afflicting the user.
++    """
++    breakdown: dict[str, float] = {}
++
++    avg_opp_hp = (
++        sum(o.hp_ratio for o in opponents) / len(opponents)
++        if opponents
++        else 1.0
++    )
++    breakdown["hp"] = (user.hp_ratio - avg_opp_hp) * config.hp_weight
++
++    matchup = type_matchup_score(user, opponents)
++    breakdown["type"] = (matchup - 1.0) * config.type_weight
++
++    bench_diff = len(own_bench) - len(opponent_bench)
++    breakdown["bench"] = bench_diff * config.bench_weight
++
++    status_penalty = sum(1 for _ in user.status.get_statuses())
++    breakdown["status"] = -status_penalty * config.status_weight
++
++    total = sum(breakdown.values())
++    logger.debug(
++        f"Battle position for {user.slug}: {total:.2f} {breakdown}"
++    )
++    return PositionScore(total=total, breakdown=breakdown)
+diff --git a/tuxemon/ai/decision_strategy.py b/tuxemon/ai/decision_strategy.py
+index 1a6b0c547..a5978e525 100644
+--- a/tuxemon/ai/decision_strategy.py
++++ b/tuxemon/ai/decision_strategy.py
+@@ -7,6 +7,11 @@ import random
+ from abc import ABC, abstractmethod
+ from typing import TYPE_CHECKING
+ 
++from tuxemon.ai.battle_analyzer import (
++    evaluate_battle_position,
++    select_best_type_matchup,
++    type_matchup_score,
++)
+ from tuxemon.technique.technique import Technique
+ 
+ if TYPE_CHECKING:
+@@ -121,6 +126,11 @@ class TrainerAIDecisionStrategy(AIDecisionStrategy):
+                     ai.action_item(item)
+                     return
+ 
++        replacement = self.evaluate_switch(ai)
++        if replacement is not None:
++            ai.action_swap(replacement)
++            return
++
+         if config is None:
+             self.default_decision(ai, valid_actions)
+             return
+@@ -185,6 +195,59 @@ class TrainerAIDecisionStrategy(AIDecisionStrategy):
+ 
+         return self.choose_action(ai, valid_actions)
+ 
++    def evaluate_switch(self, ai: AI) -> Monster | None:
++        """
++        Decide whether the AI should voluntarily switch its active monster
++        out this turn. Returns the replacement monster if switching is
++        advisable, otherwise ``None``.
++
++        The decision is based on the current battle-position score
++        (HP ratios, type matchup, bench depth, status effects) compared
++        against the trainer's difficulty ``switch_threshold``. A switch is
++        only performed when a bench monster offers at least
++        ``min_switch_advantage`` more type-matchup score than the current
++        monster.
++        """
++        combat = ai.combat_session
++        difficulty = ai.difficulty
++
++        own_bench = list(combat.get_bench(ai.character))
++        if not own_bench:
++            return None
++        if not combat.swap_tracker.can_swap(ai.monster):
++            return None
++
++        opponent = (
++            combat.right_player
++            if ai.character == combat.left_player
++            else combat.left_player
++        )
++        opponent_bench = list(combat.get_bench(opponent))
++
++        position = evaluate_battle_position(
++            ai.monster,
++            ai.opponents,
++            own_bench,
++            opponent_bench,
++            difficulty,
++        )
++        if position.total >= difficulty.switch_threshold:
++            return None
++
++        current_matchup = type_matchup_score(ai.monster, ai.opponents)
++        candidate = select_best_type_matchup(own_bench, ai.opponents)
++        candidate_matchup = type_matchup_score(candidate, ai.opponents)
++
++        if candidate_matchup - current_matchup < difficulty.min_switch_advantage:
++            return None
++
++        logger.debug(
++            f"AI switching {ai.monster.slug} -> {candidate.slug} "
++            f"(position={position.total:.2f}, "
++            f"matchup {current_matchup:.2f} -> {candidate_matchup:.2f})"
++        )
++        return candidate
++
+     def default_decision(
+         self, ai: AI, valid_actions: list[tuple[Technique, Monster]]
+     ) -> None:
+diff --git a/tuxemon/ai/manager.py b/tuxemon/ai/manager.py
+index da85ffd76..161f5a869 100644
+--- a/tuxemon/ai/manager.py
++++ b/tuxemon/ai/manager.py
+@@ -7,6 +7,7 @@ import random
+ from typing import TYPE_CHECKING
+ 
+ from tuxemon.ai.ai import AI
++from tuxemon.ai.battle_analyzer import select_best_type_matchup
+ from tuxemon.db import StatType
+ 
+ if TYPE_CHECKING:
+@@ -97,6 +98,21 @@ class AIManager:
+             logger.debug(f"Random strategy selected: {chosen.name}")
+             return chosen
+ 
++        if strategy == "type_matchup":
++            combat = self.session.client.combat_session
++            opponent = (
++                combat.right_player
++                if character == combat.left_player
++                else combat.left_player
++            )
++            opponents = combat.field_monsters.get_monsters(opponent)
++            chosen = select_best_type_matchup(available_monsters, opponents)
++            logger.debug(
++                f"Type-matchup strategy selected: {chosen.name} "
++                f"vs {[o.slug for o in opponents]}"
++            )
++            return chosen
++
+         if strategy in methods:
+             attr, func = methods[strategy]
+             chosen = func(available_monsters, key=lambda m: getattr(m, attr))
+diff --git a/tuxemon/db.py b/tuxemon/db.py
+index 845300c41..666722644 100644
+--- a/tuxemon/db.py
++++ b/tuxemon/db.py
+@@ -2054,7 +2054,15 @@ class NpcCombatModel(BaseModel):
+         None,
+         description=(
+             "Defines how the NPC selects a replacement monster when one faints. "
+-            "Examples include 'random', 'lv_highest', or 'healthiest'."
++            "Examples include 'random', 'lv_highest', 'healthiest', or "
++            "'type_matchup'."
++        ),
++    )
++    difficulty: str | None = Field(
++        None,
++        description=(
++            "AI difficulty profile ('easy', 'medium', 'hard') controlling "
++            "strategic-switching thresholds. See mods/ai_difficulty.yaml."
+         ),
+     )
+ 
