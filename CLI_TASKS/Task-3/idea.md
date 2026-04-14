@@ -1,14 +1,17 @@
 # Task-1: Widget Animation & Transition System
 
 ## Task ID
+
 Task-01
 
 ## Type
+
 Substantial New Feature
 
 ## Core Request (Turn 1)
 
 ### Summary
+
 Implement a comprehensive **animation and transition system** for pygame-menu widgets. Today, all widget state changes (show/hide, enable/disable, focus/blur, value changes) are instantaneous — there are no fade-ins, slide-ins, scale transitions, or easing curves. This task requires building a reusable animation engine that any widget can hook into, allowing smooth visual transitions between states.
 
 ### Detailed Requirements
@@ -81,14 +84,14 @@ Implement a comprehensive **animation and transition system** for pygame-menu wi
 
 ## Potential Files Modified
 
-| # | File Path | Change Type |
-|---|---|---|
-| 1 | `pygame_menu/animation.py` | **New file** — Animation, AnimationManager, easing functions |
-| 2 | `pygame_menu/transitions.py` | **New file** — Pre-built transition helpers |
-| 3 | `pygame_menu/widgets/core/widget.py` | Modify — add opacity, animate_property, render pipeline |
-| 4 | `pygame_menu/menu.py` | Modify — AnimationManager integration, entrance hooks |
-| 5 | `pygame_menu/themes.py` | Modify — new entrance animation theme attributes |
-| 6 | `pygame_menu/__init__.py` | Modify — export new modules |
+| #   | File Path                            | Change Type                                                  |
+| --- | ------------------------------------ | ------------------------------------------------------------ |
+| 1   | `pygame_menu/animation.py`           | **New file** — Animation, AnimationManager, easing functions |
+| 2   | `pygame_menu/transitions.py`         | **New file** — Pre-built transition helpers                  |
+| 3   | `pygame_menu/widgets/core/widget.py` | Modify — add opacity, animate_property, render pipeline      |
+| 4   | `pygame_menu/menu.py`                | Modify — AnimationManager integration, entrance hooks        |
+| 5   | `pygame_menu/themes.py`              | Modify — new entrance animation theme attributes             |
+| 6   | `pygame_menu/__init__.py`            | Modify — export new modules                                  |
 
 ---
 
@@ -100,16 +103,16 @@ A comprehensive **Widget Animation & Transition System** for pygame-menu, enabli
 
 ### Files Changed
 
-| File | Status | Lines | Description |
-|------|--------|-------|-------------|
-| `pygame_menu/animation.py` | **New** | ~350 | Core animation engine: 7 easing functions (`linear`, `ease_in_quad`, `ease_out_quad`, `ease_in_out_quad`, `ease_in_cubic`, `ease_out_cubic`, `ease_out_back`), `Animation` class (per-property tweening with bounce/loop/callbacks/clamping), `AnimationManager` (lifecycle management, per-widget tracking, cancellation) |
-| `pygame_menu/transitions.py` | **New** | ~310 | Pre-built helpers: `fade_in()`, `fade_out()`, `slide_in()`, `slide_out()`, `color_transition()`, `pulse()` — all retrieve the `AnimationManager` from the widget's menu automatically |
-| `pygame_menu/widgets/core/widget.py` | **Modified** | +150 | Added `_opacity` attribute (0–255), rewrote `draw()` for opacity compositing via `_OffsetSurface` proxy (ensures shadow/border/decorator layers all share uniform opacity), added public API: `set_opacity()`, `get_opacity()`, `animate_property()`, `cancel_animations()`, `has_active_animation()` |
-| `pygame_menu/menu.py` | **Modified** | +20 | Instantiated `AnimationManager` in `__init__()`, added `get_animation_manager()` method, wired `animation_manager.update(dt)` into `mainloop()` using real delta-time from `Clock.get_time()`, added animation cleanup in `remove_widget()` |
-| `pygame_menu/themes.py` | **Modified** | +20 | Added `widget_entrance_animation` (str \| None), `widget_entrance_animation_duration` (int, default 300), `widget_entrance_animation_easing` (str, default `'ease_out_quad'`) type annotations, `__init__` kwargs, and `validate()` assertions |
-| `pygame_menu/__init__.py` | **Modified** | +4 | Exported `animation` and `transitions` modules; hardened metadata parsing against `IndexError`/`AttributeError` |
-| `test/test_animation.py` | **New** | ~230 | 36 tests: easing boundary/monotonicity checks, `_interpolate` scalar/color/tuple, `_clamp_opacity`, `Animation` lifecycle/callback/bounce/clamping, `AnimationManager` create/cancel/clear |
-| `test/test_transitions.py` | **New** | ~155 | 25 tests: fade in/out opacity, slide in/out 4 directions + invalid, color transition completion, pulse registration, Widget opacity API, `animate_property`/`cancel_animations`, Menu integration + widget removal cleanup |
+| File                                 | Status       | Lines | Description                                                                                                                                                                                                                                                                                                                |
+| ------------------------------------ | ------------ | ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pygame_menu/animation.py`           | **New**      | ~350  | Core animation engine: 7 easing functions (`linear`, `ease_in_quad`, `ease_out_quad`, `ease_in_out_quad`, `ease_in_cubic`, `ease_out_cubic`, `ease_out_back`), `Animation` class (per-property tweening with bounce/loop/callbacks/clamping), `AnimationManager` (lifecycle management, per-widget tracking, cancellation) |
+| `pygame_menu/transitions.py`         | **New**      | ~310  | Pre-built helpers: `fade_in()`, `fade_out()`, `slide_in()`, `slide_out()`, `color_transition()`, `pulse()` — all retrieve the `AnimationManager` from the widget's menu automatically                                                                                                                                      |
+| `pygame_menu/widgets/core/widget.py` | **Modified** | +150  | Added `_opacity` attribute (0–255), rewrote `draw()` for opacity compositing via `_OffsetSurface` proxy (ensures shadow/border/decorator layers all share uniform opacity), added public API: `set_opacity()`, `get_opacity()`, `animate_property()`, `cancel_animations()`, `has_active_animation()`                      |
+| `pygame_menu/menu.py`                | **Modified** | +20   | Instantiated `AnimationManager` in `__init__()`, added `get_animation_manager()` method, wired `animation_manager.update(dt)` into `mainloop()` using real delta-time from `Clock.get_time()`, added animation cleanup in `remove_widget()`                                                                                |
+| `pygame_menu/themes.py`              | **Modified** | +20   | Added `widget_entrance_animation` (str \| None), `widget_entrance_animation_duration` (int, default 300), `widget_entrance_animation_easing` (str, default `'ease_out_quad'`) type annotations, `__init__` kwargs, and `validate()` assertions                                                                             |
+| `pygame_menu/__init__.py`            | **Modified** | +4    | Exported `animation` and `transitions` modules; hardened metadata parsing against `IndexError`/`AttributeError`                                                                                                                                                                                                            |
+| `test/test_animation.py`             | **New**      | ~230  | 36 tests: easing boundary/monotonicity checks, `_interpolate` scalar/color/tuple, `_clamp_opacity`, `Animation` lifecycle/callback/bounce/clamping, `AnimationManager` create/cancel/clear                                                                                                                                 |
+| `test/test_transitions.py`           | **New**      | ~155  | 25 tests: fade in/out opacity, slide in/out 4 directions + invalid, color transition completion, pulse registration, Widget opacity API, `animate_property`/`cancel_animations`, Menu integration + widget removal cleanup                                                                                                 |
 
 ### Key Design Decisions
 
@@ -130,3 +133,45 @@ A comprehensive **Widget Animation & Transition System** for pygame-menu, enabli
 714 passed, 1 skipped (full regression including test_menu, test_themes, test_widgets)
 Ruff lint: All checks passed!
 ```
+
+---
+
+## Copilot Drafted Turn 1 Prompt
+
+> pygame-menu currently has no support for animated widget transitions — every state change (show/hide, focus/blur, value change) is instantaneous. I'd like to add a reusable animation and transition system that any widget can use.
+>
+> Specifically, I need:
+>
+> 1. **An animation engine** (new module) with an `Animation` class representing a single tween/transition, an `AnimationManager` to track and tick active animations each frame, and a set of easing functions (at least `linear`, `ease_in_quad`, `ease_out_quad`, `ease_in_out_quad`, `ease_in_cubic`, and `ease_out_back`). Animations should support configurable duration, completion callbacks, and loop/bounce modes.
+> 2. **Opacity support on widgets** — a new `_opacity` attribute (0–255) on the base `Widget` class with `set_opacity()`/`get_opacity()` methods. The rendering pipeline needs to respect this so that fading a widget also fades its shadow, background, border, and decorators uniformly — not just the widget surface itself.
+> 3. **Widget-level animation methods** — `animate_property()`, `cancel_animations()`, and `has_active_animation()` on the base Widget, so any widget property (opacity, position, color, etc.) can be smoothly transitioned.
+> 4. **Pre-built transition helpers** (new module) — `fade_in()`, `fade_out()`, `slide_in()` / `slide_out()` (supporting left/right/up/down directions), `color_transition()`, and `pulse()`.
+> 5. **Menu-level integration** — the `Menu` should own an `AnimationManager` instance, tick it each frame in `mainloop()`, and clean up animations if a widget is removed mid-animation.
+> 6. **Theme support** — new theme attributes (`widget_entrance_animation`, `widget_entrance_animation_duration`, `widget_entrance_animation_easing`) so a theme can declare a default entrance animation applied to widgets when the menu opens.
+>
+> The existing test suite should still pass after these changes.
+
+### Copilot Opinions & Notes
+
+**Why this prompt works:**
+
+- It defines **what** the system should do (animation engine, opacity, transitions, menu integration, theme support) without prescribing **how** to implement it (no mention of `_OffsetSurface` proxy, `_PROPERTY_CLAMPERS`, `_interpolate`, or `Clock.get_time()`).
+- It leaves room for the two models to diverge on the hardest parts: how to composite opacity across all rendering layers, how to source delta-time, how to handle easing overshoot, and the internal architecture of the AnimationManager.
+- It's challenging enough that a first attempt will almost certainly have flaws (opacity applied at the wrong stage, missing cleanup on widget removal, naive color interpolation, hardcoded dt, no clamping for overshooting easings).
+- It does NOT say "production ready" or "PR ready."
+
+**Expected flaws to watch for in Turn 1 responses:**
+
+1. **Opacity compositing done wrong** — e.g., `set_alpha()` applied only to the widget surface but not its shadow/border/decorators, causing visual artifacts.
+2. **Delta-time** sourced incorrectly — hardcoded value or computed from wall-clock instead of from `Clock.get_time()` which already exists in the mainloop.
+3. **Easing overshoot not clamped** — `ease_out_back` goes above 1.0, which can push opacity above 255 or below 0, or color channels out of range.
+4. **No animation cleanup on widget removal** — dangling references in AnimationManager when `Menu.remove_widget()` is called.
+5. **Naive color interpolation** — not properly rounding or clamping individual RGB/A channels.
+6. **`pulse()` mutating padding** — conflicting with theme padding instead of using `_translate_virtual` or similar.
+7. **Missing validation** — `animate_property()` not raising on non-existent attributes.
+8. **Tests missing or insufficient** — not covering easing boundaries, completion callbacks, bounce mode, widget removal during animation.
+
+**Turn 2/3 strategy:**
+
+- Turn 2: Critique opacity compositing, dt handling, clamping, cleanup. Prescribe specific fixes with file/method references.
+- Turn 3: Demand tests for easing functions, AnimationManager lifecycle, fade/slide integration, widget removal cleanup. Ask for lint/format pass.

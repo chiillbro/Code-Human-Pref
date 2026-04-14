@@ -124,6 +124,7 @@ difficulties:
 ## Why It Fits the Constraint
 
 **~500-600+ lines of new core code:**
+
 - `battle_evaluator.py` (BattleSnapshot dataclass, scoring heuristic with 6+ factors): ~120 lines
 - `minimax.py` (Minimax with alpha-beta, move generation, terminal evaluation): ~180 lines
 - `strategy_controller.py` (5 phase detectors, weight profiles, move pool analysis): ~120 lines
@@ -132,6 +133,7 @@ difficulties:
 - Modifications to `decision_strategy.py`, `manager.py`, `ai.py`, `technique_tracker.py`, `opponent_evaluator.py`: ~80+ lines
 
 **Why it's naturally difficult:**
+
 - Minimax with alpha-beta pruning is a well-known but subtle algorithm — getting the pruning bounds correct is non-trivial.
 - The evaluator must be stateless and operate on snapshots, not live objects — this architectural constraint is frequently violated.
 - Phase detection that inspects move pools is more complex than simple threshold checks.
@@ -139,6 +141,7 @@ difficulties:
 - Backward compatibility with the existing AI while refactoring the decision strategy requires careful code organization.
 
 **Why it won't be flawless in one turn:**
+
 - Alpha-beta pruning is a notorious source of subtle bugs (incorrect bound initialization, failing to propagate cutoffs).
 - The model will almost certainly use live Monster objects in the tree instead of snapshots.
 - Phase detection based on move pool analysis is easy to oversimplify.
@@ -148,20 +151,20 @@ difficulties:
 
 ## Files Modified (Actual Implementation)
 
-| # | File Path | Change Type | Lines |
-|---|-----------|-------------|-------|
-| 1 | `tuxemon/ai/battle_evaluator.py` | **New file** — `MonsterSnapshot`, `BattleSnapshot`, `EvalWeights`, `BattleStateEvaluator` | 244 |
-| 2 | `tuxemon/ai/minimax.py` | **New file** — `MinimaxEngine` with alpha-beta pruning, action simulation, `apply_mistake_rate` | 512 |
-| 3 | `tuxemon/ai/strategy_controller.py` | **New file** — `StrategyController`, `BattlePhase` enum, per-phase weight profiles | 248 |
-| 4 | `tuxemon/ai/switch_evaluator.py` | **New file** — `SwitchEvaluator`, type-aware switch scoring with turn-cost discounting | 244 |
-| 5 | `mods/tuxemon/ai_difficulty.yaml` | **New file** — Difficulty presets (easy/medium/hard) with depth + mistake_rate | 20 |
-| 6 | `tuxemon/ai/decision_strategy.py` | **Modified** (+222) — Added `AdvancedTrainerAIDecisionStrategy` class | 520 |
-| 7 | `tuxemon/ai/ai.py` | **Modified** (+108/-9) — Added `AIDifficultyConfig`, `get_ai_difficulty()`, `_create_strategy()` | 368 |
-| 8 | `tuxemon/ai/manager.py` | **Modified** (+74) — Added `"smart"` switch strategy with `SwitchEvaluator` | 185 |
-| 9 | `tests/tuxemon/test_ai_battle_evaluator.py` | **New file** — Unit tests for evaluator and snapshots | 247 |
-| 10 | `tests/tuxemon/test_ai_minimax.py` | **New file** — Unit tests for minimax engine, simulation, mistake rate | 333 |
-| 11 | `tests/tuxemon/test_ai_strategy_controller.py` | **New file** — Unit tests for phase detection and weight profiles | 202 |
-| 12 | `tests/tuxemon/test_ai_switch_evaluator.py` | **New file** — Unit tests for switch scoring and force-switch logic | 208 |
+| #   | File Path                                      | Change Type                                                                                      | Lines |
+| --- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------ | ----- |
+| 1   | `tuxemon/ai/battle_evaluator.py`               | **New file** — `MonsterSnapshot`, `BattleSnapshot`, `EvalWeights`, `BattleStateEvaluator`        | 244   |
+| 2   | `tuxemon/ai/minimax.py`                        | **New file** — `MinimaxEngine` with alpha-beta pruning, action simulation, `apply_mistake_rate`  | 512   |
+| 3   | `tuxemon/ai/strategy_controller.py`            | **New file** — `StrategyController`, `BattlePhase` enum, per-phase weight profiles               | 248   |
+| 4   | `tuxemon/ai/switch_evaluator.py`               | **New file** — `SwitchEvaluator`, type-aware switch scoring with turn-cost discounting           | 244   |
+| 5   | `mods/tuxemon/ai_difficulty.yaml`              | **New file** — Difficulty presets (easy/medium/hard) with depth + mistake_rate                   | 20    |
+| 6   | `tuxemon/ai/decision_strategy.py`              | **Modified** (+222) — Added `AdvancedTrainerAIDecisionStrategy` class                            | 520   |
+| 7   | `tuxemon/ai/ai.py`                             | **Modified** (+108/-9) — Added `AIDifficultyConfig`, `get_ai_difficulty()`, `_create_strategy()` | 368   |
+| 8   | `tuxemon/ai/manager.py`                        | **Modified** (+74) — Added `"smart"` switch strategy with `SwitchEvaluator`                      | 185   |
+| 9   | `tests/tuxemon/test_ai_battle_evaluator.py`    | **New file** — Unit tests for evaluator and snapshots                                            | 247   |
+| 10  | `tests/tuxemon/test_ai_minimax.py`             | **New file** — Unit tests for minimax engine, simulation, mistake rate                           | 333   |
+| 11  | `tests/tuxemon/test_ai_strategy_controller.py` | **New file** — Unit tests for phase detection and weight profiles                                | 202   |
+| 12  | `tests/tuxemon/test_ai_switch_evaluator.py`    | **New file** — Unit tests for switch scoring and force-switch logic                              | 208   |
 
 **Totals:** 1,268 lines new code + 395 lines of modifications to existing files + 990 lines of tests = **2,653 lines total**
 
@@ -176,6 +179,7 @@ difficulties:
 The implementation adds a **Minimax-powered decision engine** layered on top of the existing AI system, fully backward-compatible with the original `TrainerAIDecisionStrategy`.
 
 **Data Flow:**
+
 ```
 AI.__init__() → _create_strategy()
   → AIConfigLoader.get_ai_difficulty() → loads ai_difficulty.yaml
@@ -214,3 +218,56 @@ AdvancedTrainerAIDecisionStrategy.make_decision():
 - `AI._create_strategy()` selects the strategy based on difficulty config; depth=0 returns the legacy strategy.
 - Existing YAML configs (`ai_opponent.yaml`, `ai_trainers.yaml`, `ai_items.yaml`, `ai_techniques.yaml`) are unmodified.
 - `AIManager.choose_replacement_monster()` only uses `SwitchEvaluator` when strategy is explicitly `"smart"`; all other strategies behave identically.
+
+---
+
+## Reviewer Difficulty Assessment & Trimmed Scope
+
+### Why the Original Task Is Too Broad
+
+The original task spec above produces ~2,653 lines across 12 files (4 new source files, 3 modified files, 1 YAML config, 4 test files). Key concerns:
+
+1. **Minimax alone is 512 lines.** Alpha-beta pruning, move generation, opponent modeling, action simulation, terminal evaluation, and mistake-rate softmax — this is essentially a standalone algorithm project.
+2. **StrategyController adds another 248 lines** with 5 battle phases, weight profiles, and move-pool-based phase detection.
+3. **Each model response would be 800-1000+ lines of code.** Over 3 turns (6 model responses), that's 5,000+ lines of model output in context, plus prompts, summaries, and analysis text. This WILL hit context limits.
+4. **The scope is not "single PR" atomic.** Minimax engine + strategy controller + switch evaluator + battle evaluator + difficulty config + integration refactors would realistically be 3-4 separate PRs in any real project.
+
+### Trimmed Scope (Recommended)
+
+**Keep the core, drop the algorithmic overkill.** Focus on:
+
+1. **BattleStateEvaluator** (`tuxemon/ai/battle_evaluator.py` — new) — `MonsterSnapshot` and `BattleSnapshot` frozen dataclasses + weighted scoring evaluator with HP ratio, type advantage, bench depth, status effects, level differential, fainted penalty. (~150 lines)
+2. **SwitchEvaluator** (`tuxemon/ai/switch_evaluator.py` — new) — Type-aware switch-in scoring (type advantage vs opponent, HP ratio, speed comparison, resistance to opponent's last-used move type, HP-threshold-based force-switching, turn-cost discounting for free attack). (~120 lines)
+3. **Integration** — Update `AIManager.choose_replacement_monster()` in `manager.py` to support a new `"smart"` strategy using `SwitchEvaluator`. Update `ai.py` to load difficulty config from YAML. (~60-80 lines)
+4. **AI Difficulty Config** (`mods/tuxemon/ai_difficulty.yaml` — new) — Easy/medium/hard presets controlling switching aggressiveness thresholds. (~20 lines)
+5. **Unit Tests** — Tests for evaluator snapshots, scoring math, and switch scoring logic. (~200-250 lines)
+
+**Total: ~550-620 lines** — achievable in 3 turns without context issues.
+
+**Dropped:**
+
+- Minimax engine with alpha-beta pruning (512 lines, too algorithmically complex)
+- StrategyController with 5 battle phases (248 lines, adds too much scope)
+- AdvancedTrainerAIDecisionStrategy (222-line refactor of decision_strategy.py)
+
+### Why This Trimmed Scope Still Works for 3 Turns
+
+- **Turn 1** will likely have models coupling snapshots to live `Monster` objects, mishandling `ElementTypesHandler` for type scoring, or botching the integration into `AIManager`.
+- **Turn 2** can address snapshot immutability issues, switch-cost discounting being missing/wrong, and type advantage calculation bugs.
+- **Turn 3** addresses test coverage, edge cases (empty bench, all fainted, same-type matchups), and linting/type-checking.
+
+The trimmed scope still makes models diverge meaningfully (evaluator architecture, type multiplier handling, HP threshold logic, integration approach) while staying within context budget.
+
+---
+
+## Drafted Turn 1 Prompt
+
+> The Tuxemon battle AI currently picks replacement monsters using simple criteria like highest level or healthiest, but it completely ignores what type of monster the opponent has on the field. A good AI opponent should consider type matchups when choosing which monster to send in — for example, it should prefer swapping to a water-type when the opponent has a fire-type active. It should also be able to evaluate how favorable the current battle position is (considering HP ratios, type advantages, bench depth, status effects) to make smarter decisions about when switching actually makes sense versus staying in. Add an AI difficulty config in YAML format (easy/medium/hard) that controls switching aggressiveness thresholds. Write unit tests for the new evaluation and switching logic.
+
+### Notes on This Prompt
+
+- **User perspective:** Describes _what_ the AI should do (consider type matchups, evaluate battle state, know when to switch) without prescribing architecture (no mention of "dataclasses", "frozen snapshots", "evaluator classes").
+- **No implementation cheatsheet:** Doesn't mention `ElementTypesHandler`, `MonsterSnapshot`, or any specific class names. Models must discover the repo's type system on their own.
+- **No AI-steering:** Doesn't say "make it production ready" or "write clean code."
+- **Room for divergence:** Both models must independently figure out how to represent battle state, score type advantages, and integrate with the existing `AIManager.choose_replacement_monster()` system.
+- **Naturally needs 3 turns:** The evaluator/snapshot architecture, type advantage integration, and switch-cost discounting are subtle enough that models will get things wrong in Turn 1.

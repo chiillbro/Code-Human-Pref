@@ -1,14 +1,17 @@
 # Task-4: Widget Validation Framework with Visual Feedback
 
 ## Task ID
+
 Task-04
 
 ## Type
+
 Substantial New Feature
 
 ## Core Request (Turn 1)
 
 ### Summary
+
 Implement a comprehensive **widget validation framework** with visual feedback for pygame-menu. Currently, there is no built-in way to validate form inputs — if a user enters an invalid email in a `TextInput`, selects an incompatible combination of options, or leaves a required field empty, the application has no standardized mechanism to check, report, or visually indicate the problem. This task requires building a composable validator system, a validation runner that evaluates validators against widget values, per-widget error state rendering (colored borders, error message labels), cross-widget validation support, and a form-level `validate_all()` API.
 
 ### Detailed Requirements
@@ -109,7 +112,7 @@ Implement a comprehensive **widget validation framework** with visual feedback f
 
 ## Why It Fits the Constraint
 
-- **~580–650 lines of new core code:** `validators.py` (~250 lines: base class, ValidationResult, 8 concrete validators, CrossWidgetValidator, composability logic), `widget.py` modifications (~150 lines: add_validator, remove_validator, validate, is_valid, set_required, auto-validate on blur/change hooks, visual error state, error label rendering, _validation_errors management), `menu.py` modifications (~80 lines: validate, is_valid, set_on_validate, reset_validation, cross-widget evaluation, layout re-trigger), `themes.py` (~40 lines: 6 new validation theme attributes + validation), `_widgetmanager.py` (~30 lines: validators/required kwargs), `__init__.py` (~10 lines: exports).
+- **~580–650 lines of new core code:** `validators.py` (~250 lines: base class, ValidationResult, 8 concrete validators, CrossWidgetValidator, composability logic), `widget.py` modifications (~150 lines: add_validator, remove_validator, validate, is_valid, set_required, auto-validate on blur/change hooks, visual error state, error label rendering, \_validation_errors management), `menu.py` modifications (~80 lines: validate, is_valid, set_on_validate, reset_validation, cross-widget evaluation, layout re-trigger), `themes.py` (~40 lines: 6 new validation theme attributes + validation), `_widgetmanager.py` (~30 lines: validators/required kwargs), `__init__.py` (~10 lines: exports).
 - **High difficulty:** The visual error label that adjusts layout is the crux — it requires understanding how `Menu._update_widget_position()` works and how widget heights feed into the layout engine. Auto-validation on blur requires hooking into the focus/unfocus lifecycle. Cross-widget validation adds another layer of ordering complexity. The model must also handle widgets that don't support `get_value()`.
 - **Natural Turn 2 material:** Layout overlap, render loops, `get_value()` crashes on non-input widgets, email regex quality, and visual state cleanup are all classic first-implementation failures.
 
@@ -117,37 +120,84 @@ Implement a comprehensive **widget validation framework** with visual feedback f
 
 ## Potential Files Modified
 
-| # | File Path | Change Type |
-|---|---|---|
-| 1 | `pygame_menu/validators.py` | **New file** — Validator base, 8 concrete validators, CrossWidgetValidator, ValidationResult |
-| 2 | `pygame_menu/widgets/core/widget.py` | Modify — validation methods, visual error rendering, auto-validate hooks |
-| 3 | `pygame_menu/menu.py` | Modify — Menu.validate(), is_valid(), cross-widget eval, layout re-trigger |
-| 4 | `pygame_menu/themes.py` | Modify — validation theme attributes |
-| 5 | `pygame_menu/_widgetmanager.py` | Modify — validators/required kwargs |
-| 6 | `pygame_menu/__init__.py` | Modify — export validators module |
+| #   | File Path                            | Change Type                                                                                  |
+| --- | ------------------------------------ | -------------------------------------------------------------------------------------------- |
+| 1   | `pygame_menu/validators.py`          | **New file** — Validator base, 8 concrete validators, CrossWidgetValidator, ValidationResult |
+| 2   | `pygame_menu/widgets/core/widget.py` | Modify — validation methods, visual error rendering, auto-validate hooks                     |
+| 3   | `pygame_menu/menu.py`                | Modify — Menu.validate(), is_valid(), cross-widget eval, layout re-trigger                   |
+| 4   | `pygame_menu/themes.py`              | Modify — validation theme attributes                                                         |
+| 5   | `pygame_menu/_widgetmanager.py`      | Modify — validators/required kwargs                                                          |
+| 6   | `pygame_menu/__init__.py`            | Modify — export validators module                                                            |
 
 ---
 
 ## PR Overview (Turn 1 Implementation)
 
 ### Summary
+
 Implemented a comprehensive Widget Validation Framework with Visual Feedback for pygame-menu. The framework provides composable validators, per-widget validation state with visual error rendering, cross-widget validation, form-level validation API, theme integration, and WidgetManager convenience kwargs.
 
 ### Files Changed
 
-| # | File | Change Type | Lines | Description |
-|---|------|------------|-------|-------------|
-| 1 | `pygame_menu/validators.py` | **New** | ~265 | Validator ABC, ValidationResult dataclass, 8 concrete validators (Required, MinLength, MaxLength, Pattern, Email, NumberRange, Custom, OneOf), CrossWidgetValidator, `run_validators()` with short-circuit/collect-all modes |
-| 2 | `pygame_menu/widgets/core/widget.py` | Modified | ~165 added | Validation state attrs (`_validators`, `_validation_errors`, `_show_validation`, `_auto_validate_on_blur/change`, `_original_border_*`), methods (`add_validator`, `remove_validator`, `clear_validators`, `validate`, `is_valid`, `set_required`, `reset_validation`, `get_validation_errors`, `_has_value`, `_apply_validation_visual`, `_reset_validation_visual`, `_build_error_surface`), auto-validate-on-blur in `_blur()`, auto-validate-on-change in `change()`, error label drawing in `draw()`, `_rect_size_delta` expansion for error label layout |
-| 3 | `pygame_menu/menu.py` | Modified | ~70 added | `_cross_validators` and `_on_validate` init attrs, `add_cross_validator()`, `validate()`, `is_valid()`, `set_on_validate()`, `reset_validation()` — cross-widget validators evaluated after individual validators |
-| 4 | `pygame_menu/themes.py` | Modified | ~30 added | 6 validation theme attributes with type annotations, `__init__` kwargs, `validate()` assertions: `widget_validation_error_color`, `widget_validation_success_color`, `widget_validation_error_border_width`, `widget_validation_error_font_size_delta`, `widget_validation_error_font_color`, `widget_validation_auto_validate_on_blur` |
-| 5 | `pygame_menu/_widgetmanager.py` | Modified | ~20 added | Pop `validators` and `required` kwargs in `_filter_widget_attributes()`, apply validators and auto-validate-on-blur from theme in `_configure_widget()` |
-| 6 | `pygame_menu/__init__.py` | Modified | ~2 changed | Added `validators` to conditional imports and `__all__` |
-| 7 | `pygame_menu/widgets/widget/textinput.py` | Modified | ~1 added | `super()._blur()` call so validation hooks fire on TextInput blur |
-| 8 | `pygame_menu/widgets/widget/rangeslider.py` | Modified | ~1 added | `super()._blur()` call so validation hooks fire on RangeSlider blur |
-| 9 | `test/test_validators.py` | **New** | ~460 | 85 tests covering all validators, short-circuit/collect-all, ValidationResult, widget validation API, visual feedback (border colors, error surface, rect expansion), auto-validate-on-blur/change, CrossWidgetValidator, Menu form validation (validate, is_valid, reset_validation, set_on_validate, cross-validators), WidgetManager kwargs, theme attributes |
+| #   | File                                        | Change Type | Lines      | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --- | ------------------------------------------- | ----------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | `pygame_menu/validators.py`                 | **New**     | ~265       | Validator ABC, ValidationResult dataclass, 8 concrete validators (Required, MinLength, MaxLength, Pattern, Email, NumberRange, Custom, OneOf), CrossWidgetValidator, `run_validators()` with short-circuit/collect-all modes                                                                                                                                                                                                                                                                                                                                   |
+| 2   | `pygame_menu/widgets/core/widget.py`        | Modified    | ~165 added | Validation state attrs (`_validators`, `_validation_errors`, `_show_validation`, `_auto_validate_on_blur/change`, `_original_border_*`), methods (`add_validator`, `remove_validator`, `clear_validators`, `validate`, `is_valid`, `set_required`, `reset_validation`, `get_validation_errors`, `_has_value`, `_apply_validation_visual`, `_reset_validation_visual`, `_build_error_surface`), auto-validate-on-blur in `_blur()`, auto-validate-on-change in `change()`, error label drawing in `draw()`, `_rect_size_delta` expansion for error label layout |
+| 3   | `pygame_menu/menu.py`                       | Modified    | ~70 added  | `_cross_validators` and `_on_validate` init attrs, `add_cross_validator()`, `validate()`, `is_valid()`, `set_on_validate()`, `reset_validation()` — cross-widget validators evaluated after individual validators                                                                                                                                                                                                                                                                                                                                              |
+| 4   | `pygame_menu/themes.py`                     | Modified    | ~30 added  | 6 validation theme attributes with type annotations, `__init__` kwargs, `validate()` assertions: `widget_validation_error_color`, `widget_validation_success_color`, `widget_validation_error_border_width`, `widget_validation_error_font_size_delta`, `widget_validation_error_font_color`, `widget_validation_auto_validate_on_blur`                                                                                                                                                                                                                        |
+| 5   | `pygame_menu/_widgetmanager.py`             | Modified    | ~20 added  | Pop `validators` and `required` kwargs in `_filter_widget_attributes()`, apply validators and auto-validate-on-blur from theme in `_configure_widget()`                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 6   | `pygame_menu/__init__.py`                   | Modified    | ~2 changed | Added `validators` to conditional imports and `__all__`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 7   | `pygame_menu/widgets/widget/textinput.py`   | Modified    | ~1 added   | `super()._blur()` call so validation hooks fire on TextInput blur                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 8   | `pygame_menu/widgets/widget/rangeslider.py` | Modified    | ~1 added   | `super()._blur()` call so validation hooks fire on RangeSlider blur                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| 9   | `test/test_validators.py`                   | **New**     | ~460       | 85 tests covering all validators, short-circuit/collect-all, ValidationResult, widget validation API, visual feedback (border colors, error surface, rect expansion), auto-validate-on-blur/change, CrossWidgetValidator, Menu form validation (validate, is_valid, reset_validation, set_on_validate, cross-validators), WidgetManager kwargs, theme attributes                                                                                                                                                                                               |
 
 ### Key Design Decisions
+
+---
+
+---
+
+## Copilot's Draft Prompt (Turn 1)
+
+> **pygame-menu** doesn't have any built-in way to validate form inputs. If a user enters a bad email in a `TextInput`, picks an invalid option combo, or leaves a required field blank, there's nothing in the library to catch it, report it, or show the user what went wrong.
+>
+> I'd like a **widget validation framework** added to pygame-menu that covers the following:
+>
+> 1. **Composable validator primitives** — things like `Required`, `MinLength`, `MaxLength`, `Pattern` (regex-based), `Email`, `NumberRange`, `Custom` (arbitrary predicate), and `OneOf` (allowed choices). A widget should be able to have multiple validators that run in order. By default, validation should short-circuit at the first failure, but there should also be a mode to collect all errors at once.
+> 2. **Widget-level validation API** — the base `Widget` class needs methods for adding/removing validators, triggering validation (which returns the results), and a quick `is_valid()` check. Validation should be triggerable explicitly, but also automatically on blur (when the widget loses focus) and optionally on every value change. There should be a convenient `set_required()` shorthand too.
+> 3. **Visual error feedback** — when a widget fails validation, it should visually indicate the problem: change its border to an error color, and render the first error message as a small label directly below the widget. That error label needs to be part of the layout so it pushes subsequent widgets down rather than overlapping them. When the widget becomes valid again, show a brief success color and then revert to normal.
+> 4. **Cross-widget validation** — support for validators that check relationships between multiple widgets (e.g., "confirm password matches password"). The cross-validator should reference the involved widgets, and if it fails, attach the error to a designated target widget.
+> 5. **Menu-level form validation** — `Menu` should get a `validate()` method that runs all individual widget validators first, then cross-widget validators, and returns a dict of widget IDs to their errors. Also add `is_valid()`, a callback hook for post-validation, and `reset_validation()` to clear everything.
+> 6. **Theme integration** — add theme attributes for the error color, success color, error border width, error font size delta, error font color, and whether auto-validate-on-blur is enabled by default.
+> 7. **WidgetManager convenience** — extend the widget addition API so users can pass `validators=[...]` and `required=True` directly when adding a widget (e.g., `menu.add.text_input("Email:", validators=[Email()], required=True)`).
+>
+> Include tests covering the validator primitives, the widget validation API, visual state changes, cross-widget validation, and the menu-level form validation.
+
+---
+
+## Copilot's Opinions & Notes
+
+### Prompt Assessment
+
+This task is a **substantial new feature** with good Turn-2/3 material. The core challenge is integrating visual error feedback into pygame-menu's existing layout engine — making that error label grow the widget's footprint and trigger `_update_widget_position()` correctly is the hardest part. The auto-validate-on-blur hook requires understanding the `_blur()` lifecycle in subclasses like `TextInput` and `RangeSlider` (which override `_blur()` without calling `super()`). The cross-widget ordering requirement (individual first, then cross) is another subtle pitfall.
+
+### What I Expect Models to Struggle With
+
+1. **Error label layout integration** — most likely they'll just blit text at a fixed offset below the widget without actually expanding the widget's reported height. This means `Menu._update_widget_position()` won't know the widget got taller, so the error text will overlap the next widget.
+2. **`_blur()` not calling `super()`** — `TextInput._blur()` and `RangeSlider._blur()` override `_blur()` without calling `super()`. If the model hooks validation into the base `_blur()`, it'll never fire for these widgets unless they also patch the subclasses.
+3. **`get_value()` crashes** — the base `Widget.get_value()` raises `ValueError` for widgets without a meaningful value (e.g., `Button`, `Image`). If `validate()` blindly calls `get_value()`, it'll crash on non-input widgets.
+4. **Render loop risk** — auto-validate-on-change triggers validation → border changes → `_force_render()` → if not careful, infinite loop.
+5. **Success color never reverting** — they'll set border to green on valid but never revert it to the original theme default.
+6. **Email regex quality** — trivial regex like `r'.+@.+'` won't cut it.
+
+### What the Prompt Doesn't Prescribe (Intentionally)
+
+- Doesn't specify file names or class names (e.g., doesn't say "create `validators.py`")
+- Doesn't specify method signatures or return types
+- Doesn't dictate the `ValidationResult` data structure
+- Doesn't mention `_rect_size_delta` or any internal mechanisms for height expansion
+- Gives the models room to choose between dataclass, named tuple, or dict for results
+- Doesn't mention `WIDGET_BORDER_POSITION_FULL` or any internal border constants
 
 1. **Guard for non-input widgets**: `widget.validate()` catches `ValueError` from `get_value()` and silently returns no errors, preventing crashes on Button/Image/Label widgets.
 
