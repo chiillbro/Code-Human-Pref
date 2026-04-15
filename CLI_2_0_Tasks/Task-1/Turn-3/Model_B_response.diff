@@ -1,0 +1,442 @@
+diff --git a/pygame_menu/menu.py b/pygame_menu/menu.py
+index b9f8a40f..dd0e31e8 100644
+--- a/pygame_menu/menu.py
++++ b/pygame_menu/menu.py
+@@ -475,6 +475,7 @@ class Menu(Base):
+         self._onwindowmouseleave = None
+         self._onwindowmouseover = None
+         self._cross_validators = []
++        self._validation_on_blur = False
+ 
+         # Menu links (pointer to previous and next menus in nested submenus),
+         # for public methods accessing, self should be used through "_current",
+@@ -3484,6 +3485,20 @@ class Menu(Base):
+         """
+         return self.validate_form(stop_on_first=True, recursive=recursive).valid
+ 
++    def set_validation_on_blur(self, on_blur: bool) -> Menu:
++        """
++        Set the menu-level default for auto-validation on blur. When
++        enabled, widgets that have validators and whose per-widget
++        ``_validation_on_blur`` is ``None`` (inherit) will automatically
++        run ``validate()`` each time they lose focus.
++
++        :param on_blur: ``True`` to enable auto-validation on blur by default
++        :return: Self reference
++        """
++        assert isinstance(on_blur, bool)
++        self._validation_on_blur = on_blur
++        return self
++
+     def get_rect(self) -> pygame.Rect:
+         """
+         Return the :py:class:`pygame.Rect` object of the Menu.
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index e75f4229..8739267c 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -363,6 +363,7 @@ class Widget(Base):
+     ]
+     _validators: list[Validator]
+     _validation_errors: list[str]
++    _validation_on_blur: bool | None
+     _validation_show_errors: bool
+     _validation_error_font: pygame.font.Font | None
+     _validation_error_surfaces: list[pygame.Surface]
+@@ -548,6 +549,7 @@ class Widget(Base):
+         # Validation
+         self._validators = []
+         self._validation_errors = []
++        self._validation_on_blur = None  # None = inherit from menu
+         self._validation_show_errors = True
+         self._validation_error_font = None
+         self._validation_error_surfaces = []
+@@ -1569,6 +1571,32 @@ class Widget(Base):
+             self._menu._widgets_surface_need_update = True
+         return self
+ 
++    def set_validation_on_blur(self, on_blur: bool | None) -> 'Widget':
++        """
++        Control whether this widget auto-validates when it loses focus.
++
++        :param on_blur: ``True`` to auto-validate on blur, ``False`` to
++            disable, or ``None`` to inherit the setting from the Menu
++        :return: Self reference
++        """
++        assert on_blur is None or isinstance(on_blur, bool)
++        self._validation_on_blur = on_blur
++        return self
++
++    def _should_validate_on_blur(self) -> bool:
++        """
++        Return whether this widget should auto-validate when it loses focus.
++        Per-widget setting takes precedence; if ``None`` the menu-level
++        ``validation_on_blur`` flag is checked.
++
++        :return: ``True`` if auto-validation on blur is enabled
++        """
++        if self._validation_on_blur is not None:
++            return self._validation_on_blur
++        if self._menu is not None and hasattr(self._menu, '_validation_on_blur'):
++            return self._menu._validation_on_blur
++        return False
++
+     def _get_validation_error_color(self) -> tuple[int, int, int, int]:
+         """
+         Return the color to use for validation error text. Uses theme if
+@@ -3117,9 +3145,13 @@ class Widget(Base):
+ 
+     def _blur(self) -> None:
+         """
+-        Function that is executed when the Widget loses the focus.
++        Function that is executed when the Widget loses the focus. When
++        auto-validation on blur is enabled and the widget has validators,
++        ``validate()`` is called automatically so the user gets immediate
++        feedback.
+         """
+-        pass
++        if self._should_validate_on_blur() and self._validators:
++            self.validate()
+ 
+     def _configure(self) -> None:
+         """
+diff --git a/pygame_menu/widgets/widget/rangeslider.py b/pygame_menu/widgets/widget/rangeslider.py
+index a983d707..c7171bd7 100644
+--- a/pygame_menu/widgets/widget/rangeslider.py
++++ b/pygame_menu/widgets/widget/rangeslider.py
+@@ -1083,6 +1083,7 @@ class RangeSlider(Widget):
+         return changed
+ 
+     def _blur(self) -> None:
++        super()._blur()
+         self._selected_mouse = False
+ 
+     def _focus(self) -> None:
+diff --git a/pygame_menu/widgets/widget/textinput.py b/pygame_menu/widgets/widget/textinput.py
+index a886b5d1..d2b8789e 100644
+--- a/pygame_menu/widgets/widget/textinput.py
++++ b/pygame_menu/widgets/widget/textinput.py
+@@ -1308,6 +1308,7 @@ class TextInput(Widget):
+         self._update_renderbox(right=1)
+ 
+     def _blur(self) -> None:
++        super()._blur()
+         # self._key_is_pressed = False
+         self._mouse_is_pressed = False
+         self._keyrepeat_mouse_ms = 0
+diff --git a/test/test_validation.py b/test/test_validation.py
+index 59ba902d..9a681c4f 100644
+--- a/test/test_validation.py
++++ b/test/test_validation.py
+@@ -992,3 +992,311 @@ def test_validate_does_not_force_render_when_state_unchanged() -> None:
+     menu._widgets_surface_need_update = False
+     ti.validate()
+     assert menu._widgets_surface_need_update is False
++
++
++# =============================================================================
++# Validate on blur
++# =============================================================================
++
++
++def test_widget_blur_no_auto_validation_by_default() -> None:
++    """By default widgets do NOT auto-validate on blur."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    # Select then deselect (blur) the widget
++    ti.select(True)
++    ti.select(False)
++
++    # No validation should have fired
++    assert ti.get_validation_errors() == []
++
++
++def test_widget_blur_auto_validates_when_per_widget_enabled() -> None:
++    """Per-widget validation_on_blur=True triggers validate() on blur."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.set_validation_on_blur(True)
++
++    ti.select(True)
++    ti.select(False)  # blur
++
++    assert ti.get_validation_errors() != []
++    assert 'required' in ti.get_validation_errors()[0].lower()
++
++
++def test_widget_blur_auto_validates_when_menu_level_enabled() -> None:
++    """Menu-level validation_on_blur=True is inherited by widgets."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    ti.select(True)
++    ti.select(False)  # blur
++
++    assert ti.get_validation_errors() != []
++
++
++def test_widget_per_widget_overrides_menu_level() -> None:
++    """Per-widget setting overrides the menu default in both directions."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    # Widget explicitly disables
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.set_validation_on_blur(False)
++
++    ti.select(True)
++    ti.select(False)
++    assert ti.get_validation_errors() == []
++
++    # Menu has it off, widget explicitly enables
++    menu2 = MenuUtils.generic_menu()
++    ti2 = menu2.add.text_input('Name2: ', textinput_id='name2')
++    ti2.add_validator(Required())
++    ti2.set_validation_on_blur(True)
++
++    ti2.select(True)
++    ti2.select(False)
++    assert ti2.get_validation_errors() != []
++
++
++def test_widget_blur_no_validators_no_error() -> None:
++    """A widget with no validators doesn't error on blur even if enabled."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    # No validators added
++
++    ti.select(True)
++    ti.select(False)  # should not raise
++    assert ti.get_validation_errors() == []
++
++
++def test_widget_blur_valid_value_clears_previous_errors() -> None:
++    """If the value is now valid, on-blur validation clears old errors."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    # First blur with empty value
++    ti.select(True)
++    ti.select(False)
++    assert ti.get_validation_errors() != []
++
++    # Set a value and blur again
++    ti.set_value('Alice')
++    ti.select(True)
++    ti.select(False)
++    assert ti.get_validation_errors() == []
++    assert ti.get_validation_footprint_height() == 0
++
++
++def test_widget_set_validation_on_blur_returns_self() -> None:
++    """set_validation_on_blur returns the widget for chaining."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    result = ti.set_validation_on_blur(True)
++    assert result is ti
++
++
++def test_widget_set_validation_on_blur_none_inherits() -> None:
++    """Setting on_blur to None makes the widget inherit from the menu."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    # Explicitly set, then reset to None (inherit)
++    ti.set_validation_on_blur(False)
++    assert ti._should_validate_on_blur() is False
++
++    ti.set_validation_on_blur(None)
++    assert ti._should_validate_on_blur() is True  # inherited from menu
++
++
++def test_menu_set_validation_on_blur_returns_self() -> None:
++    """Menu.set_validation_on_blur returns the menu for chaining."""
++    menu = MenuUtils.generic_menu()
++    result = menu.set_validation_on_blur(True)
++    assert result is menu
++
++
++# =============================================================================
++# TextInput._blur calls super
++# =============================================================================
++
++
++def test_textinput_blur_calls_super_and_validates() -> None:
++    """TextInput._blur must call super()._blur() so auto-validation fires,
++    and must still execute its own cleanup (cursor hidden, text unselected)."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    ti = menu.add.text_input('Email: ', textinput_id='email')
++    ti.add_validator(Email())
++    ti.set_value('not-an-email')
++
++    # Focus then blur
++    ti.select(True)
++    assert ti._cursor_visible is True  # TextInput sets cursor visible on focus
++
++    ti.select(False)  # triggers _blur
++
++    # Validation must have fired (from super()._blur())
++    assert ti.get_validation_errors() != []
++
++    # TextInput cleanup must have run too
++    assert ti._cursor_visible is False
++    assert ti._mouse_is_pressed is False
++
++
++def test_textinput_blur_valid_value() -> None:
++    """TextInput._blur with a valid value produces no errors."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    ti = menu.add.text_input('Email: ', textinput_id='email', default='a@b.com')
++    ti.add_validator(Email())
++
++    ti.select(True)
++    ti.select(False)
++
++    assert ti.get_validation_errors() == []
++
++
++# =============================================================================
++# RangeSlider._blur calls super
++# =============================================================================
++
++
++def test_rangeslider_blur_calls_super_and_validates() -> None:
++    """RangeSlider._blur must call super()._blur() so auto-validation fires,
++    and must still execute its own cleanup (_selected_mouse reset)."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    rs = menu.add.range_slider(
++        'Rating', default=0, range_values=(0, 10), increment=1
++    )
++    rs.add_validator(Custom(lambda v: v >= 5, message='Must be >= 5'))
++
++    rs.select(True)
++    rs.select(False)
++
++    # Validation must have fired
++    assert rs.get_validation_errors() != []
++    assert 'Must be >= 5' in rs.get_validation_errors()
++
++    # RangeSlider cleanup must have run
++    assert rs._selected_mouse is False
++
++
++def test_rangeslider_blur_valid_value() -> None:
++    """RangeSlider._blur with a valid value produces no errors."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    rs = menu.add.range_slider(
++        'Rating', default=7, range_values=(0, 10), increment=1
++    )
++    rs.add_validator(Custom(lambda v: v >= 5, message='Must be >= 5'))
++
++    rs.select(True)
++    rs.select(False)
++
++    assert rs.get_validation_errors() == []
++
++
++# =============================================================================
++# Selector / DropSelect blur inherits from base Widget
++# =============================================================================
++
++
++def test_selector_blur_validates() -> None:
++    """Selector uses base Widget._blur, so auto-validation should work."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    sel = menu.add.selector(
++        'Diff: ', [('Easy', 1), ('Hard', 2)],
++    )
++    sel.add_validator(
++        Custom(lambda v: v[1] == 2, message='Must choose Hard')
++    )
++
++    sel.select(True)
++    sel.select(False)
++
++    # Default is index 0 (Easy), so validation fails
++    assert sel.get_validation_errors() != []
++
++
++def test_toggle_blur_validates() -> None:
++    """ToggleSwitch uses base Widget._blur, so auto-validation should work."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    ts = menu.add.toggle_switch('Terms: ', False)
++    ts.add_validator(Custom(lambda v: v is True, message='Must accept'))
++
++    ts.select(True)
++    ts.select(False)
++
++    assert ts.get_validation_errors() != []
++
++
++# =============================================================================
++# Multiple widgets blur sequence
++# =============================================================================
++
++
++def test_blur_sequence_across_widgets() -> None:
++    """Selecting a new widget blurs the previous one, triggering validation."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    w1 = menu.add.text_input('First: ', textinput_id='w1')
++    w1.add_validator(Required())
++    w2 = menu.add.text_input('Second: ', textinput_id='w2')
++    w2.add_validator(Required())
++
++    # Select w1, then move to w2 (which blurs w1)
++    w1.select(True)
++    assert w1.get_validation_errors() == []  # no blur yet
++
++    # Blur w1 by selecting w2
++    w1.select(False)
++    w2.select(True)
++
++    # w1 was blurred -> should have errors
++    assert w1.get_validation_errors() != []
++    # w2 hasn't been blurred yet
++    assert w2.get_validation_errors() == []
++
++    # Now blur w2
++    w2.select(False)
++    assert w2.get_validation_errors() != []
++
++
++def test_blur_validation_with_draw() -> None:
++    """After blur triggers validation, drawing the menu should not crash."""
++    menu = MenuUtils.generic_menu()
++    menu.set_validation_on_blur(True)
++
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    ti.select(True)
++    ti.select(False)  # blur -> validates -> errors stored
++
++    menu.draw(surface)  # Should render error labels without crashing
