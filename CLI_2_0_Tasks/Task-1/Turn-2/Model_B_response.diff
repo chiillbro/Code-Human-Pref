@@ -1,0 +1,654 @@
+diff --git a/pygame_menu/menu.py b/pygame_menu/menu.py
+index b2f574de..b9f8a40f 100644
+--- a/pygame_menu/menu.py
++++ b/pygame_menu/menu.py
+@@ -1585,7 +1585,9 @@ class Menu(Base):
+ 
+         def get_rect(wid: Widget) -> pygame.Rect:
+             """
+-            Get rect cache from widget.
++            Get rect cache from widget. Uses the layout rect so any
++            validation error footprint reserved below the widget body
++            is accounted for when stacking subsequent widgets.
+ 
+             :param wid: Widget
+             :return: Rect cache
+@@ -1593,7 +1595,7 @@ class Menu(Base):
+             try:
+                 return rects_cache[wid.get_id()]
+             except KeyError:
+-                rects_cache[wid.get_id()] = wid.get_rect(render=True)
++                rects_cache[wid.get_id()] = wid.get_layout_rect(render=True)
+             return rects_cache[wid.get_id()]
+ 
+         # Get menubar height, if fixed then move all widgets within area
+diff --git a/pygame_menu/validation.py b/pygame_menu/validation.py
+index c0361f77..cfae895a 100644
+--- a/pygame_menu/validation.py
++++ b/pygame_menu/validation.py
+@@ -264,11 +264,26 @@ class Email(Validator):
+     """
+     Ensure a string value looks like a valid email address.
+ 
++    The accepted form is ``local@domain`` where:
++
++    - ``local`` is one or more runs of alphanumeric / ``._%+-`` characters
++      separated by single dots (no leading/trailing dot, no consecutive dots)
++    - ``domain`` is one or more DNS labels separated by single dots; each
++      label starts and ends with an alphanumeric character and may contain
++      hyphens in the middle (no leading/trailing hyphen, no empty labels)
++    - the TLD is at least two ASCII letters
++
++    This rejects inputs like ``user@-domain.com`` (leading hyphen),
++    ``user@domain-.com`` (trailing hyphen), ``a..b@domain.com`` (consecutive
++    dots in local), and ``user@a..b.com`` (consecutive dots in domain).
++
+     :param message: Custom error message
+     """
+ 
++    _LOCAL_RE = r'[A-Za-z0-9_%+\-]+(?:\.[A-Za-z0-9_%+\-]+)*'
++    _LABEL_RE = r'[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
+     _EMAIL_RE = re.compile(
+-        r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
++        r'^' + _LOCAL_RE + r'@(?:' + _LABEL_RE + r'\.)+[A-Za-z]{2,}$'
+     )
+ 
+     def __init__(self, message: str = 'Must be a valid email address') -> None:
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index d918959d..e75f4229 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -365,6 +365,8 @@ class Widget(Base):
+     _validation_errors: list[str]
+     _validation_show_errors: bool
+     _validation_error_font: pygame.font.Font | None
++    _validation_error_surfaces: list[pygame.Surface]
++    _validation_footprint_height: int
+     configured: bool
+     force_menu_draw_focus: bool
+     last_surface: pygame.Surface | None
+@@ -548,6 +550,8 @@ class Widget(Base):
+         self._validation_errors = []
+         self._validation_show_errors = True
+         self._validation_error_font = None
++        self._validation_error_surfaces = []
++        self._validation_footprint_height = 0
+ 
+     def _ignores_keyboard_nonphysical(self) -> bool:
+         """
+@@ -1454,11 +1458,17 @@ class Widget(Base):
+ 
+     def clear_validators(self) -> 'Widget':
+         """
+-        Remove all validators from this widget.
++        Remove all validators from this widget. Also clears any stored
++        validation error state so the visual error indicators (error text
++        and red border) disappear on the next draw.
+ 
+         :return: Self reference
+         """
+         self._validators.clear()
++        # Clear visual error state too: without validators there is nothing
++        # left that could produce errors, so stale errors would be misleading.
++        if self._validation_errors:
++            self._set_validation_errors([])
+         return self
+ 
+     def get_validators(self) -> list[Validator]:
+@@ -1488,13 +1498,28 @@ class Widget(Base):
+                 errors.append(v.message)
+                 if stop_on_first:
+                     break
+-        valid = len(errors) == 0
+-        self._validation_errors = errors
+-        if not valid:
+-            self._force_render()
+-        elif self._validation_errors != errors:
+-            self._force_render()
+-        return ValidationResult(valid=valid, errors=errors, widget=self)
++        self._set_validation_errors(errors)
++        return ValidationResult(valid=len(errors) == 0, errors=list(errors), widget=self)
++
++    def _set_validation_errors(self, errors: list[str]) -> None:
++        """
++        Store validation errors and, when the error state actually changes,
++        trigger a re-render plus invalidate the menu's widgets surface so
++        that layout accounts for (or releases) the error label footprint.
++
++        :param errors: New list of error messages
++        """
++        if errors == self._validation_errors:
++            return
++        self._validation_errors = list(errors)
++        # Rebuild error surfaces and footprint height
++        self._rebuild_validation_error_surfaces()
++        # Force render so draw() reflects the new state
++        self._force_render()
++        # Invalidate the menu widgets surface so layout recomputes y-positions
++        # to make room for (or reclaim space from) the error label footprint.
++        if self._menu is not None:
++            self._menu._widgets_surface_need_update = True
+ 
+     def is_valid(self) -> bool:
+         """
+@@ -1515,24 +1540,33 @@ class Widget(Base):
+ 
+     def clear_validation_errors(self) -> 'Widget':
+         """
+-        Clear the stored validation error messages and force a re-render
+-        so the error display is removed.
++        Clear the stored validation error messages. The visual error display
++        is removed on the next draw and the menu layout recomputes so any
++        space that was reserved for the error label is reclaimed.
+ 
+         :return: Self reference
+         """
+-        self._validation_errors = []
+-        self._force_render()
++        self._set_validation_errors([])
+         return self
+ 
+     def set_validation_show_errors(self, show: bool) -> 'Widget':
+         """
+-        Enable or disable the visual error feedback for this widget.
++        Enable or disable the visual error feedback for this widget. When
++        toggled, the error layout footprint is rebuilt so the menu surface
++        reclaims or re-reserves space appropriately.
+ 
+         :param show: If ``True`` error text is drawn below the widget
+         :return: Self reference
+         """
+         assert isinstance(show, bool)
++        if self._validation_show_errors == show:
++            return self
+         self._validation_show_errors = show
++        # Rebuild footprint (will be 0 if hiding, or computed if showing)
++        self._rebuild_validation_error_surfaces()
++        self._force_render()
++        if self._menu is not None:
++            self._menu._widgets_surface_need_update = True
+         return self
+ 
+     def _get_validation_error_color(self) -> tuple[int, int, int, int]:
+@@ -1576,20 +1610,30 @@ class Widget(Base):
+                     return sz
+         return max(self._font_size - 6, 10)
+ 
+-    def _draw_validation_errors(self, surface: pygame.Surface) -> None:
+-        """
+-        Draw validation error messages below the widget.
++    # Gap between widget body and the error text, and between successive errors
++    _VALIDATION_ERROR_TOP_GAP = 2
++    _VALIDATION_ERROR_LINE_GAP = 1
+ 
+-        :param surface: Surface to draw on
++    def _rebuild_validation_error_surfaces(self) -> None:
+         """
+-        if not self._validation_show_errors or not self._validation_errors:
++        Pre-render error text surfaces and compute the total footprint height
++        that the error label occupies below the widget. The footprint is
++        included in ``get_rect()`` results (unless explicitly excluded) so
++        the menu layout reserves space for it.
++        """
++        self._validation_error_surfaces = []
++        self._validation_footprint_height = 0
++        if not self._validation_errors or not self._validation_show_errors:
+             return
+ 
+-        error_color = self._get_validation_error_color()
+         font_size = self._get_validation_error_font_size()
++        error_color = self._get_validation_error_color()
+ 
+-        # Build a small font for error text
+-        if self._validation_error_font is None or self._validation_error_font.size('A')[1] != font_size:
++        # Build a font matching the configured size
++        if (
++            self._validation_error_font is None
++            or self._validation_error_font.size('A')[1] != font_size
++        ):
+             try:
+                 if self._font_name:
+                     from pygame_menu.font import get_font
+@@ -1599,16 +1643,41 @@ class Widget(Base):
+             except Exception:
+                 self._validation_error_font = pygame.font.SysFont('', font_size)
+ 
++        total = self._VALIDATION_ERROR_TOP_GAP
++        for idx, msg in enumerate(self._validation_errors):
++            surf = self._validation_error_font.render(msg, True, error_color[0:3])
++            self._validation_error_surfaces.append(surf)
++            total += surf.get_height()
++            if idx < len(self._validation_errors) - 1:
++                total += self._VALIDATION_ERROR_LINE_GAP
++        self._validation_footprint_height = total
++
++    def _draw_validation_errors(self, surface: pygame.Surface) -> None:
++        """
++        Draw pre-rendered validation error messages below the widget body.
++
++        :param surface: Surface to draw on
++        """
++        if (
++            not self._validation_show_errors
++            or not self._validation_errors
++            or not self._validation_error_surfaces
++        ):
++            return
++
++        # Use the widget body rect so the error text starts directly below
++        # the widget. get_rect() returns the body rect by default; only
++        # get_layout_rect() extends the height with the error footprint.
+         rect = self.get_rect()
+-        y_offset = rect.bottom + 2
+-        for msg in self._validation_errors:
+-            err_surface = self._validation_error_font.render(msg, True, error_color[0:3])
++        y_offset = rect.bottom + self._VALIDATION_ERROR_TOP_GAP
++        for err_surface in self._validation_error_surfaces:
+             surface.blit(err_surface, (rect.x, y_offset))
+-            y_offset += err_surface.get_height() + 1
++            y_offset += err_surface.get_height() + self._VALIDATION_ERROR_LINE_GAP
+ 
+     def _draw_validation_border(self, surface: pygame.Surface) -> None:
+         """
+-        Draw a red border around the widget when validation errors exist.
++        Draw a colored border around the widget body (not the error label)
++        when validation errors exist.
+ 
+         :param surface: Surface to draw on
+         """
+@@ -1843,6 +1912,28 @@ class Widget(Base):
+         """
+         return self.get_rect(to_real_position=True)
+ 
++    def get_validation_footprint_height(self) -> int:
++        """
++        Return the extra height (in px) currently reserved below the widget
++        body for the validation error label. ``0`` when there are no errors
++        or visual error display is disabled.
++
++        :return: Footprint height in pixels
++        """
++        return self._validation_footprint_height
++
++    def get_layout_rect(self, render: bool = True) -> pygame.Rect:
++        """
++        Return the widget rect as used by menu layout. This is the same as
++        :py:meth:`get_rect` but extends the height with any reserved
++        validation error footprint, so that widgets following this one get
++        positioned below the error label instead of overlapping it.
++
++        :param render: Force widget rendering
++        :return: Layout rect including validation footprint
++        """
++        return self.get_rect(render=render, include_validation_footprint=True)
++
+     def get_rect(
+         self,
+         inflate: Tuple2IntType | None = None,
+@@ -1852,6 +1943,7 @@ class Widget(Base):
+         to_absolute_position: bool = False,
+         render: bool = False,
+         real_position_visible: bool = True,
++        include_validation_footprint: bool = False,
+     ) -> pygame.Rect:
+         """
+         Return the :py:class:`pygame.Rect` object of the Widget. This method
+@@ -1864,6 +1956,7 @@ class Widget(Base):
+         :param to_absolute_position: Transform the widget rect to absolute coordinates (if the Widget does not change the position if scrollbars move offsets). Used by events
+         :param render: Force widget rendering
+         :param real_position_visible: Return only the visible width/height if ``to_real_position=True``
++        :param include_validation_footprint: If ``True`` the returned rect height is extended by the space reserved for the validation error label. This is used by menu layout code via :py:meth:`get_layout_rect` so subsequent widgets get pushed below the error text. Drawing/selection callers keep the default ``False`` so they only cover the widget body
+         :return: Widget rect object
+         """
+         if render:
+@@ -1881,11 +1974,21 @@ class Widget(Base):
+         pad_bottom = padding[2] * apply_padding + inflate[1] / 2
+         pad_left = padding[3] * apply_padding + inflate[0] / 2
+ 
++        extra_height = (
++            self._validation_footprint_height if include_validation_footprint else 0
++        )
++
+         rect = pygame.Rect(
+             int(self._rect.x - pad_left),
+             int(self._rect.y - pad_top),
+             int(self._rect.width + pad_left + pad_right + self._rect_size_delta[0]),
+-            int(self._rect.height + pad_bottom + pad_top + self._rect_size_delta[1]),
++            int(
++                self._rect.height
++                + pad_bottom
++                + pad_top
++                + self._rect_size_delta[1]
++                + extra_height
++            ),
+         )
+ 
+         if self._scrollarea is not None:
+diff --git a/test/test_validation.py b/test/test_validation.py
+index f0df4543..59ba902d 100644
+--- a/test/test_validation.py
++++ b/test/test_validation.py
+@@ -672,3 +672,323 @@ def test_widget_validate_widget_without_get_value() -> None:
+     result = label.validate()
+     # Label raises ValueError from get_value, so value=None, Required fails
+     assert not result.valid
++
++
++# =============================================================================
++# Email regex strictness
++# =============================================================================
++
++
++def test_email_rejects_leading_hyphen_in_domain() -> None:
++    """Email regex must reject a domain label that starts with '-'."""
++    v = Email()
++    assert v('user@-domain.com') is False
++    assert v('user@foo-.com') is False
++    assert v('a@-.com') is False
++
++
++def test_email_rejects_trailing_hyphen_in_domain() -> None:
++    """Email regex must reject a domain label that ends with '-'."""
++    v = Email()
++    assert v('user@domain-.com') is False
++    assert v('user@foo-.bar-.com') is False
++
++
++def test_email_rejects_consecutive_dots_in_domain() -> None:
++    """Email regex must reject consecutive dots in the domain."""
++    v = Email()
++    assert v('user@a..b.com') is False
++    assert v('user@foo.bar..baz.com') is False
++
++
++def test_email_rejects_consecutive_dots_in_local() -> None:
++    """Email regex must reject consecutive dots in the local part."""
++    v = Email()
++    assert v('a..b@example.com') is False
++
++
++def test_email_rejects_leading_trailing_dots() -> None:
++    """Email regex must reject leading/trailing dots."""
++    v = Email()
++    assert v('.user@example.com') is False
++    assert v('user.@example.com') is False
++    assert v('user@.example.com') is False
++    assert v('user@example.com.') is False
++
++
++def test_email_accepts_valid_with_hyphen_inside_label() -> None:
++    """Hyphens inside a label (not at edges) are allowed."""
++    v = Email()
++    assert v('user@my-domain.com') is True
++    assert v('user@a-b-c.org') is True
++    assert v('user+tag@sub-1.domain.co') is True
++
++
++def test_email_accepts_various_valid_forms() -> None:
++    """Sanity check: common valid emails still pass."""
++    v = Email()
++    assert v('user@example.com') is True
++    assert v('user.name@sub.domain.org') is True
++    assert v('u_s.e+r@example.co.uk') is True
++    assert v('x@y.zz') is True
++
++
++# =============================================================================
++# clear_validators clears visual error state
++# =============================================================================
++
++
++def test_clear_validators_clears_existing_errors() -> None:
++    """clear_validators must also drop stored errors and footprint."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.validate()
++
++    # Error is present and takes up layout footprint
++    assert ti.get_validation_errors() != []
++    assert ti.get_validation_footprint_height() > 0
++
++    ti.clear_validators()
++
++    # Errors gone, footprint reclaimed
++    assert ti.get_validators() == []
++    assert ti.get_validation_errors() == []
++    assert ti.get_validation_footprint_height() == 0
++
++
++def test_clear_validators_triggers_menu_relayout() -> None:
++    """clear_validators must invalidate _widgets_surface_need_update when
++    removing existing errors."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.validate()
++
++    # Reset the flag explicitly so we only observe the effect of clear_validators
++    menu._widgets_surface_need_update = False
++    ti.clear_validators()
++    assert menu._widgets_surface_need_update is True
++
++
++def test_clear_validators_on_widget_without_errors_is_idempotent() -> None:
++    """clear_validators on a widget without errors must not force a relayout."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name', default='John')
++    ti.add_validator(Required())
++    # Don't call validate(), so no errors are set yet
++    assert ti.get_validation_errors() == []
++
++    menu._widgets_surface_need_update = False
++    ti.clear_validators()
++    # No errors to clear, so no layout invalidation needed
++    assert menu._widgets_surface_need_update is False
++
++
++# =============================================================================
++# Layout footprint for error labels
++# =============================================================================
++
++
++def test_layout_rect_matches_body_when_no_errors() -> None:
++    """get_layout_rect equals get_rect when there are no validation errors."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name', default='John')
++    ti.add_validator(Required())
++    ti.validate()
++
++    body = ti.get_rect(render=True)
++    layout = ti.get_layout_rect()
++    assert layout.height == body.height
++    assert ti.get_validation_footprint_height() == 0
++
++
++def test_layout_rect_extended_when_errors_present() -> None:
++    """get_layout_rect is taller than get_rect when errors exist."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.validate()
++
++    body = ti.get_rect(render=True)
++    layout = ti.get_layout_rect()
++    footprint = ti.get_validation_footprint_height()
++
++    assert footprint > 0
++    assert layout.height == body.height + footprint
++
++
++def test_body_rect_unchanged_by_errors() -> None:
++    """The widget body rect (get_rect default) stays constant regardless of errors."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    # Before validation
++    before_height = ti.get_rect(render=True).height
++
++    ti.validate()
++    menu.render()
++    after_height = ti.get_rect(render=True).height
++
++    assert before_height == after_height
++
++
++def test_next_widget_pushed_below_error_label() -> None:
++    """A widget after an erroring one must be positioned below the error text.
++
++    Uses ``center_content=False`` so layout positions are only affected by the
++    per-widget stacking logic, not by whole-menu re-centering.
++    """
++    menu = MenuUtils.generic_menu(center_content=False)
++    first = menu.add.text_input('First: ', textinput_id='first')
++    first.add_validator(Required())
++    second = menu.add.text_input('Second: ', textinput_id='second')
++
++    # Positions without errors
++    menu.render()
++    first_bottom_before = first.get_rect().bottom
++    second_y_before = second.get_rect().y
++    gap_before = second_y_before - first_bottom_before
++
++    # Trigger error, which reserves error footprint below `first`
++    first.validate()
++    menu.render()
++
++    first_bottom_after = first.get_rect().bottom
++    second_y_after = second.get_rect().y
++
++    # first widget body is unchanged (no re-centering when center_content=False)
++    assert first_bottom_before == first_bottom_after
++
++    # second widget moved further down by at least the error footprint height
++    assert second_y_after > second_y_before
++    footprint = first.get_validation_footprint_height()
++    assert (second_y_after - second_y_before) >= footprint
++
++    # The gap between widgets grew by the footprint height
++    gap_after = second_y_after - first_bottom_after
++    assert (gap_after - gap_before) >= footprint
++
++
++def test_error_resolved_reclaims_layout_space() -> None:
++    """When errors are cleared, the layout reclaims the space."""
++    menu = MenuUtils.generic_menu(center_content=False)
++    first = menu.add.text_input('First: ', textinput_id='first')
++    first.add_validator(Required())
++    second = menu.add.text_input('Second: ', textinput_id='second')
++
++    menu.render()
++    baseline_second_y = second.get_rect().y
++
++    # Trigger error -> second pushed down
++    first.validate()
++    menu.render()
++    pushed_y = second.get_rect().y
++    assert pushed_y > baseline_second_y
++
++    # Resolve error by setting a value and revalidating
++    first.set_value('Alice')
++    first.validate()
++    menu.render()
++    resolved_y = second.get_rect().y
++    assert resolved_y == baseline_second_y
++
++
++def test_validate_marks_menu_surface_for_update_when_errors_change() -> None:
++    """A state change (errors appear/disappear) must invalidate the menu surface."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    # Reset the flag explicitly so we only observe the effect of validate()
++    menu._widgets_surface_need_update = False
++
++    # First validate() creates errors -> must invalidate
++    ti.validate()
++    assert menu._widgets_surface_need_update is True
++
++    # Reset again
++    menu._widgets_surface_need_update = False
++
++    # Re-validating with the same failure does NOT invalidate (state unchanged)
++    ti.validate()
++    assert menu._widgets_surface_need_update is False
++
++    # Resolving the error invalidates again
++    ti.set_value('Alice')
++    ti.validate()
++    assert menu._widgets_surface_need_update is True
++
++
++def test_clear_validation_errors_reclaims_footprint() -> None:
++    """clear_validation_errors drops the layout footprint."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.validate()
++
++    assert ti.get_validation_footprint_height() > 0
++
++    ti.clear_validation_errors()
++    assert ti.get_validation_footprint_height() == 0
++    assert ti.get_validation_errors() == []
++
++
++def test_hide_errors_drops_footprint() -> None:
++    """Disabling visual errors drops the footprint; enabling re-adds it."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.validate()
++
++    assert ti.get_validation_footprint_height() > 0
++
++    ti.set_validation_show_errors(False)
++    assert ti.get_validation_footprint_height() == 0
++
++    ti.set_validation_show_errors(True)
++    assert ti.get_validation_footprint_height() > 0
++
++
++def test_multiple_error_messages_increase_footprint() -> None:
++    """More error messages produce a bigger footprint."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.validate()
++    one_error_height = ti.get_validation_footprint_height()
++
++    ti.clear_validators()
++    ti.add_validator(Required())
++    ti.add_validator(MinLength(3))
++    ti.validate(stop_on_first=False)
++    two_errors_height = ti.get_validation_footprint_height()
++
++    assert two_errors_height > one_error_height
++
++
++# =============================================================================
++# Dead-code cleanup regression
++# =============================================================================
++
++
++def test_validate_does_not_force_render_when_state_unchanged() -> None:
++    """Re-validating with the same errors must not trigger extra work.
++
++    Previously the code path had unreachable dead code (comparing errors
++    against itself). Now, state changes are detected via _set_validation_errors.
++    """
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name', default='John')
++    ti.add_validator(Required())
++
++    # First validate (passes, no change from initial empty errors)
++    menu._widgets_surface_need_update = False
++    ti.validate()
++    assert menu._widgets_surface_need_update is False
++
++    # Re-validate (still passes, state unchanged)
++    menu._widgets_surface_need_update = False
++    ti.validate()
++    assert menu._widgets_surface_need_update is False

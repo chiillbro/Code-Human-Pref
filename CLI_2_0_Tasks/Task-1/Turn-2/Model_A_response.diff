@@ -1,0 +1,374 @@
+diff --git a/pygame_menu/validation.py b/pygame_menu/validation.py
+index c0361f77..8ea59688 100644
+--- a/pygame_menu/validation.py
++++ b/pygame_menu/validation.py
+@@ -264,11 +264,25 @@ class Email(Validator):
+     """
+     Ensure a string value looks like a valid email address.
+ 
++    Local part: alphanumerics plus ``._%+-``, no consecutive dots, must
++    not start or end with a dot.
++
++    Domain: labels separated by dots; each label starts and ends with an
++    alphanumeric, may contain hyphens in between, no consecutive dots.
++
+     :param message: Custom error message
+     """
+ 
++    # Local part: no leading/trailing dot, no consecutive dots
++    # Domain labels: start/end with alnum, hyphens only in the middle,
++    # each label 1-63 chars, TLD at least 2 alpha chars
+     _EMAIL_RE = re.compile(
+-        r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
++        r'^[a-zA-Z0-9]'                           # first char of local
++        r'(?:[a-zA-Z0-9_%+\-]*[a-zA-Z0-9])?'      # middle + last of local (no dot yet)
++        r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9_%+\-]*[a-zA-Z0-9])?)*'  # dot-separated local parts
++        r'@'
++        r'(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+' # domain labels
++        r'[a-zA-Z]{2,}$'                           # TLD
+     )
+ 
+     def __init__(self, message: str = 'Must be a valid email address') -> None:
+diff --git a/pygame_menu/widgets/core/widget.py b/pygame_menu/widgets/core/widget.py
+index d918959d..879f0e1b 100644
+--- a/pygame_menu/widgets/core/widget.py
++++ b/pygame_menu/widgets/core/widget.py
+@@ -365,6 +365,7 @@ class Widget(Base):
+     _validation_errors: list[str]
+     _validation_show_errors: bool
+     _validation_error_font: pygame.font.Font | None
++    _validation_error_height: int
+     configured: bool
+     force_menu_draw_focus: bool
+     last_surface: pygame.Surface | None
+@@ -548,6 +549,7 @@ class Widget(Base):
+         self._validation_errors = []
+         self._validation_show_errors = True
+         self._validation_error_font = None
++        self._validation_error_height = 0
+ 
+     def _ignores_keyboard_nonphysical(self) -> bool:
+         """
+@@ -1454,11 +1456,13 @@ class Widget(Base):
+ 
+     def clear_validators(self) -> 'Widget':
+         """
+-        Remove all validators from this widget.
++        Remove all validators from this widget and clear any existing
++        validation error state.
+ 
+         :return: Self reference
+         """
+         self._validators.clear()
++        self.clear_validation_errors()
+         return self
+ 
+     def get_validators(self) -> list[Validator]:
+@@ -1489,10 +1493,10 @@ class Widget(Base):
+                 if stop_on_first:
+                     break
+         valid = len(errors) == 0
++        had_errors = len(self._validation_errors) > 0
+         self._validation_errors = errors
+-        if not valid:
+-            self._force_render()
+-        elif self._validation_errors != errors:
++        if not valid or had_errors:
++            self._update_validation_error_height()
+             self._force_render()
+         return ValidationResult(valid=valid, errors=errors, widget=self)
+ 
+@@ -1515,12 +1519,13 @@ class Widget(Base):
+ 
+     def clear_validation_errors(self) -> 'Widget':
+         """
+-        Clear the stored validation error messages and force a re-render
+-        so the error display is removed.
++        Clear the stored validation error messages, remove the extra
++        layout height, and force a re-render so the error display is removed.
+ 
+         :return: Self reference
+         """
+         self._validation_errors = []
++        self._update_validation_error_height()
+         self._force_render()
+         return self
+ 
+@@ -1576,9 +1581,66 @@ class Widget(Base):
+                     return sz
+         return max(self._font_size - 6, 10)
+ 
++    def _ensure_validation_error_font(self) -> None:
++        """
++        Lazily create or recreate the font used for validation error text.
++        """
++        font_size = self._get_validation_error_font_size()
++        if (
++            self._validation_error_font is not None
++            and self._validation_error_font.size('A')[1] == font_size
++        ):
++            return
++        try:
++            if self._font_name:
++                from pygame_menu.font import get_font
++                self._validation_error_font = get_font(self._font_name, font_size)
++            else:
++                self._validation_error_font = pygame.font.SysFont('', font_size)
++        except Exception:
++            self._validation_error_font = pygame.font.SysFont('', font_size)
++
++    def _compute_validation_error_height(self) -> int:
++        """
++        Compute the total pixel height that the validation error labels
++        would occupy below the widget content.
++
++        :return: Height in pixels (0 when there are no errors to show)
++        """
++        if not self._validation_show_errors or not self._validation_errors:
++            return 0
++        self._ensure_validation_error_font()
++        gap = 2  # px gap between widget content and first error line
++        line_spacing = 1  # px between consecutive error lines
++        total = gap
++        for msg in self._validation_errors:
++            err_surface = self._validation_error_font.render(msg, True, (0, 0, 0))
++            total += err_surface.get_height() + line_spacing
++        return total
++
++    def _update_validation_error_height(self) -> None:
++        """
++        Recompute the validation error height, update
++        ``_rect_size_delta`` to include it, and invalidate the menu
++        layout so widgets are repositioned.
++        """
++        old_h = self._validation_error_height
++        new_h = self._compute_validation_error_height()
++        if new_h == old_h:
++            return
++        # Adjust _rect_size_delta: remove old contribution, add new one
++        self._rect_size_delta = (
++            self._rect_size_delta[0],
++            self._rect_size_delta[1] - old_h + new_h,
++        )
++        self._validation_error_height = new_h
++        self.force_menu_surface_update()
++
+     def _draw_validation_errors(self, surface: pygame.Surface) -> None:
+         """
+-        Draw validation error messages below the widget.
++        Draw validation error messages below the widget content, inside
++        the expanded rect area that was reserved by
++        ``_update_validation_error_height``.
+ 
+         :param surface: Surface to draw on
+         """
+@@ -1586,25 +1648,18 @@ class Widget(Base):
+             return
+ 
+         error_color = self._get_validation_error_color()
+-        font_size = self._get_validation_error_font_size()
+-
+-        # Build a small font for error text
+-        if self._validation_error_font is None or self._validation_error_font.size('A')[1] != font_size:
+-            try:
+-                if self._font_name:
+-                    from pygame_menu.font import get_font
+-                    self._validation_error_font = get_font(self._font_name, font_size)
+-                else:
+-                    self._validation_error_font = pygame.font.SysFont('', font_size)
+-            except Exception:
+-                self._validation_error_font = pygame.font.SysFont('', font_size)
++        self._ensure_validation_error_font()
+ 
++        # Position errors below the original widget content.
++        # get_rect() includes the delta; subtract it to find the
++        # original bottom, then start 2 px below that.
+         rect = self.get_rect()
+-        y_offset = rect.bottom + 2
++        y_offset = rect.bottom - self._validation_error_height + 2
++        line_spacing = 1
+         for msg in self._validation_errors:
+             err_surface = self._validation_error_font.render(msg, True, error_color[0:3])
+             surface.blit(err_surface, (rect.x, y_offset))
+-            y_offset += err_surface.get_height() + 1
++            y_offset += err_surface.get_height() + line_spacing
+ 
+     def _draw_validation_border(self, surface: pygame.Surface) -> None:
+         """
+diff --git a/test/test_validation.py b/test/test_validation.py
+index f0df4543..15d7704f 100644
+--- a/test/test_validation.py
++++ b/test/test_validation.py
+@@ -150,11 +150,31 @@ def test_max_value() -> None:
+ def test_email() -> None:
+     """Test Email validator."""
+     v = Email()
++    # Valid addresses
+     assert v('user@example.com') is True
+     assert v('user@sub.domain.org') is True
++    assert v('first.last@example.com') is True
++    assert v('user+tag@example.com') is True
++    assert v('a@b.co') is True
++    assert v('user@my-domain.com') is True
++
++    # Invalid addresses
+     assert v('not-an-email') is False
+     assert v('@missing.com') is False
+     assert v('missing@') is False
++
++    # Domain edge cases
++    assert v('user@-domain.com') is False  # domain starts with hyphen
++    assert v('user@domain-.com') is False  # domain label ends with hyphen
++    assert v('user@domain..com') is False  # consecutive dots in domain
++    assert v('user@.domain.com') is False  # domain starts with dot
++
++    # Local part edge cases
++    assert v('a..b@example.com') is False  # consecutive dots in local
++    assert v('.user@example.com') is False  # local starts with dot
++    assert v('user.@example.com') is False  # local ends with dot
++
++    # Empty / non-string
+     assert v('') is True  # Empty passes (use Required for empty check)
+     assert v('   ') is True  # Whitespace only passes
+     assert v(42) is True  # Non-string passes
+@@ -672,3 +692,140 @@ def test_widget_validate_widget_without_get_value() -> None:
+     result = label.validate()
+     # Label raises ValueError from get_value, so value=None, Required fails
+     assert not result.valid
++
++
++# =============================================================================
++# Layout behaviour — error labels affect widget height
++# =============================================================================
++
++
++def test_validation_errors_increase_widget_rect_height() -> None:
++    """Widget rect height must grow to include the error text area."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    rect_before = ti.get_rect()
++    height_before = rect_before.height
++
++    ti.validate()  # fails — empty field
++
++    rect_after = ti.get_rect()
++    height_after = rect_after.height
++    assert height_after > height_before, (
++        f'expected rect height to grow, got {height_before} -> {height_after}'
++    )
++    assert ti._validation_error_height > 0
++
++
++def test_validation_errors_shrink_back_on_clear() -> None:
++    """Widget rect height must shrink back when errors are cleared."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    height_clean = ti.get_rect().height
++
++    ti.validate()  # fails
++    assert ti.get_rect().height > height_clean
++
++    ti.clear_validation_errors()
++    assert ti.get_rect().height == height_clean
++    assert ti._validation_error_height == 0
++
++
++def test_validation_errors_shrink_back_on_valid() -> None:
++    """When a previously-invalid widget becomes valid the height resets."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    height_clean = ti.get_rect().height
++
++    ti.validate()  # fails — empty
++    assert ti.get_rect().height > height_clean
++
++    ti.set_value('John')
++    ti.validate()  # now passes
++    assert ti.get_rect().height == height_clean
++    assert ti._validation_error_height == 0
++
++
++def test_clear_validators_clears_error_state() -> None:
++    """clear_validators() must also remove existing error text/borders."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    ti.validate()  # fails
++    assert len(ti.get_validation_errors()) == 1
++    assert ti._validation_error_height > 0
++
++    ti.clear_validators()
++    assert len(ti.get_validators()) == 0
++    assert len(ti.get_validation_errors()) == 0
++    assert ti._validation_error_height == 0
++
++
++def test_validation_error_height_hidden_when_show_disabled() -> None:
++    """No extra height when _validation_show_errors is False."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.set_validation_show_errors(False)
++
++    height_before = ti.get_rect().height
++    ti.validate()
++    assert ti.get_rect().height == height_before
++    assert ti._validation_error_height == 0
++
++
++def test_multiple_errors_increase_height_more() -> None:
++    """Multiple error lines take more height than a single one."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++    ti.add_validator(MinLength(3))
++
++    # Single error (stop_on_first=True)
++    ti.validate(stop_on_first=True)
++    h_one = ti._validation_error_height
++    assert h_one > 0
++
++    # Two errors (stop_on_first=False)
++    ti.validate(stop_on_first=False)
++    h_two = ti._validation_error_height
++    assert h_two > h_one
++
++
++def test_validation_error_height_updates_menu_surface() -> None:
++    """Verifying that the menu surface is marked for update after validation."""
++    menu = MenuUtils.generic_menu()
++    ti = menu.add.text_input('Name: ', textinput_id='name')
++    ti.add_validator(Required())
++
++    # Draw once to settle the menu state
++    menu.draw(surface)
++    menu._widgets_surface_need_update = False
++
++    ti.validate()  # triggers _update_validation_error_height -> force_menu_surface_update
++    assert menu._widgets_surface_need_update is True
++
++
++def test_draw_after_validation_no_overlap() -> None:
++    """Draw a menu with two widgets; error text should not crash drawing."""
++    menu = MenuUtils.generic_menu()
++    ti1 = menu.add.text_input('Field 1: ', textinput_id='f1')
++    ti2 = menu.add.text_input('Field 2: ', textinput_id='f2')
++    ti1.add_validator(Required())
++    ti1.validate()
++
++    # Force the menu to recalculate positions
++    menu.render()
++
++    # The second widget should be pushed down
++    r1 = ti1.get_rect()
++    r2 = ti2.get_rect()
++    assert r2.top >= r1.bottom, (
++        f'second widget top ({r2.top}) should be >= first widget bottom ({r1.bottom})'
++    )
