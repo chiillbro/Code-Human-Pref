@@ -1,0 +1,320 @@
+diff --git a/docs/api.md b/docs/api.md
+index 8717e93..226a321 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -505,8 +505,9 @@ Rule properties (all optional, applied in the order listed):
+ 
+ * `every` (Integer): emit only every Nth call (the 1st, N+1th, 2N+1th, ...).
+ * `rate` (Number): probability between `0` and `1` that a call is emitted.
+-* `limit` (Integer) / `window` (Number): emit at most `limit` calls per
+-  `window` milliseconds (fixed window).
++* `limit` (Integer) / `window` (Number): token-bucket rate limiter. The bucket
++  holds up to `limit` tokens, starts full, and refills smoothly at
++  `limit / window` tokens per millisecond. Each emitted log consumes one token.
+ * `test` (Function): custom predicate `(args, level) => boolean` receiving the
+   raw log-method arguments. Return `false` to drop. `this` is the logger.
+ * `dedupe` (Object): suppress repeated identical messages.
+@@ -518,11 +519,17 @@ Rule properties (all optional, applied in the order listed):
+   * `dedupe.key` (Function): optional `(args) => key` extractor. By default the
+     message format string is used (or `Error#message` if the first argument is
+     an `Error`).
++  * `dedupe.maxKeys` (Integer): maximum distinct keys tracked at once
++    (default `10000`). When exceeded the least-recently-used key is evicted and
++    its pending summary (if any) is flushed immediately.
+ 
+ Shorthands: a number value is treated as `{ rate: <n> }`, a function value is
+ treated as `{ test: <fn> }`, and `false`/`null` disables sampling for that
+ level (useful when overriding on a child).
+ 
++A key that is neither `'*'` nor a known level label (including custom levels)
++throws at construction time.
++
+ ```js
+ const logger = pino({
+   sampling: {
+diff --git a/lib/sampling.js b/lib/sampling.js
+index 836d279..b56892b 100644
+--- a/lib/sampling.js
++++ b/lib/sampling.js
+@@ -44,6 +44,9 @@ function assertRule (label, rule) {
+     if (d.key !== undefined && typeof d.key !== 'function') {
+       throw Error(`sampling.${label}.dedupe.key must be a function`)
+     }
++    if (d.maxKeys !== undefined && (!Number.isInteger(d.maxKeys) || d.maxKeys < 1)) {
++      throw Error(`sampling.${label}.dedupe.maxKeys must be a positive integer`)
++    }
+   }
+   if (rule.test !== undefined && typeof rule.test !== 'function') {
+     throw Error(`sampling.${label}.test must be a function`)
+@@ -95,16 +98,27 @@ function genSampler (rule, num) {
+   }
+ 
+   if (rule.limit !== undefined) {
++    // Token bucket: starts full with `limit` tokens, refills smoothly at
++    // `limit / window` tokens per millisecond, capped at `limit`. Each emitted
++    // log consumes one token. Avoids the 2x boundary burst of a fixed window.
+     const limit = rule.limit
+-    const window = rule.window
+-    let start = 0
+-    let count = 0
+-    checks.push(function limitCheck () {
+-      const now = Date.now()
+-      if (now - start >= window) { start = now; count = 0 }
+-      if (count < limit) { count++; return true }
+-      return false
+-    })
++    const refillPerMs = limit / rule.window
++    let tokens = limit
++    let last = Date.now()
++    checks.push(limit <= 0
++      ? function limitCheck () { return false }
++      : function limitCheck () {
++        const now = Date.now()
++        const elapsed = now - last
++        if (elapsed > 0) {
++          tokens += elapsed * refillPerMs
++          if (tokens > limit) tokens = limit
++          last = now
++        }
++        if (tokens >= 1) { tokens -= 1; return true }
++        return false
++      }
++    )
+   }
+ 
+   if (typeof rule.test === 'function') {
+@@ -117,23 +131,44 @@ function genSampler (rule, num) {
+   if (rule.dedupe !== undefined) {
+     const window = rule.dedupe.window
+     const keyFn = rule.dedupe.key || defaultDedupeKey
++    const maxKeys = rule.dedupe.maxKeys === undefined ? 10000 : rule.dedupe.maxKeys
++    // LRU via Map insertion order: a hit deletes-then-sets to promote the key
++    // to most-recently-used; an insert at capacity evicts the first (oldest)
++    // entry, clearing its timer and flushing any pending summary.
+     const seen = new Map()
++
++    function flush (key, state, logger) {
++      if (state.count > 0) {
++        // bypass sampling by writing directly so the summary is never dropped
++        logger[writeSym]({ sampling: { suppressed: state.count, key } }, `suppressed ${state.count} duplicate log(s)`, num)
++      }
++    }
++
+     checks.push(function dedupeCheck (args) {
+       const key = keyFn(args)
+       if (key === undefined || key === null) return true
+       const entry = seen.get(key)
+-      if (entry !== undefined) { entry.count++; return false }
+-      const state = { count: 0 }
+-      seen.set(key, state)
++      if (entry !== undefined) {
++        entry.count++
++        seen.delete(key)
++        seen.set(key, entry)
++        return false
++      }
++      if (seen.size >= maxKeys) {
++        const oldestKey = seen.keys().next().value
++        const oldest = seen.get(oldestKey)
++        seen.delete(oldestKey)
++        clearTimeout(oldest.timer)
++        flush(oldestKey, oldest, oldest.logger)
++      }
+       const logger = this
+-      const timer = setTimeout(function dedupeFlush () {
++      const state = { count: 0, logger, timer: null }
++      seen.set(key, state)
++      state.timer = setTimeout(function dedupeFlush () {
+         seen.delete(key)
+-        if (state.count > 0) {
+-          // bypass sampling by writing directly so the summary is never dropped
+-          logger[writeSym]({ sampling: { suppressed: state.count, key } }, `suppressed ${state.count} duplicate log(s)`, num)
+-        }
++        flush(key, state, logger)
+       }, window)
+-      if (typeof timer.unref === 'function') timer.unref()
++      if (typeof state.timer.unref === 'function') state.timer.unref()
+       return true
+     })
+   }
+@@ -152,6 +187,12 @@ function genSampler (rule, num) {
+ function buildSampling (rules, levels) {
+   if (!rules) return null
+   assertSampling(rules)
++  for (const label in rules) {
++    if (label === '*') continue
++    if (levels.values[label] === undefined) {
++      throw Error(`sampling.${label}: unknown level "${label}" (known levels: ${Object.keys(levels.values).join(', ')})`)
++    }
++  }
+   const samplers = {}
+   const wildcard = rules['*']
+   let count = 0
+diff --git a/pino.d.ts b/pino.d.ts
+index be8603c..25e1e2b 100644
+--- a/pino.d.ts
++++ b/pino.d.ts
+@@ -68,6 +68,12 @@ declare namespace pino {
+        * default the message format string (or `Error#message`) is used.
+        */
+       key?: (args: unknown[]) => unknown;
++      /**
++       * Maximum number of distinct keys tracked concurrently. When exceeded
++       * the least-recently-used key is evicted (its pending summary, if any,
++       * is flushed immediately). Default: `10000`.
++       */
++      maxKeys?: number;
+     }
+ 
+     export interface SamplingRule {
+@@ -80,11 +86,14 @@ declare namespace pino {
+        */
+       every?: number;
+       /**
+-       * Maximum number of log calls emitted per `window` milliseconds.
++       * Token-bucket capacity: at most `limit` log calls may be emitted in any
++       * burst. The bucket starts full and refills smoothly at `limit / window`
++       * tokens per millisecond.
+        */
+       limit?: number;
+       /**
+-       * Fixed window length in milliseconds used by `limit`.
++       * Refill window in milliseconds used by `limit` (the bucket regains
++       * `limit` tokens over `window` ms).
+        */
+       window?: number;
+       /**
+diff --git a/test/sampling.test.js b/test/sampling.test.js
+index cc07e63..206f8b2 100644
+--- a/test/sampling.test.js
++++ b/test/sampling.test.js
+@@ -58,21 +58,43 @@ describe('sampling', () => {
+     plan.ok(ratio > 0.2 && ratio < 0.4, `ratio ${ratio} should be ~0.3`)
+   })
+ 
+-  test('limit + window: caps emissions per fixed window', async t => {
+-    const plan = tspl(t, { plan: 2 })
++  test('limit + window: token bucket starts full and caps burst at limit', async t => {
++    const plan = tspl(t, { plan: 1 })
+     const stream = captureStream()
+     const logger = pino({ sampling: { info: { limit: 3, window: 60000 } } }, stream)
+ 
+     for (let i = 0; i < 20; i++) logger.info('x')
+     plan.equal(stream.lines.length, 3)
++  })
+ 
+-    // simulate window rollover by waiting on a tiny window
+-    const stream2 = captureStream()
+-    const logger2 = pino({ sampling: { info: { limit: 2, window: 30 } } }, stream2)
+-    for (let i = 0; i < 10; i++) logger2.info('x')
+-    await sleep(40)
+-    for (let i = 0; i < 10; i++) logger2.info('x')
+-    plan.equal(stream2.lines.length, 4)
++  test('limit + window: token bucket refills smoothly (no 2x boundary burst)', async t => {
++    const plan = tspl(t, { plan: 2 })
++    // 4 tokens per 40ms => 1 token per 10ms
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { limit: 4, window: 40 } } }, stream)
++
++    for (let i = 0; i < 20; i++) logger.info('x')
++    plan.equal(stream.lines.length, 4)
++
++    // After ~50ms we should have refilled all 4 tokens (capped), so a second
++    // burst yields at most `limit` more — never 2x at a boundary.
++    await sleep(60)
++    for (let i = 0; i < 20; i++) logger.info('x')
++    plan.ok(stream.lines.length <= 8, `got ${stream.lines.length}, must be <= 2*limit`)
++  })
++
++  test('limit + window: partial refill yields proportional tokens', async t => {
++    const plan = tspl(t, { plan: 1 })
++    // 10 tokens per 200ms => 1 token per 20ms
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { limit: 10, window: 200 } } }, stream)
++
++    for (let i = 0; i < 50; i++) logger.info('x') // drain to 0
++    const drained = stream.lines.length
++    await sleep(50) // ~2-3 tokens refilled, definitely < limit
++    for (let i = 0; i < 50; i++) logger.info('x')
++    const refilled = stream.lines.length - drained
++    plan.ok(refilled >= 1 && refilled < 10, `partial refill gave ${refilled} tokens (expected 1..9)`)
+   })
+ 
+   test('test: custom predicate receives raw args and level', async t => {
+@@ -237,6 +259,45 @@ describe('sampling - dedupe', () => {
+     plan.equal(stream.lines.filter(l => l.sampling).length, 0)
+   })
+ 
++  test('dedupe maxKeys evicts least-recently-used and flushes its summary', async t => {
++    const plan = tspl(t, { plan: 5 })
++    const stream = captureStream()
++    const logger = pino({
++      sampling: { info: { dedupe: { window: 60000, maxKeys: 2 } } }
++    }, stream)
++
++    logger.info('a') // seen: [a]
++    logger.info('b') // seen: [a, b]
++    logger.info('a') // hit -> promote: seen: [b, a], a.count=1
++    logger.info('a') // hit -> a.count=2
++    // insert 'c' at capacity -> evict oldest 'b' (count=0, no summary)
++    logger.info('c') // seen: [a, c]
++    plan.equal(stream.lines.filter(l => l.sampling).length, 0)
++    // insert 'd' at capacity -> evict oldest 'a' (count=2, summary flushed)
++    logger.info('d') // seen: [c, d]
++
++    const summaries = stream.lines.filter(l => l.sampling)
++    plan.equal(summaries.length, 1)
++    plan.equal(summaries[0].sampling.key, 'a')
++    plan.equal(summaries[0].sampling.suppressed, 2)
++    // 'a' was evicted, so logging it again is a fresh first-occurrence
++    const before = stream.lines.length
++    logger.info('a')
++    plan.equal(stream.lines.length, before + 1)
++  })
++
++  test('dedupe maxKeys defaults and bounds map size', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({
++      sampling: { info: { dedupe: { window: 60000, maxKeys: 3 } } }
++    }, stream)
++
++    for (let i = 0; i < 100; i++) logger.info('k' + i)
++    // every key is unique -> all emitted, no summaries (count=0 on eviction)
++    plan.equal(stream.lines.filter(l => l.sampling).length, 0)
++  })
++
+   test('dedupe window resets after expiry', async t => {
+     const plan = tspl(t, { plan: 1 })
+     const stream = captureStream()
+@@ -343,6 +404,30 @@ describe('sampling - validation', () => {
+     const plan = tspl(t, { plan: 1 })
+     plan.throws(() => pino({ sampling: { info: 'bad' } }, sink()), /sampling rule must be an object/)
+   })
++
++  test('rejects invalid dedupe.maxKeys', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.throws(() => pino({ sampling: { info: { dedupe: { window: 1000, maxKeys: 0 } } } }, sink()), /maxKeys must be a positive integer/)
++  })
++
++  test('rejects unknown level label', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.throws(() => pino({ sampling: { bogus: { every: 3 } } }, sink()), /sampling.bogus: unknown level "bogus"/)
++  })
++
++  test('rejects unknown level label on child override', t => {
++    const plan = tspl(t, { plan: 1 })
++    const parent = pino(sink())
++    plan.throws(() => parent.child({}, { sampling: { nope: { rate: 0.5 } } }), /unknown level "nope"/)
++  })
++
++  test('accepts custom level label', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.doesNotThrow(() => pino({
++      customLevels: { verbose: 11 },
++      sampling: { verbose: { every: 2 } }
++    }, sink()))
++  })
+ })
+ 
+ describe('sampling - composition', () => {
