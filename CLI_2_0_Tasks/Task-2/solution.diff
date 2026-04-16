@@ -1,0 +1,1704 @@
+diff --git a/lib/levels.js b/lib/levels.js
+index 67e6a99d..cf8b2b76 100644
+--- a/lib/levels.js
++++ b/lib/levels.js
+@@ -7,14 +7,19 @@ const {
+   streamSym,
+   formattersSym,
+   hooksSym,
+-  levelCompSym
++  levelCompSym,
++  samplingSym,
++  samplingMetaKeySym
+ } = require('./symbols')
+ const { noop, genLog } = require('./tools')
++const { genSampledLog } = require('./sampling')
+ const { DEFAULT_LEVELS, SORTING_ORDER } = require('./constants')
+ 
+ const levelMethods = {
+-  fatal: (hook) => {
+-    const logFatal = genLog(DEFAULT_LEVELS.fatal, hook)
++  fatal: (hook, samplingEngine, samplingMetaKey) => {
++    const logFatal = samplingEngine
++      ? genSampledLog(DEFAULT_LEVELS.fatal, hook, samplingEngine, samplingMetaKey)
++      : genLog(DEFAULT_LEVELS.fatal, hook)
+     return function (...args) {
+       const stream = this[streamSym]
+       logFatal.call(this, ...args)
+@@ -27,11 +32,11 @@ const levelMethods = {
+       }
+     }
+   },
+-  error: (hook) => genLog(DEFAULT_LEVELS.error, hook),
+-  warn: (hook) => genLog(DEFAULT_LEVELS.warn, hook),
+-  info: (hook) => genLog(DEFAULT_LEVELS.info, hook),
+-  debug: (hook) => genLog(DEFAULT_LEVELS.debug, hook),
+-  trace: (hook) => genLog(DEFAULT_LEVELS.trace, hook)
++  error: (hook, samplingEngine, samplingMetaKey) => samplingEngine ? genSampledLog(DEFAULT_LEVELS.error, hook, samplingEngine, samplingMetaKey) : genLog(DEFAULT_LEVELS.error, hook),
++  warn: (hook, samplingEngine, samplingMetaKey) => samplingEngine ? genSampledLog(DEFAULT_LEVELS.warn, hook, samplingEngine, samplingMetaKey) : genLog(DEFAULT_LEVELS.warn, hook),
++  info: (hook, samplingEngine, samplingMetaKey) => samplingEngine ? genSampledLog(DEFAULT_LEVELS.info, hook, samplingEngine, samplingMetaKey) : genLog(DEFAULT_LEVELS.info, hook),
++  debug: (hook, samplingEngine, samplingMetaKey) => samplingEngine ? genSampledLog(DEFAULT_LEVELS.debug, hook, samplingEngine, samplingMetaKey) : genLog(DEFAULT_LEVELS.debug, hook),
++  trace: (hook, samplingEngine, samplingMetaKey) => samplingEngine ? genSampledLog(DEFAULT_LEVELS.trace, hook, samplingEngine, samplingMetaKey) : genLog(DEFAULT_LEVELS.trace, hook)
+ }
+ 
+ const nums = Object.keys(DEFAULT_LEVELS).reduce((o, k) => {
+@@ -86,13 +91,21 @@ function setLevel (level) {
+   const useOnlyCustomLevelsVal = this[useOnlyCustomLevelsSym]
+   const levelComparison = this[levelCompSym]
+   const hook = this[hooksSym].logMethod
++  const samplingEngine = this[samplingSym] || null
++  const samplingMetaKey = this[samplingMetaKeySym] || '_sampling'
+ 
+   for (const key in values) {
+     if (levelComparison(values[key], levelVal) === false) {
+       this[key] = noop
+       continue
+     }
+-    this[key] = isStandardLevel(key, useOnlyCustomLevelsVal) ? levelMethods[key](hook) : genLog(values[key], hook)
++    if (isStandardLevel(key, useOnlyCustomLevelsVal)) {
++      this[key] = levelMethods[key](hook, samplingEngine, samplingMetaKey)
++    } else {
++      this[key] = samplingEngine
++        ? genSampledLog(values[key], hook, samplingEngine, samplingMetaKey)
++        : genLog(values[key], hook)
++    }
+   }
+ 
+   this.emit(
+diff --git a/lib/proto.js b/lib/proto.js
+index a6ba7226..9023475f 100644
+--- a/lib/proto.js
++++ b/lib/proto.js
+@@ -27,7 +27,9 @@ const {
+   formatOptsSym,
+   stringifiersSym,
+   msgPrefixSym,
+-  hooksSym
++  hooksSym,
++  samplingSym,
++  samplingMetaKeySym
+ } = require('./symbols')
+ const {
+   getLevel,
+@@ -49,6 +51,7 @@ const {
+   version
+ } = require('./meta')
+ const redaction = require('./redaction')
++const { buildSamplingEngine } = require('./sampling')
+ 
+ // note: use of class is satirical
+ // https://github.com/pinojs/pino/pull/433#pullrequestreview-127703127
+@@ -168,8 +171,24 @@ function child (bindings, options) {
+     instance[msgPrefixSym] = (this[msgPrefixSym] || '') + options.msgPrefix
+   }
+ 
++  // Child sampling override: if options.sampling is provided, build a new engine
++  if (options.hasOwnProperty('sampling')) {
++    if (options.sampling === null || options.sampling === false) {
++      // Disable sampling for this child
++      instance[samplingSym] = null
++    } else if (typeof options.sampling === 'object') {
++      const engine = buildSamplingEngine(options.sampling, instance.levels)
++      instance[samplingSym] = engine
++      if (options.sampling.metaKey) {
++        instance[samplingMetaKeySym] = options.sampling.metaKey
++      }
++    }
++    // Force rebuild of level methods so sampling change takes effect
++    instance[setLevelSym](options.level || this.level)
++  }
++
+   instance[chindingsSym] = asChindings(instance, bindings)
+-  if ((options.level !== undefined && options.level !== this.level) || options.hasOwnProperty('customLevels')) {
++  if (!options.hasOwnProperty('sampling') && ((options.level !== undefined && options.level !== this.level) || options.hasOwnProperty('customLevels'))) {
+     const childLevel = options.level || this.level
+     instance[setLevelSym](childLevel)
+   }
+diff --git a/lib/sampling.js b/lib/sampling.js
+new file mode 100644
+index 00000000..b08da42c
+--- /dev/null
++++ b/lib/sampling.js
+@@ -0,0 +1,490 @@
++'use strict'
++
++/**
++ * Sampling and rate-limiting engine for pino.
++ *
++ * Provides three sampling methods:
++ *   - probability: emit each log with a given probability (0.0–1.0)
++ *   - rate: token-bucket rate limiting (max N logs/sec with smooth refill)
++ *   - every: deterministic downsampling (emit every Nth log)
++ *
++ * Also provides per-key deduplication with a bounded LRU cache.
++ */
++
++const { samplingSym } = require('./symbols')
++
++// ---------------------------------------------------------------------------
++// Validation
++// ---------------------------------------------------------------------------
++
++function validateSamplingConfig (sampling, levels) {
++  if (sampling == null) return null
++  if (typeof sampling !== 'object' || Array.isArray(sampling)) {
++    throw Error('pino – sampling must be a plain object')
++  }
++
++  const rules = sampling.rules
++  if (rules !== undefined && rules !== null) {
++    if (!Array.isArray(rules)) {
++      throw Error('pino – sampling.rules must be an array')
++    }
++    const seenLevels = new Set()
++    for (let i = 0; i < rules.length; i++) {
++      const rule = rules[i]
++      if (!rule || typeof rule !== 'object') {
++        throw Error('pino – sampling.rules[' + i + '] must be an object')
++      }
++      if (typeof rule.level !== 'string') {
++        throw Error('pino – sampling.rules[' + i + '].level must be a string')
++      }
++      if (levels.values[rule.level] === undefined) {
++        throw Error('pino – sampling.rules[' + i + '].level "' + rule.level + '" is not a known level')
++      }
++      if (seenLevels.has(rule.level)) {
++        throw Error('pino – sampling.rules contains duplicate level "' + rule.level + '"')
++      }
++      seenLevels.add(rule.level)
++
++      switch (rule.method) {
++        case 'probability':
++          if (typeof rule.value !== 'number' || rule.value < 0 || rule.value > 1) {
++            throw Error('pino – sampling.rules[' + i + '].value for probability must be a number between 0 and 1')
++          }
++          break
++        case 'rate':
++          if (typeof rule.rate !== 'number' || rule.rate <= 0) {
++            throw Error('pino – sampling.rules[' + i + '].rate must be a positive number')
++          }
++          break
++        case 'every':
++          if (typeof rule.value !== 'number' || rule.value < 1 || rule.value !== Math.floor(rule.value)) {
++            throw Error('pino – sampling.rules[' + i + '].value for every must be a positive integer >= 1')
++          }
++          break
++        default:
++          throw Error('pino – sampling.rules[' + i + '].method must be "probability", "rate", or "every"')
++      }
++    }
++  }
++
++  const dedupe = sampling.dedupe
++  if (dedupe !== undefined && dedupe !== null) {
++    if (typeof dedupe !== 'object' || Array.isArray(dedupe)) {
++      throw Error('pino – sampling.dedupe must be a plain object')
++    }
++    if (dedupe.enabled) {
++      if (dedupe.ttlMs !== undefined && (typeof dedupe.ttlMs !== 'number' || dedupe.ttlMs <= 0)) {
++        throw Error('pino – sampling.dedupe.ttlMs must be a positive number')
++      }
++      if (dedupe.maxKeys !== undefined && (typeof dedupe.maxKeys !== 'number' || dedupe.maxKeys < 1 || dedupe.maxKeys !== Math.floor(dedupe.maxKeys))) {
++        throw Error('pino – sampling.dedupe.maxKeys must be a positive integer')
++      }
++    }
++  }
++
++  return sampling
++}
++
++// ---------------------------------------------------------------------------
++// LRU Cache for deduplication
++// ---------------------------------------------------------------------------
++
++class LruCache {
++  constructor (maxSize) {
++    this._max = maxSize
++    this._map = new Map()
++  }
++
++  get (key) {
++    const entry = this._map.get(key)
++    if (entry === undefined) return undefined
++    // Promote to most-recently-used by delete-then-set
++    this._map.delete(key)
++    this._map.set(key, entry)
++    return entry
++  }
++
++  set (key, value) {
++    // If key exists, delete first to update insertion order
++    if (this._map.has(key)) {
++      this._map.delete(key)
++      this._map.set(key, value)
++      return null
++    }
++    let evicted = null
++    if (this._map.size >= this._max) {
++      // Evict oldest (first inserted) entry
++      const oldest = this._map.keys().next().value
++      evicted = this._map.get(oldest)
++      this._map.delete(oldest)
++    }
++    this._map.set(key, value)
++    return evicted // return evicted entry so caller can emit summary, or null
++  }
++
++  delete (key) {
++    return this._map.delete(key)
++  }
++
++  has (key) {
++    return this._map.has(key)
++  }
++
++  clear () {
++    this._map.clear()
++  }
++
++  get size () {
++    return this._map.size
++  }
++
++  // Iterate entries for TTL expiry sweep
++  entries () {
++    return this._map.entries()
++  }
++
++  // Delete and return entry without promotion
++  evict (key) {
++    const entry = this._map.get(key)
++    if (entry !== undefined) {
++      this._map.delete(key)
++    }
++    return entry
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Token Bucket (smooth refill)
++// ---------------------------------------------------------------------------
++
++class TokenBucket {
++  constructor (rate) {
++    this._rate = rate          // tokens per second
++    this._tokens = rate        // start full
++    this._lastRefill = Date.now()
++  }
++
++  consume () {
++    this._refill()
++    if (this._tokens >= 1) {
++      this._tokens -= 1
++      return true
++    }
++    return false
++  }
++
++  _refill () {
++    const now = Date.now()
++    const elapsed = (now - this._lastRefill) / 1000 // seconds
++    if (elapsed > 0) {
++      this._tokens = Math.min(this._rate, this._tokens + elapsed * this._rate)
++      this._lastRefill = now
++    }
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Sampling Engine
++// ---------------------------------------------------------------------------
++
++class SamplingEngine {
++  constructor (config, levelValues) {
++    this._rulesByLevelNum = new Map()
++    this._counters = new Map()
++    this._dropCounts = new Map()
++    this._buckets = new Map()
++    this._dedupe = null
++    this._dedupeKey = 'msg'
++    this._dedupeTtlMs = 5000
++    this._sweepInterval = null
++    this._randomFn = Math.random
++
++    if (config.randomFn && typeof config.randomFn === 'function') {
++      this._randomFn = config.randomFn
++    }
++
++    // Build rule index keyed by numeric level value
++    if (config.rules) {
++      for (let i = 0; i < config.rules.length; i++) {
++        const rule = config.rules[i]
++        const numLevel = levelValues[rule.level]
++        const ruleEntry = {
++          method: rule.method,
++          value: rule.value,
++          rate: rule.rate,
++          level: rule.level,
++          levelNum: numLevel
++        }
++        this._rulesByLevelNum.set(numLevel, ruleEntry)
++        this._dropCounts.set(numLevel, 0)
++
++        if (rule.method === 'every') {
++          this._counters.set(numLevel, 0)
++        } else if (rule.method === 'rate') {
++          this._buckets.set(numLevel, new TokenBucket(rule.rate))
++        }
++      }
++    }
++
++    // Set up deduplication
++    if (config.dedupe && config.dedupe.enabled) {
++      const maxKeys = config.dedupe.maxKeys || 10000
++      this._dedupe = new LruCache(maxKeys)
++      this._dedupeKey = config.dedupe.key || 'msg'
++      this._dedupeTtlMs = config.dedupe.ttlMs || 5000
++      this._dedupeMaxKeys = maxKeys
++
++      // Periodic sweep to expire TTL entries and emit summaries
++      this._pendingSummaries = []
++      this._sweepInterval = setInterval(() => {
++        this._sweepExpired()
++      }, Math.min(this._dedupeTtlMs, 1000))
++      // Unref so it doesn't keep the process alive
++      if (this._sweepInterval.unref) {
++        this._sweepInterval.unref()
++      }
++    }
++  }
++
++  /**
++   * Check whether a log at the given numeric level with the given message
++   * should be emitted. Returns an object with `{ emit, meta }` where meta
++   * contains sampling metadata to inject, or null if the log should be dropped.
++   */
++  shouldEmit (levelNum, msg) {
++    // Deduplication check (applied before method-based sampling)
++    if (this._dedupe !== null) {
++      const dedupeKey = typeof msg === 'string' ? msg : ''
++      const existing = this._dedupe.get(dedupeKey)
++      if (existing !== undefined) {
++        const now = Date.now()
++        if (now - existing.firstSeen < this._dedupeTtlMs) {
++          existing.count += 1
++          existing.levelNum = levelNum
++          return { emit: false, meta: null }
++        }
++        // TTL expired — allow this one through but emit summary for the suppressed
++        if (existing.count > 0) {
++          this._pendingSummaries.push({
++            msg: 'dedupe: suppressed ' + existing.count + ' occurrences of \'' + dedupeKey + '\'',
++            levelNum: existing.levelNum
++          })
++        }
++        this._dedupe.delete(dedupeKey)
++      }
++
++      // Insert/re-insert into cache
++      const evicted = this._dedupe.set(dedupeKey, {
++        firstSeen: Date.now(),
++        count: 0,
++        levelNum
++      })
++      if (evicted !== null && evicted.count > 0) {
++        this._pendingSummaries.push({
++          msg: 'dedupe: suppressed ' + evicted.count + ' occurrences (evicted)',
++          levelNum: evicted.levelNum
++        })
++      }
++    }
++
++    // Method-based sampling
++    const rule = this._rulesByLevelNum.get(levelNum)
++    if (rule === undefined) {
++      // No rule for this level — pass through unsampled
++      return { emit: true, meta: null }
++    }
++
++    let emit = true
++
++    switch (rule.method) {
++      case 'probability': {
++        emit = this._randomFn() < rule.value
++        break
++      }
++      case 'rate': {
++        const bucket = this._buckets.get(levelNum)
++        emit = bucket.consume()
++        break
++      }
++      case 'every': {
++        const count = this._counters.get(levelNum) + 1
++        this._counters.set(levelNum, count)
++        emit = (count % rule.value) === 0
++        break
++      }
++    }
++
++    if (!emit) {
++      this._dropCounts.set(levelNum, (this._dropCounts.get(levelNum) || 0) + 1)
++      return { emit: false, meta: null }
++    }
++
++    const dropped = this._dropCounts.get(levelNum) || 0
++    this._dropCounts.set(levelNum, 0)
++
++    const meta = {
++      method: rule.method
++    }
++    if (rule.method === 'probability') {
++      meta.value = rule.value
++    } else if (rule.method === 'rate') {
++      meta.rate = rule.rate
++    } else if (rule.method === 'every') {
++      meta.value = rule.value
++    }
++    meta.dropped = dropped
++
++    return { emit: true, meta }
++  }
++
++  /**
++   * Drain any pending dedupe summary logs. Returns an array of
++   * { msg, levelNum } objects or an empty array.
++   */
++  drainSummaries () {
++    if (this._pendingSummaries === undefined || this._pendingSummaries.length === 0) {
++      return []
++    }
++    const summaries = this._pendingSummaries
++    this._pendingSummaries = []
++    return summaries
++  }
++
++  _sweepExpired () {
++    if (this._dedupe === null) return
++    const now = Date.now()
++    const toDelete = []
++    for (const [key, entry] of this._dedupe.entries()) {
++      if (now - entry.firstSeen >= this._dedupeTtlMs) {
++        toDelete.push({ key, entry })
++      }
++    }
++    for (let i = 0; i < toDelete.length; i++) {
++      const { key, entry } = toDelete[i]
++      this._dedupe.delete(key)
++      if (entry.count > 0) {
++        this._pendingSummaries.push({
++          msg: 'dedupe: suppressed ' + entry.count + ' occurrences of \'' + key + '\'',
++          levelNum: entry.levelNum
++        })
++      }
++    }
++  }
++
++  destroy () {
++    if (this._sweepInterval !== null) {
++      clearInterval(this._sweepInterval)
++      this._sweepInterval = null
++    }
++    if (this._dedupe !== null) {
++      this._dedupe.clear()
++    }
++    this._rulesByLevelNum.clear()
++    this._counters.clear()
++    this._dropCounts.clear()
++    this._buckets.clear()
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Factory for creating a sampling engine from config
++// ---------------------------------------------------------------------------
++
++function buildSamplingEngine (config, levels) {
++  if (!config || (!config.rules && !config.dedupe)) return null
++  return new SamplingEngine(config, levels.values)
++}
++
++// ---------------------------------------------------------------------------
++// Generate a sampling-aware LOG variant for genLog
++//
++// This returns a wrapper function that checks sampling before calling
++// the original LOG function. It is ONLY created when sampling is active;
++// when sampling is null the original genLog path is untouched (zero cost).
++// ---------------------------------------------------------------------------
++
++function genSampledLog (level, hook, samplingEngine, samplingMetaKey) {
++  if (!hook) return SAMPLED_LOG
++
++  return function hookWrappedSampledLog (...args) {
++    hook.call(this, args, SAMPLED_LOG, level)
++  }
++
++  function SAMPLED_LOG (o, ...n) {
++    const engine = this[samplingSym]
++    if (!engine) {
++      // Fallback: no engine on this instance, should not happen but be safe
++      return
++    }
++
++    // Determine the message string for dedupe purposes
++    let msgForDedupe
++    if (typeof o === 'object') {
++      msgForDedupe = (o === null && n.length === 0) ? '' : (typeof n[0] === 'string' ? n[0] : '')
++    } else {
++      msgForDedupe = o === undefined ? (typeof n[0] === 'string' ? n[0] : '') : (typeof o === 'string' ? o : '')
++    }
++
++    const result = engine.shouldEmit(level, msgForDedupe)
++    if (!result.emit) return
++
++    // Inject sampling metadata into the merge object
++    if (result.meta !== null) {
++      if (typeof o === 'object' && o !== null) {
++        o[samplingMetaKey] = result.meta
++      } else if (typeof o !== 'object') {
++        // For non-object first arg, we cannot inject metadata into the obj
++        // so we just log without metadata injection (msg-only logs)
++      }
++    }
++
++    // Delegate to the write path
++    const { mapHttpRequest, mapHttpResponse } = require('pino-std-serializers')
++    const format = require('quick-format-unescaped')
++    const { writeSym, msgPrefixSym, formatOptsSym } = require('./symbols')
++
++    if (typeof o === 'object') {
++      let msg = o
++      if (o !== null) {
++        if (o.method && o.headers && o.socket) {
++          o = mapHttpRequest(o)
++        } else if (typeof o.setHeader === 'function') {
++          o = mapHttpResponse(o)
++        }
++      }
++      let formatParams
++      if (msg === null && n.length === 0) {
++        formatParams = [null]
++      } else {
++        msg = n.shift()
++        formatParams = n
++      }
++      if (typeof this[msgPrefixSym] === 'string' && msg !== undefined && msg !== null) {
++        msg = this[msgPrefixSym] + msg
++      }
++      this[writeSym](o, format(msg, formatParams, this[formatOptsSym]), level)
++    } else {
++      let msg = o === undefined ? n.shift() : o
++      if (typeof this[msgPrefixSym] === 'string' && msg !== undefined && msg !== null) {
++        msg = this[msgPrefixSym] + msg
++      }
++      this[writeSym](null, format(msg, n, this[formatOptsSym]), level)
++    }
++
++    // Emit any pending dedupe summaries
++    const summaries = engine.drainSummaries()
++    for (let i = 0; i < summaries.length; i++) {
++      const summary = summaries[i]
++      this[writeSym]({ [samplingMetaKey]: { method: 'dedupe', dedupe: true } }, summary.msg, summary.levelNum)
++    }
++  }
++}
++
++module.exports = {
++  validateSamplingConfig,
++  buildSamplingEngine,
++  genSampledLog,
++  SamplingEngine,
++  LruCache,
++  TokenBucket
++}
+diff --git a/lib/symbols.js b/lib/symbols.js
+index d745bd1f..9dd24a6a 100644
+--- a/lib/symbols.js
++++ b/lib/symbols.js
+@@ -29,6 +29,8 @@ const nestedKeySym = Symbol('pino.nestedKey')
+ const nestedKeyStrSym = Symbol('pino.nestedKeyStr')
+ const mixinMergeStrategySym = Symbol('pino.mixinMergeStrategy')
+ const msgPrefixSym = Symbol('pino.msgPrefix')
++const samplingSym = Symbol('pino.sampling')
++const samplingMetaKeySym = Symbol('pino.samplingMetaKey')
+ 
+ const wildcardFirstSym = Symbol('pino.wildcardFirst')
+ 
+@@ -72,5 +74,7 @@ module.exports = {
+   nestedKeyStrSym,
+   mixinMergeStrategySym,
+   msgPrefixSym,
++  samplingSym,
++  samplingMetaKeySym,
+   transportUsesMultistreamSym
+ }
+diff --git a/pino.d.ts b/pino.d.ts
+index 0296f291..49d6abe3 100644
+--- a/pino.d.ts
++++ b/pino.d.ts
+@@ -27,6 +27,57 @@ declare namespace pino {
+     type MixinFn<CustomLevels extends string = never> = (mergeObject: object, level: number, logger:Logger<CustomLevels>) => object
+     type MixinMergeStrategyFn = (mergeObject: object, mixinObject: object) => object
+ 
++    interface SamplingRule {
++      /** The level name this rule applies to. */
++      level: LevelOrString;
++      /** The sampling method. */
++      method: 'probability' | 'rate' | 'every';
++      /**
++       * For `probability`: a number between 0 and 1 (inclusive).
++       * For `every`: a positive integer N (emit every Nth log).
++       */
++      value?: number;
++      /**
++       * For `rate`: the maximum number of logs per second (token-bucket with smooth refill).
++       */
++      rate?: number;
++    }
++
++    interface SamplingDedupe {
++      /** Enable per-key deduplication. */
++      enabled: boolean;
++      /** The log field to deduplicate on. Default: `'msg'`. */
++      key?: string;
++      /** Time-to-live in milliseconds before a duplicate is allowed again. Default: `5000`. */
++      ttlMs?: number;
++      /** Maximum number of keys in the LRU cache. Default: `10000`. */
++      maxKeys?: number;
++    }
++
++    interface SamplingMeta {
++      /** The sampling method that matched. */
++      method: 'probability' | 'rate' | 'every' | 'dedupe';
++      /** For probability: the configured probability value. */
++      value?: number;
++      /** For rate: the configured rate value. */
++      rate?: number;
++      /** Number of logs dropped since the last emitted log for this rule. */
++      dropped?: number;
++      /** Whether this is a deduplication summary log. */
++      dedupe?: boolean;
++    }
++
++    interface SamplingOptions {
++      /** Per-level sampling rules. At most one rule per level; duplicate levels throw. */
++      rules?: SamplingRule[];
++      /** Per-key deduplication configuration. */
++      dedupe?: SamplingDedupe;
++      /** Custom key name for sampling metadata in log output. Default: `'_sampling'`. */
++      metaKey?: string;
++      /** Custom random function for probability sampling. Default: `Math.random`. */
++      randomFn?: () => number;
++    }
++
+     type CustomLevelLogger<CustomLevels extends string, UseOnlyCustomLevels extends boolean = boolean> = {
+       /**
+        * Define additional logging levels.
+@@ -705,6 +756,12 @@ declare namespace pino {
+        * logs newline delimited JSON with `\r\n` instead of `\n`. Default: `false`.
+        */
+       crlf?: boolean;
++      /**
++       * Configure per-level log sampling, rate-limiting, and deduplication.
++       * When set, logs at configured levels are subject to the specified sampling rules.
++       * Levels without rules pass through unsampled. Default: `null` (no sampling).
++       */
++      sampling?: SamplingOptions | null;
+     }
+ 
+     export interface ChildLoggerOptions<CustomLevels extends string = never> {
+@@ -717,7 +774,12 @@ declare namespace pino {
+         log?: (object: object) => object;
+       };
+       redact?: string[] | redactOptions;
+-      msgPrefix?: string
++      msgPrefix?: string;
++      /**
++       * Override or disable sampling for this child logger.
++       * Pass `null` or `false` to disable sampling inherited from parent.
++       */
++      sampling?: SamplingOptions | null | false;
+     }
+ 
+     /**
+@@ -796,6 +858,8 @@ declare namespace pino {
+       readonly useOnlyCustomLevelsSym: unique symbol;
+       readonly formattersSym: unique symbol;
+       readonly hooksSym: unique symbol;
++      readonly samplingSym: unique symbol;
++      readonly samplingMetaKeySym: unique symbol;
+     }
+ 
+     /**
+diff --git a/pino.js b/pino.js
+index 9720bcb1..fab093c1 100644
+--- a/pino.js
++++ b/pino.js
+@@ -20,6 +20,7 @@ const {
+   noop
+ } = require('./lib/tools')
+ const { version } = require('./lib/meta')
++const { validateSamplingConfig, buildSamplingEngine } = require('./lib/sampling')
+ const {
+   chindingsSym,
+   redactFmtSym,
+@@ -44,6 +45,8 @@ const {
+   nestedKeyStrSym,
+   mixinMergeStrategySym,
+   msgPrefixSym,
++  samplingSym,
++  samplingMetaKeySym,
+   transportUsesMultistreamSym
+ } = symbols
+ const { epochTime, nullTime } = time
+@@ -80,7 +83,8 @@ const defaultOptions = {
+   customLevels: null,
+   useOnlyCustomLevels: false,
+   depthLimit: 5,
+-  edgeLimit: 100
++  edgeLimit: 100,
++  sampling: null
+ }
+ 
+ const normalize = createArgsNormalizer(defaultOptions)
+@@ -114,7 +118,8 @@ function pino (...args) {
+     depthLimit,
+     edgeLimit,
+     onChild,
+-    msgPrefix
++    msgPrefix,
++    sampling
+   } = opts
+ 
+   const stringifySafe = configure({
+@@ -166,6 +171,11 @@ function pino (...args) {
+   assertDefaultLevelFound(level, customLevels, useOnlyCustomLevels)
+   const levels = mappings(customLevels, useOnlyCustomLevels)
+ 
++  // Validate and build sampling engine
++  validateSamplingConfig(sampling, levels)
++  const samplingEngine = buildSamplingEngine(sampling, levels)
++  const samplingMetaKey = (sampling && sampling.metaKey) || '_sampling'
++
+   if (stream && stream[transportUsesMultistreamSym] === true) {
+     let sampleLabel = typeof level === 'string' ? level : undefined
+     if (!sampleLabel || levels[sampleLabel] === undefined) {
+@@ -220,7 +230,9 @@ function pino (...args) {
+     [hooksSym]: hooks,
+     silent: noop,
+     onChild,
+-    [msgPrefixSym]: msgPrefix
++    [msgPrefixSym]: msgPrefix,
++    [samplingSym]: samplingEngine,
++    [samplingMetaKeySym]: samplingMetaKey
+   })
+ 
+   Object.setPrototypeOf(instance, proto())
+diff --git a/test/sampling.test.js b/test/sampling.test.js
+new file mode 100644
+index 00000000..39eff93c
+--- /dev/null
++++ b/test/sampling.test.js
+@@ -0,0 +1,903 @@
++'use strict'
++
++const { describe, test } = require('node:test')
++const assert = require('node:assert')
++const { sink, once, sleep } = require('./helper')
++const pino = require('../')
++const {
++  validateSamplingConfig,
++  buildSamplingEngine,
++  LruCache,
++  TokenBucket,
++  SamplingEngine
++} = require('../lib/sampling')
++
++// ---------------------------------------------------------------------------
++// Validation
++// ---------------------------------------------------------------------------
++
++describe('sampling validation', () => {
++  test('null sampling is accepted', () => {
++    const result = validateSamplingConfig(null, pino.levels)
++    assert.equal(result, null)
++  })
++
++  test('undefined sampling is accepted', () => {
++    const result = validateSamplingConfig(undefined, pino.levels)
++    assert.equal(result, null)
++  })
++
++  test('non-object sampling throws', () => {
++    assert.throws(
++      () => validateSamplingConfig('bad', pino.levels),
++      /sampling must be a plain object/
++    )
++  })
++
++  test('array sampling throws', () => {
++    assert.throws(
++      () => validateSamplingConfig([], pino.levels),
++      /sampling must be a plain object/
++    )
++  })
++
++  test('rules must be an array', () => {
++    assert.throws(
++      () => validateSamplingConfig({ rules: 'bad' }, pino.levels),
++      /sampling.rules must be an array/
++    )
++  })
++
++  test('rule must be an object', () => {
++    assert.throws(
++      () => validateSamplingConfig({ rules: ['bad'] }, pino.levels),
++      /sampling.rules\[0\] must be an object/
++    )
++  })
++
++  test('rule.level must be a string', () => {
++    assert.throws(
++      () => validateSamplingConfig({ rules: [{ level: 30, method: 'probability', value: 0.5 }] }, pino.levels),
++      /sampling.rules\[0\].level must be a string/
++    )
++  })
++
++  test('rule.level must be a known level', () => {
++    assert.throws(
++      () => validateSamplingConfig({ rules: [{ level: 'unknown', method: 'probability', value: 0.5 }] }, pino.levels),
++      /not a known level/
++    )
++  })
++
++  test('duplicate levels throw', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        rules: [
++          { level: 'info', method: 'probability', value: 0.5 },
++          { level: 'info', method: 'every', value: 3 }
++        ]
++      }, pino.levels),
++      /duplicate level "info"/
++    )
++  })
++
++  test('probability value must be between 0 and 1', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        rules: [{ level: 'info', method: 'probability', value: 1.5 }]
++      }, pino.levels),
++      /value for probability must be a number between 0 and 1/
++    )
++  })
++
++  test('probability value of 0 is valid', () => {
++    const result = validateSamplingConfig({
++      rules: [{ level: 'info', method: 'probability', value: 0 }]
++    }, pino.levels)
++    assert.ok(result)
++  })
++
++  test('probability value of 1 is valid', () => {
++    const result = validateSamplingConfig({
++      rules: [{ level: 'info', method: 'probability', value: 1 }]
++    }, pino.levels)
++    assert.ok(result)
++  })
++
++  test('rate must be a positive number', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        rules: [{ level: 'info', method: 'rate', rate: 0 }]
++      }, pino.levels),
++      /rate must be a positive number/
++    )
++  })
++
++  test('rate with negative value throws', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        rules: [{ level: 'info', method: 'rate', rate: -5 }]
++      }, pino.levels),
++      /rate must be a positive number/
++    )
++  })
++
++  test('every value must be a positive integer', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        rules: [{ level: 'info', method: 'every', value: 0.5 }]
++      }, pino.levels),
++      /value for every must be a positive integer/
++    )
++  })
++
++  test('every value of 0 throws', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        rules: [{ level: 'info', method: 'every', value: 0 }]
++      }, pino.levels),
++      /value for every must be a positive integer/
++    )
++  })
++
++  test('unknown method throws', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        rules: [{ level: 'info', method: 'unknown', value: 1 }]
++      }, pino.levels),
++      /method must be "probability", "rate", or "every"/
++    )
++  })
++
++  test('dedupe must be a plain object', () => {
++    assert.throws(
++      () => validateSamplingConfig({ dedupe: 'bad' }, pino.levels),
++      /sampling.dedupe must be a plain object/
++    )
++  })
++
++  test('dedupe.ttlMs must be positive', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        dedupe: { enabled: true, ttlMs: -1 }
++      }, pino.levels),
++      /sampling.dedupe.ttlMs must be a positive number/
++    )
++  })
++
++  test('dedupe.maxKeys must be a positive integer', () => {
++    assert.throws(
++      () => validateSamplingConfig({
++        dedupe: { enabled: true, maxKeys: 0.5 }
++      }, pino.levels),
++      /sampling.dedupe.maxKeys must be a positive integer/
++    )
++  })
++
++  test('valid dedupe config passes', () => {
++    const result = validateSamplingConfig({
++      dedupe: { enabled: true, ttlMs: 3000, maxKeys: 100 }
++    }, pino.levels)
++    assert.ok(result)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// LruCache
++// ---------------------------------------------------------------------------
++
++describe('LruCache', () => {
++  test('basic set and get', () => {
++    const cache = new LruCache(3)
++    cache.set('a', 1)
++    cache.set('b', 2)
++    assert.equal(cache.get('a'), 1)
++    assert.equal(cache.get('b'), 2)
++    assert.equal(cache.size, 2)
++  })
++
++  test('eviction when limit reached', () => {
++    const cache = new LruCache(2)
++    cache.set('a', { v: 1 })
++    cache.set('b', { v: 2 })
++    const evicted = cache.set('c', { v: 3 })
++    // 'a' was the oldest, should be evicted
++    assert.ok(evicted !== null)
++    assert.equal(evicted.v, 1)
++    assert.equal(cache.get('a'), undefined)
++    assert.equal(cache.size, 2)
++  })
++
++  test('get promotes to most recently used', () => {
++    const cache = new LruCache(2)
++    cache.set('a', 1)
++    cache.set('b', 2)
++    // Access 'a' to promote it
++    cache.get('a')
++    // Now 'b' is oldest
++    const evicted = cache.set('c', 3)
++    assert.equal(evicted, 2) // b was evicted and returned
++    assert.equal(cache.get('b'), undefined) // b was evicted
++    assert.equal(cache.get('a'), 1) // a was promoted
++    assert.equal(cache.get('c'), 3)
++  })
++
++  test('overwriting existing key does not evict', () => {
++    const cache = new LruCache(2)
++    cache.set('a', 1)
++    cache.set('b', 2)
++    const evicted = cache.set('a', 10)
++    assert.equal(evicted, null)
++    assert.equal(cache.get('a'), 10)
++    assert.equal(cache.size, 2)
++  })
++
++  test('has returns correct values', () => {
++    const cache = new LruCache(3)
++    cache.set('x', 42)
++    assert.equal(cache.has('x'), true)
++    assert.equal(cache.has('y'), false)
++  })
++
++  test('delete removes entry', () => {
++    const cache = new LruCache(3)
++    cache.set('x', 42)
++    cache.delete('x')
++    assert.equal(cache.get('x'), undefined)
++    assert.equal(cache.size, 0)
++  })
++
++  test('clear empties cache', () => {
++    const cache = new LruCache(3)
++    cache.set('a', 1)
++    cache.set('b', 2)
++    cache.clear()
++    assert.equal(cache.size, 0)
++  })
++
++  test('evict removes without promotion', () => {
++    const cache = new LruCache(3)
++    cache.set('a', 1)
++    cache.set('b', 2)
++    const entry = cache.evict('a')
++    assert.equal(entry, 1)
++    assert.equal(cache.get('a'), undefined)
++    assert.equal(cache.size, 1)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// TokenBucket
++// ---------------------------------------------------------------------------
++
++describe('TokenBucket', () => {
++  test('starts full and allows burst', () => {
++    const bucket = new TokenBucket(5)
++    for (let i = 0; i < 5; i++) {
++      assert.equal(bucket.consume(), true)
++    }
++    // Should be empty now
++    assert.equal(bucket.consume(), false)
++  })
++
++  test('refills over time', async () => {
++    const bucket = new TokenBucket(10)
++    // Drain the bucket
++    for (let i = 0; i < 10; i++) {
++      bucket.consume()
++    }
++    assert.equal(bucket.consume(), false)
++    // Wait for tokens to refill
++    await sleep(200)
++    // Should have ~2 tokens after 200ms at 10/s
++    assert.equal(bucket.consume(), true)
++  })
++
++  test('tokens capped at rate', async () => {
++    const bucket = new TokenBucket(3)
++    // Wait long enough to theoretically over-fill
++    await sleep(500)
++    // Should still only have 3 tokens max
++    let consumed = 0
++    while (bucket.consume()) consumed++
++    assert.equal(consumed, 3)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// SamplingEngine – shouldEmit
++// ---------------------------------------------------------------------------
++
++describe('SamplingEngine', () => {
++  test('no rules passes everything through', () => {
++    const engine = new SamplingEngine({ rules: [] }, { info: 30 })
++    const result = engine.shouldEmit(30, 'hello')
++    assert.equal(result.emit, true)
++    assert.equal(result.meta, null) // no rule for this level => no meta
++  })
++
++  test('probability with custom randomFn', () => {
++    let callCount = 0
++    const engine = new SamplingEngine({
++      rules: [{ level: 'info', method: 'probability', value: 0.5 }],
++      randomFn: () => {
++        callCount++
++        return callCount <= 3 ? 0.1 : 0.9 // first 3 pass, rest fail
++      }
++    }, { info: 30 })
++
++    const results = []
++    for (let i = 0; i < 6; i++) {
++      results.push(engine.shouldEmit(30, 'msg').emit)
++    }
++    assert.deepEqual(results, [true, true, true, false, false, false])
++  })
++
++  test('probability metadata contains method and value', () => {
++    const engine = new SamplingEngine({
++      rules: [{ level: 'info', method: 'probability', value: 1.0 }],
++      randomFn: () => 0.5 // always passes
++    }, { info: 30 })
++
++    const result = engine.shouldEmit(30, 'msg')
++    assert.equal(result.emit, true)
++    assert.equal(result.meta.method, 'probability')
++    assert.equal(result.meta.value, 1.0)
++    assert.equal(result.meta.dropped, 0)
++  })
++
++  test('probability tracks dropped count', () => {
++    let calls = 0
++    const engine = new SamplingEngine({
++      rules: [{ level: 'info', method: 'probability', value: 0.5 }],
++      randomFn: () => {
++        calls++
++        // Drop first 3, then emit
++        return calls <= 3 ? 0.9 : 0.1
++      }
++    }, { info: 30 })
++
++    for (let i = 0; i < 3; i++) {
++      assert.equal(engine.shouldEmit(30, 'test').emit, false)
++    }
++    const result = engine.shouldEmit(30, 'test')
++    assert.equal(result.emit, true)
++    assert.equal(result.meta.dropped, 3)
++  })
++
++  test('every method emits every Nth log', () => {
++    const engine = new SamplingEngine({
++      rules: [{ level: 'debug', method: 'every', value: 3 }]
++    }, { debug: 20 })
++
++    const emitted = []
++    for (let i = 0; i < 10; i++) {
++      emitted.push(engine.shouldEmit(20, 'msg ' + i).emit)
++    }
++    // Counter starts at 0, increments to 1,2,3,...
++    // Emits when count % 3 === 0 → at counts 3, 6, 9
++    assert.deepEqual(emitted, [
++      false, false, true,  // count 1,2,3
++      false, false, true,  // count 4,5,6
++      false, false, true,  // count 7,8,9
++      false                // count 10
++    ])
++  })
++
++  test('every=1 emits every log', () => {
++    const engine = new SamplingEngine({
++      rules: [{ level: 'info', method: 'every', value: 1 }]
++    }, { info: 30 })
++
++    for (let i = 0; i < 5; i++) {
++      assert.equal(engine.shouldEmit(30, 'msg').emit, true)
++    }
++  })
++
++  test('every metadata contains method, value and dropped count', () => {
++    const engine = new SamplingEngine({
++      rules: [{ level: 'info', method: 'every', value: 3 }]
++    }, { info: 30 })
++
++    // First 2 are dropped, 3rd is emitted
++    engine.shouldEmit(30, 'a')
++    engine.shouldEmit(30, 'b')
++    const result = engine.shouldEmit(30, 'c')
++    assert.equal(result.emit, true)
++    assert.equal(result.meta.method, 'every')
++    assert.equal(result.meta.value, 3)
++    assert.equal(result.meta.dropped, 2)
++  })
++
++  test('rate method uses token bucket', () => {
++    const engine = new SamplingEngine({
++      rules: [{ level: 'warn', method: 'rate', rate: 3 }]
++    }, { warn: 40 })
++
++    // Should burst up to 3
++    assert.equal(engine.shouldEmit(40, 'a').emit, true)
++    assert.equal(engine.shouldEmit(40, 'b').emit, true)
++    assert.equal(engine.shouldEmit(40, 'c').emit, true)
++    // 4th should be dropped
++    assert.equal(engine.shouldEmit(40, 'd').emit, false)
++  })
++
++  test('rate metadata contains method, rate and dropped count', () => {
++    const engine = new SamplingEngine({
++      rules: [{ level: 'info', method: 'rate', rate: 2 }]
++    }, { info: 30 })
++
++    const result = engine.shouldEmit(30, 'msg')
++    assert.equal(result.emit, true)
++    assert.equal(result.meta.method, 'rate')
++    assert.equal(result.meta.rate, 2)
++    assert.equal(result.meta.dropped, 0)
++  })
++
++  test('levels without rules pass through', () => {
++    const engine = new SamplingEngine({
++      rules: [{ level: 'info', method: 'probability', value: 0 }],
++      randomFn: () => 0.5
++    }, { info: 30, warn: 40 })
++
++    // info should be dropped (probability 0)
++    assert.equal(engine.shouldEmit(30, 'test').emit, false)
++    // warn has no rule, should pass through
++    const result = engine.shouldEmit(40, 'test')
++    assert.equal(result.emit, true)
++    assert.equal(result.meta, null)
++  })
++
++  test('destroy cleans up resources', () => {
++    const engine = new SamplingEngine({
++      rules: [{ level: 'info', method: 'every', value: 2 }],
++      dedupe: { enabled: true, ttlMs: 1000, maxKeys: 10 }
++    }, { info: 30 })
++
++    engine.destroy()
++    assert.equal(engine._rulesByLevelNum.size, 0)
++    assert.equal(engine._counters.size, 0)
++    assert.equal(engine._sweepInterval, null)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// Deduplication
++// ---------------------------------------------------------------------------
++
++describe('SamplingEngine deduplication', () => {
++  test('suppresses duplicate messages within TTL', () => {
++    const engine = new SamplingEngine({
++      dedupe: { enabled: true, ttlMs: 5000, maxKeys: 100 }
++    }, {})
++
++    const first = engine.shouldEmit(30, 'duplicate msg')
++    assert.equal(first.emit, true)
++
++    // Same message again should be suppressed
++    const second = engine.shouldEmit(30, 'duplicate msg')
++    assert.equal(second.emit, false)
++
++    // Different message should pass
++    const diff = engine.shouldEmit(30, 'different msg')
++    assert.equal(diff.emit, true)
++  })
++
++  test('dedupe allows after TTL expiry', async () => {
++    const engine = new SamplingEngine({
++      dedupe: { enabled: true, ttlMs: 100, maxKeys: 100 }
++    }, {})
++
++    engine.shouldEmit(30, 'ttl-test')
++    assert.equal(engine.shouldEmit(30, 'ttl-test').emit, false)
++
++    await sleep(150)
++
++    // After TTL, same message is allowed again
++    const result = engine.shouldEmit(30, 'ttl-test')
++    assert.equal(result.emit, true)
++    engine.destroy()
++  })
++
++  test('LRU eviction generates summary', () => {
++    const engine = new SamplingEngine({
++      dedupe: { enabled: true, ttlMs: 60000, maxKeys: 2 }
++    }, {})
++
++    engine.shouldEmit(30, 'msg-a')  // cache: [a]
++    engine.shouldEmit(30, 'msg-a')  // suppress, a.count = 1
++    engine.shouldEmit(30, 'msg-b')  // cache: [a, b]
++    engine.shouldEmit(30, 'msg-c')  // evicts 'a' → summary
++
++    const summaries = engine.drainSummaries()
++    assert.equal(summaries.length, 1)
++    assert.ok(summaries[0].msg.includes('suppressed'))
++    assert.ok(summaries[0].msg.includes('1'))
++    engine.destroy()
++  })
++
++  test('dedupe with zero suppressed count does not generate summary on eviction', () => {
++    const engine = new SamplingEngine({
++      dedupe: { enabled: true, ttlMs: 60000, maxKeys: 2 }
++    }, {})
++
++    engine.shouldEmit(30, 'msg-a')  // cache: [a], count=0
++    engine.shouldEmit(30, 'msg-b')  // cache: [a, b]
++    engine.shouldEmit(30, 'msg-c')  // evicts 'a' but count=0 → no summary
++
++    const summaries = engine.drainSummaries()
++    assert.equal(summaries.length, 0)
++    engine.destroy()
++  })
++
++  test('sweep expired entries generates summaries', async () => {
++    const engine = new SamplingEngine({
++      dedupe: { enabled: true, ttlMs: 100, maxKeys: 100 }
++    }, {})
++
++    engine.shouldEmit(30, 'sweep-test')  // first occurrence
++    engine.shouldEmit(30, 'sweep-test')  // suppressed, count=1
++    engine.shouldEmit(30, 'sweep-test')  // suppressed, count=2
++
++    // Wait for sweep interval to fire (TTL=100ms, sweep=min(100,1000)=100ms)
++    await sleep(250)
++
++    const summaries = engine.drainSummaries()
++    assert.equal(summaries.length, 1)
++    assert.ok(summaries[0].msg.includes('suppressed'))
++    assert.ok(summaries[0].msg.includes('2'))
++    engine.destroy()
++  })
++})
++
++// ---------------------------------------------------------------------------
++// buildSamplingEngine
++// ---------------------------------------------------------------------------
++
++describe('buildSamplingEngine', () => {
++  test('returns null for null config', () => {
++    assert.equal(buildSamplingEngine(null, pino.levels), null)
++  })
++
++  test('returns null for empty config', () => {
++    assert.equal(buildSamplingEngine({}, pino.levels), null)
++  })
++
++  test('returns engine for valid rules config', () => {
++    const engine = buildSamplingEngine({
++      rules: [{ level: 'info', method: 'every', value: 5 }]
++    }, pino.levels)
++    assert.ok(engine instanceof SamplingEngine)
++    engine.destroy()
++  })
++
++  test('returns engine for valid dedupe config', () => {
++    const engine = buildSamplingEngine({
++      dedupe: { enabled: true }
++    }, pino.levels)
++    assert.ok(engine instanceof SamplingEngine)
++    engine.destroy()
++  })
++})
++
++// ---------------------------------------------------------------------------
++// Integration: pino({ sampling }) end-to-end
++// ---------------------------------------------------------------------------
++
++describe('sampling integration', () => {
++  test('no sampling option works normally', async () => {
++    const stream = sink()
++    const logger = pino(stream)
++    logger.info('hello')
++    const result = await once(stream, 'data')
++    assert.equal(result.msg, 'hello')
++    assert.equal(result.level, 30)
++  })
++
++  test('probability=1 emits all logs', async () => {
++    const stream = sink()
++    const logger = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'probability', value: 1.0 }]
++      }
++    }, stream)
++
++    const expected = 10
++    let count = 0
++    const done = new Promise((resolve) => {
++      stream.on('data', () => {
++        count++
++        if (count === expected) resolve()
++      })
++    })
++
++    for (let i = 0; i < expected; i++) {
++      logger.info('test')
++    }
++
++    await done
++    assert.equal(count, expected)
++  })
++
++  test('probability=0 emits no logs', async () => {
++    const stream = sink()
++    const logger = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'probability', value: 0 }]
++      }
++    }, stream)
++
++    let count = 0
++    stream.on('data', () => { count++ })
++
++    for (let i = 0; i < 50; i++) {
++      logger.info('should be dropped')
++    }
++
++    await sleep(50)
++    assert.equal(count, 0)
++  })
++
++  test('every-N sampling reduces output', async () => {
++    const stream = sink()
++    const logger = pino({
++      level: 'debug',
++      sampling: {
++        rules: [{ level: 'debug', method: 'every', value: 5 }]
++      }
++    }, stream)
++
++    let count = 0
++    stream.on('data', () => { count++ })
++
++    for (let i = 0; i < 20; i++) {
++      logger.debug('test')
++    }
++
++    await sleep(50)
++    assert.equal(count, 4) // 20 / 5 = 4
++  })
++
++  test('sampling metadata is injected via merge object', async () => {
++    const stream = sink()
++    const logger = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'every', value: 2 }]
++      }
++    }, stream)
++
++    // First log is dropped (1 % 2 !== 0), second is emitted (2 % 2 === 0)
++    logger.info({ foo: 'bar' }, 'first')
++    logger.info({ foo: 'baz' }, 'second')
++
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, 'second')
++    assert.equal(data.foo, 'baz')
++    assert.ok(data._sampling, 'should have _sampling metadata')
++    assert.equal(data._sampling.method, 'every')
++    assert.equal(data._sampling.value, 2)
++    assert.equal(data._sampling.dropped, 1)
++  })
++
++  test('custom metaKey changes metadata property name', async () => {
++    const stream = sink()
++    const logger = pino({
++      sampling: {
++        metaKey: '__sample',
++        rules: [{ level: 'info', method: 'probability', value: 1.0 }]
++      }
++    }, stream)
++
++    logger.info({ data: 1 }, 'test')
++    const data = await once(stream, 'data')
++    assert.equal(data.__sample.method, 'probability')
++    assert.equal(data._sampling, undefined)
++  })
++
++  test('levels without rules are not affected', async () => {
++    const stream = sink()
++    const logger = pino({
++      level: 'trace',
++      sampling: {
++        rules: [{ level: 'debug', method: 'probability', value: 0 }]
++      }
++    }, stream)
++
++    // debug should be fully suppressed, info should pass normally
++    logger.debug('suppressed')
++    logger.info('passed')
++
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, 'passed')
++    assert.equal(data.level, 30) // info
++  })
++
++  test('error level is not sampled by default', async () => {
++    const stream = sink()
++    const logger = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'probability', value: 0 }]
++      }
++    }, stream)
++
++    logger.info('dropped')
++    logger.error('not dropped')
++
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, 'not dropped')
++    assert.equal(data.level, 50)
++  })
++
++  test('rate limiting allows burst then blocks', async () => {
++    const stream = sink()
++    const logger = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'rate', rate: 3 }]
++      }
++    }, stream)
++
++    let count = 0
++    stream.on('data', () => { count++ })
++
++    // Send 10 logs rapidly
++    for (let i = 0; i < 10; i++) {
++      logger.info('burst')
++    }
++
++    await sleep(50)
++    assert.equal(count, 3) // only burst of 3 should pass
++  })
++
++  test('string-only logs work with sampling', async () => {
++    const stream = sink()
++    const logger = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'every', value: 1 }]
++      }
++    }, stream)
++
++    logger.info('plain string')
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, 'plain string')
++  })
++
++  test('format string logs work with sampling', async () => {
++    const stream = sink()
++    const logger = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'every', value: 1 }]
++      }
++    }, stream)
++
++    logger.info('hello %s', 'world')
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, 'hello world')
++  })
++
++  test('msgPrefix works with sampling', async () => {
++    const stream = sink()
++    const logger = pino({
++      msgPrefix: '[PREFIX] ',
++      sampling: {
++        rules: [{ level: 'info', method: 'every', value: 1 }]
++      }
++    }, stream)
++
++    logger.info('test message')
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, '[PREFIX] test message')
++  })
++})
++
++// ---------------------------------------------------------------------------
++// Integration: child loggers
++// ---------------------------------------------------------------------------
++
++describe('sampling child loggers', () => {
++  test('child inherits parent sampling', async () => {
++    const stream = sink()
++    const parent = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'probability', value: 0 }]
++      }
++    }, stream)
++
++    const child = parent.child({ child: true })
++
++    let count = 0
++    stream.on('data', () => { count++ })
++
++    for (let i = 0; i < 20; i++) {
++      child.info('should be dropped')
++    }
++
++    await sleep(50)
++    assert.equal(count, 0)
++  })
++
++  test('child can override sampling with new config', async () => {
++    const stream = sink()
++    const parent = pino({
++      level: 'trace',
++      sampling: {
++        rules: [{ level: 'debug', method: 'probability', value: 0 }]
++      }
++    }, stream)
++
++    // Child overrides to emit all debug logs (sampling goes in options, 2nd arg)
++    const child = parent.child({}, {
++      sampling: {
++        rules: [{ level: 'debug', method: 'probability', value: 1.0 }]
++      }
++    })
++
++    child.debug({ test: true }, 'from child')
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, 'from child')
++    assert.equal(data.test, true)
++  })
++
++  test('child can disable sampling with null', async () => {
++    const stream = sink()
++    const parent = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'probability', value: 0 }]
++      }
++    }, stream)
++
++    // Disable sampling on child (sampling goes in options, 2nd arg)
++    const child = parent.child({}, { sampling: null })
++
++    child.info('should pass')
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, 'should pass')
++  })
++
++  test('child can disable sampling with false', async () => {
++    const stream = sink()
++    const parent = pino({
++      sampling: {
++        rules: [{ level: 'info', method: 'probability', value: 0 }]
++      }
++    }, stream)
++
++    const child = parent.child({}, { sampling: false })
++
++    child.info('should pass')
++    const data = await once(stream, 'data')
++    assert.equal(data.msg, 'should pass')
++  })
++})
++
++// ---------------------------------------------------------------------------
++// Integration: pino constructor validation
++// ---------------------------------------------------------------------------
++
++describe('sampling pino constructor validation', () => {
++  test('invalid sampling config throws at construction', () => {
++    assert.throws(
++      () => pino({
++        sampling: { rules: [{ level: 'info', method: 'bad' }] }
++      }),
++      /method must be "probability", "rate", or "every"/
++    )
++  })
++
++  test('invalid probability throws at construction', () => {
++    assert.throws(
++      () => pino({
++        sampling: { rules: [{ level: 'info', method: 'probability', value: -1 }] }
++      }),
++      /value for probability must be a number between 0 and 1/
++    )
++  })
++
++  test('invalid level name throws at construction', () => {
++    assert.throws(
++      () => pino({
++        sampling: { rules: [{ level: 'nonexistent', method: 'every', value: 1 }] }
++      }),
++      /not a known level/
++    )
++  })
++})
