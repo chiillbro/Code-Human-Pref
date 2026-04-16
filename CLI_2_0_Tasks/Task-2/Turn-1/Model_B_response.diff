@@ -1,0 +1,566 @@
+diff --git a/lib/levels.js b/lib/levels.js
+index 67e6a99..5b44d13 100644
+--- a/lib/levels.js
++++ b/lib/levels.js
+@@ -7,9 +7,11 @@ const {
+   streamSym,
+   formattersSym,
+   hooksSym,
+-  levelCompSym
++  levelCompSym,
++  samplingSym
+ } = require('./symbols')
+ const { noop, genLog } = require('./tools')
++const { dedupeKey } = require('./sampling')
+ const { DEFAULT_LEVELS, SORTING_ORDER } = require('./constants')
+ 
+ const levelMethods = {
+@@ -56,6 +58,41 @@ function genLsCache (instance) {
+   return instance
+ }
+ 
++/**
++ * Wraps a level log method with a sampling/dedupe gate. Runs BEFORE the
++ * wrapped fn, so suppressed logs never hit format()/asJson()/write().
++ *
++ * @param {Function} fn the underlying level log method (already hook-aware)
++ * @param {{sampler: Function|null, deduper: Function|null}} rule
++ * @returns {Function}
++ */
++function wrapWithSampling (fn, rule) {
++  const sampler = rule.sampler
++  const deduper = rule.deduper
++  // Fast paths specialised per rule shape to avoid branching in the hot path.
++  if (sampler && !deduper) {
++    return function sampledLog (...args) {
++      if (sampler() === false) return
++      return fn.apply(this, args)
++    }
++  }
++  if (deduper && !sampler) {
++    return function dedupedLog (...args) {
++      const res = deduper(dedupeKey(args))
++      if (res.summary !== null) fn.call(this, res.summary)
++      if (res.allow === false) return
++      return fn.apply(this, args)
++    }
++  }
++  return function sampledDedupedLog (...args) {
++    if (sampler() === false) return
++    const res = deduper(dedupeKey(args))
++    if (res.summary !== null) fn.call(this, res.summary)
++    if (res.allow === false) return
++    return fn.apply(this, args)
++  }
++}
++
+ function isStandardLevel (level, useOnlyCustomLevels) {
+   if (useOnlyCustomLevels) {
+     return false
+@@ -86,13 +123,19 @@ function setLevel (level) {
+   const useOnlyCustomLevelsVal = this[useOnlyCustomLevelsSym]
+   const levelComparison = this[levelCompSym]
+   const hook = this[hooksSym].logMethod
++  const sampling = this[samplingSym]
+ 
+   for (const key in values) {
+     if (levelComparison(values[key], levelVal) === false) {
+       this[key] = noop
+       continue
+     }
+-    this[key] = isStandardLevel(key, useOnlyCustomLevelsVal) ? levelMethods[key](hook) : genLog(values[key], hook)
++    const fn = isStandardLevel(key, useOnlyCustomLevelsVal) ? levelMethods[key](hook) : genLog(values[key], hook)
++    // Only pay the wrapping cost when a sampling/dedupe rule exists for this level.
++    // Levels without a rule keep the unwrapped fast path.
++    this[key] = (sampling !== null && sampling !== undefined && sampling[key] !== undefined)
++      ? wrapWithSampling(fn, sampling[key])
++      : fn
+   }
+ 
+   this.emit(
+diff --git a/lib/proto.js b/lib/proto.js
+index a6ba722..9b4becf 100644
+--- a/lib/proto.js
++++ b/lib/proto.js
+@@ -27,8 +27,10 @@ const {
+   formatOptsSym,
+   stringifiersSym,
+   msgPrefixSym,
+-  hooksSym
++  hooksSym,
++  samplingSym
+ } = require('./symbols')
++const { buildSamplingState } = require('./sampling')
+ const {
+   getLevel,
+   setLevel,
+@@ -169,7 +171,19 @@ function child (bindings, options) {
+   }
+ 
+   instance[chindingsSym] = asChindings(instance, bindings)
+-  if ((options.level !== undefined && options.level !== this.level) || options.hasOwnProperty('customLevels')) {
++
++  // Child loggers inherit the parent's sampling state via prototype by default,
++  // which means parent-defined counters/dedupers are shared across children
++  // (desired for rateLimit semantics). When the child supplies its own
++  // `sampling` option, build a fresh state scoped to this child.
++  const samplingOverride = options.hasOwnProperty('sampling')
++    ? buildSamplingState(options.sampling, instance.levels || this.levels)
++    : undefined
++  if (samplingOverride !== undefined) {
++    instance[samplingSym] = samplingOverride
++  }
++
++  if ((options.level !== undefined && options.level !== this.level) || options.hasOwnProperty('customLevels') || samplingOverride !== undefined) {
+     const childLevel = options.level || this.level
+     instance[setLevelSym](childLevel)
+   }
+diff --git a/lib/sampling.js b/lib/sampling.js
+new file mode 100644
+index 0000000..ae2f6ce
+--- /dev/null
++++ b/lib/sampling.js
+@@ -0,0 +1,173 @@
++'use strict'
++
++/**
++ * Sampling and deduplication utilities for pino.
++ *
++ * These are invoked BEFORE serialization (and before any format() call)
++ * by a per-level wrapper installed in `setLevel()`. When sampling is not
++ * configured, no wrappers are installed so the hot path is unaffected.
++ */
++
++const SAMPLING_TYPES = ['probabilistic', 'rateLimit', 'everyN']
++
++/**
++ * Builds a `shouldLog()` predicate for a single per-level rule.
++ * Returns null if the rule does not define a sampler (dedupe-only).
++ */
++function createSampler (rule) {
++  if (rule == null) return null
++  const type = rule.type
++  if (type === undefined) return null
++  if (!SAMPLING_TYPES.includes(type)) {
++    throw Error(`invalid sampling rule type "${type}" - expected one of ${SAMPLING_TYPES.join(', ')}`)
++  }
++
++  if (type === 'probabilistic') {
++    const rate = typeof rule.rate === 'number' ? rule.rate : 1
++    if (rate < 0 || rate > 1) {
++      throw Error('probabilistic sampling rate must be between 0 and 1')
++    }
++    if (rate >= 1) return () => true
++    if (rate <= 0) return () => false
++    return () => Math.random() < rate
++  }
++
++  if (type === 'everyN') {
++    const n = rule.n | 0
++    if (n <= 0) throw Error('everyN sampling requires positive integer n')
++    if (n === 1) return () => true
++    let counter = 0
++    return () => {
++      counter++
++      if (counter >= n) {
++        counter = 0
++        return true
++      }
++      return false
++    }
++  }
++
++  // rateLimit: allow at most `maxPerInterval` logs per `intervalMs`.
++  const maxPerInterval = rule.maxPerInterval | 0
++  const intervalMs = rule.intervalMs | 0
++  if (maxPerInterval <= 0) throw Error('rateLimit sampling requires positive maxPerInterval')
++  if (intervalMs <= 0) throw Error('rateLimit sampling requires positive intervalMs')
++
++  let windowStart = 0
++  let count = 0
++  return () => {
++    const now = Date.now()
++    if (now - windowStart >= intervalMs) {
++      windowStart = now
++      count = 0
++    }
++    if (count < maxPerInterval) {
++      count++
++      return true
++    }
++    return false
++  }
++}
++
++/**
++ * Extracts a dedupe key from the arguments passed to a log method.
++ * Falls back to '' when no stable key can be derived (treated as
++ * "never match" by the deduper).
++ */
++function dedupeKey (args) {
++  const a0 = args[0]
++  if (typeof a0 === 'string') return a0
++  if (a0 && typeof a0 === 'object') {
++    if (a0 instanceof Error) return 'err:' + (a0.message || a0.name || '')
++    if (typeof args[1] === 'string') return args[1]
++    if (typeof a0.msg === 'string') return a0.msg
++    if (a0.err && typeof a0.err.message === 'string') return 'err:' + a0.err.message
++  }
++  return ''
++}
++
++/**
++ * Builds a deduper that suppresses messages with an identical key within
++ * `windowMs`. Returns `{ allow, summary }` per call where `summary`, when
++ * non-null, is the text that should replace the current log describing the
++ * number of suppressed occurrences since the window opened.
++ */
++function createDeduper (opts) {
++  const windowMs = opts.windowMs | 0
++  if (windowMs <= 0) throw Error('dedupe requires positive windowMs')
++  const summaryTemplate = typeof opts.summary === 'string'
++    ? opts.summary
++    : 'message repeated {count} times in {window}ms: {msg}'
++
++  const seen = new Map() // key -> { expires, count }
++
++  function format (key, count) {
++    return summaryTemplate
++      .replace('{count}', String(count))
++      .replace('{window}', String(windowMs))
++      .replace('{msg}', key)
++  }
++
++  return function dedupe (key) {
++    if (key === '') return { allow: true, summary: null }
++    const now = Date.now()
++    const entry = seen.get(key)
++    if (entry === undefined || entry.expires <= now) {
++      // emit a summary for the prior expired window if we suppressed anything
++      let summary = null
++      if (entry !== undefined && entry.count > 1) {
++        summary = format(key, entry.count - 1)
++      }
++      seen.set(key, { expires: now + windowMs, count: 1 })
++      return { allow: true, summary }
++    }
++    entry.count++
++    return { allow: false, summary: null }
++  }
++}
++
++/**
++ * Given the user-supplied `sampling` option and the logger level map,
++ * returns an object shaped as `{ [levelLabel]: { sampler, deduper } }`
++ * plus a `hasAny` flag so `setLevel()` can skip the wrapping loop when no
++ * rule applies.
++ */
++function buildSamplingState (samplingOpts, levels) {
++  if (samplingOpts == null) return null
++
++  const rules = samplingOpts.rules || {}
++  const dedupe = samplingOpts.dedupe || null
++
++  // dedupe.levels defaults to "every non-silent level"
++  let dedupeLevels = null
++  if (dedupe) {
++    if (Array.isArray(dedupe.levels)) {
++      dedupeLevels = new Set(dedupe.levels)
++    }
++  }
++
++  const state = {}
++  let hasAny = false
++
++  for (const label in levels.values) {
++    const hasRule = Object.prototype.hasOwnProperty.call(rules, label)
++    const applyDedupe = dedupe !== null && (dedupeLevels === null || dedupeLevels.has(label))
++    if (!hasRule && !applyDedupe) continue
++
++    const sampler = hasRule ? createSampler(rules[label]) : null
++    const deduper = applyDedupe ? createDeduper(dedupe) : null
++    if (sampler === null && deduper === null) continue
++
++    state[label] = { sampler, deduper }
++    hasAny = true
++  }
++
++  return hasAny ? state : null
++}
++
++module.exports = {
++  buildSamplingState,
++  createSampler,
++  createDeduper,
++  dedupeKey
++}
+diff --git a/lib/symbols.js b/lib/symbols.js
+index d745bd1..941b65c 100644
+--- a/lib/symbols.js
++++ b/lib/symbols.js
+@@ -29,6 +29,7 @@ const nestedKeySym = Symbol('pino.nestedKey')
+ const nestedKeyStrSym = Symbol('pino.nestedKeyStr')
+ const mixinMergeStrategySym = Symbol('pino.mixinMergeStrategy')
+ const msgPrefixSym = Symbol('pino.msgPrefix')
++const samplingSym = Symbol('pino.sampling')
+ 
+ const wildcardFirstSym = Symbol('pino.wildcardFirst')
+ 
+@@ -72,5 +73,6 @@ module.exports = {
+   nestedKeyStrSym,
+   mixinMergeStrategySym,
+   msgPrefixSym,
++  samplingSym,
+   transportUsesMultistreamSym
+ }
+diff --git a/pino.d.ts b/pino.d.ts
+index 434dddd..534a42d 100644
+--- a/pino.d.ts
++++ b/pino.d.ts
+@@ -347,8 +347,45 @@ declare namespace pino {
+         <T, TMsg extends string = string>(obj: [T] extends [object] ? T & LogFnFields : T, msg?: T extends string ? never : TMsg, ...args: ParseLogFnArgs<TMsg> extends [unknown, ...unknown[]] ? ParseLogFnArgs<TMsg> : unknown[]): void;
+     }
+ 
++    /**
++     * Per-level sampling rule. Evaluated BEFORE serialization, so suppressed
++     * logs never pay the cost of formatting or writing. When `sampling` is
++     * not supplied to the logger, there is zero overhead on the hot path.
++     */
++    export type SamplingRule =
++      | { type: 'probabilistic'; rate: number }
++      | { type: 'rateLimit'; maxPerInterval: number; intervalMs: number }
++      | { type: 'everyN'; n: number };
++
++    export interface DedupeOptions {
++      /** Time window (ms) in which repeated identical messages are suppressed. */
++      windowMs: number;
++      /** Restrict dedupe to these level labels. Defaults to all levels. */
++      levels?: string[];
++      /**
++       * Template string for the summary emitted when a window closes with
++       * suppressed messages. Supports `{count}`, `{window}`, `{msg}`
++       * placeholders. Defaults to
++       * `message repeated {count} times in {window}ms: {msg}`.
++       */
++      summary?: string;
++    }
++
++    export interface SamplingOptions {
++      /** Per-level sampling rules, keyed by level label (e.g. `info`, `debug`). */
++      rules?: Record<string, SamplingRule>;
++      /** Suppress repeated identical messages within a time window. */
++      dedupe?: DedupeOptions;
++    }
++
+     export interface LoggerOptions<CustomLevels extends string = never, UseOnlyCustomLevels extends boolean = boolean> {
+       transport?: TransportSingleOptions | TransportMultiOptions | TransportPipelineOptions
++      /**
++       * Control log flow with per-level sampling and/or deduplication.
++       * Child loggers inherit parent rules but can override by passing their
++       * own `sampling` option to `.child()`.
++       */
++      sampling?: SamplingOptions;
+       /**
+        * Avoid error causes by circular references in the object tree. Default: `true`.
+        */
+@@ -718,6 +755,8 @@ declare namespace pino {
+       };
+       redact?: string[] | redactOptions;
+       msgPrefix?: string
++      /** Override the parent logger's sampling rules for this child. */
++      sampling?: SamplingOptions;
+     }
+ 
+     /**
+diff --git a/pino.js b/pino.js
+index 9720bcb..b750f85 100644
+--- a/pino.js
++++ b/pino.js
+@@ -44,8 +44,10 @@ const {
+   nestedKeyStrSym,
+   mixinMergeStrategySym,
+   msgPrefixSym,
++  samplingSym,
+   transportUsesMultistreamSym
+ } = symbols
++const { buildSamplingState } = require('./lib/sampling')
+ const { epochTime, nullTime } = time
+ const { pid } = process
+ const hostname = os.hostname()
+@@ -114,7 +116,8 @@ function pino (...args) {
+     depthLimit,
+     edgeLimit,
+     onChild,
+-    msgPrefix
++    msgPrefix,
++    sampling
+   } = opts
+ 
+   const stringifySafe = configure({
+@@ -166,6 +169,8 @@ function pino (...args) {
+   assertDefaultLevelFound(level, customLevels, useOnlyCustomLevels)
+   const levels = mappings(customLevels, useOnlyCustomLevels)
+ 
++  const samplingState = buildSamplingState(sampling, levels)
++
+   if (stream && stream[transportUsesMultistreamSym] === true) {
+     let sampleLabel = typeof level === 'string' ? level : undefined
+     if (!sampleLabel || levels[sampleLabel] === undefined) {
+@@ -220,7 +225,8 @@ function pino (...args) {
+     [hooksSym]: hooks,
+     silent: noop,
+     onChild,
+-    [msgPrefixSym]: msgPrefix
++    [msgPrefixSym]: msgPrefix,
++    [samplingSym]: samplingState
+   })
+ 
+   Object.setPrototypeOf(instance, proto())
+diff --git a/test/sampling.test.js b/test/sampling.test.js
+new file mode 100644
+index 0000000..ea880a5
+--- /dev/null
++++ b/test/sampling.test.js
+@@ -0,0 +1,142 @@
++'use strict'
++
++const test = require('node:test')
++const assert = require('node:assert')
++
++const { sink, sleep } = require('./helper')
++const pino = require('../')
++
++test('probabilistic sampling with rate=0 drops everything', () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const logger = pino({
++    sampling: { rules: { info: { type: 'probabilistic', rate: 0 } } }
++  }, stream)
++  for (let i = 0; i < 50; i++) logger.info('hi %d', i)
++  assert.equal(received.length, 0)
++})
++
++test('probabilistic sampling with rate=1 emits everything', () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const logger = pino({
++    sampling: { rules: { info: { type: 'probabilistic', rate: 1 } } }
++  }, stream)
++  for (let i = 0; i < 25; i++) logger.info('hi')
++  assert.equal(received.length, 25)
++})
++
++test('everyN emits 1 in N logs', () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const logger = pino({
++    sampling: { rules: { info: { type: 'everyN', n: 5 } } }
++  }, stream)
++  for (let i = 0; i < 20; i++) logger.info('hi')
++  assert.equal(received.length, 4)
++})
++
++test('rateLimit caps emissions within a window', () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const logger = pino({
++    sampling: {
++      rules: { info: { type: 'rateLimit', maxPerInterval: 3, intervalMs: 10_000 } }
++    }
++  }, stream)
++  for (let i = 0; i < 100; i++) logger.info('hi')
++  assert.equal(received.length, 3)
++})
++
++test('dedupe suppresses repeated identical messages and emits a summary', async () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const logger = pino({
++    sampling: { dedupe: { windowMs: 50, levels: ['error'] } }
++  }, stream)
++  for (let i = 0; i < 10; i++) logger.error('same error')
++  // only the first should go through while window is open
++  assert.equal(received.length, 1)
++  assert.equal(received[0].msg, 'same error')
++
++  // wait for window to expire and log again to trigger the summary
++  await sleep(80)
++  logger.error('same error')
++  // summary from prior window + the fresh log
++  assert.equal(received.length, 3)
++  assert.ok(received[1].msg.includes('repeated 9 times'))
++  assert.equal(received[2].msg, 'same error')
++})
++
++test('dedupe does not affect distinct messages', () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const logger = pino({
++    sampling: { dedupe: { windowMs: 1000 } }
++  }, stream)
++  logger.info('a')
++  logger.info('b')
++  logger.info('c')
++  assert.equal(received.length, 3)
++})
++
++test('levels without a rule keep the fast path and are unaffected', () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const logger = pino({
++    level: 'trace',
++    sampling: { rules: { debug: { type: 'everyN', n: 100 } } }
++  }, stream)
++  for (let i = 0; i < 5; i++) logger.info('hi')
++  for (let i = 0; i < 5; i++) logger.debug('dbg')
++  assert.equal(received.filter(r => r.msg === 'hi').length, 5)
++  assert.equal(received.filter(r => r.msg === 'dbg').length, 0)
++})
++
++test('child inherits parent sampling rules', () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const parent = pino({
++    sampling: { rules: { info: { type: 'everyN', n: 3 } } }
++  }, stream)
++  const child = parent.child({ component: 'x' })
++  // parent + child share the same counter (inherited via prototype)
++  for (let i = 0; i < 6; i++) child.info('hi')
++  assert.equal(received.length, 2)
++})
++
++test('child can override parent sampling rules', () => {
++  const stream = sink()
++  const received = []
++  stream.on('data', (d) => received.push(d))
++  const parent = pino({
++    sampling: { rules: { info: { type: 'probabilistic', rate: 0 } } }
++  }, stream)
++  const child = parent.child({}, {
++    sampling: { rules: { info: { type: 'probabilistic', rate: 1 } } }
++  })
++  child.info('child-msg')
++  parent.info('parent-msg')
++  assert.equal(received.length, 1)
++  assert.equal(received[0].msg, 'child-msg')
++})
++
++test('invalid sampling type throws', () => {
++  assert.throws(() => pino({
++    sampling: { rules: { info: { type: 'bogus' } } }
++  }), /invalid sampling rule type/)
++})
++
++test('probabilistic rate out of range throws', () => {
++  assert.throws(() => pino({
++    sampling: { rules: { info: { type: 'probabilistic', rate: 2 } } }
++  }), /probabilistic sampling rate/)
++})

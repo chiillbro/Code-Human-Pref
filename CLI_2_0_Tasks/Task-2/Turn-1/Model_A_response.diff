@@ -1,0 +1,936 @@
+diff --git a/docs/api.md b/docs/api.md
+index e05bca7..8717e93 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -485,6 +485,60 @@ child.info('User authenticated!')
+ // >  [HTTP] User authenticated!
+ ```
+ 
++<a id=opt-sampling></a>
++#### `sampling` (Object)
++
++Default: `undefined`
++
++Per-level sampling rules for reducing log volume in high-throughput scenarios.
++Keys are level labels (e.g. `info`, `debug`, custom level names) or `'*'` as a
++fallback for any level not explicitly configured. Each value is a rule object
++(or a shorthand — see below).
++
++When `sampling` is not configured, the logging hot path is completely
++unaffected — the generated log methods are byte-for-byte identical to a logger
++without the option. When a rule is configured for a level, the sampling
++decision is taken *before* message formatting and serialization, so dropped
++logs incur almost no cost.
++
++Rule properties (all optional, applied in the order listed):
++
++* `every` (Integer): emit only every Nth call (the 1st, N+1th, 2N+1th, ...).
++* `rate` (Number): probability between `0` and `1` that a call is emitted.
++* `limit` (Integer) / `window` (Number): emit at most `limit` calls per
++  `window` milliseconds (fixed window).
++* `test` (Function): custom predicate `(args, level) => boolean` receiving the
++  raw log-method arguments. Return `false` to drop. `this` is the logger.
++* `dedupe` (Object): suppress repeated identical messages.
++  * `dedupe.window` (Number): deduplication window in milliseconds. The first
++    occurrence of a given key is emitted immediately; duplicates within the
++    window are dropped. When the window expires a single summary line is
++    emitted at the same level with a
++    `sampling: { suppressed: <n>, key: <key> }` property.
++  * `dedupe.key` (Function): optional `(args) => key` extractor. By default the
++    message format string is used (or `Error#message` if the first argument is
++    an `Error`).
++
++Shorthands: a number value is treated as `{ rate: <n> }`, a function value is
++treated as `{ test: <fn> }`, and `false`/`null` disables sampling for that
++level (useful when overriding on a child).
++
++```js
++const logger = pino({
++  sampling: {
++    debug: { rate: 0.05 },               // ~5% of debug logs
++    info:  { every: 10 },                // every 10th info log
++    warn:  { limit: 100, window: 1000 }, // max 100 warn logs / second
++    error: { dedupe: { window: 5000 } }, // collapse identical error storms
++    '*':   { rate: 1 }                   // everything else passes through
++  }
++})
++```
++
++Child loggers inherit the parent's sampling rules (and share their counters)
++by default. A child may override or disable individual levels via
++[`options.sampling`](#options-sampling).
++
+ <a id=opt-base></a>
+ #### `base` (Object)
+ 
+@@ -968,6 +1022,22 @@ child.info('message proxied!')
+ // >  [HTTP] [Proxy] message proxied!
+ ```
+ 
++<a id="options-sampling"></a>
++##### `options.sampling` (Object | null | false)
++
++Per-level sampling rules for the child logger. Rules are shallow-merged over
++the parent's rules (so you can override a single level) and the child gets
++its own independent counters. Pass `null` or `false` to disable sampling on
++the child entirely, or set an individual level to `false` to opt that level
++out of an inherited rule.
++
++```js
++const parent = pino({ sampling: { info: { rate: 0.1 }, debug: { every: 100 } } })
++const child = parent.child({}, { sampling: { info: false } }) // info unsampled, debug inherited
++```
++
++* See [`sampling` logger option](#opt-sampling)
++
+ ##### `options.redact` (Array | Object)
+ 
+ Setting `options.redact` to an array or object will override the parent `redact` options. To remove `redact` options inherited from the parent logger set this value as an empty array (`[]`).
+diff --git a/lib/levels.js b/lib/levels.js
+index 67e6a99..d288b16 100644
+--- a/lib/levels.js
++++ b/lib/levels.js
+@@ -7,14 +7,15 @@ const {
+   streamSym,
+   formattersSym,
+   hooksSym,
+-  levelCompSym
++  levelCompSym,
++  samplingSym
+ } = require('./symbols')
+ const { noop, genLog } = require('./tools')
+ const { DEFAULT_LEVELS, SORTING_ORDER } = require('./constants')
+ 
+ const levelMethods = {
+-  fatal: (hook) => {
+-    const logFatal = genLog(DEFAULT_LEVELS.fatal, hook)
++  fatal: (hook, sampler) => {
++    const logFatal = genLog(DEFAULT_LEVELS.fatal, hook, sampler)
+     return function (...args) {
+       const stream = this[streamSym]
+       logFatal.call(this, ...args)
+@@ -27,11 +28,11 @@ const levelMethods = {
+       }
+     }
+   },
+-  error: (hook) => genLog(DEFAULT_LEVELS.error, hook),
+-  warn: (hook) => genLog(DEFAULT_LEVELS.warn, hook),
+-  info: (hook) => genLog(DEFAULT_LEVELS.info, hook),
+-  debug: (hook) => genLog(DEFAULT_LEVELS.debug, hook),
+-  trace: (hook) => genLog(DEFAULT_LEVELS.trace, hook)
++  error: (hook, sampler) => genLog(DEFAULT_LEVELS.error, hook, sampler),
++  warn: (hook, sampler) => genLog(DEFAULT_LEVELS.warn, hook, sampler),
++  info: (hook, sampler) => genLog(DEFAULT_LEVELS.info, hook, sampler),
++  debug: (hook, sampler) => genLog(DEFAULT_LEVELS.debug, hook, sampler),
++  trace: (hook, sampler) => genLog(DEFAULT_LEVELS.trace, hook, sampler)
+ }
+ 
+ const nums = Object.keys(DEFAULT_LEVELS).reduce((o, k) => {
+@@ -86,13 +87,15 @@ function setLevel (level) {
+   const useOnlyCustomLevelsVal = this[useOnlyCustomLevelsSym]
+   const levelComparison = this[levelCompSym]
+   const hook = this[hooksSym].logMethod
++  const sampling = this[samplingSym]
+ 
+   for (const key in values) {
+     if (levelComparison(values[key], levelVal) === false) {
+       this[key] = noop
+       continue
+     }
+-    this[key] = isStandardLevel(key, useOnlyCustomLevelsVal) ? levelMethods[key](hook) : genLog(values[key], hook)
++    const sampler = sampling && sampling.samplers[values[key]]
++    this[key] = isStandardLevel(key, useOnlyCustomLevelsVal) ? levelMethods[key](hook, sampler) : genLog(values[key], hook, sampler)
+   }
+ 
+   this.emit(
+diff --git a/lib/proto.js b/lib/proto.js
+index a6ba722..357f945 100644
+--- a/lib/proto.js
++++ b/lib/proto.js
+@@ -27,6 +27,7 @@ const {
+   formatOptsSym,
+   stringifiersSym,
+   msgPrefixSym,
++  samplingSym,
+   hooksSym
+ } = require('./symbols')
+ const {
+@@ -49,6 +50,7 @@ const {
+   version
+ } = require('./meta')
+ const redaction = require('./redaction')
++const { buildSampling, mergeSampling } = require('./sampling')
+ 
+ // note: use of class is satirical
+ // https://github.com/pinojs/pino/pull/433#pullrequestreview-127703127
+@@ -168,8 +170,18 @@ function child (bindings, options) {
+     instance[msgPrefixSym] = (this[msgPrefixSym] || '') + options.msgPrefix
+   }
+ 
++  if (options.hasOwnProperty('sampling') === true) {
++    if (options.sampling === null || options.sampling === false) {
++      instance[samplingSym] = null
++    } else {
++      const parentSampling = this[samplingSym]
++      const mergedRules = mergeSampling(parentSampling && parentSampling.rules, options.sampling)
++      instance[samplingSym] = buildSampling(mergedRules, instance.levels)
++    }
++  }
++
+   instance[chindingsSym] = asChindings(instance, bindings)
+-  if ((options.level !== undefined && options.level !== this.level) || options.hasOwnProperty('customLevels')) {
++  if ((options.level !== undefined && options.level !== this.level) || options.hasOwnProperty('customLevels') || options.hasOwnProperty('sampling')) {
+     const childLevel = options.level || this.level
+     instance[setLevelSym](childLevel)
+   }
+diff --git a/lib/sampling.js b/lib/sampling.js
+new file mode 100644
+index 0000000..836d279
+--- /dev/null
++++ b/lib/sampling.js
+@@ -0,0 +1,183 @@
++'use strict'
++
++/* eslint no-prototype-builtins: 0 */
++
++const { writeSym } = require('./symbols')
++
++function normalizeRule (rule) {
++  if (rule === false || rule === null) return false
++  if (typeof rule === 'number') return { rate: rule }
++  if (typeof rule === 'function') return { test: rule }
++  if (typeof rule !== 'object') {
++    throw Error('sampling rule must be an object, number, function, false or null')
++  }
++  return rule
++}
++
++function assertRule (label, rule) {
++  if (rule === false) return
++  if (rule.rate !== undefined && (typeof rule.rate !== 'number' || rule.rate < 0 || rule.rate > 1)) {
++    throw Error(`sampling.${label}.rate must be a number between 0 and 1`)
++  }
++  if (rule.every !== undefined && (!Number.isInteger(rule.every) || rule.every < 1)) {
++    throw Error(`sampling.${label}.every must be a positive integer`)
++  }
++  if (rule.limit !== undefined) {
++    if (!Number.isInteger(rule.limit) || rule.limit < 0) {
++      throw Error(`sampling.${label}.limit must be a non-negative integer`)
++    }
++    if (rule.window === undefined) {
++      throw Error(`sampling.${label}.limit requires sampling.${label}.window`)
++    }
++  }
++  if (rule.window !== undefined && (!Number.isFinite(rule.window) || rule.window <= 0)) {
++    throw Error(`sampling.${label}.window must be a positive number (ms)`)
++  }
++  if (rule.dedupe !== undefined) {
++    const d = rule.dedupe
++    if (d === null || typeof d !== 'object') {
++      throw Error(`sampling.${label}.dedupe must be an object`)
++    }
++    if (!Number.isFinite(d.window) || d.window <= 0) {
++      throw Error(`sampling.${label}.dedupe.window must be a positive number (ms)`)
++    }
++    if (d.key !== undefined && typeof d.key !== 'function') {
++      throw Error(`sampling.${label}.dedupe.key must be a function`)
++    }
++  }
++  if (rule.test !== undefined && typeof rule.test !== 'function') {
++    throw Error(`sampling.${label}.test must be a function`)
++  }
++}
++
++function assertSampling (sampling) {
++  if (sampling === null || typeof sampling !== 'object') {
++    throw Error('sampling option must be an object')
++  }
++  for (const label in sampling) {
++    assertRule(label, normalizeRule(sampling[label]))
++  }
++}
++
++// Extract a cheap identity key from the raw log-method arguments
++// without running format() or any serializers.
++function defaultDedupeKey (args) {
++  const o = args[0]
++  if (o === null || o === undefined) return args[1]
++  if (typeof o === 'object') {
++    return o instanceof Error ? o.message : args[1]
++  }
++  return o
++}
++
++function genSampler (rule, num) {
++  rule = normalizeRule(rule)
++  if (rule === false) return null
++
++  const checks = []
++
++  if (rule.every !== undefined && rule.every > 1) {
++    const every = rule.every
++    let n = 0
++    checks.push(function everyCheck () {
++      if (n === 0) { n = every - 1; return true }
++      n--
++      return false
++    })
++  }
++
++  if (rule.rate !== undefined && rule.rate < 1) {
++    const rate = rule.rate
++    checks.push(rate <= 0
++      ? function rateCheck () { return false }
++      : function rateCheck () { return Math.random() < rate }
++    )
++  }
++
++  if (rule.limit !== undefined) {
++    const limit = rule.limit
++    const window = rule.window
++    let start = 0
++    let count = 0
++    checks.push(function limitCheck () {
++      const now = Date.now()
++      if (now - start >= window) { start = now; count = 0 }
++      if (count < limit) { count++; return true }
++      return false
++    })
++  }
++
++  if (typeof rule.test === 'function') {
++    const test = rule.test
++    checks.push(function testCheck (args) {
++      return test.call(this, args, num) !== false
++    })
++  }
++
++  if (rule.dedupe !== undefined) {
++    const window = rule.dedupe.window
++    const keyFn = rule.dedupe.key || defaultDedupeKey
++    const seen = new Map()
++    checks.push(function dedupeCheck (args) {
++      const key = keyFn(args)
++      if (key === undefined || key === null) return true
++      const entry = seen.get(key)
++      if (entry !== undefined) { entry.count++; return false }
++      const state = { count: 0 }
++      seen.set(key, state)
++      const logger = this
++      const timer = setTimeout(function dedupeFlush () {
++        seen.delete(key)
++        if (state.count > 0) {
++          // bypass sampling by writing directly so the summary is never dropped
++          logger[writeSym]({ sampling: { suppressed: state.count, key } }, `suppressed ${state.count} duplicate log(s)`, num)
++        }
++      }, window)
++      if (typeof timer.unref === 'function') timer.unref()
++      return true
++    })
++  }
++
++  if (checks.length === 0) return null
++  if (checks.length === 1) return checks[0]
++
++  return function composedSampler (args) {
++    for (let i = 0; i < checks.length; i++) {
++      if (checks[i].call(this, args) === false) return false
++    }
++    return true
++  }
++}
++
++function buildSampling (rules, levels) {
++  if (!rules) return null
++  assertSampling(rules)
++  const samplers = {}
++  const wildcard = rules['*']
++  let count = 0
++  for (const label in levels.values) {
++    if (label === 'silent') continue
++    const rule = rules.hasOwnProperty(label) ? rules[label] : wildcard
++    if (rule === undefined) continue
++    const num = levels.values[label]
++    const sampler = genSampler(rule, num)
++    if (sampler !== null) {
++      samplers[num] = sampler
++      count++
++    }
++  }
++  if (count === 0 && wildcard === undefined) return null
++  return { rules, samplers }
++}
++
++function mergeSampling (parentRules, childRules) {
++  if (!parentRules) return childRules
++  return Object.assign({}, parentRules, childRules)
++}
++
++module.exports = {
++  assertSampling,
++  buildSampling,
++  mergeSampling,
++  genSampler
++}
+diff --git a/lib/symbols.js b/lib/symbols.js
+index d745bd1..941b65c 100644
+--- a/lib/symbols.js
++++ b/lib/symbols.js
+@@ -29,6 +29,7 @@ const nestedKeySym = Symbol('pino.nestedKey')
+ const nestedKeyStrSym = Symbol('pino.nestedKeyStr')
+ const mixinMergeStrategySym = Symbol('pino.mixinMergeStrategy')
+ const msgPrefixSym = Symbol('pino.msgPrefix')
++const samplingSym = Symbol('pino.sampling')
+ 
+ const wildcardFirstSym = Symbol('pino.wildcardFirst')
+ 
+@@ -72,5 +73,6 @@ module.exports = {
+   nestedKeyStrSym,
+   mixinMergeStrategySym,
+   msgPrefixSym,
++  samplingSym,
+   transportUsesMultistreamSym
+ }
+diff --git a/lib/tools.js b/lib/tools.js
+index 5b4af61..f00682c 100644
+--- a/lib/tools.js
++++ b/lib/tools.js
+@@ -37,10 +37,26 @@ const asString = nodeMajor >= 25 ? str => JSON.stringify(str) : _asString
+ function noop () {
+ }
+ 
+-function genLog (level, hook) {
+-  if (!hook) return LOG
++function genLog (level, hook, sampler) {
++  // When sampling is not configured for this level we return the plain
++  // LOG (or hook-wrapped LOG) function so the hot path is identical to the
++  // non-sampling case – no extra branch, no extra allocation.
++  if (!sampler) {
++    if (!hook) return LOG
++    return function hookWrappedLog (...args) {
++      hook.call(this, args, LOG, level)
++    }
++  }
++
++  if (!hook) {
++    return function sampledLog (...args) {
++      if (sampler.call(this, args) === false) return
++      LOG.apply(this, args)
++    }
++  }
+ 
+-  return function hookWrappedLog (...args) {
++  return function sampledHookWrappedLog (...args) {
++    if (sampler.call(this, args) === false) return
+     hook.call(this, args, LOG, level)
+   }
+ 
+diff --git a/pino.d.ts b/pino.d.ts
+index 434dddd..be8603c 100644
+--- a/pino.d.ts
++++ b/pino.d.ts
+@@ -55,6 +55,62 @@ declare namespace pino {
+       remove?: boolean;
+     }
+ 
++    export interface SamplingDedupeOptions {
++      /**
++       * Length of the deduplication window in milliseconds. The first log line
++       * for a given key is emitted immediately; subsequent identical lines
++       * within the window are suppressed. When the window expires a single
++       * summary line is emitted reporting how many duplicates were dropped.
++       */
++      window: number;
++      /**
++       * Custom key extractor receiving the raw log-method arguments. By
++       * default the message format string (or `Error#message`) is used.
++       */
++      key?: (args: unknown[]) => unknown;
++    }
++
++    export interface SamplingRule {
++      /**
++       * Probability (0..1) that any individual log call is emitted.
++       */
++      rate?: number;
++      /**
++       * Emit only every Nth log call (the 1st, N+1th, 2N+1th, ...).
++       */
++      every?: number;
++      /**
++       * Maximum number of log calls emitted per `window` milliseconds.
++       */
++      limit?: number;
++      /**
++       * Fixed window length in milliseconds used by `limit`.
++       */
++      window?: number;
++      /**
++       * Suppress repeated identical messages within a time window and emit a
++       * summary when the window closes.
++       */
++      dedupe?: SamplingDedupeOptions;
++      /**
++       * Custom predicate receiving the raw log-method arguments and the level
++       * value. Return `false` to drop the log.
++       */
++      test?: (this: Logger, args: unknown[], level: number) => boolean;
++    }
++
++    /**
++     * Per-level sampling configuration. Keys are level labels (e.g. `info`,
++     * `debug`, custom level names) or `'*'` as a fallback for any level that
++     * is not explicitly configured. A value of `false`/`null` disables
++     * sampling for that level (useful when overriding on a child); a number
++     * is shorthand for `{ rate: number }`; a function is shorthand for
++     * `{ test: function }`.
++     */
++    export type SamplingOptions = {
++      [level: string]: SamplingRule | SamplingRule['test'] | number | false | null;
++    }
++
+     export interface LoggerExtras<CustomLevels extends string = never, UseOnlyCustomLevels extends boolean = boolean> extends EventEmitter {
+       /**
+        * Exposes the Pino package version. Also available on the exported pino function.
+@@ -666,6 +722,12 @@ declare namespace pino {
+        */
+       msgPrefix?: string
+ 
++      /**
++       * Per-level sampling rules. When omitted (the default) the logging hot
++       * path is completely unaffected. See `SamplingOptions`.
++       */
++      sampling?: SamplingOptions;
++
+       /**
+        * An object mapping to hook functions. Hook functions allow for customizing internal logger operations.
+        * Hook functions must be synchronous functions.
+@@ -718,6 +780,7 @@ declare namespace pino {
+       };
+       redact?: string[] | redactOptions;
+       msgPrefix?: string
++      sampling?: SamplingOptions | null | false;
+     }
+ 
+     /**
+diff --git a/pino.js b/pino.js
+index 9720bcb..eba78d5 100644
+--- a/pino.js
++++ b/pino.js
+@@ -9,6 +9,7 @@ const proto = require('./lib/proto')
+ const symbols = require('./lib/symbols')
+ const { configure } = require('safe-stable-stringify')
+ const { assertDefaultLevelFound, mappings, genLsCache, genLevelComparison, assertLevelComparison } = require('./lib/levels')
++const { buildSampling } = require('./lib/sampling')
+ const { DEFAULT_LEVELS, SORTING_ORDER } = require('./lib/constants')
+ const {
+   createArgsNormalizer,
+@@ -44,6 +45,7 @@ const {
+   nestedKeyStrSym,
+   mixinMergeStrategySym,
+   msgPrefixSym,
++  samplingSym,
+   transportUsesMultistreamSym
+ } = symbols
+ const { epochTime, nullTime } = time
+@@ -114,7 +116,8 @@ function pino (...args) {
+     depthLimit,
+     edgeLimit,
+     onChild,
+-    msgPrefix
++    msgPrefix,
++    sampling
+   } = opts
+ 
+   const stringifySafe = configure({
+@@ -195,6 +198,8 @@ function pino (...args) {
+   assertLevelComparison(levelComparison)
+   const levelCompFunc = genLevelComparison(levelComparison)
+ 
++  const samplingState = sampling ? buildSampling(sampling, levels) : null
++
+   Object.assign(instance, {
+     levels,
+     [levelCompSym]: levelCompFunc,
+@@ -218,6 +223,7 @@ function pino (...args) {
+     [chindingsSym]: chindings,
+     [formattersSym]: allFormatters,
+     [hooksSym]: hooks,
++    [samplingSym]: samplingState,
+     silent: noop,
+     onChild,
+     [msgPrefixSym]: msgPrefix
+diff --git a/test/sampling.test.js b/test/sampling.test.js
+new file mode 100644
+index 0000000..cc07e63
+--- /dev/null
++++ b/test/sampling.test.js
+@@ -0,0 +1,368 @@
++'use strict'
++
++const { describe, test } = require('node:test')
++const tspl = require('@matteo.collina/tspl')
++
++const { sink, once, sleep } = require('./helper')
++const pino = require('../')
++
++function captureStream () {
++  const lines = []
++  return {
++    lines,
++    write (s) { lines.push(JSON.parse(s)) }
++  }
++}
++
++describe('sampling', () => {
++  test('no sampling configured leaves hot path untouched (LOG function)', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const logger = pino(sink())
++    plan.equal(logger.info.name, 'LOG')
++    plan.equal(logger.error.name, 'LOG')
++  })
++
++  test('every: emits 1st, N+1th, ... and only for the configured level', async t => {
++    const plan = tspl(t, { plan: 4 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { every: 3 } } }, stream)
++
++    for (let i = 0; i < 10; i++) logger.info('m%d', i)
++    for (let i = 0; i < 5; i++) logger.warn('w%d', i)
++
++    const infos = stream.lines.filter(l => l.level === 30)
++    const warns = stream.lines.filter(l => l.level === 40)
++    plan.equal(infos.length, 4)
++    plan.deepEqual(infos.map(l => l.msg), ['m0', 'm3', 'm6', 'm9'])
++    plan.equal(warns.length, 5)
++    plan.equal(logger.warn.name, 'LOG')
++  })
++
++  test('rate: 0 drops everything, 1 keeps everything', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { rate: 0 }, warn: { rate: 1 } } }, stream)
++
++    for (let i = 0; i < 50; i++) { logger.info('x'); logger.warn('y') }
++    plan.equal(stream.lines.filter(l => l.level === 30).length, 0)
++    plan.equal(stream.lines.filter(l => l.level === 40).length, 50)
++  })
++
++  test('rate: number shorthand and approximate distribution', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: 0.3 } }, stream)
++
++    for (let i = 0; i < 4000; i++) logger.info('x')
++    const ratio = stream.lines.length / 4000
++    plan.ok(ratio > 0.2 && ratio < 0.4, `ratio ${ratio} should be ~0.3`)
++  })
++
++  test('limit + window: caps emissions per fixed window', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { limit: 3, window: 60000 } } }, stream)
++
++    for (let i = 0; i < 20; i++) logger.info('x')
++    plan.equal(stream.lines.length, 3)
++
++    // simulate window rollover by waiting on a tiny window
++    const stream2 = captureStream()
++    const logger2 = pino({ sampling: { info: { limit: 2, window: 30 } } }, stream2)
++    for (let i = 0; i < 10; i++) logger2.info('x')
++    await sleep(40)
++    for (let i = 0; i < 10; i++) logger2.info('x')
++    plan.equal(stream2.lines.length, 4)
++  })
++
++  test('test: custom predicate receives raw args and level', async t => {
++    const plan = tspl(t, { plan: 3 })
++    const stream = captureStream()
++    let seenLevel
++    const logger = pino({
++      sampling: {
++        info: {
++          test (args, level) {
++            seenLevel = level
++            return args[0] !== 'drop'
++          }
++        }
++      }
++    }, stream)
++
++    logger.info('drop')
++    logger.info('keep')
++    plan.equal(seenLevel, 30)
++    plan.equal(stream.lines.length, 1)
++    plan.equal(stream.lines[0].msg, 'keep')
++  })
++
++  test('function shorthand is treated as test', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: (args) => args[0] === 'ok' } }, stream)
++    logger.info('no')
++    logger.info('ok')
++    plan.deepEqual(stream.lines.map(l => l.msg), ['ok'])
++  })
++
++  test('wildcard rule applies to unconfigured levels', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { '*': { every: 2 }, error: false } }, stream)
++
++    for (let i = 0; i < 4; i++) logger.info('i')
++    for (let i = 0; i < 4; i++) logger.error('e')
++    plan.equal(stream.lines.filter(l => l.level === 30).length, 2)
++    plan.equal(stream.lines.filter(l => l.level === 50).length, 4)
++  })
++
++  test('dropped logs do not pay serialization cost', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    let serialized = 0
++    const logger = pino({
++      sampling: { info: { rate: 0 } },
++      serializers: { foo () { serialized++; return 'x' } }
++    }, stream)
++
++    for (let i = 0; i < 10; i++) logger.info({ foo: {} }, 'x')
++    plan.equal(stream.lines.length, 0)
++    plan.equal(serialized, 0)
++  })
++
++  test('dropped logs do not invoke logMethod hook', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    let hooked = 0
++    const logger = pino({
++      sampling: { info: { every: 5 } },
++      hooks: { logMethod (args, method) { hooked++; method.apply(this, args) } }
++    }, stream)
++
++    for (let i = 0; i < 10; i++) logger.info('x')
++    plan.equal(stream.lines.length, 2)
++    plan.equal(hooked, 2)
++  })
++
++  test('works with custom levels', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({
++      customLevels: { verbose: 11 },
++      level: 'verbose',
++      sampling: { verbose: { every: 4 } }
++    }, stream)
++
++    for (let i = 0; i < 8; i++) logger.verbose('v')
++    plan.equal(stream.lines.filter(l => l.level === 11).length, 2)
++  })
++})
++
++describe('sampling - dedupe', () => {
++  test('emits first occurrence, suppresses duplicates, then emits summary', async t => {
++    const plan = tspl(t, { plan: 6 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { error: { dedupe: { window: 30 } } } }, stream)
++
++    logger.error('boom')
++    logger.error('boom')
++    logger.error('boom')
++    logger.error('other')
++
++    plan.equal(stream.lines.length, 2)
++    plan.deepEqual(stream.lines.map(l => l.msg), ['boom', 'other'])
++
++    await sleep(60)
++
++    const summaries = stream.lines.filter(l => l.sampling)
++    plan.equal(summaries.length, 1)
++    plan.equal(summaries[0].level, 50)
++    plan.equal(summaries[0].sampling.suppressed, 2)
++    plan.equal(summaries[0].sampling.key, 'boom')
++  })
++
++  test('dedupe keys Error arguments by message', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { error: { dedupe: { window: 30 } } } }, stream)
++
++    logger.error(new Error('db down'))
++    logger.error(new Error('db down'))
++    logger.error(new Error('db down'))
++
++    plan.equal(stream.lines.length, 1)
++    await sleep(60)
++    const summary = stream.lines.find(l => l.sampling)
++    plan.equal(summary.sampling.suppressed, 2)
++  })
++
++  test('dedupe with merging object keys on the message argument', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { dedupe: { window: 30 } } } }, stream)
++
++    logger.info({ a: 1 }, 'same')
++    logger.info({ a: 2 }, 'same')
++    logger.info({ a: 3 }, 'diff')
++
++    plan.deepEqual(stream.lines.map(l => l.msg), ['same', 'diff'])
++    await sleep(60)
++  })
++
++  test('dedupe custom key function', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({
++      sampling: {
++        info: { dedupe: { window: 30, key: (args) => args[0] && args[0].code } }
++      }
++    }, stream)
++
++    logger.info({ code: 'E1' }, 'a')
++    logger.info({ code: 'E1' }, 'b')
++    logger.info({ code: 'E2' }, 'c')
++
++    plan.deepEqual(stream.lines.map(l => l.msg), ['a', 'c'])
++    await sleep(60)
++  })
++
++  test('no summary when nothing was suppressed', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { dedupe: { window: 20 } } } }, stream)
++
++    logger.info('once')
++    await sleep(40)
++    plan.equal(stream.lines.filter(l => l.sampling).length, 0)
++  })
++
++  test('dedupe window resets after expiry', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { dedupe: { window: 20 } } } }, stream)
++
++    logger.info('x')
++    logger.info('x')
++    await sleep(40)
++    logger.info('x')
++    await sleep(40)
++    plan.deepEqual(
++      stream.lines.filter(l => !l.sampling).map(l => l.msg),
++      ['x', 'x']
++    )
++  })
++})
++
++describe('sampling - child loggers', () => {
++  test('children inherit and share parent sampler state by default', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const parent = pino({ sampling: { info: { every: 3 } } }, stream)
++    const child = parent.child({ component: 'c' })
++
++    parent.info('p0') // emitted
++    child.info('c1')  // dropped
++    parent.info('p2') // dropped
++    child.info('c3')  // emitted
++    plan.deepEqual(stream.lines.map(l => l.msg), ['p0', 'c3'])
++  })
++
++  test('child can override a single level rule', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    const parent = pino({ sampling: { info: { rate: 0 }, warn: { every: 2 } } }, stream)
++    const child = parent.child({}, { sampling: { info: { every: 1 } } })
++
++    for (let i = 0; i < 4; i++) child.info('i')
++    for (let i = 0; i < 4; i++) child.warn('w')
++    plan.equal(stream.lines.filter(l => l.level === 30).length, 4)
++    // warn rule inherited from parent (independent state on the override path)
++    plan.equal(stream.lines.filter(l => l.level === 40).length, 2)
++  })
++
++  test('child can disable a single inherited level with false', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const parent = pino({ sampling: { info: { rate: 0 } } }, stream)
++    const child = parent.child({}, { sampling: { info: false } })
++
++    for (let i = 0; i < 3; i++) child.info('i')
++    plan.equal(stream.lines.length, 3)
++  })
++
++  test('child can disable all sampling with null', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    const parent = pino({ sampling: { '*': { rate: 0 } } }, stream)
++    const child = parent.child({}, { sampling: null })
++
++    child.info('i'); child.warn('w')
++    plan.equal(stream.lines.length, 2)
++    plan.equal(child.info.name, 'LOG')
++  })
++
++  test('child level change preserves inherited sampling', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const parent = pino({ sampling: { info: { every: 2 } } }, stream)
++    const child = parent.child({}, { level: 'debug' })
++
++    for (let i = 0; i < 4; i++) child.info('i')
++    plan.equal(stream.lines.length, 2)
++  })
++})
++
++describe('sampling - validation', () => {
++  test('rejects non-object sampling', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.throws(() => pino({ sampling: 'nope' }, sink()), /sampling option must be an object/)
++  })
++
++  test('rejects out-of-range rate', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.throws(() => pino({ sampling: { info: { rate: 2 } } }, sink()), /rate must be a number between 0 and 1/)
++  })
++
++  test('rejects non-integer every', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.throws(() => pino({ sampling: { info: { every: 1.5 } } }, sink()), /every must be a positive integer/)
++  })
++
++  test('rejects limit without window', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.throws(() => pino({ sampling: { info: { limit: 5 } } }, sink()), /requires sampling.info.window/)
++  })
++
++  test('rejects dedupe without window', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.throws(() => pino({ sampling: { info: { dedupe: {} } } }, sink()), /dedupe.window must be a positive number/)
++  })
++
++  test('rejects invalid rule type', t => {
++    const plan = tspl(t, { plan: 1 })
++    plan.throws(() => pino({ sampling: { info: 'bad' } }, sink()), /sampling rule must be an object/)
++  })
++})
++
++describe('sampling - composition', () => {
++  test('multiple checks short-circuit', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const logger = pino({ sampling: { info: { every: 2, limit: 2, window: 60000 } } }, stream)
++
++    // every:2 keeps calls 0,2,4,6,8 -> limit:2 keeps first 2 of those
++    for (let i = 0; i < 10; i++) logger.info('x')
++    plan.equal(stream.lines.length, 2)
++  })
++})
++
++test('sampling integrates with sink stream output', async t => {
++  const plan = tspl(t, { plan: 1 })
++  const stream = sink()
++  const logger = pino({ sampling: { info: { every: 2 } } }, stream)
++  const o = once(stream, 'data')
++  logger.info('first')
++  const line = await o
++  plan.equal(line.msg, 'first')
++})
