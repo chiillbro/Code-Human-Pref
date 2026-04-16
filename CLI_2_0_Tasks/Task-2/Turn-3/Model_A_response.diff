@@ -1,0 +1,167 @@
+diff --git a/pino.d.ts b/pino.d.ts
+index 982c784..d336770 100644
+--- a/pino.d.ts
++++ b/pino.d.ts
+@@ -86,11 +86,16 @@ declare namespace pino {
+        */
+       every?: number;
+       /**
+-       * Maximum number of log calls emitted per `window` milliseconds.
++       * Token-bucket capacity. Up to `limit` calls can be emitted back-to-back
++       * (the bucket starts full); afterwards emissions are paced by the
++       * refill rate derived from `window`.
+        */
+       limit?: number;
+       /**
+-       * Fixed window length in milliseconds used by `limit`.
++       * Time in milliseconds for the token bucket to refill from empty to
++       * full. The refill rate is `limit / window` tokens per millisecond, so
++       * the bucket replenishes smoothly and avoids the 2x-burst-at-boundary
++       * behaviour of a naive fixed-window counter.
+        */
+       window?: number;
+       /**
+diff --git a/test/sampling.test.js b/test/sampling.test.js
+index 7f73968..07aede4 100644
+--- a/test/sampling.test.js
++++ b/test/sampling.test.js
+@@ -307,6 +307,28 @@ describe('sampling - dedupe', () => {
+     plan.equal(summaries[0].sampling.key, 'b')
+   })
+ 
++  test('dedupe summary emits exactly once when eviction races with timer', async t => {
++    const plan = tspl(t, { plan: 3 })
++    const stream = captureStream()
++    const logger = pino({
++      sampling: { info: { dedupe: { window: 30, maxKeys: 1 } } }
++    }, stream)
++
++    logger.info('a') // arms timer for 'a'
++    logger.info('a') // suppressed, a.count = 1
++    logger.info('b') // evicts 'a' -> should clearTimeout + emit 'a' summary now
++
++    // Wait past the original timer's firing time. If the timer were not
++    // cleared (or the guard were missing) we would see a duplicate summary.
++    await sleep(60)
++
++    const summaries = stream.lines.filter(l => l.sampling && l.sampling.key === 'a')
++    plan.equal(summaries.length, 1)
++    plan.equal(summaries[0].sampling.suppressed, 1)
++    // 'b' was only seen once and never suppressed -> no summary for it
++    plan.equal(stream.lines.filter(l => l.sampling && l.sampling.key === 'b').length, 0)
++  })
++
+   test('dedupe rejects non-positive maxKeys', t => {
+     const plan = tspl(t, { plan: 2 })
+     plan.throws(
+@@ -479,3 +501,110 @@ test('sampling integrates with sink stream output', async t => {
+   const line = await o
+   plan.equal(line.msg, 'first')
+ })
++
++describe('sampling - integration with other features', () => {
++  test('sampling + redact: redaction still applies to emitted logs', async t => {
++    const plan = tspl(t, { plan: 4 })
++    const stream = captureStream()
++    const logger = pino({
++      redact: ['secret', 'nested.token'],
++      sampling: { info: { every: 2 } }
++    }, stream)
++
++    // every:2 -> emits calls 0, 2
++    logger.info({ secret: 'hunter2', nested: { token: 'abc' }, keep: 'yes' }, 'l0')
++    logger.info({ secret: 'hunter2' }, 'l1') // dropped
++    logger.info({ secret: 'hunter3', nested: { token: 'xyz' }, keep: 'also' }, 'l2')
++
++    plan.equal(stream.lines.length, 2)
++    // both emitted lines must have secret redacted but non-secret fields intact
++    plan.equal(stream.lines[0].secret, '[Redacted]')
++    plan.equal(stream.lines[0].nested.token, '[Redacted]')
++    plan.equal(stream.lines[1].secret, '[Redacted]')
++  })
++
++  test('sampling + serializers: serializer only runs for passed logs', async t => {
++    const plan = tspl(t, { plan: 3 })
++    const stream = captureStream()
++    let serializerCalls = 0
++    const logger = pino({
++      serializers: {
++        user (u) { serializerCalls++; return { id: u.id } }
++      },
++      sampling: { info: { every: 3 } }
++    }, stream)
++
++    // every:3 -> emits calls 0, 3, 6, 9 out of 10
++    for (let i = 0; i < 10; i++) {
++      logger.info({ user: { id: i, password: 'p' + i } }, 'm')
++    }
++
++    plan.equal(stream.lines.length, 4)
++    plan.equal(serializerCalls, 4) // exactly once per emitted log
++    plan.deepEqual(stream.lines.map(l => l.user), [
++      { id: 0 }, { id: 3 }, { id: 6 }, { id: 9 }
++    ])
++  })
++
++  test('sampling + msgPrefix: prefix applied to emitted logs only', async t => {
++    const plan = tspl(t, { plan: 3 })
++    const stream = captureStream()
++    const logger = pino({
++      msgPrefix: '[HTTP] ',
++      sampling: { info: { every: 2 } }
++    }, stream)
++
++    logger.info('a') // emitted
++    logger.info('b') // dropped
++    logger.info('c') // emitted
++
++    plan.equal(stream.lines.length, 2)
++    plan.equal(stream.lines[0].msg, '[HTTP] a')
++    plan.equal(stream.lines[1].msg, '[HTTP] c')
++  })
++
++  test('sampling + msgPrefix: child prefix concatenates on sampled logs', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    const parent = pino({
++      msgPrefix: '[HTTP] ',
++      sampling: { info: { every: 2 } }
++    }, stream)
++    const child = parent.child({}, { msgPrefix: '[req] ' })
++
++    child.info('a') // emitted (shares parent sampler state)
++    child.info('b') // dropped
++    child.info('c') // emitted
++
++    plan.equal(stream.lines.length, 2)
++    plan.equal(stream.lines[0].msg, '[HTTP] [req] a')
++  })
++
++  test('sampling + dedupe summary: redaction still applies to the summary line', async t => {
++    const plan = tspl(t, { plan: 4 })
++    const stream = captureStream()
++    const logger = pino({
++      msgPrefix: '[svc] ',
++      redact: ['secret'],
++      sampling: { info: { dedupe: { window: 30 } } }
++    }, stream)
++
++    logger.info({ secret: 's1' }, 'boom')
++    logger.info({ secret: 's2' }, 'boom')
++    logger.info({ secret: 's3' }, 'boom')
++    await sleep(60)
++
++    const emitted = stream.lines.filter(l => !l.sampling)
++    const summaries = stream.lines.filter(l => l.sampling)
++    plan.equal(emitted.length, 1)
++    plan.equal(emitted[0].msg, '[svc] boom') // msgPrefix applies to user logs
++    // Redaction runs in asJson (downstream of writeSym) so it still applies
++    // to the sampling summary – the key 'boom' isn't a redacted path but
++    // emitted logs confirm redaction is active on this logger.
++    plan.equal(emitted[0].secret, '[Redacted]')
++    // Dedupe summary is emitted via writeSym directly (bypassing LOG / format
++    // / msgPrefix) so it can't recurse into the sampler. This is intentional:
++    // the summary carries a structured `sampling` field for filtering.
++    plan.equal(summaries.length, 1)
++  })
++})

@@ -1,0 +1,128 @@
+diff --git a/pino.d.ts b/pino.d.ts
+index 982c784..36abdb9 100644
+--- a/pino.d.ts
++++ b/pino.d.ts
+@@ -86,11 +86,16 @@ declare namespace pino {
+        */
+       every?: number;
+       /**
+-       * Maximum number of log calls emitted per `window` milliseconds.
++       * Token-bucket capacity. The bucket starts full with `limit` tokens and
++       * each emitted log consumes one. A burst of up to `limit` calls can
++       * therefore go through immediately; once drained, calls are paced at the
++       * sustained refill rate (see `window`). Requires `window`.
+        */
+       limit?: number;
+       /**
+-       * Fixed window length in milliseconds used by `limit`.
++       * Token-bucket refill period in milliseconds — the time it takes for an
++       * empty bucket to refill back to `limit` tokens (i.e. the bucket refills
++       * at `limit / window` tokens per ms).
+        */
+       window?: number;
+       /**
+diff --git a/test/sampling.test.js b/test/sampling.test.js
+index 7f73968..f6f9328 100644
+--- a/test/sampling.test.js
++++ b/test/sampling.test.js
+@@ -307,6 +307,31 @@ describe('sampling - dedupe', () => {
+     plan.equal(summaries[0].sampling.key, 'b')
+   })
+ 
++  test('dedupe LRU eviction does not double-emit when timer fires after eviction', async t => {
++    const plan = tspl(t, { plan: 4 })
++    const stream = captureStream()
++    // Short window so the original timer for 'a' would fire during this test
++    // if it had not been correctly cancelled / guarded on eviction.
++    const logger = pino({
++      sampling: { info: { dedupe: { window: 30, maxKeys: 1 } } }
++    }, stream)
++
++    logger.info('a')
++    logger.info('a')        // suppressed, a.count = 1
++    logger.info('b')        // maxKeys=1: evicts 'a' synchronously, flushes its summary
++
++    let summaries = stream.lines.filter(l => l.sampling)
++    plan.equal(summaries.length, 1)
++    plan.equal(summaries[0].sampling.key, 'a')
++    plan.equal(summaries[0].sampling.suppressed, 1)
++
++    // Wait well past the original window for 'a' (and 'b') – the cleared/guarded
++    // timer for 'a' must NOT produce a second summary.
++    await sleep(80)
++    summaries = stream.lines.filter(l => l.sampling)
++    plan.deepEqual(summaries.map(s => s.sampling.key), ['a'])
++  })
++
+   test('dedupe rejects non-positive maxKeys', t => {
+     const plan = tspl(t, { plan: 2 })
+     plan.throws(
+@@ -470,6 +495,68 @@ describe('sampling - composition', () => {
+   })
+ })
+ 
++describe('sampling - integration with other features', () => {
++  test('redaction is applied to logs that pass sampling', async t => {
++    const plan = tspl(t, { plan: 3 })
++    const stream = captureStream()
++    const logger = pino({
++      redact: ['secret'],
++      sampling: { info: { every: 2 } }
++    }, stream)
++
++    logger.info({ secret: 'hunter2', keep: 1 }, 'a') // emitted
++    logger.info({ secret: 'hunter2', keep: 2 }, 'b') // dropped
++    logger.info({ secret: 'hunter2', keep: 3 }, 'c') // emitted
++
++    plan.equal(stream.lines.length, 2)
++    plan.equal(stream.lines[0].secret, '[Redacted]')
++    plan.deepEqual(stream.lines.map(l => l.keep), [1, 3])
++  })
++
++  test('serializers run only for logs that pass sampling', async t => {
++    const plan = tspl(t, { plan: 3 })
++    const stream = captureStream()
++    let calls = 0
++    const logger = pino({
++      sampling: { info: { every: 2 } },
++      serializers: { foo (v) { calls++; return v.id } }
++    }, stream)
++
++    for (let i = 0; i < 6; i++) logger.info({ foo: { id: i } }, 'x')
++
++    plan.equal(stream.lines.length, 3)
++    // serializer ran only for the 3 emitted lines, not the 3 dropped ones
++    plan.equal(calls, 3)
++    plan.deepEqual(stream.lines.map(l => l.foo), [0, 2, 4])
++  })
++
++  test('msgPrefix is applied to logs that pass sampling', async t => {
++    const plan = tspl(t, { plan: 2 })
++    const stream = captureStream()
++    const logger = pino({
++      msgPrefix: '[S] ',
++      sampling: { info: { every: 2 } }
++    }, stream)
++
++    logger.info('one')
++    logger.info('two')
++    logger.info('three')
++
++    plan.equal(stream.lines.length, 2)
++    plan.deepEqual(stream.lines.map(l => l.msg), ['[S] one', '[S] three'])
++  })
++
++  test('child msgPrefix + inherited sampling', async t => {
++    const plan = tspl(t, { plan: 1 })
++    const stream = captureStream()
++    const parent = pino({ msgPrefix: '[P] ', sampling: { info: { every: 2 } } }, stream)
++    const child = parent.child({}, { msgPrefix: '[C] ' })
++
++    child.info('a'); child.info('b'); child.info('c')
++    plan.deepEqual(stream.lines.map(l => l.msg), ['[P] [C] a', '[P] [C] c'])
++  })
++})
++
+ test('sampling integrates with sink stream output', async t => {
+   const plan = tspl(t, { plan: 1 })
+   const stream = sink()
