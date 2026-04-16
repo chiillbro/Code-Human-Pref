@@ -1,0 +1,810 @@
+diff --git a/docs/api.md b/docs/api.md
+index e05bca7..13c6096 100644
+--- a/docs/api.md
++++ b/docs/api.md
+@@ -31,6 +31,11 @@
+   * [pino.stdTimeFunctions](#pino-stdtimefunctions)
+   * [pino.symbols](#pino-symbols)
+   * [pino.version](#pino-version)
++  * [pino.context()](#pino-context)
++  * [pino.getContext()](#pino-getcontext)
++  * [pino.setContext()](#pino-setcontext)
++  * [pino.enterContextWith()](#pino-entercontextwith)
++  * [pino.contextMiddleware()](#pino-contextmiddleware)
+ * [Interfaces](#interfaces)
+   * [MultiStreamRes](#multistreamres)
+   * [StreamEntry](#streamentry)
+@@ -1457,6 +1462,102 @@ Exposes the Pino package version. Also available on the logger instance.
+ 
+ * See [`logger.version`](#version)
+ 
++<a id="pino-context"></a>
++### `pino.context(fields, fn, [...args])`
++
++Runs `fn` inside a new request-scoped context. The key/value pairs in
++`fields` are merged with any parent scope and then automatically included
++in every log line emitted from `fn` (or from async continuations it
++spawns) until it returns.
++
++Nested calls inherit from their parent scope; inner fields override outer
++fields of the same name. Explicit fields passed at log time (e.g. `logger.info({ foo: 1 }, 'msg')`)
++still override context fields.
++
++```js
++const pino = require('pino')
++const logger = pino()
++
++function handleRequest (req) {
++  pino.context({ reqId: req.id, userId: req.user?.id }, () => {
++    // Every log line below includes reqId and userId, even across
++    // awaits or setTimeout, without having to pass a child logger.
++    doWork()
++  })
++}
++
++async function doWork () {
++  await Promise.resolve()
++  logger.info('processing')
++}
++```
++
++Additional arguments supplied to `pino.context` are forwarded to `fn`.
++
++This API requires [`AsyncLocalStorage`][als] and will throw a clear error if it is
++not available in the current runtime. When no context scope is active,
++the normal logging code path is used and has no measurable overhead.
++
++[als]: https://nodejs.org/api/async_context.html#class-asynclocalstorage
++
++<a id="pino-getcontext"></a>
++### `pino.getContext() => Object | undefined`
++
++Returns a shallow copy of the fields bound to the current context scope,
++or `undefined` when called outside of a scope. Mutating the returned
++object does not affect the live scope; use [`pino.setContext()`](#pino-setcontext)
++for that.
++
++<a id="pino-setcontext"></a>
++### `pino.setContext(fields)`
++
++Merges `fields` into the current scope. Useful when a field becomes
++available partway through the scope (e.g. once the user has been
++authenticated). Throws if there is no active scope. Does not affect
++parent scopes.
++
++```js
++pino.context({ reqId: req.id }, async () => {
++  const user = await authenticate(req)
++  pino.setContext({ userId: user.id })
++  // all subsequent log lines in this scope include reqId and userId
++})
++```
++
++<a id="pino-entercontextwith"></a>
++### `pino.enterContextWith(fields)`
++
++Enters a context scope for the remainder of the current synchronous
++execution and persists it through subsequent async work. Mirrors
++[`AsyncLocalStorage.prototype.enterWith`][enterWith] and is intended as an escape
++hatch for integrations that cannot wrap a callback. Prefer
++[`pino.context()`](#pino-context) where possible, because a dangling
++`enterWith` can leak context to unrelated work scheduled on the same
++async resource.
++
++[enterWith]: https://nodejs.org/api/async_context.html#asynclocalstorageenterwithstore
++
++<a id="pino-contextmiddleware"></a>
++### `pino.contextMiddleware([fieldsOrFn]) => middleware`
++
++Returns a connect/Express/Fastify-compatible middleware that opens a
++context scope for the lifetime of the request. `fieldsOrFn` may be a
++static object of fields, or a function that receives `(req, res)` and
++returns an object of fields.
++
++```js
++const express = require('express')
++const pino = require('pino')
++const logger = pino()
++
++const app = express()
++app.use(pino.contextMiddleware(req => ({ reqId: req.id })))
++app.get('/', (req, res) => {
++  logger.info('handling request') // includes reqId automatically
++  res.end()
++})
++```
++
+ ## Interfaces
+ <a id="pino-multistreamres"></a>
+ 
+diff --git a/lib/context.js b/lib/context.js
+new file mode 100644
+index 0000000..a4268fb
+--- /dev/null
++++ b/lib/context.js
+@@ -0,0 +1,161 @@
++'use strict'
++
++// Request-scoped context for pino, backed by AsyncLocalStorage.
++//
++// The ALS instance is created lazily, the first time any context API is
++// invoked. This keeps the logging fast path untouched for users that do
++// not opt in: `getContextStore()` returns `undefined` via a single null
++// check when no scope has ever been entered.
++
++let AsyncLocalStorage = null
++try {
++  ({ AsyncLocalStorage } = require('node:async_hooks'))
++} catch (_) {
++  // async_hooks is unavailable (e.g. some non-Node runtimes). We keep
++  // AsyncLocalStorage as null and surface a clear error if the user
++  // actually tries to use the context API.
++}
++
++let als = null
++
++function ensureAls () {
++  if (als !== null) return als
++  if (AsyncLocalStorage === null || typeof AsyncLocalStorage !== 'function') {
++    throw new Error(
++      'pino.context requires AsyncLocalStorage, which is not available in this environment'
++    )
++  }
++  als = new AsyncLocalStorage()
++  return als
++}
++
++function assertFields (fields, apiName) {
++  if (fields === null || typeof fields !== 'object' || Array.isArray(fields)) {
++    throw new TypeError(`${apiName} requires a plain object of fields`)
++  }
++}
++
++/**
++ * Runs `fn` inside a new context scope with `fields` merged over the
++ * current scope (if any). Nested scopes inherit from their parent; inner
++ * fields override outer fields of the same name.
++ *
++ * @param {object} fields
++ * @param {Function} fn
++ * @param  {...any} args Forwarded to `fn`.
++ * @returns The return value of `fn`.
++ */
++function context (fields, fn, ...args) {
++  assertFields(fields, 'pino.context')
++  if (typeof fn !== 'function') {
++    throw new TypeError('pino.context requires a callback function')
++  }
++  const storage = ensureAls()
++  const parent = storage.getStore()
++  const merged = parent ? Object.assign({}, parent, fields) : Object.assign({}, fields)
++  return storage.run(merged, fn, ...args)
++}
++
++/**
++ * Returns the fields bound to the current context scope, or `undefined`
++ * if no scope is active.
++ *
++ * @returns {object|undefined}
++ */
++function getContext () {
++  if (als === null) return undefined
++  const store = als.getStore()
++  if (store === undefined) return undefined
++  // Return a shallow copy so callers cannot mutate the live store in
++  // surprising ways; use setContext() to update fields.
++  return Object.assign({}, store)
++}
++
++/**
++ * Merges `fields` into the current context scope. Throws if no scope is
++ * active. Does not affect parent scopes.
++ *
++ * @param {object} fields
++ */
++function setContext (fields) {
++  assertFields(fields, 'pino.setContext')
++  if (als === null || als.getStore() === undefined) {
++    throw new Error('pino.setContext called without an active context scope')
++  }
++  Object.assign(als.getStore(), fields)
++}
++
++/**
++ * Enters a context scope for the remainder of the current synchronous
++ * execution and persists it through subsequent async work. This mirrors
++ * `AsyncLocalStorage.prototype.enterWith` and is intended as an escape
++ * hatch for integrations that cannot wrap a callback (e.g. some stream
++ * pipelines).
++ *
++ * @param {object} fields
++ */
++function enterContextWith (fields) {
++  assertFields(fields, 'pino.enterContextWith')
++  const storage = ensureAls()
++  const parent = storage.getStore()
++  const merged = parent ? Object.assign({}, parent, fields) : Object.assign({}, fields)
++  storage.enterWith(merged)
++}
++
++/**
++ * Returns a connect/Express/Fastify-compatible middleware that opens a
++ * context scope for the lifetime of the request. `fieldsOrFn` may be a
++ * static object of fields, or a function that receives `(req, res)` and
++ * returns an object of fields.
++ *
++ * @param {object|Function} [fieldsOrFn]
++ */
++function contextMiddleware (fieldsOrFn) {
++  let resolver
++  if (fieldsOrFn === undefined || fieldsOrFn === null) {
++    resolver = () => ({})
++  } else if (typeof fieldsOrFn === 'function') {
++    resolver = fieldsOrFn
++  } else if (typeof fieldsOrFn === 'object' && !Array.isArray(fieldsOrFn)) {
++    resolver = () => fieldsOrFn
++  } else {
++    throw new TypeError(
++      'pino.contextMiddleware expects an object of fields or a function returning one'
++    )
++  }
++
++  return function pinoContextMiddleware (req, res, next) {
++    const fields = resolver(req, res) || {}
++    if (typeof fields !== 'object' || Array.isArray(fields)) {
++      return next(new TypeError('pino.contextMiddleware field resolver must return a plain object'))
++    }
++    context(fields, next)
++  }
++}
++
++/**
++ * Internal accessor used by the logging fast path. Returns the active
++ * store or `undefined`. Designed to be cheap when no ALS exists.
++ */
++function getContextStore () {
++  if (als === null) return undefined
++  return als.getStore()
++}
++
++/**
++ * Test-only helper to reset the internal ALS reference. Not part of
++ * the public API.
++ */
++function _resetForTests () {
++  als = null
++}
++
++module.exports = {
++  context,
++  getContext,
++  setContext,
++  enterContextWith,
++  contextMiddleware,
++  getContextStore,
++  _resetForTests
++}
+diff --git a/lib/proto.js b/lib/proto.js
+index a6ba722..2e1e6a5 100644
+--- a/lib/proto.js
++++ b/lib/proto.js
+@@ -49,6 +49,7 @@ const {
+   version
+ } = require('./meta')
+ const redaction = require('./redaction')
++const { getContextStore } = require('./context')
+ 
+ // note: use of class is satirical
+ // https://github.com/pinojs/pino/pull/433#pullrequestreview-127703127
+@@ -226,6 +227,15 @@ function write (_obj, msg, num) {
+     }
+   }
+ 
++  // Merge request-scoped context fields before mixin so that the final
++  // precedence is: explicit log obj > context > mixin. getContextStore
++  // returns undefined via a single null check when no context scope has
++  // ever been opened, keeping the fast path fast.
++  const ctxStore = getContextStore()
++  if (ctxStore !== undefined) {
++    obj = Object.assign({}, ctxStore, obj)
++  }
++
+   if (mixin) {
+     obj = mixinMergeStrategy(obj, mixin(obj, num, this))
+   }
+diff --git a/pino.d.ts b/pino.d.ts
+index 434dddd..cf0f006 100644
+--- a/pino.d.ts
++++ b/pino.d.ts
+@@ -854,6 +854,80 @@ declare namespace pino {
+       opts?: MultiStreamOptions
+     ): MultiStreamRes<TLevel>
+ 
++    /**
++     * A plain object of key/value pairs bound to an async context scope.
++     * These fields are automatically merged into every log line produced
++     * inside the scope.
++     */
++    export type ContextFields = Record<string, unknown>
++
++    /**
++     * A resolver used by {@link contextMiddleware}. Receives the current
++     * request/response pair and must return the fields to bind for the
++     * duration of the request.
++     */
++    export type ContextFieldsResolver<Req = unknown, Res = unknown> = (
++      req: Req,
++      res: Res
++    ) => ContextFields
++
++    /**
++     * Connect/Express-style middleware signature produced by
++     * {@link contextMiddleware}.
++     */
++    export type ContextMiddleware<Req = unknown, Res = unknown> = (
++      req: Req,
++      res: Res,
++      next: (err?: unknown) => void
++    ) => void
++
++    /**
++     * Runs `fn` inside a new request-scoped context. Any fields bound
++     * here will be included in every log line emitted (directly or via
++     * async continuations) until `fn` returns. Nested calls inherit
++     * from their parent scope; inner fields override outer fields of
++     * the same name.
++     *
++     * Throws if `AsyncLocalStorage` is not available in the current
++     * runtime.
++     */
++    export function context<T> (fields: ContextFields, fn: () => T): T
++    export function context<T, A extends unknown[]> (
++      fields: ContextFields,
++      fn: (...args: A) => T,
++      ...args: A
++    ): T
++
++    /**
++     * Returns a shallow copy of the fields bound to the current context
++     * scope, or `undefined` if no scope is active.
++     */
++    export function getContext (): ContextFields | undefined
++
++    /**
++     * Merges `fields` into the current context scope. Throws if called
++     * outside of an active scope. Does not affect parent scopes.
++     */
++    export function setContext (fields: ContextFields): void
++
++    /**
++     * Enters a context scope for the remainder of the current
++     * synchronous execution and persists it through subsequent async
++     * work. Mirrors `AsyncLocalStorage.prototype.enterWith` and is
++     * intended as an escape hatch for integrations that cannot wrap a
++     * callback. Prefer {@link context} where possible.
++     */
++    export function enterContextWith (fields: ContextFields): void
++
++    /**
++     * Creates a connect/Express/Fastify-compatible middleware that
++     * opens a context scope for the lifetime of the request. Accepts
++     * either a static object of fields or a resolver function.
++     */
++    export function contextMiddleware<Req = unknown, Res = unknown> (
++      fieldsOrFn?: ContextFields | ContextFieldsResolver<Req, Res>
++    ): ContextMiddleware<Req, Res>
++
+     export { pino as default, pino }
+ }
+ 
+diff --git a/pino.js b/pino.js
+index 9720bcb..7e5cff7 100644
+--- a/pino.js
++++ b/pino.js
+@@ -246,6 +246,20 @@ module.exports.destination = (dest = process.stdout.fd) => {
+ module.exports.transport = require('./lib/transport')
+ module.exports.multistream = require('./lib/multistream')
+ 
++const {
++  context: pinoContext,
++  getContext,
++  setContext,
++  enterContextWith,
++  contextMiddleware
++} = require('./lib/context')
++
++module.exports.context = pinoContext
++module.exports.getContext = getContext
++module.exports.setContext = setContext
++module.exports.enterContextWith = enterContextWith
++module.exports.contextMiddleware = contextMiddleware
++
+ module.exports.levels = mappings()
+ module.exports.stdSerializers = serializers
+ module.exports.stdTimeFunctions = Object.assign({}, time)
+diff --git a/test/context.test.js b/test/context.test.js
+new file mode 100644
+index 0000000..0e92d00
+--- /dev/null
++++ b/test/context.test.js
+@@ -0,0 +1,339 @@
++'use strict'
++
++const test = require('node:test')
++const assert = require('node:assert')
++const os = require('node:os')
++
++const { sink, once } = require('./helper')
++const pino = require('../')
++
++const { pid } = process
++const hostname = os.hostname()
++
++test('pino.context exposes the expected helpers', () => {
++  assert.equal(typeof pino.context, 'function')
++  assert.equal(typeof pino.getContext, 'function')
++  assert.equal(typeof pino.setContext, 'function')
++  assert.equal(typeof pino.enterContextWith, 'function')
++  assert.equal(typeof pino.contextMiddleware, 'function')
++})
++
++test('context fields are merged into every log line', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++
++  pino.context({ reqId: 'abc-123', userId: 42 }, () => {
++    instance.info('hello')
++  })
++
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    reqId: 'abc-123',
++    userId: 42,
++    msg: 'hello'
++  })
++})
++
++test('no context scope keeps log output unchanged', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++  instance.info('hello')
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    msg: 'hello'
++  })
++})
++
++test('context fields propagate across async boundaries', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++
++  await pino.context({ reqId: 'async-1' }, async () => {
++    await Promise.resolve()
++    await new Promise(resolve => setImmediate(resolve))
++    instance.info('deep async')
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.reqId, 'async-1')
++  assert.equal(result.msg, 'deep async')
++})
++
++test('nested scopes inherit from the parent and inner overrides outer', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++
++  pino.context({ reqId: 'outer', region: 'us-east' }, () => {
++    pino.context({ reqId: 'inner', userId: 7 }, () => {
++      instance.info('nested')
++    })
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.reqId, 'inner')
++  assert.equal(result.region, 'us-east')
++  assert.equal(result.userId, 7)
++})
++
++test('explicit log object overrides context fields', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++
++  pino.context({ reqId: 'ctx-id' }, () => {
++    instance.info({ reqId: 'override-id', extra: true }, 'override')
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.reqId, 'override-id')
++  assert.equal(result.extra, true)
++})
++
++test('context beats mixin in field precedence', async () => {
++  const stream = sink()
++  const instance = pino({
++    mixin () {
++      return { source: 'mixin', mixinOnly: true }
++    }
++  }, stream)
++
++  pino.context({ source: 'ctx', reqId: 'r1' }, () => {
++    instance.info('priority')
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.source, 'ctx')
++  assert.equal(result.mixinOnly, true)
++  assert.equal(result.reqId, 'r1')
++})
++
++test('getContext returns a copy of the current scope fields', () => {
++  pino.context({ a: 1, b: 2 }, () => {
++    const fields = pino.getContext()
++    assert.deepEqual(fields, { a: 1, b: 2 })
++    // Mutating the returned copy must not affect subsequent reads.
++    fields.a = 99
++    assert.deepEqual(pino.getContext(), { a: 1, b: 2 })
++  })
++})
++
++test('getContext returns undefined outside a scope', () => {
++  assert.equal(pino.getContext(), undefined)
++})
++
++test('setContext merges into the current scope', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++
++  pino.context({ reqId: 'r-1' }, () => {
++    pino.setContext({ userId: 'u-1' })
++    instance.info('after set')
++    assert.deepEqual(pino.getContext(), { reqId: 'r-1', userId: 'u-1' })
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.reqId, 'r-1')
++  assert.equal(result.userId, 'u-1')
++})
++
++test('setContext mutation in child does not leak into parent', () => {
++  pino.context({ reqId: 'parent' }, () => {
++    pino.context({ span: 's1' }, () => {
++      pino.setContext({ span: 's2', extra: 1 })
++      assert.deepEqual(pino.getContext(), { reqId: 'parent', span: 's2', extra: 1 })
++    })
++    assert.deepEqual(pino.getContext(), { reqId: 'parent' })
++  })
++})
++
++test('setContext throws when called outside of a scope', () => {
++  assert.throws(
++    () => pino.setContext({ foo: 'bar' }),
++    /pino\.setContext called without an active context scope/
++  )
++})
++
++test('context validates its inputs', () => {
++  assert.throws(() => pino.context(null, () => {}), /pino\.context requires a plain object/)
++  assert.throws(() => pino.context([], () => {}), /pino\.context requires a plain object/)
++  assert.throws(() => pino.context({}, 'not-a-fn'), /pino\.context requires a callback function/)
++})
++
++test('setContext validates its input', () => {
++  pino.context({ a: 1 }, () => {
++    assert.throws(() => pino.setContext(null), /pino\.setContext requires a plain object/)
++    assert.throws(() => pino.setContext([]), /pino\.setContext requires a plain object/)
++  })
++})
++
++test('context forwards extra arguments to the callback', () => {
++  const result = pino.context({ a: 1 }, (x, y) => x + y, 2, 3)
++  assert.equal(result, 5)
++})
++
++test('enterContextWith activates a scope without a callback', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++
++  await new Promise(resolve => {
++    setImmediate(() => {
++      pino.enterContextWith({ reqId: 'enter-with' })
++      instance.info('escape hatch')
++      resolve()
++    })
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.reqId, 'enter-with')
++})
++
++test('enterContextWith inherits from existing parent scope', () => {
++  pino.context({ reqId: 'outer' }, () => {
++    pino.enterContextWith({ span: 'sibling' })
++    assert.deepEqual(pino.getContext(), { reqId: 'outer', span: 'sibling' })
++  })
++})
++
++test('contextMiddleware opens a scope for the request lifetime', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++  const mw = pino.contextMiddleware(req => ({ reqId: req.id, path: req.path }))
++
++  const fakeReq = { id: 'req-9', path: '/items' }
++  const fakeRes = {}
++
++  await new Promise((resolve, reject) => {
++    mw(fakeReq, fakeRes, () => {
++      try {
++        instance.info('inside middleware')
++        assert.deepEqual(pino.getContext(), { reqId: 'req-9', path: '/items' })
++        resolve()
++      } catch (err) {
++        reject(err)
++      }
++    })
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.reqId, 'req-9')
++  assert.equal(result.path, '/items')
++})
++
++test('contextMiddleware accepts a static object of fields', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++  const mw = pino.contextMiddleware({ service: 'api' })
++
++  await new Promise(resolve => {
++    mw({}, {}, () => {
++      instance.info('static fields')
++      resolve()
++    })
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.service, 'api')
++})
++
++test('contextMiddleware with no args opens an empty scope', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++  const mw = pino.contextMiddleware()
++
++  await new Promise(resolve => {
++    mw({}, {}, () => {
++      assert.deepEqual(pino.getContext(), {})
++      instance.info('empty')
++      resolve()
++    })
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.msg, 'empty')
++  assert.equal(result.reqId, undefined)
++})
++
++test('contextMiddleware rejects invalid arguments', () => {
++  assert.throws(() => pino.contextMiddleware('bad'), /pino\.contextMiddleware/)
++  assert.throws(() => pino.contextMiddleware(42), /pino\.contextMiddleware/)
++  assert.throws(() => pino.contextMiddleware([]), /pino\.contextMiddleware/)
++})
++
++test('contextMiddleware forwards error when resolver returns a non-object', () => {
++  const mw = pino.contextMiddleware(() => 'not-an-object')
++  let forwarded
++  mw({}, {}, (err) => {
++    forwarded = err
++  })
++  assert.ok(forwarded instanceof TypeError)
++})
++
++test('context fields interact correctly with child loggers', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++  const child = instance.child({ module: 'payments' })
++
++  pino.context({ reqId: 'req-c1' }, () => {
++    child.info('child log')
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.module, 'payments')
++  assert.equal(result.reqId, 'req-c1')
++  assert.equal(result.msg, 'child log')
++})
++
++test('clear error when AsyncLocalStorage is unavailable', () => {
++  // Simulate async_hooks being unavailable by reloading the context
++  // module with a stubbed require cache entry. We validate the error
++  // message rather than the full behaviour because ALS is always
++  // available in supported Node versions.
++  const Module = require('module')
++  const originalLoad = Module._load
++  const contextPath = require.resolve('../lib/context')
++  delete require.cache[contextPath]
++  Module._load = function (request, ...rest) {
++    if (request === 'node:async_hooks') {
++      throw new Error('simulated missing module')
++    }
++    return originalLoad.call(this, request, ...rest)
++  }
++  try {
++    const ctx = require('../lib/context')
++    assert.throws(
++      () => ctx.context({ a: 1 }, () => {}),
++      /AsyncLocalStorage, which is not available/
++    )
++    assert.throws(
++      () => ctx.enterContextWith({ a: 1 }),
++      /AsyncLocalStorage, which is not available/
++    )
++  } finally {
++    Module._load = originalLoad
++    delete require.cache[contextPath]
++    // Force the real module back into cache for subsequent tests in
++    // other files that may run in the same process.
++    require('../lib/context')
++  }
++})
++
++test('context passes Error objects as the log object', async () => {
++  const stream = sink()
++  const instance = pino(stream)
++
++  pino.context({ reqId: 'err-1' }, () => {
++    instance.error(new Error('boom'))
++  })
++
++  const result = await once(stream, 'data')
++  assert.equal(result.reqId, 'err-1')
++  assert.equal(result.msg, 'boom')
++  assert.equal(result.err.message, 'boom')
++})
+diff --git a/test/types/pino-top-export.tst.ts b/test/types/pino-top-export.tst.ts
+index cc1f639..052bf52 100644
+--- a/test/types/pino-top-export.tst.ts
++++ b/test/types/pino-top-export.tst.ts
+@@ -4,12 +4,19 @@ import type { SonicBoom } from 'sonic-boom'
+ import type ThreadStream from 'thread-stream'
+ 
+ import {
++  context,
++  contextMiddleware,
+   destination,
++  enterContextWith,
++  getContext,
++  type ContextFields,
++  type ContextMiddleware,
+   type LevelMapping,
+   levels,
+   multistream,
+   type MultiStreamRes,
+   type SerializedError,
++  setContext,
+   stdSerializers,
+   stdTimeFunctions,
+   transport,
+@@ -30,3 +37,16 @@ expect(
+     options: { some: 'options for', the: 'transport' }
+   })
+ ).type.toBe<ThreadStream>()
++
++// Context API typings
++expect(context({ reqId: 'a' }, () => 42)).type.toBe<number>()
++expect(
++  context({ reqId: 'a' }, (a: number, b: number) => a + b, 1, 2)
++).type.toBe<number>()
++expect(getContext()).type.toBe<ContextFields | undefined>()
++expect(setContext({ userId: 'u' })).type.toBe<void>()
++expect(enterContextWith({ tenantId: 't' })).type.toBe<void>()
++expect(contextMiddleware({ service: 'api' })).type.toBe<ContextMiddleware>()
++expect(
++  contextMiddleware<{ id: string }, { statusCode: number }>(req => ({ reqId: req.id }))
++).type.toBe<ContextMiddleware<{ id: string }, { statusCode: number }>>()

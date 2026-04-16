@@ -1,0 +1,755 @@
+diff --git a/lib/context.js b/lib/context.js
+new file mode 100644
+index 0000000..191d3b9
+--- /dev/null
++++ b/lib/context.js
+@@ -0,0 +1,98 @@
++'use strict'
++
++let AsyncLocalStorage
++try {
++  AsyncLocalStorage = require('node:async_hooks').AsyncLocalStorage
++} catch {}
++
++function flattenStore (store) {
++  const chain = []
++  let current = store
++  while (current) {
++    chain.push(current.fields)
++    current = current.parent
++  }
++  // Apply outermost first so innermost wins
++  const result = {}
++  for (let i = chain.length - 1; i >= 0; i--) {
++    Object.assign(result, chain[i])
++  }
++  return result
++}
++
++function createContext (userMixin) {
++  if (!AsyncLocalStorage) {
++    throw new Error(
++      'pino context requires AsyncLocalStorage, available in Node.js >= 12.17.0. ' +
++      'Set { context: false } or omit the option to disable this feature.'
++    )
++  }
++
++  const als = new AsyncLocalStorage()
++
++  function composedMixin (obj, num, logger) {
++    const store = als.getStore()
++    let contextFields
++    if (store !== undefined) {
++      contextFields = flattenStore(store)
++    }
++
++    let userFields
++    if (userMixin) {
++      userFields = userMixin(obj, num, logger)
++    }
++
++    if (!contextFields && !userFields) return {}
++    if (!contextFields) return userFields
++    if (!userFields) return contextFields
++
++    // User mixin fields override context fields
++    return Object.assign({}, contextFields, userFields)
++  }
++
++  const controller = {
++    run (fields, fn) {
++      const parent = als.getStore()
++      return als.run({ fields, parent }, fn)
++    },
++
++    get (key) {
++      const store = als.getStore()
++      if (store === undefined) return undefined
++      const flattened = flattenStore(store)
++      if (key !== undefined) return flattened[key]
++      return flattened
++    },
++
++    set (fields) {
++      const store = als.getStore()
++      if (store === undefined) {
++        throw new Error('pino.context.set() called outside of a context scope. Use context.run() first.')
++      }
++      Object.assign(store.fields, fields)
++    },
++
++    enterWith (fields) {
++      const parent = als.getStore()
++      als.enterWith({ fields, parent })
++    },
++
++    middleware (extractor) {
++      const extract = extractor || function defaultExtractor (req) {
++        const fields = {}
++        if (req.id) fields.requestId = req.id
++        return fields
++      }
++
++      return function contextMiddleware (req, res, next) {
++        const fields = extract(req, res)
++        const parent = als.getStore()
++        als.run({ fields, parent }, next)
++      }
++    }
++  }
++
++  return { controller, composedMixin }
++}
++
++module.exports = { createContext }
+diff --git a/lib/symbols.js b/lib/symbols.js
+index d745bd1..1b6c040 100644
+--- a/lib/symbols.js
++++ b/lib/symbols.js
+@@ -31,6 +31,7 @@ const mixinMergeStrategySym = Symbol('pino.mixinMergeStrategy')
+ const msgPrefixSym = Symbol('pino.msgPrefix')
+ 
+ const wildcardFirstSym = Symbol('pino.wildcardFirst')
++const contextSym = Symbol('pino.context')
+ 
+ // public symbols, no need to use the same pino
+ // version for these
+@@ -72,5 +73,6 @@ module.exports = {
+   nestedKeyStrSym,
+   mixinMergeStrategySym,
+   msgPrefixSym,
+-  transportUsesMultistreamSym
++  transportUsesMultistreamSym,
++  contextSym
+ }
+diff --git a/pino.d.ts b/pino.d.ts
+index 434dddd..a03f3f8 100644
+--- a/pino.d.ts
++++ b/pino.d.ts
+@@ -27,6 +27,60 @@ declare namespace pino {
+     type MixinFn<CustomLevels extends string = never> = (mergeObject: object, level: number, logger:Logger<CustomLevels>) => object
+     type MixinMergeStrategyFn = (mergeObject: object, mixinObject: object) => object
+ 
++    export interface ContextController {
++      /**
++       * Run a function within a new async context scope.
++       * Fields are automatically included in all log lines within the scope.
++       * Inner scopes override outer scope fields with the same key.
++       *
++       * @param fields - key-value pairs to include in log lines within the scope
++       * @param fn - function to execute within the context scope
++       * @returns the return value of fn
++       */
++      run<T>(fields: Record<string, any>, fn: () => T): T;
++
++      /**
++       * Get all current context fields, flattened across nested scopes.
++       * Returns undefined if no scope is active.
++       */
++      get(): Record<string, any> | undefined;
++
++      /**
++       * Get a single field value from the current context.
++       * Returns undefined if no scope is active or the key is not set.
++       *
++       * @param key - the field name to retrieve
++       */
++      get(key: string): any;
++
++      /**
++       * Set fields on the current context scope. Merges with existing fields.
++       * Throws if no scope is active.
++       *
++       * @param fields - key-value pairs to add to the current scope
++       */
++      set(fields: Record<string, any>): void;
++
++      /**
++       * Transition into a new context scope without wrapping a callback.
++       * Same caveats as AsyncLocalStorage.enterWith() - the context is bound
++       * to the current execution resource and will persist for its lifetime.
++       *
++       * @param fields - key-value pairs for the new scope
++       */
++      enterWith(fields: Record<string, any>): void;
++
++      /**
++       * Returns an Express/Connect-style middleware function that creates a
++       * context scope for each request.
++       *
++       * @param extractor - optional function to extract fields from the request.
++       *   Receives (req, res) and must return an object of fields.
++       *   Defaults to extracting req.id as requestId.
++       */
++      middleware(extractor?: (req: any, res: any) => Record<string, any>): (req: any, res: any, next: () => void) => void;
++    }
++
+     type CustomLevelLogger<CustomLevels extends string, UseOnlyCustomLevels extends boolean = boolean> = {
+       /**
+        * Define additional logging levels.
+@@ -127,6 +181,12 @@ declare namespace pino {
+        * call the callback when finished
+        */
+       flush(cb?: (err?: Error) => void): void;
++
++      /**
++       * Context controller for AsyncLocalStorage-based field injection.
++       * Only available when the `context` option is set to `true`.
++       */
++      context?: ContextController;
+     }
+ 
+     /// Exported types and interfaces
+@@ -705,6 +765,18 @@ declare namespace pino {
+        * logs newline delimited JSON with `\r\n` instead of `\n`. Default: `false`.
+        */
+       crlf?: boolean;
++
++      /**
++       * Enable AsyncLocalStorage-based context for automatic field injection.
++       * When true, creates a `logger.context` controller for managing async scopes.
++       * Fields bound via `logger.context.run()` automatically appear in every log line
++       * within that async scope. Composes with the `mixin` option if both are set.
++       * Zero overhead when disabled. Default: `false`.
++       *
++       * Requires Node.js >= 12.17.0 (AsyncLocalStorage). Throws at creation time
++       * if AsyncLocalStorage is not available.
++       */
++      context?: boolean;
+     }
+ 
+     export interface ChildLoggerOptions<CustomLevels extends string = never> {
+diff --git a/pino.js b/pino.js
+index 9720bcb..63f5dcb 100644
+--- a/pino.js
++++ b/pino.js
+@@ -19,6 +19,7 @@ const {
+   normalizeDestFileDescriptor,
+   noop
+ } = require('./lib/tools')
++const { createContext } = require('./lib/context')
+ const { version } = require('./lib/meta')
+ const {
+   chindingsSym,
+@@ -114,7 +115,8 @@ function pino (...args) {
+     depthLimit,
+     edgeLimit,
+     onChild,
+-    msgPrefix
++    msgPrefix,
++    context
+   } = opts
+ 
+   const stringifySafe = configure({
+@@ -225,6 +227,14 @@ function pino (...args) {
+ 
+   Object.setPrototypeOf(instance, proto())
+ 
++  if (context === true) {
++    const ctx = createContext(mixin)
++    instance[mixinSym] = ctx.composedMixin
++    instance.context = ctx.controller
++  } else if (context !== undefined && context !== false) {
++    throw Error(`Unknown context option type "${typeof context}" - expected "true" or "false"`)
++  }
++
+   genLsCache(instance)
+ 
+   instance[setLevelSym](level)
+diff --git a/test/context.test.js b/test/context.test.js
+new file mode 100644
+index 0000000..dfcec63
+--- /dev/null
++++ b/test/context.test.js
+@@ -0,0 +1,460 @@
++'use strict'
++
++const test = require('node:test')
++const assert = require('node:assert')
++const os = require('node:os')
++const tspl = require('@matteo.collina/tspl')
++
++const { sink, once } = require('./helper')
++const pino = require('../')
++
++const { pid } = process
++const hostname = os.hostname()
++
++test('context fields are included in log output', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({ requestId: 'abc-123' }, () => {
++    instance.info('test')
++  })
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    requestId: 'abc-123',
++    msg: 'test'
++  })
++})
++
++test('no extra fields when no context scope is active', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.info('test')
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    msg: 'test'
++  })
++})
++
++test('nested scopes - inner fields override outer', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({ userId: 1 }, () => {
++    instance.context.run({ userId: 2 }, () => {
++      instance.info('inner')
++    })
++  })
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    userId: 2,
++    msg: 'inner'
++  })
++})
++
++test('nested scopes - fields accumulate', async (t) => {
++  const plan = tspl(t, { plan: 2 })
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({ requestId: 'abc' }, () => {
++    instance.context.run({ userId: 42 }, () => {
++      instance.info('nested')
++    })
++  })
++  const result = await once(stream, 'data')
++  plan.equal(result.requestId, 'abc')
++  plan.equal(result.userId, 42)
++  await plan
++})
++
++test('context.get() returns flattened fields inside scope', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({ requestId: 'abc', userId: 1 }, () => {
++    const fields = instance.context.get()
++    assert.deepEqual(fields, { requestId: 'abc', userId: 1 })
++  })
++})
++
++test('context.get() returns undefined outside scope', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const result = instance.context.get()
++  assert.equal(result, undefined)
++})
++
++test('context.get(key) returns single field', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({ requestId: 'abc', userId: 42 }, () => {
++    assert.equal(instance.context.get('requestId'), 'abc')
++    assert.equal(instance.context.get('userId'), 42)
++    assert.equal(instance.context.get('nonexistent'), undefined)
++  })
++})
++
++test('context.set() mutates current scope', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({ requestId: 'abc' }, () => {
++    instance.context.set({ traceId: 'xyz' })
++    instance.info('test')
++  })
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    requestId: 'abc',
++    traceId: 'xyz',
++    msg: 'test'
++  })
++})
++
++test('context.set() throws outside scope', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  assert.throws(() => {
++    instance.context.set({ foo: 'bar' })
++  }, /context.set\(\) called outside of a context scope/)
++})
++
++test('context.enterWith() sets context without callback wrapper', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.enterWith({ background: true })
++  instance.info('test')
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    background: true,
++    msg: 'test'
++  })
++})
++
++test('child loggers inherit context', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const child = instance.child({ module: 'auth' })
++  instance.context.run({ requestId: 'abc' }, () => {
++    child.info('child log')
++  })
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    module: 'auth',
++    requestId: 'abc',
++    msg: 'child log'
++  })
++})
++
++test('works with user mixin - both fields appear', async () => {
++  const stream = sink()
++  const instance = pino({
++    context: true,
++    mixin () {
++      return { service: 'api' }
++    }
++  }, stream)
++  instance.context.run({ requestId: 'abc' }, () => {
++    instance.info('test')
++  })
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    requestId: 'abc',
++    service: 'api',
++    msg: 'test'
++  })
++})
++
++test('user mixin overrides context fields on conflict', async () => {
++  const stream = sink()
++  const instance = pino({
++    context: true,
++    mixin () {
++      return { source: 'mixin' }
++    }
++  }, stream)
++  instance.context.run({ source: 'context' }, () => {
++    instance.info('test')
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.source, 'mixin')
++})
++
++test('logged object overrides context and mixin fields', async () => {
++  const stream = sink()
++  const instance = pino({
++    context: true,
++    mixin () {
++      return { source: 'mixin' }
++    }
++  }, stream)
++  instance.context.run({ source: 'context', requestId: 'abc' }, () => {
++    instance.info({ source: 'logged' }, 'test')
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.source, 'logged')
++  assert.equal(result.requestId, 'abc')
++})
++
++test('custom mixinMergeStrategy is respected with context', async () => {
++  const stream = sink()
++  const instance = pino({
++    context: true,
++    mixin () {
++      return { fromMixin: true }
++    },
++    mixinMergeStrategy (mergeObject, mixinObject) {
++      // Custom strategy: mixin wins over logged object
++      return Object.assign(mergeObject, mixinObject)
++    }
++  }, stream)
++  instance.context.run({ requestId: 'abc' }, () => {
++    instance.info({ fromMixin: false }, 'test')
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.fromMixin, true)
++  assert.equal(result.requestId, 'abc')
++})
++
++test('context disabled by default', async () => {
++  const stream = sink()
++  const instance = pino({}, stream)
++  assert.equal(instance.context, undefined)
++})
++
++test('context: true without mixin works', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({ foo: 'bar' }, () => {
++    instance.info('test')
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.foo, 'bar')
++})
++
++test('context invalid option type throws', async () => {
++  const stream = sink()
++  assert.throws(() => {
++    pino({ context: 'yes' }, stream)
++  }, /Unknown context option type/)
++})
++
++test('async context propagates through promises', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  await instance.context.run({ requestId: 'async-123' }, async () => {
++    await new Promise(resolve => setTimeout(resolve, 10))
++    instance.info('after await')
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.requestId, 'async-123')
++})
++
++test('async context propagates through setTimeout', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  await new Promise((resolve) => {
++    instance.context.run({ requestId: 'timeout-123' }, () => {
++      setTimeout(() => {
++        instance.info('in timeout')
++        resolve()
++      }, 10)
++    })
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.requestId, 'timeout-123')
++})
++
++test('context.middleware() returns a function', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const mw = instance.context.middleware()
++  assert.equal(typeof mw, 'function')
++  assert.equal(mw.length, 3)
++})
++
++test('context.middleware() creates scope with default extractor', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const mw = instance.context.middleware()
++  const fakeReq = { id: 'req-001' }
++  const fakeRes = {}
++  await new Promise((resolve) => {
++    mw(fakeReq, fakeRes, () => {
++      instance.info('middleware test')
++      resolve()
++    })
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.requestId, 'req-001')
++})
++
++test('context.middleware() with custom extractor', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const mw = instance.context.middleware((req) => ({
++    method: req.method,
++    path: req.url
++  }))
++  const fakeReq = { method: 'GET', url: '/api/users' }
++  const fakeRes = {}
++  await new Promise((resolve) => {
++    mw(fakeReq, fakeRes, () => {
++      instance.info('custom extractor test')
++      resolve()
++    })
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.method, 'GET')
++  assert.equal(result.path, '/api/users')
++})
++
++test('context.run() returns the value of the callback', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const result = instance.context.run({ a: 1 }, () => {
++    return 42
++  })
++  assert.equal(result, 42)
++})
++
++test('context.run() returns the value of an async callback', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const result = await instance.context.run({ a: 1 }, async () => {
++    return 'hello'
++  })
++  assert.equal(result, 'hello')
++})
++
++test('user mixin receives correct arguments when composed with context', async (t) => {
++  const plan = tspl(t, { plan: 3 })
++  const stream = sink()
++  const instance = pino({
++    context: true,
++    mixin (obj, num, logger) {
++      plan.deepEqual(obj, { custom: 'data' })
++      plan.equal(num, 30)
++      plan.ok(logger !== undefined)
++      return { fromMixin: true }
++    }
++  }, stream)
++  instance.context.run({ requestId: 'abc' }, () => {
++    instance.info({ custom: 'data' }, 'test')
++  })
++  await plan
++})
++
++test('nested context.set() only affects current scope', async (t) => {
++  const plan = tspl(t, { plan: 2 })
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({ requestId: 'abc' }, () => {
++    instance.context.run({ userId: 1 }, () => {
++      instance.context.set({ extra: 'inner' })
++      const innerFields = instance.context.get()
++      plan.deepEqual(innerFields, { requestId: 'abc', userId: 1, extra: 'inner' })
++    })
++    // After inner scope exits, extra should not be present
++    const outerFields = instance.context.get()
++    plan.deepEqual(outerFields, { requestId: 'abc' })
++  })
++  await plan
++})
++
++test('multiple context fields in single run', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  instance.context.run({
++    requestId: 'abc',
++    userId: 42,
++    tenantId: 'org-1',
++    traceId: 'trace-xyz'
++  }, () => {
++    instance.info('test')
++  })
++  const result = await once(stream, 'data')
++  assert.equal(result.requestId, 'abc')
++  assert.equal(result.userId, 42)
++  assert.equal(result.tenantId, 'org-1')
++  assert.equal(result.traceId, 'trace-xyz')
++})
++
++test('context is not shared across independent async chains', async (t) => {
++  const plan = tspl(t, { plan: 1 })
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const results = []
++
++  stream.on('data', (data) => {
++    results.push(data)
++  })
++
++  const p1 = new Promise((resolve) => {
++    instance.context.run({ requestId: 'req-1' }, () => {
++      setTimeout(() => {
++        instance.info('from chain 1')
++        resolve()
++      }, 10)
++    })
++  })
++
++  const p2 = new Promise((resolve) => {
++    instance.context.run({ requestId: 'req-2' }, () => {
++      setTimeout(() => {
++        instance.info('from chain 2')
++        resolve()
++      }, 10)
++    })
++  })
++
++  await Promise.all([p1, p2])
++  // Allow stream to flush
++  await new Promise(resolve => setTimeout(resolve, 50))
++
++  const ids = results.map(r => r.requestId).sort()
++  plan.deepEqual(ids, ['req-1', 'req-2'])
++  await plan
++})
++
++test('context with child that has own bindings', async () => {
++  const stream = sink()
++  const instance = pino({ context: true }, stream)
++  const child = instance.child({ component: 'db' })
++  instance.context.run({ requestId: 'abc', traceId: 'trace-1' }, () => {
++    child.info('query executed')
++  })
++  const result = await once(stream, 'data')
++  delete result.time
++  assert.deepEqual(result, {
++    pid,
++    hostname,
++    level: 30,
++    component: 'db',
++    requestId: 'abc',
++    traceId: 'trace-1',
++    msg: 'query executed'
++  })
++})
+diff --git a/test/types/pino.tst.ts b/test/types/pino.tst.ts
+index 337f557..bcac163 100644
+--- a/test/types/pino.tst.ts
++++ b/test/types/pino.tst.ts
+@@ -679,3 +679,26 @@ const someGenericFunction = <T extends string | number | symbol = never>(
+ ) => {
+   info(arg)
+ }
++
++// Context API
++const ctxLogger = pino({ context: true })
++if (ctxLogger.context) {
++  // run with fields and callback
++  const runResult: number = ctxLogger.context.run({ requestId: 'abc' }, () => 42)
++  // get all fields
++  const allFields: Record<string, any> | undefined = ctxLogger.context.get()
++  // get single field
++  const singleField: any = ctxLogger.context.get('requestId')
++  // set fields
++  ctxLogger.context.set({ traceId: 'xyz' })
++  // enterWith
++  ctxLogger.context.enterWith({ background: true })
++  // middleware with no extractor
++  const mw: (req: any, res: any, next: () => void) => void = ctxLogger.context.middleware()
++  // middleware with custom extractor
++  const mwCustom = ctxLogger.context.middleware((req: any, res: any) => ({ id: req.id }))
++}
++
++// context option accepts boolean
++pino({ context: false })
++pino({ context: true })
