@@ -1,0 +1,484 @@
+diff --git a/src/vijaybase/commands/diff_cmd.py b/src/vijaybase/commands/diff_cmd.py
+new file mode 100644
+index 0000000..d22182c
+--- /dev/null
++++ b/src/vijaybase/commands/diff_cmd.py
+@@ -0,0 +1,122 @@
++from __future__ import annotations
++
++import argparse
++
++from vijaybase.config import load_config
++from vijaybase.diff import (
++    AddColumn,
++    AddIndex,
++    CreateTable,
++    DiffOp,
++    DropColumn,
++    DropIndex,
++    DropTable,
++    ReconstructTable,
++    RenameColumn,
++    compute_diff,
++)
++from vijaybase.introspector import introspect_database
++from vijaybase.schema_parser import parse_schema_dir, validate_schema
++
++
++def run_diff(args: argparse.Namespace) -> int:
++    config = load_config()
++
++    desired = parse_schema_dir(config.schema_path)
++    if not desired.tables:
++        print("No schema files found. Add .yaml files to the schema/ directory.")
++        return 1
++    errors = validate_schema(desired)
++    if errors:
++        print("Schema validation failed:")
++        for err in errors:
++            print(f"  - {err}")
++        return 1
++
++    current = introspect_database(config.database_path)
++
++    ops = compute_diff(current, desired)
++    if not ops:
++        print("No changes detected. Database schema matches YAML definition.")
++        return 0
++
++    print(f"Detected {len(ops)} change(s):\n")
++    for op in ops:
++        print(f"  {_format_op(op)}")
++
++    return 0
++
++
++def _format_op(op: DiffOp) -> str:
++    if isinstance(op, CreateTable):
++        cols = ", ".join(c.name for c in op.table.columns)
++        return f"+ Create table '{op.table.name}' ({cols})"
++    elif isinstance(op, DropTable):
++        return f"- Drop table '{op.table.name}'"
++    elif isinstance(op, AddColumn):
++        nullable = "" if op.column.nullable else " NOT NULL"
++        default = f" DEFAULT {op.column.default}" if op.column.default else ""
++        return (
++            f"+ Add column '{op.table_name}.{op.column.name}' "
++            f"{op.column.type}{nullable}{default}"
++        )
++    elif isinstance(op, DropColumn):
++        return f"- Drop column '{op.table_name}.{op.column.name}'"
++    elif isinstance(op, RenameColumn):
++        return (
++            f"~ Rename column '{op.table_name}.{op.old_name}' "
++            f"-> '{op.new_name}'"
++        )
++    elif isinstance(op, AddIndex):
++        cols = ", ".join(op.index.columns)
++        unique = "unique " if op.index.unique else ""
++        return f"+ Add {unique}index '{op.index.name}' on {op.index.table}({cols})"
++    elif isinstance(op, DropIndex):
++        return f"- Drop index '{op.index.name}'"
++    elif isinstance(op, ReconstructTable):
++        changes = _describe_reconstruct(op)
++        return f"~ Reconstruct table '{op.table_name}' ({changes})"
++    return f"  {op}"
++
++
++def _describe_reconstruct(op: ReconstructTable) -> str:
++    """Summarize what changed inside a table reconstruction."""
++    parts: list[str] = []
++
++    old_pk = op.old_table.primary_key
++    new_pk = op.new_table.primary_key
++    if old_pk != new_pk:
++        parts.append("primary key changed")
++
++    old_fks = frozenset(op.old_table.foreign_keys)
++    new_fks = frozenset(op.new_table.foreign_keys)
++    if old_fks != new_fks:
++        added_fks = len(new_fks - old_fks)
++        removed_fks = len(old_fks - new_fks)
++        if added_fks:
++            parts.append(f"{added_fks} FK(s) added")
++        if removed_fks:
++            parts.append(f"{removed_fks} FK(s) removed")
++
++    old_checks = frozenset(c.expression for c in op.old_table.checks)
++    new_checks = frozenset(c.expression for c in op.new_table.checks)
++    if old_checks != new_checks:
++        parts.append("check constraints changed")
++
++    old_cols = {c.name: c for c in op.old_table.columns}
++    new_cols = {c.name: c for c in op.new_table.columns}
++    added = sorted(set(new_cols) - set(old_cols))
++    removed = sorted(set(old_cols) - set(new_cols))
++    modified = []
++    for name in sorted(set(old_cols) & set(new_cols)):
++        if old_cols[name] != new_cols[name]:
++            modified.append(name)
++
++    if added:
++        parts.append(f"added columns: {', '.join(added)}")
++    if removed:
++        parts.append(f"removed columns: {', '.join(removed)}")
++    if modified:
++        parts.append(f"modified columns: {', '.join(modified)}")
++
++    return "; ".join(parts) if parts else "schema changed"
+
+
+
+diff --git a/src/vijaybase/cli.py b/src/vijaybase/cli.py
+index 8c96ec0..144e1ec 100644
+--- a/src/vijaybase/cli.py
++++ b/src/vijaybase/cli.py
+@@ -6,6 +6,7 @@ import sys
+ from vijaybase import __version__
+ from vijaybase.commands import (
+     apply_cmd,
++    diff_cmd,
+     generate_cmd,
+     init_cmd,
+     merge_cmd,
+@@ -43,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
+     p_gen.add_argument("description", help="Short description (used in filename)")
+     p_gen.set_defaults(func=generate_cmd.run_generate)
+ 
++    # diff
++    p_diff = subparsers.add_parser(
++        "diff", help="Preview schema changes without generating a migration"
++    )
++    p_diff.set_defaults(func=diff_cmd.run_diff)
++
+     # apply
+     p_apply = subparsers.add_parser("apply", help="Apply pending migrations")
+     p_apply.add_argument(
+diff --git a/src/vijaybase/diff.py b/src/vijaybase/diff.py
+index 1130f25..4918410 100644
+--- a/src/vijaybase/diff.py
++++ b/src/vijaybase/diff.py
+@@ -41,6 +41,13 @@ class DropColumn(DiffOp):
+     column: ColumnDef
+ 
+ 
++@dataclass(frozen=True)
++class RenameColumn(DiffOp):
++    table_name: str
++    old_name: str
++    new_name: str
++
++
+ @dataclass(frozen=True)
+ class AddIndex(DiffOp):
+     index: IndexDef
+@@ -104,6 +111,15 @@ def _normalize_default(val: str | None) -> str | None:
+     return v
+ 
+ 
++def _column_signature(col: ColumnDef) -> tuple:
++    """Return a column's structural signature (everything except name).
++
++    Used for rename detection: if a removed column and an added column
++    share the same signature, it's a rename rather than drop+add.
++    """
++    return (col.type, col.nullable, _normalize_default(col.default), col.unique)
++
++
+ def _columns_equal(a: ColumnDef, b: ColumnDef) -> bool:
+     """Compare columns with normalized defaults."""
+     return (
+@@ -158,7 +174,7 @@ def _diff_table(cur_t: TableDef, des_t: TableDef) -> list[DiffOp]:
+     if cur_check_exprs != des_check_exprs:
+         needs_reconstruct = True
+ 
+-    # Compare columns
++    # Compare columns — with rename detection
+     cur_cols = {c.name: c for c in cur_t.columns}
+     des_cols = {c.name: c for c in des_t.columns}
+ 
+@@ -166,6 +182,16 @@ def _diff_table(cur_t: TableDef, des_t: TableDef) -> list[DiffOp]:
+     removed_cols = set(cur_cols) - set(des_cols)
+     common_cols = set(cur_cols) & set(des_cols)
+ 
++    # Detect renames: a removed column and an added column with the exact
++    # same type/nullable/default/unique is treated as a rename.
++    renames = _detect_renames(cur_cols, des_cols, removed_cols, added_cols)
++    for old_name, new_name in renames:
++        simple_ops.append(RenameColumn(table_name, old_name, new_name))
++    renamed_old = {old for old, _ in renames}
++    renamed_new = {new for _, new in renames}
++    added_cols -= renamed_new
++    removed_cols -= renamed_old
++
+     for col_name in sorted(added_cols):
+         col = des_cols[col_name]
+         # ALTER TABLE ADD COLUMN only works if nullable or has default
+@@ -175,8 +201,7 @@ def _diff_table(cur_t: TableDef, des_t: TableDef) -> list[DiffOp]:
+             needs_reconstruct = True
+ 
+     for col_name in sorted(removed_cols):
+-        # SQLite 3.35+ supports ALTER TABLE DROP COLUMN but with restrictions.
+-        # For safety, if dropping a column, use reconstruct.
++        # Column truly removed (not renamed) — requires reconstruct
+         needs_reconstruct = True
+ 
+     for col_name in sorted(common_cols):
+@@ -200,12 +225,48 @@ def _diff_table(cur_t: TableDef, des_t: TableDef) -> list[DiffOp]:
+             simple_ops.append(AddIndex(des_idx[idx_name]))
+ 
+     if needs_reconstruct:
+-        # Collapse everything into a single ReconstructTable
+-        # But keep index ops that are purely additive on the new table
+-        return [ReconstructTable(table_name, cur_t, des_t)]
++        # Collapse into ReconstructTable, but preserve renames —
++        # they happen via ALTER TABLE RENAME COLUMN before reconstruction
++        rename_ops = [op for op in simple_ops if isinstance(op, RenameColumn)]
++        return rename_ops + [ReconstructTable(table_name, cur_t, des_t)]
+     return simple_ops
+ 
+ 
++def _detect_renames(
++    cur_cols: dict[str, ColumnDef],
++    des_cols: dict[str, ColumnDef],
++    removed: set[str],
++    added: set[str],
++) -> list[tuple[str, str]]:
++    """Match removed columns to added columns with identical signatures.
++
++    Returns list of (old_name, new_name) pairs. Each column participates
++    in at most one rename (greedy 1:1 matching).
++    """
++    if not removed or not added:
++        return []
++
++    # Build signature -> list of column names for each side
++    removed_by_sig: dict[tuple, list[str]] = {}
++    for name in sorted(removed):
++        sig = _column_signature(cur_cols[name])
++        removed_by_sig.setdefault(sig, []).append(name)
++
++    added_by_sig: dict[tuple, list[str]] = {}
++    for name in sorted(added):
++        sig = _column_signature(des_cols[name])
++        added_by_sig.setdefault(sig, []).append(name)
++
++    renames: list[tuple[str, str]] = []
++    for sig, old_names in removed_by_sig.items():
++        new_names = added_by_sig.get(sig, [])
++        # Pair them 1:1 in sorted order
++        for old_name, new_name in zip(old_names, new_names):
++            renames.append((old_name, new_name))
++
++    return renames
++
++
+ def _toposort_for_create(
+     table_names: set[str], schema: SchemaDef
+ ) -> list[str]:
+diff --git a/src/vijaybase/migration_generator.py b/src/vijaybase/migration_generator.py
+index 4fd2c10..2a85753 100644
+--- a/src/vijaybase/migration_generator.py
++++ b/src/vijaybase/migration_generator.py
+@@ -9,6 +9,7 @@ from vijaybase.diff import (
+     DropIndex,
+     DropTable,
+     ReconstructTable,
++    RenameColumn,
+ )
+ from vijaybase.models import (
+     ColumnDef,
+@@ -49,6 +50,10 @@ def _op_to_up_sql(op: DiffOp) -> list[str]:
+         return [_add_column_sql(op.table_name, op.column)]
+     elif isinstance(op, DropColumn):
+         return [f"ALTER TABLE [{op.table_name}] DROP COLUMN [{op.column.name}]"]
++    elif isinstance(op, RenameColumn):
++        return [
++            f"ALTER TABLE [{op.table_name}] RENAME COLUMN [{op.old_name}] TO [{op.new_name}]"
++        ]
+     elif isinstance(op, AddIndex):
+         return [_create_index_sql(op.index)]
+     elif isinstance(op, DropIndex):
+@@ -74,6 +79,11 @@ def _op_to_down_sql(op: DiffOp, current_schema: SchemaDef) -> list[str]:
+         return [f"ALTER TABLE [{op.table_name}] DROP COLUMN [{op.column.name}]"]
+     elif isinstance(op, DropColumn):
+         return [_add_column_sql(op.table_name, op.column)]
++    elif isinstance(op, RenameColumn):
++        # Reverse the rename
++        return [
++            f"ALTER TABLE [{op.table_name}] RENAME COLUMN [{op.new_name}] TO [{op.old_name}]"
++        ]
+     elif isinstance(op, AddIndex):
+         return [_drop_index_sql(op.index)]
+     elif isinstance(op, DropIndex):
+diff --git a/tests/test_diff.py b/tests/test_diff.py
+index c63b687..07ab3ac 100644
+--- a/tests/test_diff.py
++++ b/tests/test_diff.py
+@@ -5,6 +5,7 @@ from vijaybase.diff import (
+     DropIndex,
+     DropTable,
+     ReconstructTable,
++    RenameColumn,
+     compute_diff,
+ )
+ from vijaybase.models import (
+@@ -172,3 +173,158 @@ def test_remove_column_requires_reconstruct():
+     desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
+     ops = compute_diff(current, desired)
+     assert any(isinstance(op, ReconstructTable) for op in ops)
++
++
++# --- Rename detection tests ---
++
++
++def test_rename_column_same_signature():
++    """Column disappears, new one appears with exact same type/nullable/default/unique -> rename."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="name", type="TEXT", nullable=False),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="full_name", type="TEXT", nullable=False),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old)})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
++    ops = compute_diff(current, desired)
++    rename_ops = [op for op in ops if isinstance(op, RenameColumn)]
++    assert len(rename_ops) == 1
++    assert rename_ops[0].old_name == "name"
++    assert rename_ops[0].new_name == "full_name"
++    # Should NOT trigger a reconstruct
++    assert not any(isinstance(op, ReconstructTable) for op in ops)
++
++
++def test_rename_column_different_type_is_not_rename():
++    """Different type means it's not a rename — triggers reconstruct."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="name", type="TEXT"),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="full_name", type="INTEGER"),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old)})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
++    ops = compute_diff(current, desired)
++    # No rename — different types
++    assert not any(isinstance(op, RenameColumn) for op in ops)
++    assert any(isinstance(op, ReconstructTable) for op in ops)
++
++
++def test_rename_column_with_default():
++    """Rename with matching default value."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="status", type="INTEGER", nullable=False, default="0"),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="state", type="INTEGER", nullable=False, default="0"),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old)})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
++    ops = compute_diff(current, desired)
++    rename_ops = [op for op in ops if isinstance(op, RenameColumn)]
++    assert len(rename_ops) == 1
++    assert rename_ops[0].old_name == "status"
++    assert rename_ops[0].new_name == "state"
++
++
++def test_rename_plus_other_changes():
++    """Rename alongside a reconstruct-triggering change should emit both."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="name", type="TEXT"),
++        ColumnDef(name="age", type="INTEGER"),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="full_name", type="TEXT"),
++        ColumnDef(name="age", type="TEXT"),  # type change -> reconstruct
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old, pk=())})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new, pk=())})
++    ops = compute_diff(current, desired)
++    # Rename should still be detected
++    rename_ops = [op for op in ops if isinstance(op, RenameColumn)]
++    assert len(rename_ops) == 1
++    assert rename_ops[0].old_name == "name"
++    assert rename_ops[0].new_name == "full_name"
++    # Reconstruct also needed due to age type change
++    assert any(isinstance(op, ReconstructTable) for op in ops)
++
++
++def test_multiple_renames():
++    """Two columns renamed simultaneously."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="fname", type="TEXT"),
++        ColumnDef(name="lname", type="TEXT"),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="first_name", type="TEXT"),
++        ColumnDef(name="last_name", type="TEXT"),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old)})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
++    ops = compute_diff(current, desired)
++    rename_ops = [op for op in ops if isinstance(op, RenameColumn)]
++    assert len(rename_ops) == 2
++    old_names = {r.old_name for r in rename_ops}
++    new_names = {r.new_name for r in rename_ops}
++    assert old_names == {"fname", "lname"}
++    assert new_names == {"first_name", "last_name"}
++
++
++# --- FK dependency ordering tests ---
++
++
++def test_three_level_fk_create_order():
++    """users -> orders -> audit_log: CREATE must respect FK dependencies."""
++    users = _simple_table("users")
++    fk_orders = ForeignKeyDef(columns=("user_id",), ref_table="users", ref_columns=("id",))
++    orders = _simple_table(
++        "orders",
++        cols=(ColumnDef(name="id", type="INTEGER"), ColumnDef(name="user_id", type="INTEGER")),
++        fks=(fk_orders,),
++    )
++    fk_audit = ForeignKeyDef(columns=("order_id",), ref_table="orders", ref_columns=("id",))
++    audit_log = _simple_table(
++        "audit_log",
++        cols=(ColumnDef(name="id", type="INTEGER"), ColumnDef(name="order_id", type="INTEGER")),
++        fks=(fk_audit,),
++    )
++    current = SchemaDef(tables={})
++    desired = SchemaDef(tables={"audit_log": audit_log, "orders": orders, "users": users})
++    ops = compute_diff(current, desired)
++    names = [op.table.name for op in ops if isinstance(op, CreateTable)]
++    assert names == ["users", "orders", "audit_log"]
++
++
++def test_three_level_fk_drop_order():
++    """Dropping users -> orders -> audit_log must reverse: audit_log first."""
++    users = _simple_table("users")
++    fk_orders = ForeignKeyDef(columns=("user_id",), ref_table="users", ref_columns=("id",))
++    orders = _simple_table(
++        "orders",
++        cols=(ColumnDef(name="id", type="INTEGER"), ColumnDef(name="user_id", type="INTEGER")),
++        fks=(fk_orders,),
++    )
++    fk_audit = ForeignKeyDef(columns=("order_id",), ref_table="orders", ref_columns=("id",))
++    audit_log = _simple_table(
++        "audit_log",
++        cols=(ColumnDef(name="id", type="INTEGER"), ColumnDef(name="order_id", type="INTEGER")),
++        fks=(fk_audit,),
++    )
++    current = SchemaDef(tables={"audit_log": audit_log, "orders": orders, "users": users})
++    desired = SchemaDef(tables={})
++    ops = compute_diff(current, desired)
++    names = [op.table.name for op in ops if isinstance(op, DropTable)]
++    assert names == ["audit_log", "orders", "users"]

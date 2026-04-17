@@ -1,0 +1,855 @@
+diff --git a/src/vijaybase/commands/diff_cmd.py b/src/vijaybase/commands/diff_cmd.py
+new file mode 100644
+index 0000000..4f5dd85
+--- /dev/null
++++ b/src/vijaybase/commands/diff_cmd.py
+@@ -0,0 +1,129 @@
++from __future__ import annotations
++
++import argparse
++
++from vijaybase.config import load_config
++from vijaybase.diff import (
++    AddColumn,
++    AddIndex,
++    CreateTable,
++    DropColumn,
++    DropIndex,
++    DropTable,
++    ReconstructTable,
++    RenameColumn,
++    compute_diff,
++)
++from vijaybase.introspector import introspect_database
++from vijaybase.schema_parser import parse_schema_dir, validate_schema
++
++
++def run_diff(args: argparse.Namespace) -> int:
++    config = load_config()
++
++    desired = parse_schema_dir(config.schema_path)
++    if not desired.tables:
++        print("No schema files found. Add .yaml files to the schema/ directory.")
++        return 1
++    errors = validate_schema(desired)
++    if errors:
++        print("Schema validation failed:")
++        for err in errors:
++            print(f"  - {err}")
++        return 1
++
++    current = introspect_database(config.database_path)
++    ops = compute_diff(current, desired)
++
++    if not ops:
++        print("No changes detected. Database schema matches YAML definition.")
++        return 0
++
++    print(f"Detected {len(ops)} operation(s):\n")
++    for op in ops:
++        print(f"  {_format_op(op)}")
++
++    print()
++    print("Run 'vijaybase generate <description>' to create a migration from these changes.")
++    return 0
++
++
++def _format_op(op) -> str:
++    if isinstance(op, CreateTable):
++        cols = ", ".join(c.name for c in op.table.columns)
++        return f"+ Create table '{op.table.name}' ({cols})"
++    elif isinstance(op, DropTable):
++        return f"- Drop table '{op.table.name}'"
++    elif isinstance(op, AddColumn):
++        nullable = "" if op.column.nullable else " NOT NULL"
++        default = f" DEFAULT {op.column.default}" if op.column.default else ""
++        return (
++            f"+ Add column '{op.table_name}.{op.column.name}' "
++            f"{op.column.type}{nullable}{default}"
++        )
++    elif isinstance(op, DropColumn):
++        return f"- Drop column '{op.table_name}.{op.column.name}'"
++    elif isinstance(op, RenameColumn):
++        return (
++            f"~ Rename column '{op.table_name}.{op.old_name}' "
++            f"-> '{op.new_name}'"
++        )
++    elif isinstance(op, AddIndex):
++        unique = "unique " if op.index.unique else ""
++        cols = ", ".join(op.index.columns)
++        return (
++            f"+ Add {unique}index '{op.index.name}' "
++            f"on '{op.index.table}' ({cols})"
++        )
++    elif isinstance(op, DropIndex):
++        return f"- Drop index '{op.index.name}'"
++    elif isinstance(op, ReconstructTable):
++        changes = _describe_reconstruct(op)
++        return (
++            f"~ Reconstruct table '{op.table_name}' ({changes})"
++        )
++    return f"  {op}"
++
++
++def _describe_reconstruct(op: ReconstructTable) -> str:
++    """Build a human-readable summary of what changed inside a ReconstructTable."""
++    parts: list[str] = []
++
++    old_cols = {c.name for c in op.old_table.columns}
++    new_cols = {c.name for c in op.new_table.columns}
++    rename_map = dict(op.column_renames)
++    reverse_rename = {v: k for k, v in rename_map.items()}
++
++    # Renamed columns
++    for old_name, new_name in op.column_renames:
++        parts.append(f"rename {old_name} -> {new_name}")
++
++    # Truly added columns (not renames)
++    for name in sorted(new_cols - old_cols):
++        if name not in reverse_rename:
++            parts.append(f"add column {name}")
++
++    # Truly dropped columns (not renames)
++    for name in sorted(old_cols - new_cols):
++        if name not in rename_map:
++            parts.append(f"drop column {name}")
++
++    # Modified columns
++    old_col_map = {c.name: c for c in op.old_table.columns}
++    new_col_map = {c.name: c for c in op.new_table.columns}
++    for name in sorted(old_cols & new_cols):
++        if old_col_map[name] != new_col_map[name]:
++            parts.append(f"alter column {name}")
++
++    if op.old_table.primary_key != op.new_table.primary_key:
++        parts.append("change primary key")
++
++    if frozenset(op.old_table.foreign_keys) != frozenset(op.new_table.foreign_keys):
++        parts.append("change foreign keys")
++
++    old_checks = frozenset(c.expression for c in op.old_table.checks)
++    new_checks = frozenset(c.expression for c in op.new_table.checks)
++    if old_checks != new_checks:
++        parts.append("change constraints")
++
++    return ", ".join(parts) if parts else "rebuild"
+
+
+diff --git a/src/vijaybase/cli.py b/src/vijaybase/cli.py
+index 8c96ec0..4233f8f 100644
+--- a/src/vijaybase/cli.py
++++ b/src/vijaybase/cli.py
+@@ -6,6 +6,7 @@ import sys
+ from vijaybase import __version__
+ from vijaybase.commands import (
+     apply_cmd,
++    diff_cmd,
+     generate_cmd,
+     init_cmd,
+     merge_cmd,
+@@ -78,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
+     )
+     p_merge.set_defaults(func=merge_cmd.run_merge)
+ 
++    # diff
++    p_diff = subparsers.add_parser(
++        "diff", help="Preview schema changes without generating a migration"
++    )
++    p_diff.set_defaults(func=diff_cmd.run_diff)
++
+     return parser
+ 
+ 
+diff --git a/src/vijaybase/diff.py b/src/vijaybase/diff.py
+index 1130f25..89706c4 100644
+--- a/src/vijaybase/diff.py
++++ b/src/vijaybase/diff.py
+@@ -51,11 +51,19 @@ class DropIndex(DiffOp):
+     index: IndexDef
+ 
+ 
++@dataclass(frozen=True)
++class RenameColumn(DiffOp):
++    table_name: str
++    old_name: str
++    new_name: str
++
++
+ @dataclass(frozen=True)
+ class ReconstructTable(DiffOp):
+     table_name: str
+     old_table: TableDef
+     new_table: TableDef
++    column_renames: tuple[tuple[str, str], ...] = ()  # (old_name, new_name) pairs
+ 
+ 
+ # --- Diff computation ---
+@@ -108,7 +116,14 @@ def _columns_equal(a: ColumnDef, b: ColumnDef) -> bool:
+     """Compare columns with normalized defaults."""
+     return (
+         a.name == b.name
+-        and a.type == b.type
++        and _column_signature_equal(a, b)
++    )
++
++
++def _column_signature_equal(a: ColumnDef, b: ColumnDef) -> bool:
++    """Compare column properties ignoring name (for rename detection)."""
++    return (
++        a.type == b.type
+         and a.nullable == b.nullable
+         and _normalize_default(a.default) == _normalize_default(b.default)
+         and a.unique == b.unique
+@@ -166,7 +181,35 @@ def _diff_table(cur_t: TableDef, des_t: TableDef) -> list[DiffOp]:
+     removed_cols = set(cur_cols) - set(des_cols)
+     common_cols = set(cur_cols) & set(des_cols)
+ 
+-    for col_name in sorted(added_cols):
++    # Detect renames: a removed column paired with an added column that has
++    # the exact same type, nullable, default, and unique constraints.
++    # When multiple candidates match, prefer the one closest in ordinal position.
++    cur_col_positions = {c.name: i for i, c in enumerate(cur_t.columns)}
++    des_col_positions = {c.name: i for i, c in enumerate(des_t.columns)}
++
++    renames: list[tuple[str, str]] = []  # (old_name, new_name)
++    remaining_added = set(added_cols)
++    remaining_removed = set(removed_cols)
++
++    for old_name in sorted(removed_cols):
++        old_col = cur_cols[old_name]
++        old_pos = cur_col_positions[old_name]
++        # Find all added cols with matching signature
++        candidates = [
++            new_name for new_name in remaining_added
++            if _column_signature_equal(old_col, des_cols[new_name])
++        ]
++        if candidates:
++            # Pick the candidate closest in ordinal position
++            best = min(candidates, key=lambda n: abs(des_col_positions[n] - old_pos))
++            renames.append((old_name, best))
++            remaining_added.discard(best)
++            remaining_removed.discard(old_name)
++
++    for old_name, new_name in renames:
++        simple_ops.append(RenameColumn(table_name, old_name, new_name))
++
++    for col_name in sorted(remaining_added):
+         col = des_cols[col_name]
+         # ALTER TABLE ADD COLUMN only works if nullable or has default
+         if col.nullable or col.default is not None:
+@@ -174,9 +217,8 @@ def _diff_table(cur_t: TableDef, des_t: TableDef) -> list[DiffOp]:
+         else:
+             needs_reconstruct = True
+ 
+-    for col_name in sorted(removed_cols):
+-        # SQLite 3.35+ supports ALTER TABLE DROP COLUMN but with restrictions.
+-        # For safety, if dropping a column, use reconstruct.
++    for col_name in sorted(remaining_removed):
++        # Column truly removed (not a rename) — requires reconstruct
+         needs_reconstruct = True
+ 
+     for col_name in sorted(common_cols):
+@@ -200,9 +242,10 @@ def _diff_table(cur_t: TableDef, des_t: TableDef) -> list[DiffOp]:
+             simple_ops.append(AddIndex(des_idx[idx_name]))
+ 
+     if needs_reconstruct:
+-        # Collapse everything into a single ReconstructTable
+-        # But keep index ops that are purely additive on the new table
+-        return [ReconstructTable(table_name, cur_t, des_t)]
++        # Collapse everything into a single ReconstructTable,
++        # carrying rename info so the data copy maps old->new column names.
++        rename_tuples = tuple(renames)
++        return [ReconstructTable(table_name, cur_t, des_t, rename_tuples)]
+     return simple_ops
+ 
+ 
+diff --git a/src/vijaybase/migration_generator.py b/src/vijaybase/migration_generator.py
+index 4fd2c10..db12736 100644
+--- a/src/vijaybase/migration_generator.py
++++ b/src/vijaybase/migration_generator.py
+@@ -9,6 +9,7 @@ from vijaybase.diff import (
+     DropIndex,
+     DropTable,
+     ReconstructTable,
++    RenameColumn,
+ )
+ from vijaybase.models import (
+     ColumnDef,
+@@ -49,12 +50,18 @@ def _op_to_up_sql(op: DiffOp) -> list[str]:
+         return [_add_column_sql(op.table_name, op.column)]
+     elif isinstance(op, DropColumn):
+         return [f"ALTER TABLE [{op.table_name}] DROP COLUMN [{op.column.name}]"]
++    elif isinstance(op, RenameColumn):
++        return [
++            f"ALTER TABLE [{op.table_name}] RENAME COLUMN [{op.old_name}] TO [{op.new_name}]"
++        ]
+     elif isinstance(op, AddIndex):
+         return [_create_index_sql(op.index)]
+     elif isinstance(op, DropIndex):
+         return [_drop_index_sql(op.index)]
+     elif isinstance(op, ReconstructTable):
+-        return _reconstruct_table_sql(op.table_name, op.old_table, op.new_table)
++        return _reconstruct_table_sql(
++            op.table_name, op.old_table, op.new_table, op.column_renames
++        )
+     return []
+ 
+ 
+@@ -74,13 +81,20 @@ def _op_to_down_sql(op: DiffOp, current_schema: SchemaDef) -> list[str]:
+         return [f"ALTER TABLE [{op.table_name}] DROP COLUMN [{op.column.name}]"]
+     elif isinstance(op, DropColumn):
+         return [_add_column_sql(op.table_name, op.column)]
++    elif isinstance(op, RenameColumn):
++        return [
++            f"ALTER TABLE [{op.table_name}] RENAME COLUMN [{op.new_name}] TO [{op.old_name}]"
++        ]
+     elif isinstance(op, AddIndex):
+         return [_drop_index_sql(op.index)]
+     elif isinstance(op, DropIndex):
+         return [_create_index_sql(op.index)]
+     elif isinstance(op, ReconstructTable):
+-        # Rollback: reconstruct back to old table
+-        return _reconstruct_table_sql(op.table_name, op.new_table, op.old_table)
++        # Rollback: reconstruct back to old table with reversed renames
++        reverse_renames = tuple((new, old) for old, new in op.column_renames)
++        return _reconstruct_table_sql(
++            op.table_name, op.new_table, op.old_table, reverse_renames
++        )
+     return []
+ 
+ 
+@@ -159,16 +173,25 @@ def _drop_index_sql(index: IndexDef) -> str:
+ 
+ 
+ def _reconstruct_table_sql(
+-    table_name: str, old_table: TableDef, new_table: TableDef
++    table_name: str,
++    old_table: TableDef,
++    new_table: TableDef,
++    column_renames: tuple[tuple[str, str], ...] = (),
+ ) -> list[str]:
+     """Generate the 12-step table reconstruction sequence.
+ 
+     This is the SQLite-recommended approach for changes that ALTER TABLE
+     cannot handle (column type changes, PK changes, FK changes, etc.).
++    column_renames is a list of (old_name, new_name) pairs so data is
++    preserved across renames.
+     """
+     temp_name = f"__{table_name}_old"
+     stmts: list[str] = []
+ 
++    # Build rename mappings: old_name -> new_name
++    rename_map = dict(column_renames)
++    reverse_rename = {v: k for k, v in rename_map.items()}
++
+     stmts.append("PRAGMA foreign_keys=OFF")
+ 
+     # Rename old table
+@@ -177,16 +200,32 @@ def _reconstruct_table_sql(
+     # Create new table
+     stmts.append(_create_table_sql(new_table))
+ 
+-    # Copy data: use columns common to both old and new
++    # Copy data: map old column names to new column names
+     old_col_names = {c.name for c in old_table.columns}
+     new_col_names = {c.name for c in new_table.columns}
+-    common_cols = sorted(old_col_names & new_col_names)
+ 
+-    if common_cols:
+-        cols_sql = ", ".join(f"[{c}]" for c in common_cols)
++    # For each new column, figure out where its data comes from in the old table
++    insert_cols: list[str] = []   # column names in the new table
++    select_exprs: list[str] = []  # expressions selecting from the old table
++
++    for new_col in sorted(new_col_names):
++        if new_col in old_col_names:
++            # Same name exists in both
++            insert_cols.append(f"[{new_col}]")
++            select_exprs.append(f"[{new_col}]")
++        elif new_col in reverse_rename and reverse_rename[new_col] in old_col_names:
++            # This new column was renamed from an old column
++            old_name = reverse_rename[new_col]
++            insert_cols.append(f"[{new_col}]")
++            select_exprs.append(f"[{old_name}]")
++        # else: truly new column, gets its DEFAULT — skip it
++
++    if insert_cols:
++        ins = ", ".join(insert_cols)
++        sel = ", ".join(select_exprs)
+         stmts.append(
+-            f"INSERT INTO [{table_name}] ({cols_sql}) "
+-            f"SELECT {cols_sql} FROM [{temp_name}]"
++            f"INSERT INTO [{table_name}] ({ins}) "
++            f"SELECT {sel} FROM [{temp_name}]"
+         )
+ 
+     # Drop old table
+diff --git a/tests/test_cli.py b/tests/test_cli.py
+index 391ab45..d281089 100644
+--- a/tests/test_cli.py
++++ b/tests/test_cli.py
+@@ -126,3 +126,69 @@ def test_no_changes_generate(tmp_path, monkeypatch, sample_schema_yaml, capsys):
+     assert rc == 0
+     output = capsys.readouterr().out
+     assert "no changes" in output.lower() or "No changes" in output
++
++
++def test_diff_shows_changes(tmp_path, monkeypatch, sample_schema_yaml, capsys):
++    monkeypatch.chdir(tmp_path)
++    main(["init", "--database", "test.sqlite"])
++    (tmp_path / "schema" / "users.yaml").write_text(sample_schema_yaml)
++
++    # Diff before any migrations applied (all tables are new)
++    rc = main(["diff"])
++    assert rc == 0
++    output = capsys.readouterr().out
++    assert "Create table" in output
++    assert "users" in output
++
++
++def test_diff_no_changes(tmp_path, monkeypatch, sample_schema_yaml, capsys):
++    monkeypatch.chdir(tmp_path)
++    main(["init", "--database", "test.sqlite"])
++    (tmp_path / "schema" / "users.yaml").write_text(sample_schema_yaml)
++    main(["generate", "initial"])
++    main(["apply"])
++
++    rc = main(["diff"])
++    assert rc == 0
++    output = capsys.readouterr().out
++    assert "No changes" in output
++
++
++def test_diff_shows_rename(tmp_path, monkeypatch, capsys):
++    monkeypatch.chdir(tmp_path)
++    main(["init", "--database", "test.sqlite"])
++    schema_v1 = """\
++tables:
++  users:
++    columns:
++      id:
++        type: INTEGER
++        primary_key: true
++      name:
++        type: TEXT
++        nullable: false
++"""
++    (tmp_path / "schema" / "users.yaml").write_text(schema_v1)
++    main(["generate", "initial"])
++    main(["apply"])
++    capsys.readouterr()  # clear
++
++    # Rename name -> full_name
++    schema_v2 = """\
++tables:
++  users:
++    columns:
++      id:
++        type: INTEGER
++        primary_key: true
++      full_name:
++        type: TEXT
++        nullable: false
++"""
++    (tmp_path / "schema" / "users.yaml").write_text(schema_v2)
++    rc = main(["diff"])
++    assert rc == 0
++    output = capsys.readouterr().out
++    assert "Rename column" in output
++    assert "name" in output
++    assert "full_name" in output
+diff --git a/tests/test_diff.py b/tests/test_diff.py
+index c63b687..e1d95ff 100644
+--- a/tests/test_diff.py
++++ b/tests/test_diff.py
+@@ -5,6 +5,7 @@ from vijaybase.diff import (
+     DropIndex,
+     DropTable,
+     ReconstructTable,
++    RenameColumn,
+     compute_diff,
+ )
+ from vijaybase.models import (
+@@ -172,3 +173,178 @@ def test_remove_column_requires_reconstruct():
+     desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
+     ops = compute_diff(current, desired)
+     assert any(isinstance(op, ReconstructTable) for op in ops)
++
++
++# --- Rename detection ---
++
++def test_rename_column_detected():
++    """A column disappears and a new one with same type/nullable/default/unique appears -> rename."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="name", type="TEXT", nullable=False),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="full_name", type="TEXT", nullable=False),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old)})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
++    ops = compute_diff(current, desired)
++    rename_ops = [op for op in ops if isinstance(op, RenameColumn)]
++    assert len(rename_ops) == 1
++    assert rename_ops[0].old_name == "name"
++    assert rename_ops[0].new_name == "full_name"
++    # Should NOT be a reconstruct (rename is simple ALTER TABLE RENAME COLUMN)
++    assert not any(isinstance(op, ReconstructTable) for op in ops)
++
++
++def test_rename_column_with_different_type_is_not_rename():
++    """If the type changes alongside the name change, it's not a rename — it's a reconstruct."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="name", type="TEXT", nullable=False),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="full_name", type="INTEGER", nullable=False),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old)})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
++    ops = compute_diff(current, desired)
++    assert not any(isinstance(op, RenameColumn) for op in ops)
++    assert any(isinstance(op, ReconstructTable) for op in ops)
++
++
++def test_rename_column_with_default_match():
++    """Rename detected when default values also match."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="status", type="INTEGER", nullable=False, default="0"),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="state", type="INTEGER", nullable=False, default="0"),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old)})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
++    ops = compute_diff(current, desired)
++    rename_ops = [op for op in ops if isinstance(op, RenameColumn)]
++    assert len(rename_ops) == 1
++    assert rename_ops[0].old_name == "status"
++    assert rename_ops[0].new_name == "state"
++
++
++def test_rename_plus_add_column():
++    """A rename and an unrelated add can coexist."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="name", type="TEXT"),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="full_name", type="TEXT"),
++        ColumnDef(name="bio", type="TEXT"),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old)})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new)})
++    ops = compute_diff(current, desired)
++    rename_ops = [op for op in ops if isinstance(op, RenameColumn)]
++    add_ops = [op for op in ops if isinstance(op, AddColumn)]
++    assert len(rename_ops) == 1
++    assert rename_ops[0].old_name == "name"
++    assert rename_ops[0].new_name == "full_name"
++    assert len(add_ops) == 1
++    assert add_ops[0].column.name == "bio"
++
++
++def test_rename_with_reconstruct_carries_mapping():
++    """When a rename happens alongside a PK change (requiring reconstruct),
++    the ReconstructTable op carries the rename info."""
++    cols_old = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="name", type="TEXT"),
++    )
++    cols_new = (
++        ColumnDef(name="id", type="INTEGER"),
++        ColumnDef(name="full_name", type="TEXT"),
++    )
++    current = SchemaDef(tables={"t": _simple_table("t", cols_old, pk=("id",))})
++    desired = SchemaDef(tables={"t": _simple_table("t", cols_new, pk=("id", "full_name"))})
++    ops = compute_diff(current, desired)
++    recon_ops = [op for op in ops if isinstance(op, ReconstructTable)]
++    assert len(recon_ops) == 1
++    assert ("name", "full_name") in recon_ops[0].column_renames
++
++
++# --- FK dependency ordering (3-level chain) ---
++
++def test_create_three_level_fk_chain_in_order():
++    """users -> orders -> audit_log should be created in that order."""
++    users = _simple_table("users")
++    fk_orders = ForeignKeyDef(
++        columns=("user_id",), ref_table="users", ref_columns=("id",)
++    )
++    orders = _simple_table(
++        "orders",
++        cols=(
++            ColumnDef(name="id", type="INTEGER"),
++            ColumnDef(name="user_id", type="INTEGER"),
++        ),
++        fks=(fk_orders,),
++    )
++    fk_audit = ForeignKeyDef(
++        columns=("order_id",), ref_table="orders", ref_columns=("id",)
++    )
++    audit_log = _simple_table(
++        "audit_log",
++        cols=(
++            ColumnDef(name="id", type="INTEGER"),
++            ColumnDef(name="order_id", type="INTEGER"),
++        ),
++        fks=(fk_audit,),
++    )
++    current = SchemaDef(tables={})
++    desired = SchemaDef(tables={
++        "audit_log": audit_log, "orders": orders, "users": users,
++    })
++    ops = compute_diff(current, desired)
++    create_ops = [op for op in ops if isinstance(op, CreateTable)]
++    names = [op.table.name for op in create_ops]
++    assert names.index("users") < names.index("orders")
++    assert names.index("orders") < names.index("audit_log")
++
++
++def test_drop_three_level_fk_chain_in_reverse_order():
++    """Dropping users -> orders -> audit_log should drop audit_log first, then orders, then users."""
++    users = _simple_table("users")
++    fk_orders = ForeignKeyDef(
++        columns=("user_id",), ref_table="users", ref_columns=("id",)
++    )
++    orders = _simple_table(
++        "orders",
++        cols=(
++            ColumnDef(name="id", type="INTEGER"),
++            ColumnDef(name="user_id", type="INTEGER"),
++        ),
++        fks=(fk_orders,),
++    )
++    fk_audit = ForeignKeyDef(
++        columns=("order_id",), ref_table="orders", ref_columns=("id",)
++    )
++    audit_log = _simple_table(
++        "audit_log",
++        cols=(
++            ColumnDef(name="id", type="INTEGER"),
++            ColumnDef(name="order_id", type="INTEGER"),
++        ),
++        fks=(fk_audit,),
++    )
++    current = SchemaDef(tables={
++        "audit_log": audit_log, "orders": orders, "users": users,
++    })
++    desired = SchemaDef(tables={})
++    ops = compute_diff(current, desired)
++    drop_ops = [op for op in ops if isinstance(op, DropTable)]
++    names = [op.table.name for op in drop_ops]
++    assert names.index("audit_log") < names.index("orders")
++    assert names.index("orders") < names.index("users")
+diff --git a/tests/test_end_to_end.py b/tests/test_end_to_end.py
+index 103258b..7ef81c3 100644
+--- a/tests/test_end_to_end.py
++++ b/tests/test_end_to_end.py
+@@ -327,3 +327,145 @@ def test_apply_with_target(tmp_path, monkeypatch):
+     assert "bio" not in col_names  # Second migration not applied
+     assert "name" in col_names  # First migration applied
+     conn.close()
++
++
++def test_column_rename_preserves_data(tmp_path, monkeypatch):
++    """Renaming a column should preserve data, not drop+add."""
++    monkeypatch.chdir(tmp_path)
++    main(["init", "--database", "test.sqlite"])
++
++    schema_v1 = """\
++tables:
++  users:
++    columns:
++      id:
++        type: INTEGER
++        primary_key: true
++      name:
++        type: TEXT
++        nullable: false
++"""
++    (tmp_path / "schema" / "users.yaml").write_text(schema_v1)
++    main(["generate", "initial"])
++    main(["apply"])
++
++    # Insert data
++    conn = sqlite3.connect(str(tmp_path / "test.sqlite"))
++    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
++    conn.execute("INSERT INTO users (id, name) VALUES (2, 'Bob')")
++    conn.commit()
++    conn.close()
++
++    # Rename name -> full_name (same type, nullable, default, unique)
++    schema_v2 = """\
++tables:
++  users:
++    columns:
++      id:
++        type: INTEGER
++        primary_key: true
++      full_name:
++        type: TEXT
++        nullable: false
++"""
++    (tmp_path / "schema" / "users.yaml").write_text(schema_v2)
++    assert main(["generate", "rename_name_to_full_name"]) == 0
++    assert main(["apply"]) == 0
++
++    # Data should be preserved under the new column name
++    conn = sqlite3.connect(str(tmp_path / "test.sqlite"))
++    rows = conn.execute("SELECT full_name FROM users ORDER BY id").fetchall()
++    assert rows == [("Alice",), ("Bob",)]
++
++    cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
++    assert "full_name" in cols
++    assert "name" not in cols
++    conn.close()
++
++    # Rollback should restore the old column name and data
++    assert main(["rollback"]) == 0
++    conn = sqlite3.connect(str(tmp_path / "test.sqlite"))
++    rows = conn.execute("SELECT name FROM users ORDER BY id").fetchall()
++    assert rows == [("Alice",), ("Bob",)]
++    conn.close()
++
++
++def test_three_level_fk_create_and_drop(tmp_path, monkeypatch):
++    """users -> orders -> audit_log: create in order, drop in reverse."""
++    monkeypatch.chdir(tmp_path)
++    main(["init", "--database", "test.sqlite"])
++
++    schema = """\
++tables:
++  users:
++    columns:
++      id:
++        type: INTEGER
++        primary_key: true
++      name:
++        type: TEXT
++        nullable: false
++  orders:
++    columns:
++      id:
++        type: INTEGER
++        primary_key: true
++      user_id:
++        type: INTEGER
++        nullable: false
++    foreign_keys:
++      - columns: [user_id]
++        references:
++          table: users
++          columns: [id]
++        on_delete: CASCADE
++  audit_log:
++    columns:
++      id:
++        type: INTEGER
++        primary_key: true
++      order_id:
++        type: INTEGER
++        nullable: false
++    foreign_keys:
++      - columns: [order_id]
++        references:
++          table: orders
++          columns: [id]
++        on_delete: CASCADE
++"""
++    (tmp_path / "schema" / "all.yaml").write_text(schema)
++    assert main(["generate", "initial"]) == 0
++    assert main(["apply"]) == 0
++
++    # Verify all tables exist and FK constraints work
++    conn = sqlite3.connect(str(tmp_path / "test.sqlite"))
++    conn.execute("PRAGMA foreign_keys = ON")
++    tables = {r[0] for r in conn.execute(
++        "SELECT name FROM sqlite_master WHERE type='table'"
++    ).fetchall()}
++    assert {"users", "orders", "audit_log"}.issubset(tables)
++
++    conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')")
++    conn.execute("INSERT INTO orders (id, user_id) VALUES (1, 1)")
++    conn.execute("INSERT INTO audit_log (id, order_id) VALUES (1, 1)")
++    conn.commit()
++
++    # Cascade delete: deleting user cascades to orders, which cascades to audit_log
++    conn.execute("DELETE FROM users WHERE id = 1")
++    conn.commit()
++    assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
++    assert conn.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] == 0
++    conn.close()
++
++    # Rollback should drop in correct order (audit_log, orders, users)
++    assert main(["rollback"]) == 0
++
++    conn = sqlite3.connect(str(tmp_path / "test.sqlite"))
++    tables = {r[0] for r in conn.execute(
++        "SELECT name FROM sqlite_master WHERE type='table'"
++    ).fetchall()}
++    assert "users" not in tables
++    assert "orders" not in tables
++    assert "audit_log" not in tables
++    conn.close()
+diff --git a/tests/test_migration_generator.py b/tests/test_migration_generator.py
+index 3900898..698355f 100644
+--- a/tests/test_migration_generator.py
++++ b/tests/test_migration_generator.py
+@@ -1,4 +1,4 @@
+-from vijaybase.diff import AddColumn, AddIndex, CreateTable, DropTable, ReconstructTable
++from vijaybase.diff import AddColumn, AddIndex, CreateTable, DropTable, ReconstructTable, RenameColumn
+ from vijaybase.migration_generator import generate_down_sql, generate_up_sql
+ from vijaybase.models import (
+     CheckConstraintDef,
+@@ -151,3 +151,43 @@ def test_column_unique_sql():
+     ops = [CreateTable(t)]
+     stmts = generate_up_sql(ops)
+     assert "UNIQUE" in stmts[0]
++
++
++def test_rename_column_sql():
++    ops = [RenameColumn("users", "name", "full_name")]
++    stmts = generate_up_sql(ops)
++    assert len(stmts) == 1
++    assert "RENAME COLUMN [name] TO [full_name]" in stmts[0]
++    assert "[users]" in stmts[0]
++
++
++def test_rename_column_down_sql():
++    ops = [RenameColumn("users", "name", "full_name")]
++    current = SchemaDef(tables={})
++    down = generate_down_sql(ops, current)
++    assert len(down) == 1
++    assert "RENAME COLUMN [full_name] TO [name]" in down[0]
++
++
++def test_reconstruct_with_rename_preserves_data():
++    """ReconstructTable with column_renames should map old->new in INSERT...SELECT."""
++    old = _make_table(
++        "t",
++        cols=(
++            ColumnDef(name="id", type="INTEGER"),
++            ColumnDef(name="name", type="TEXT"),
++        ),
++    )
++    new = _make_table(
++        "t",
++        cols=(
++            ColumnDef(name="id", type="INTEGER"),
++            ColumnDef(name="full_name", type="TEXT", nullable=False),
++        ),
++    )
++    ops = [ReconstructTable("t", old, new, column_renames=(("name", "full_name"),))]
++    stmts = generate_up_sql(ops)
++    # The INSERT...SELECT should map [full_name] from [name]
++    insert_stmt = [s for s in stmts if "INSERT INTO" in s][0]
++    assert "[full_name]" in insert_stmt
++    assert "[name]" in insert_stmt
