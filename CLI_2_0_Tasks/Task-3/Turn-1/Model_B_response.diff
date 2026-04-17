@@ -1,0 +1,1653 @@
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..7d99fbc
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,16 @@
++[build-system]
++requires = ["setuptools>=68.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "vijaybase"
++version = "0.1.0"
++description = "Database schema migration and versioning for SQLite"
++requires-python = ">=3.10"
++dependencies = ["pyyaml>=6.0"]
++
++[project.scripts]
++vijaybase = "vijaybase.cli:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
+diff --git a/src/vijaybase/__init__.py b/src/vijaybase/__init__.py
+new file mode 100644
+index 0000000..ae02021
+--- /dev/null
++++ b/src/vijaybase/__init__.py
+@@ -0,0 +1,2 @@
++"""Vijaybase - Database schema migration and versioning for SQLite."""
++__version__ = "0.1.0"
+diff --git a/src/vijaybase/__main__.py b/src/vijaybase/__main__.py
+new file mode 100644
+index 0000000..b5f84c2
+--- /dev/null
++++ b/src/vijaybase/__main__.py
+@@ -0,0 +1,3 @@
++from vijaybase.cli import main
++
++main()
+diff --git a/src/vijaybase/cli.py b/src/vijaybase/cli.py
+new file mode 100644
+index 0000000..00a213e
+--- /dev/null
++++ b/src/vijaybase/cli.py
+@@ -0,0 +1,399 @@
++"""vijaybase CLI entry-point."""
++from __future__ import annotations
++
++import argparse
++import sys
++
++from .config import Config, create_config, load_config
++from .conflict import detect_conflicts
++from .diff import compute_diff
++from .errors import ConflictError, VijaybaseError
++from .history import HistoryManager
++from .introspect import introspect_db
++from .migration import (
++    apply_migration_sql,
++    create_migration_file,
++    get_pending_chain,
++    load_all_migrations,
++    verify_checksum,
++)
++from .schema import load_schema
++from .sql_generator import generate_sql
++
++
++def main(argv: list[str] | None = None) -> None:
++    parser = argparse.ArgumentParser(
++        prog="vijaybase",
++        description="Schema migration & versioning for SQLite",
++    )
++    sub = parser.add_subparsers(dest="command")
++
++    # init
++    p_init = sub.add_parser("init", help="Initialise a new vijaybase project")
++    p_init.add_argument("--db", default="vijaybase.db", help="SQLite database path")
++
++    # generate
++    p_gen = sub.add_parser("generate", help="Generate a migration from schema diff")
++    p_gen.add_argument("description", help="Short description of the change")
++
++    # apply
++    p_app = sub.add_parser("apply", help="Apply pending migrations")
++    p_app.add_argument("--dry-run", action="store_true", help="Print SQL only")
++    p_app.add_argument("--target", default=None, help="Stop after this migration ID")
++
++    # rollback
++    p_rb = sub.add_parser("rollback", help="Rollback applied migrations")
++    p_rb.add_argument("--dry-run", action="store_true", help="Print SQL only")
++    p_rb.add_argument("--steps", type=int, default=1, help="Number of migrations to undo")
++
++    # status
++    sub.add_parser("status", help="Show migration status")
++
++    # validate
++    sub.add_parser("validate", help="Validate schema files and migration integrity")
++
++    # merge
++    sub.add_parser("merge", help="Create a merge migration to resolve forks")
++
++    args = parser.parse_args(argv)
++    if not args.command:
++        parser.print_help()
++        sys.exit(1)
++
++    try:
++        {
++            "init": _cmd_init,
++            "generate": _cmd_generate,
++            "apply": _cmd_apply,
++            "rollback": _cmd_rollback,
++            "status": _cmd_status,
++            "validate": _cmd_validate,
++            "merge": _cmd_merge,
++        }[args.command](args)
++    except VijaybaseError as exc:
++        print(f"Error: {exc}", file=sys.stderr)
++        sys.exit(1)
++
++
++# ---------------------------------------------------------------------------
++# init
++# ---------------------------------------------------------------------------
++
++def _cmd_init(args: argparse.Namespace) -> None:
++    cfg = create_config(db_path=args.db)
++    HistoryManager(cfg.database)  # creates DB + history table
++    print(f"Initialised vijaybase project.")
++    print(f"  config   : vijaybase.yaml")
++    print(f"  database : {cfg.database}")
++    print(f"  schema   : {cfg.schema_dir}/")
++    print(f"  migrations: {cfg.migrations_dir}/")
++    print(f"\nCreate your table definitions in {cfg.schema_dir}/*.yaml, then run:")
++    print(f"  vijaybase generate <description>")
++
++
++# ---------------------------------------------------------------------------
++# generate
++# ---------------------------------------------------------------------------
++
++def _cmd_generate(args: argparse.Namespace) -> None:
++    cfg = load_config()
++    desired = load_schema(cfg.schema_dir)
++    history = HistoryManager(cfg.database)
++    current = introspect_db(cfg.database)
++    head = history.get_current_head()
++
++    ops = compute_diff(current, desired)
++    if not ops:
++        print("No schema changes detected.")
++        return
++
++    up_sql, down_sql = generate_sql(ops, current, desired)
++    mf = create_migration_file(
++        migrations_dir=cfg.migrations_dir,
++        description=args.description,
++        parent=head,
++        up_sql=up_sql,
++        down_sql=down_sql,
++    )
++    print(f"Created migration: {mf.id}")
++    print(f"  file: {mf.file_path}")
++    _print_ops_summary(ops)
++    print(f"\nRun 'vijaybase apply' to execute.")
++
++
++# ---------------------------------------------------------------------------
++# apply
++# ---------------------------------------------------------------------------
++
++def _cmd_apply(args: argparse.Namespace) -> None:
++    cfg = load_config()
++    history = HistoryManager(cfg.database)
++    all_migs = load_all_migrations(cfg.migrations_dir)
++    applied = history.get_applied_migrations()
++
++    # Conflict check
++    forks = detect_conflicts(all_migs, applied)
++    if forks:
++        _print_forks(forks)
++        raise ConflictError("Resolve forks before applying. Run 'vijaybase merge'.")
++
++    chain = get_pending_chain(all_migs, applied)
++    if not chain:
++        print("Nothing to apply – database is up to date.")
++        return
++
++    # Optionally stop at --target
++    if args.target:
++        cut: list = []
++        for m in chain:
++            cut.append(m)
++            if m.id == args.target:
++                break
++        else:
++            raise VijaybaseError(f"Target migration '{args.target}' not found in pending chain.")
++        chain = cut
++
++    for mf in chain:
++        verify_checksum(mf)
++        if args.dry_run:
++            print(f"-- Migration: {mf.id} (up)")
++            print(mf.up_sql)
++            print()
++        else:
++            apply_migration_sql(cfg.database, mf.up_sql)
++            history.record(mf.id, "up", mf.checksum)
++            print(f"Applied: {mf.id}")
++
++    if args.dry_run:
++        print("(dry-run – no changes made)")
++
++
++# ---------------------------------------------------------------------------
++# rollback
++# ---------------------------------------------------------------------------
++
++def _cmd_rollback(args: argparse.Namespace) -> None:
++    cfg = load_config()
++    history = HistoryManager(cfg.database)
++    all_migs = load_all_migrations(cfg.migrations_dir)
++    applied = history.get_applied_migrations()
++
++    if not applied:
++        print("Nothing to rollback.")
++        return
++
++    idx = {m.id: m for m in all_migs}
++    to_rollback = list(reversed(applied[-args.steps :]))
++
++    for mid in to_rollback:
++        mf = idx.get(mid)
++        if mf is None:
++            raise VijaybaseError(f"Migration file for '{mid}' not found.")
++        verify_checksum(mf)
++        if args.dry_run:
++            print(f"-- Migration: {mf.id} (down)")
++            print(mf.down_sql)
++            print()
++        else:
++            apply_migration_sql(cfg.database, mf.down_sql)
++            history.record(mf.id, "down", mf.checksum)
++            print(f"Rolled back: {mf.id}")
++
++    if args.dry_run:
++        print("(dry-run – no changes made)")
++
++
++# ---------------------------------------------------------------------------
++# status
++# ---------------------------------------------------------------------------
++
++def _cmd_status(args: argparse.Namespace) -> None:
++    cfg = load_config()
++    history = HistoryManager(cfg.database)
++    all_migs = load_all_migrations(cfg.migrations_dir)
++    applied = history.get_applied_migrations()
++    head = applied[-1] if applied else "(none)"
++
++    print(f"Database : {cfg.database}")
++    print(f"Head     : {head}")
++    print()
++
++    if applied:
++        print(f"Applied ({len(applied)}):")
++        for mid in applied:
++            print(f"  [applied] {mid}")
++    else:
++        print("No migrations applied yet.")
++
++    try:
++        pending = get_pending_chain(all_migs, applied)
++    except ConflictError:
++        pending = []
++    if pending:
++        print(f"\nPending ({len(pending)}):")
++        for mf in pending:
++            print(f"  [pending] {mf.id}")
++
++    forks = detect_conflicts(all_migs, applied)
++    if forks:
++        print()
++        _print_forks(forks)
++
++
++# ---------------------------------------------------------------------------
++# validate
++# ---------------------------------------------------------------------------
++
++def _cmd_validate(args: argparse.Namespace) -> None:
++    cfg = load_config()
++    errors: list[str] = []
++
++    # 1. Schema files
++    try:
++        load_schema(cfg.schema_dir)
++        print("[OK] Schema YAML is valid.")
++    except VijaybaseError as e:
++        errors.append(f"Schema: {e}")
++        print(f"[FAIL] Schema: {e}")
++
++    # 2. Migration files
++    all_migs = load_all_migrations(cfg.migrations_dir)
++    idx = {m.id: m for m in all_migs}
++
++    for mf in all_migs:
++        try:
++            verify_checksum(mf)
++        except VijaybaseError as e:
++            errors.append(str(e))
++            print(f"[FAIL] {e}")
++
++        if mf.parent and mf.parent not in idx:
++            msg = f"Migration '{mf.id}' references unknown parent '{mf.parent}'"
++            errors.append(msg)
++            print(f"[FAIL] {msg}")
++
++        if mf.merge_parent and mf.merge_parent not in idx:
++            msg = f"Migration '{mf.id}' references unknown merge_parent '{mf.merge_parent}'"
++            errors.append(msg)
++            print(f"[FAIL] {msg}")
++
++    if not errors:
++        print(f"[OK] All {len(all_migs)} migration(s) valid.")
++
++    # 3. Conflict check
++    history = HistoryManager(cfg.database)
++    applied = history.get_applied_migrations()
++    forks = detect_conflicts(all_migs, applied)
++    if forks:
++        _print_forks(forks)
++        errors.append("Unresolved forks detected.")
++    else:
++        print("[OK] No migration conflicts.")
++
++    if errors:
++        print(f"\n{len(errors)} problem(s) found.")
++        sys.exit(1)
++    else:
++        print("\nAll checks passed.")
++
++
++# ---------------------------------------------------------------------------
++# merge
++# ---------------------------------------------------------------------------
++
++def _cmd_merge(args: argparse.Namespace) -> None:
++    cfg = load_config()
++    history = HistoryManager(cfg.database)
++    all_migs = load_all_migrations(cfg.migrations_dir)
++    applied = history.get_applied_migrations()
++    head = history.get_current_head()
++
++    forks = detect_conflicts(all_migs, applied)
++    if not forks:
++        print("No conflicts to merge.")
++        return
++
++    for fork in forks:
++        print(f"Fork at parent '{fork.parent}':")
++        print(f"  applied   : {fork.applied_branches}")
++        print(f"  unapplied : {fork.unapplied_branches}")
++
++        # Re-diff current DB against the desired YAML schema to produce a
++        # migration that reconciles the unapplied branch.
++        desired = load_schema(cfg.schema_dir)
++        current = introspect_db(cfg.database)
++        ops = compute_diff(current, desired)
++
++        if ops:
++            up_sql, down_sql = generate_sql(ops, current, desired)
++        else:
++            up_sql = "-- No SQL changes needed (merge bookkeeping only)"
++            down_sql = "-- No SQL changes needed (merge bookkeeping only)"
++
++        merge_parent = fork.unapplied_branches[0]
++        mf = create_migration_file(
++            migrations_dir=cfg.migrations_dir,
++            description="merge",
++            parent=head,
++            up_sql=up_sql,
++            down_sql=down_sql,
++            merge_parent=merge_parent,
++        )
++        print(f"\nCreated merge migration: {mf.id}")
++        print(f"  merges '{merge_parent}' into current head '{head}'")
++        print(f"  file  : {mf.file_path}")
++        print(f"\nReview the file, then run 'vijaybase apply'.")
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _print_ops_summary(ops) -> None:
++    from .diff import (
++        AddCheck, AddColumn, AddForeignKey, AddIndex, AlterColumn,
++        ChangePrimaryKey, CreateTable, DropCheck, DropColumn,
++        DropForeignKey, DropIndex, DropTable,
++    )
++    labels = {
++        CreateTable: "create table",
++        DropTable: "drop table",
++        AddColumn: "add column",
++        DropColumn: "drop column",
++        AlterColumn: "alter column",
++        AddIndex: "add index",
++        DropIndex: "drop index",
++        AddForeignKey: "add foreign key",
++        DropForeignKey: "drop foreign key",
++        AddCheck: "add check",
++        DropCheck: "drop check",
++        ChangePrimaryKey: "change primary key",
++    }
++    for op in ops:
++        lbl = labels.get(type(op), type(op).__name__)
++        detail = ""
++        if hasattr(op, "table"):
++            detail = op.table.name
++        elif hasattr(op, "table_name"):
++            detail = op.table_name
++            if hasattr(op, "column"):
++                detail += f".{op.column.name}"
++            elif hasattr(op, "index"):
++                detail += f".{op.index.name}"
++            elif hasattr(op, "fk"):
++                detail += f" -> {op.fk.references_table}"
++            elif hasattr(op, "check"):
++                detail += f".{op.check.name}"
++            elif hasattr(op, "new"):
++                detail += f".{op.new.name}"
++        print(f"  {lbl}: {detail}")
++
++
++def _print_forks(forks) -> None:
++    for f in forks:
++        print(f"CONFLICT – fork at parent '{f.parent}':")
++        for b in f.applied_branches:
++            print(f"  [applied]   {b}")
++        for b in f.unapplied_branches:
++            print(f"  [unapplied] {b}")
++        print("  Run 'vijaybase merge' to resolve.")
+diff --git a/src/vijaybase/config.py b/src/vijaybase/config.py
+new file mode 100644
+index 0000000..4086e29
+--- /dev/null
++++ b/src/vijaybase/config.py
+@@ -0,0 +1,58 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++
++import yaml
++
++from .errors import VijaybaseError
++
++CONFIG_FILE = "vijaybase.yaml"
++
++
++@dataclass
++class Config:
++    database: str
++    schema_dir: str
++    migrations_dir: str
++
++
++def load_config(project_dir: str = ".") -> Config:
++    config_path = Path(project_dir) / CONFIG_FILE
++    if not config_path.exists():
++        raise VijaybaseError(
++            f"'{CONFIG_FILE}' not found. Run 'vijaybase init' first."
++        )
++    with open(config_path) as f:
++        data = yaml.safe_load(f)
++    if not isinstance(data, dict):
++        raise VijaybaseError(f"Invalid config file '{CONFIG_FILE}'")
++    return Config(
++        database=data.get("database", "vijaybase.db"),
++        schema_dir=data.get("schema_dir", "schema"),
++        migrations_dir=data.get("migrations_dir", "migrations"),
++    )
++
++
++def create_config(project_dir: str = ".", db_path: str = "vijaybase.db") -> Config:
++    config = Config(
++        database=db_path,
++        schema_dir="schema",
++        migrations_dir="migrations",
++    )
++    config_path = Path(project_dir) / CONFIG_FILE
++    with open(config_path, "w") as f:
++        yaml.dump(
++            {
++                "database": config.database,
++                "schema_dir": config.schema_dir,
++                "migrations_dir": config.migrations_dir,
++            },
++            f,
++            default_flow_style=False,
++        )
++
++    Path(project_dir, config.schema_dir).mkdir(exist_ok=True)
++    Path(project_dir, config.migrations_dir).mkdir(exist_ok=True)
++
++    return config
+diff --git a/src/vijaybase/conflict.py b/src/vijaybase/conflict.py
+new file mode 100644
+index 0000000..f63b3ba
+--- /dev/null
++++ b/src/vijaybase/conflict.py
+@@ -0,0 +1,46 @@
++"""Detect migration forks and support merging."""
++from __future__ import annotations
++
++from collections import defaultdict
++from dataclasses import dataclass
++
++from .migration import MigrationFile
++
++
++@dataclass
++class Fork:
++    parent: str | None
++    applied_branches: list[str]
++    unapplied_branches: list[str]
++
++
++def detect_conflicts(
++    all_migrations: list[MigrationFile],
++    applied_ids: list[str],
++) -> list[Fork]:
++    """Return unresolved forks (same parent, one branch applied, the other not)."""
++    applied_set = set(applied_ids)
++
++    children_of: dict[str | None, list[MigrationFile]] = defaultdict(list)
++    for m in all_migrations:
++        children_of[m.parent].append(m)
++
++    # Which unapplied branches already have a merge migration?
++    merged_ids: set[str] = set()
++    for m in all_migrations:
++        if m.merge_parent:
++            merged_ids.add(m.merge_parent)
++
++    forks: list[Fork] = []
++    for parent, kids in children_of.items():
++        if len(kids) <= 1:
++            continue
++        applied = [k.id for k in kids if k.id in applied_set]
++        unapplied = [
++            k.id for k in kids
++            if k.id not in applied_set and k.id not in merged_ids
++        ]
++        if applied and unapplied:
++            forks.append(Fork(parent=parent, applied_branches=applied, unapplied_branches=unapplied))
++
++    return forks
+diff --git a/src/vijaybase/diff.py b/src/vijaybase/diff.py
+new file mode 100644
+index 0000000..64cc1ee
+--- /dev/null
++++ b/src/vijaybase/diff.py
+@@ -0,0 +1,155 @@
++"""Diff two Schema objects and produce a list of structured operations."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from .schema import Check, Column, ForeignKey, Index, Schema, Table
++
++
++# ---- diff operation types ---------------------------------------------------
++
++@dataclass(frozen=True)
++class CreateTable:
++    table: Table
++
++@dataclass(frozen=True)
++class DropTable:
++    table: Table
++
++@dataclass(frozen=True)
++class AddColumn:
++    table_name: str
++    column: Column
++
++@dataclass(frozen=True)
++class DropColumn:
++    table_name: str
++    column: Column
++
++@dataclass(frozen=True)
++class AlterColumn:
++    table_name: str
++    old: Column
++    new: Column
++
++@dataclass(frozen=True)
++class AddIndex:
++    table_name: str
++    index: Index
++
++@dataclass(frozen=True)
++class DropIndex:
++    table_name: str
++    index: Index
++
++@dataclass(frozen=True)
++class AddForeignKey:
++    table_name: str
++    fk: ForeignKey
++
++@dataclass(frozen=True)
++class DropForeignKey:
++    table_name: str
++    fk: ForeignKey
++
++@dataclass(frozen=True)
++class AddCheck:
++    table_name: str
++    check: Check
++
++@dataclass(frozen=True)
++class DropCheck:
++    table_name: str
++    check: Check
++
++@dataclass(frozen=True)
++class ChangePrimaryKey:
++    table_name: str
++    old_pk: tuple[str, ...]
++    new_pk: tuple[str, ...]
++
++
++DiffOp = (
++    CreateTable | DropTable
++    | AddColumn | DropColumn | AlterColumn
++    | AddIndex | DropIndex
++    | AddForeignKey | DropForeignKey
++    | AddCheck | DropCheck
++    | ChangePrimaryKey
++)
++
++
++# ---- public API -------------------------------------------------------------
++
++def compute_diff(current: Schema, desired: Schema) -> list[DiffOp]:
++    ops: list[DiffOp] = []
++    cur_names = set(current.tables)
++    des_names = set(desired.tables)
++
++    for name in sorted(des_names - cur_names):
++        ops.append(CreateTable(table=desired.tables[name]))
++
++    for name in sorted(cur_names - des_names):
++        ops.append(DropTable(table=current.tables[name]))
++
++    for name in sorted(cur_names & des_names):
++        ops.extend(_diff_table(current.tables[name], desired.tables[name]))
++
++    return ops
++
++
++# ---- per-table diff ---------------------------------------------------------
++
++def _diff_table(cur: Table, des: Table) -> list[DiffOp]:
++    ops: list[DiffOp] = []
++    name = cur.name
++
++    # columns
++    cur_cols = {c.name: c for c in cur.columns}
++    des_cols = {c.name: c for c in des.columns}
++
++    for cn in sorted(set(des_cols) - set(cur_cols)):
++        ops.append(AddColumn(table_name=name, column=des_cols[cn]))
++    for cn in sorted(set(cur_cols) - set(des_cols)):
++        ops.append(DropColumn(table_name=name, column=cur_cols[cn]))
++    for cn in sorted(set(cur_cols) & set(des_cols)):
++        if cur_cols[cn] != des_cols[cn]:
++            ops.append(AlterColumn(table_name=name, old=cur_cols[cn], new=des_cols[cn]))
++
++    # primary key
++    if cur.primary_key != des.primary_key:
++        ops.append(ChangePrimaryKey(table_name=name, old_pk=cur.primary_key, new_pk=des.primary_key))
++
++    # indexes
++    cur_idx = {i.name: i for i in cur.indexes}
++    des_idx = {i.name: i for i in des.indexes}
++    for iname in sorted(set(des_idx) - set(cur_idx)):
++        ops.append(AddIndex(table_name=name, index=des_idx[iname]))
++    for iname in sorted(set(cur_idx) - set(des_idx)):
++        ops.append(DropIndex(table_name=name, index=cur_idx[iname]))
++    for iname in sorted(set(cur_idx) & set(des_idx)):
++        if cur_idx[iname] != des_idx[iname]:
++            ops.append(DropIndex(table_name=name, index=cur_idx[iname]))
++            ops.append(AddIndex(table_name=name, index=des_idx[iname]))
++
++    # foreign keys (compared by value, not name)
++    cur_fks = set(cur.foreign_keys)
++    des_fks = set(des.foreign_keys)
++    for fk in sorted(des_fks - cur_fks, key=lambda f: f.columns):
++        ops.append(AddForeignKey(table_name=name, fk=fk))
++    for fk in sorted(cur_fks - des_fks, key=lambda f: f.columns):
++        ops.append(DropForeignKey(table_name=name, fk=fk))
++
++    # CHECK constraints
++    cur_chk = {c.name: c for c in cur.checks}
++    des_chk = {c.name: c for c in des.checks}
++    for cn in sorted(set(des_chk) - set(cur_chk)):
++        ops.append(AddCheck(table_name=name, check=des_chk[cn]))
++    for cn in sorted(set(cur_chk) - set(des_chk)):
++        ops.append(DropCheck(table_name=name, check=cur_chk[cn]))
++    for cn in sorted(set(cur_chk) & set(des_chk)):
++        if cur_chk[cn] != des_chk[cn]:
++            ops.append(DropCheck(table_name=name, check=cur_chk[cn]))
++            ops.append(AddCheck(table_name=name, check=des_chk[cn]))
++
++    return ops
+diff --git a/src/vijaybase/errors.py b/src/vijaybase/errors.py
+new file mode 100644
+index 0000000..17ef755
+--- /dev/null
++++ b/src/vijaybase/errors.py
+@@ -0,0 +1,18 @@
++class VijaybaseError(Exception):
++    """Base exception for vijaybase."""
++
++
++class SchemaError(VijaybaseError):
++    """Invalid schema definition."""
++
++
++class MigrationError(VijaybaseError):
++    """Migration-related error."""
++
++
++class ConflictError(VijaybaseError):
++    """Migration conflict / fork detected."""
++
++
++class ChecksumError(VijaybaseError):
++    """Migration file content has been tampered with."""
+diff --git a/src/vijaybase/history.py b/src/vijaybase/history.py
+new file mode 100644
+index 0000000..d8ae6bc
+--- /dev/null
++++ b/src/vijaybase/history.py
+@@ -0,0 +1,73 @@
++"""Manage the _vijaybase_history table inside the target SQLite DB."""
++from __future__ import annotations
++
++import sqlite3
++
++_CREATE_HISTORY = """\
++CREATE TABLE IF NOT EXISTS _vijaybase_history (
++    id          INTEGER PRIMARY KEY AUTOINCREMENT,
++    migration_id TEXT    NOT NULL,
++    direction   TEXT    NOT NULL CHECK(direction IN ('up', 'down')),
++    applied_at  TEXT    NOT NULL DEFAULT (datetime('now')),
++    checksum    TEXT    NOT NULL
++);
++"""
++
++
++class HistoryManager:
++    def __init__(self, db_path: str):
++        self.db_path = db_path
++        self._ensure_table()
++
++    # ---- public API ---------------------------------------------------------
++
++    def get_applied_migrations(self) -> list[str]:
++        """Return an ordered list of currently-applied migration IDs."""
++        conn = self._connect()
++        try:
++            rows = conn.execute(
++                "SELECT migration_id, direction "
++                "FROM _vijaybase_history ORDER BY id"
++            ).fetchall()
++        finally:
++            conn.close()
++
++        applied: list[str] = []
++        for mid, direction in rows:
++            if direction == "up":
++                applied.append(mid)
++            else:
++                try:
++                    applied.remove(mid)
++                except ValueError:
++                    pass
++        return applied
++
++    def get_current_head(self) -> str | None:
++        applied = self.get_applied_migrations()
++        return applied[-1] if applied else None
++
++    def record(self, migration_id: str, direction: str, checksum: str) -> None:
++        conn = self._connect()
++        try:
++            conn.execute(
++                "INSERT INTO _vijaybase_history (migration_id, direction, checksum) "
++                "VALUES (?, ?, ?)",
++                (migration_id, direction, checksum),
++            )
++            conn.commit()
++        finally:
++            conn.close()
++
++    # ---- internal -----------------------------------------------------------
++
++    def _ensure_table(self) -> None:
++        conn = self._connect()
++        try:
++            conn.execute(_CREATE_HISTORY)
++            conn.commit()
++        finally:
++            conn.close()
++
++    def _connect(self) -> sqlite3.Connection:
++        return sqlite3.connect(self.db_path)
+diff --git a/src/vijaybase/introspect.py b/src/vijaybase/introspect.py
+new file mode 100644
+index 0000000..6c417f6
+--- /dev/null
++++ b/src/vijaybase/introspect.py
+@@ -0,0 +1,191 @@
++"""Read the live SQLite schema into our data-model objects."""
++from __future__ import annotations
++
++import os
++import re
++import sqlite3
++
++from .schema import Check, Column, ForeignKey, Index, Schema, Table
++
++_SKIP_TABLES = {"sqlite_sequence", "_vijaybase_history"}
++
++
++def introspect_db(db_path: str) -> Schema:
++    if not os.path.exists(db_path):
++        return Schema()
++    conn = sqlite3.connect(db_path)
++    conn.row_factory = sqlite3.Row
++    try:
++        return _introspect(conn)
++    finally:
++        conn.close()
++
++
++def _introspect(conn: sqlite3.Connection) -> Schema:
++    schema = Schema()
++    cursor = conn.execute(
++        "SELECT name, sql FROM sqlite_master "
++        "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
++    )
++    rows = cursor.fetchall()
++    for row in rows:
++        tname = row["name"]
++        if tname in _SKIP_TABLES:
++            continue
++        create_sql = row["sql"] or ""
++        schema.tables[tname] = Table(
++            name=tname,
++            columns=_columns(conn, tname),
++            primary_key=_primary_key(conn, tname),
++            indexes=_indexes(conn, tname),
++            foreign_keys=_foreign_keys(conn, tname),
++            checks=_checks(create_sql),
++        )
++    return schema
++
++
++# ---- columns ---------------------------------------------------------------
++
++def _columns(conn: sqlite3.Connection, table: str) -> list[Column]:
++    cols: list[Column] = []
++    for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall():
++        default = row["dflt_value"]
++        if default is not None:
++            if (
++                len(default) >= 2
++                and default[0] in ("'", '"')
++                and default[-1] == default[0]
++            ):
++                default = default[1:-1]
++        col_type = (row["type"] or "TEXT").upper()
++        cols.append(
++            Column(
++                name=row["name"],
++                type=col_type,
++                nullable=not row["notnull"],
++                default=default,
++                unique=_col_has_unique(conn, table, row["name"]),
++            )
++        )
++    return cols
++
++
++def _col_has_unique(conn: sqlite3.Connection, table: str, column: str) -> bool:
++    for idx in conn.execute(f'PRAGMA index_list("{table}")').fetchall():
++        if not idx["unique"] or idx["origin"] != "u":
++            continue
++        info = conn.execute(f'PRAGMA index_info("{idx["name"]}")').fetchall()
++        if len(info) == 1 and info[0]["name"] == column:
++            return True
++    return False
++
++
++# ---- primary key -----------------------------------------------------------
++
++def _primary_key(conn: sqlite3.Connection, table: str) -> tuple[str, ...]:
++    pk_parts: list[tuple[int, str]] = []
++    for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall():
++        if row["pk"]:
++            pk_parts.append((row["pk"], row["name"]))
++    pk_parts.sort()
++    return tuple(n for _, n in pk_parts)
++
++
++# ---- indexes ---------------------------------------------------------------
++
++def _indexes(conn: sqlite3.Connection, table: str) -> list[Index]:
++    result: list[Index] = []
++    for row in conn.execute(f'PRAGMA index_list("{table}")').fetchall():
++        if row["origin"] != "c":  # only explicit CREATE INDEX
++            continue
++        info = conn.execute(f'PRAGMA index_info("{row["name"]}")').fetchall()
++        result.append(
++            Index(
++                name=row["name"],
++                columns=tuple(r["name"] for r in info),
++                unique=bool(row["unique"]),
++            )
++        )
++    return result
++
++
++# ---- foreign keys ----------------------------------------------------------
++
++def _foreign_keys(conn: sqlite3.Connection, table: str) -> list[ForeignKey]:
++    rows = conn.execute(f'PRAGMA foreign_key_list("{table}")').fetchall()
++    buckets: dict[int, dict] = {}
++    for row in rows:
++        fk_id = row["id"]
++        if fk_id not in buckets:
++            buckets[fk_id] = {
++                "cols": [],
++                "ref_table": row["table"],
++                "ref_cols": [],
++                "on_delete": (row["on_delete"] or "NO ACTION").upper(),
++            }
++        buckets[fk_id]["cols"].append((row["seq"], row["from"]))
++        buckets[fk_id]["ref_cols"].append((row["seq"], row["to"]))
++
++    fks: list[ForeignKey] = []
++    for b in buckets.values():
++        b["cols"].sort()
++        b["ref_cols"].sort()
++        fks.append(
++            ForeignKey(
++                columns=tuple(c for _, c in b["cols"]),
++                references_table=b["ref_table"],
++                references_columns=tuple(c for _, c in b["ref_cols"]),
++                on_delete=b["on_delete"],
++            )
++        )
++    return fks
++
++
++# ---- CHECK constraints (parsed from CREATE TABLE SQL) ----------------------
++
++def _checks(create_sql: str) -> list[Check]:
++    if not create_sql:
++        return []
++
++    results: list[Check] = []
++    seen_exprs: set[str] = set()
++
++    # Named: CONSTRAINT name CHECK (...)
++    for m in re.finditer(
++        r"CONSTRAINT\s+[\"']?(\w+)[\"']?\s+CHECK\s*\(",
++        create_sql,
++        re.IGNORECASE,
++    ):
++        name = m.group(1)
++        body, _ = _balanced(create_sql, m.end() - 1)
++        if body and body not in seen_exprs:
++            results.append(Check(name=name, expression=body))
++            seen_exprs.add(body)
++
++    # Unnamed CHECK (...)
++    for m in re.finditer(r"CHECK\s*\(", create_sql, re.IGNORECASE):
++        prefix = create_sql[: m.start()].rstrip()
++        if re.search(r"CONSTRAINT\s+[\"']?\w+[\"']?\s*$", prefix, re.IGNORECASE):
++            continue  # already captured above
++        body, _ = _balanced(create_sql, m.end() - 1)
++        if body and body not in seen_exprs:
++            results.append(Check(name=f"chk_{len(results)}", expression=body))
++            seen_exprs.add(body)
++
++    return results
++
++
++def _balanced(sql: str, start: int) -> tuple[str, int]:
++    """Return the content inside balanced parentheses starting at *start*."""
++    depth = 0
++    i = start
++    while i < len(sql):
++        ch = sql[i]
++        if ch == "(":
++            depth += 1
++        elif ch == ")":
++            depth -= 1
++            if depth == 0:
++                return sql[start + 1 : i].strip(), i
++        i += 1
++    return "", len(sql)
+diff --git a/src/vijaybase/migration.py b/src/vijaybase/migration.py
+new file mode 100644
+index 0000000..3772754
+--- /dev/null
++++ b/src/vijaybase/migration.py
+@@ -0,0 +1,255 @@
++"""Read / write migration YAML files and execute SQL against the DB."""
++from __future__ import annotations
++
++import hashlib
++import sqlite3
++from dataclasses import dataclass
++from datetime import datetime, timezone
++from pathlib import Path
++
++import yaml
++
++from .errors import ChecksumError, MigrationError
++
++
++@dataclass
++class MigrationFile:
++    id: str
++    parent: str | None
++    merge_parent: str | None
++    description: str
++    created_at: str
++    checksum: str
++    up_sql: str
++    down_sql: str
++    file_path: Path | None = None
++
++
++def checksum_of(up_sql: str, down_sql: str) -> str:
++    blob = (up_sql + "\n---\n" + down_sql).encode()
++    return "sha256:" + hashlib.sha256(blob).hexdigest()
++
++
++# ---------------------------------------------------------------------------
++# File I/O
++# ---------------------------------------------------------------------------
++
++def load_migration(path: Path) -> MigrationFile:
++    with open(path) as f:
++        data = yaml.safe_load(f)
++    if not isinstance(data, dict):
++        raise MigrationError(f"Invalid migration file: {path}")
++    return MigrationFile(
++        id=data["id"],
++        parent=data.get("parent"),
++        merge_parent=data.get("merge_parent"),
++        description=data.get("description", ""),
++        created_at=data.get("created_at", ""),
++        checksum=data.get("checksum", ""),
++        up_sql=data.get("up", ""),
++        down_sql=data.get("down", ""),
++        file_path=path,
++    )
++
++
++def load_all_migrations(migrations_dir: str | Path) -> list[MigrationFile]:
++    mdir = Path(migrations_dir)
++    if not mdir.is_dir():
++        return []
++    files = sorted(mdir.glob("*.yaml")) + sorted(mdir.glob("*.yml"))
++    return [load_migration(f) for f in files]
++
++
++def create_migration_file(
++    migrations_dir: str | Path,
++    description: str,
++    parent: str | None,
++    up_sql: str,
++    down_sql: str,
++    merge_parent: str | None = None,
++) -> MigrationFile:
++    mdir = Path(migrations_dir)
++    mdir.mkdir(exist_ok=True)
++
++    ts = datetime.now(timezone.utc)
++    slug = _slugify(description)
++    mid = f"{ts:%Y%m%d_%H%M%S}_{slug}"
++    cs = checksum_of(up_sql, down_sql)
++
++    mf = MigrationFile(
++        id=mid,
++        parent=parent,
++        merge_parent=merge_parent,
++        description=description,
++        created_at=ts.isoformat(),
++        checksum=cs,
++        up_sql=up_sql,
++        down_sql=down_sql,
++    )
++
++    filename = f"{mid}.yaml"
++    path = mdir / filename
++    mf.file_path = path
++
++    data = {
++        "id": mf.id,
++        "parent": mf.parent,
++        "description": mf.description,
++        "created_at": mf.created_at,
++        "checksum": mf.checksum,
++        "up": mf.up_sql,
++        "down": mf.down_sql,
++    }
++    if merge_parent:
++        data["merge_parent"] = merge_parent
++
++    with open(path, "w") as f:
++        yaml.dump(data, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
++
++    return mf
++
++
++# ---------------------------------------------------------------------------
++# Helpers for building the migration chain
++# ---------------------------------------------------------------------------
++
++def build_migration_index(migrations: list[MigrationFile]) -> dict[str, MigrationFile]:
++    return {m.id: m for m in migrations}
++
++
++def get_pending_chain(
++    all_migrations: list[MigrationFile],
++    applied_ids: list[str],
++) -> list[MigrationFile]:
++    """Return the ordered list of not-yet-applied migrations reachable from
++    the current head, following parent -> child links."""
++    idx = build_migration_index(all_migrations)
++    applied_set = set(applied_ids)
++
++    # parent -> [children]
++    children_of: dict[str | None, list[MigrationFile]] = {}
++    for m in all_migrations:
++        children_of.setdefault(m.parent, []).append(m)
++
++    head: str | None = applied_ids[-1] if applied_ids else None
++    chain: list[MigrationFile] = []
++
++    while True:
++        kids = children_of.get(head, [])
++        unapplied = [k for k in kids if k.id not in applied_set]
++        if not unapplied:
++            break
++        if len(unapplied) > 1:
++            # Prefer a merge migration if one exists
++            merges = [k for k in unapplied if k.merge_parent]
++            if len(merges) == 1:
++                nxt = merges[0]
++            else:
++                from .errors import ConflictError
++                ids = ", ".join(k.id for k in unapplied)
++                raise ConflictError(
++                    f"Fork detected at '{head}': [{ids}]. "
++                    f"Run 'vijaybase merge' to resolve."
++                )
++        else:
++            nxt = unapplied[0]
++        chain.append(nxt)
++        head = nxt.id
++
++    return chain
++
++
++# ---------------------------------------------------------------------------
++# Execute a migration
++# ---------------------------------------------------------------------------
++
++def _split_sql(sql: str) -> list[str]:
++    """Split SQL into statements, respecting quoted strings and comments."""
++    stmts: list[str] = []
++    current: list[str] = []
++    in_string = False
++    i = 0
++    while i < len(sql):
++        ch = sql[i]
++        if in_string:
++            current.append(ch)
++            if ch == "'":
++                if i + 1 < len(sql) and sql[i + 1] == "'":
++                    current.append("'")
++                    i += 2
++                    continue
++                in_string = False
++        elif ch == "'":
++            in_string = True
++            current.append(ch)
++        elif ch == "-" and i + 1 < len(sql) and sql[i + 1] == "-":
++            while i < len(sql) and sql[i] != "\n":
++                i += 1
++            continue
++        elif ch == ";":
++            stmt = "".join(current).strip()
++            if stmt:
++                stmts.append(stmt)
++            current = []
++        else:
++            current.append(ch)
++        i += 1
++    tail = "".join(current).strip()
++    if tail:
++        stmts.append(tail)
++    return stmts
++
++
++def apply_migration_sql(db_path: str, sql: str) -> None:
++    """Execute migration SQL wrapped in a transaction.
++
++    PRAGMA foreign_keys cannot be toggled inside a transaction, so we set it
++    once before BEGIN and restore it after COMMIT/ROLLBACK.
++    """
++    stmts = _split_sql(sql)
++    regular_stmts = [s for s in stmts if not s.upper().startswith("PRAGMA")]
++    needs_fk_off = any(s.upper().startswith("PRAGMA") for s in stmts)
++
++    conn = sqlite3.connect(db_path, isolation_level=None)
++    try:
++        if needs_fk_off:
++            conn.execute("PRAGMA foreign_keys = OFF")
++
++        conn.execute("BEGIN TRANSACTION")
++        try:
++            for stmt in regular_stmts:
++                conn.execute(stmt)
++            conn.execute("COMMIT")
++        except Exception:
++            conn.execute("ROLLBACK")
++            raise
++        finally:
++            conn.execute("PRAGMA foreign_keys = ON")
++    finally:
++        conn.close()
++
++
++def verify_checksum(mf: MigrationFile) -> None:
++    expected = checksum_of(mf.up_sql, mf.down_sql)
++    if mf.checksum != expected:
++        raise ChecksumError(
++            f"Migration '{mf.id}' checksum mismatch "
++            f"(expected {expected}, got {mf.checksum}). "
++            f"The file may have been modified."
++        )
++
++
++# ---------------------------------------------------------------------------
++# Misc
++# ---------------------------------------------------------------------------
++
++def _slugify(text: str) -> str:
++    slug = text.lower().strip()
++    out: list[str] = []
++    for ch in slug:
++        if ch.isalnum():
++            out.append(ch)
++        elif ch in (" ", "-", "_"):
++            if out and out[-1] != "_":
++                out.append("_")
++    return "".join(out).strip("_")[:60]
+diff --git a/src/vijaybase/schema.py b/src/vijaybase/schema.py
+new file mode 100644
+index 0000000..709345f
+--- /dev/null
++++ b/src/vijaybase/schema.py
+@@ -0,0 +1,154 @@
++"""Schema models and YAML parsing."""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from pathlib import Path
++
++import yaml
++
++from .errors import SchemaError
++
++
++@dataclass(frozen=True)
++class Column:
++    name: str
++    type: str
++    nullable: bool = True
++    default: str | None = None
++    unique: bool = False
++
++
++@dataclass(frozen=True)
++class ForeignKey:
++    columns: tuple[str, ...]
++    references_table: str
++    references_columns: tuple[str, ...]
++    on_delete: str = "NO ACTION"
++
++
++@dataclass(frozen=True)
++class Index:
++    name: str
++    columns: tuple[str, ...]
++    unique: bool = False
++
++
++@dataclass(frozen=True)
++class Check:
++    name: str
++    expression: str
++
++
++@dataclass
++class Table:
++    name: str
++    columns: list[Column]
++    primary_key: tuple[str, ...]
++    indexes: list[Index] = field(default_factory=list)
++    foreign_keys: list[ForeignKey] = field(default_factory=list)
++    checks: list[Check] = field(default_factory=list)
++
++
++@dataclass
++class Schema:
++    tables: dict[str, Table] = field(default_factory=dict)
++
++
++# ---------------------------------------------------------------------------
++# YAML -> Schema
++# ---------------------------------------------------------------------------
++
++def _parse_column(name: str, defn) -> Column:
++    if not isinstance(defn, dict):
++        raise SchemaError(f"Column '{name}' definition must be a mapping")
++    col_type = defn.get("type")
++    if not col_type:
++        raise SchemaError(f"Column '{name}' must specify a 'type'")
++    raw_default = defn.get("default")
++    default = str(raw_default) if raw_default is not None else None
++    return Column(
++        name=name,
++        type=col_type.upper(),
++        nullable=defn.get("nullable", True),
++        default=default,
++        unique=defn.get("unique", False),
++    )
++
++
++def _parse_table(name: str, defn: dict) -> Table:
++    if not isinstance(defn, dict):
++        raise SchemaError(f"Table '{name}' definition must be a mapping")
++
++    raw_cols = defn.get("columns")
++    if not raw_cols:
++        raise SchemaError(f"Table '{name}' must have at least one column")
++    columns = [_parse_column(cn, cd) for cn, cd in raw_cols.items()]
++
++    pk = defn.get("primary_key", [])
++    if isinstance(pk, str):
++        pk = [pk]
++    primary_key = tuple(pk)
++
++    indexes: list[Index] = []
++    for idx_name, idx_def in (defn.get("indexes") or {}).items():
++        if not isinstance(idx_def, dict):
++            raise SchemaError(f"Index '{idx_name}' on '{name}' must be a mapping")
++        indexes.append(
++            Index(
++                name=idx_name,
++                columns=tuple(idx_def.get("columns", [])),
++                unique=idx_def.get("unique", False),
++            )
++        )
++
++    foreign_keys: list[ForeignKey] = []
++    for fk_def in defn.get("foreign_keys") or []:
++        foreign_keys.append(
++            ForeignKey(
++                columns=tuple(fk_def.get("columns", [])),
++                references_table=fk_def.get("references_table", ""),
++                references_columns=tuple(fk_def.get("references_columns", [])),
++                on_delete=fk_def.get("on_delete", "NO ACTION").upper(),
++            )
++        )
++
++    checks: list[Check] = []
++    for chk_def in defn.get("checks") or []:
++        checks.append(
++            Check(
++                name=chk_def.get("name", ""),
++                expression=chk_def.get("expression", ""),
++            )
++        )
++
++    return Table(
++        name=name,
++        columns=columns,
++        primary_key=primary_key,
++        indexes=indexes,
++        foreign_keys=foreign_keys,
++        checks=checks,
++    )
++
++
++def load_schema(schema_dir: str | Path) -> Schema:
++    """Load and merge all YAML files in *schema_dir* into a single Schema."""
++    schema_dir = Path(schema_dir)
++    if not schema_dir.is_dir():
++        raise SchemaError(f"Schema directory '{schema_dir}' does not exist")
++
++    yaml_files = sorted(schema_dir.glob("*.yaml")) + sorted(schema_dir.glob("*.yml"))
++    if not yaml_files:
++        raise SchemaError(f"No YAML files found in '{schema_dir}'")
++
++    schema = Schema()
++    for yf in yaml_files:
++        with open(yf) as f:
++            data = yaml.safe_load(f)
++        if not data or "tables" not in data:
++            continue
++        for tname, tdef in data["tables"].items():
++            if tname in schema.tables:
++                raise SchemaError(f"Table '{tname}' defined in multiple files")
++            schema.tables[tname] = _parse_table(tname, tdef)
++    return schema
+diff --git a/src/vijaybase/sql_generator.py b/src/vijaybase/sql_generator.py
+new file mode 100644
+index 0000000..a440741
+--- /dev/null
++++ b/src/vijaybase/sql_generator.py
+@@ -0,0 +1,205 @@
++"""Turn diff operations into executable SQLite SQL."""
++from __future__ import annotations
++
++from collections import defaultdict
++
++from .diff import (
++    AddCheck,
++    AddColumn,
++    AddForeignKey,
++    AddIndex,
++    AlterColumn,
++    ChangePrimaryKey,
++    CreateTable,
++    DiffOp,
++    DropCheck,
++    DropColumn,
++    DropForeignKey,
++    DropIndex,
++    DropTable,
++)
++from .schema import Column, ForeignKey, Index, Schema, Table
++
++# Operations that require the "recreate table" pattern in SQLite.
++_NEEDS_RECREATE = (
++    AlterColumn,
++    ChangePrimaryKey,
++    AddForeignKey,
++    DropForeignKey,
++    AddCheck,
++    DropCheck,
++    DropColumn,
++)
++
++
++def generate_sql(
++    ops: list[DiffOp],
++    old_schema: Schema,
++    new_schema: Schema,
++) -> tuple[str, str]:
++    """Return ``(up_sql, down_sql)``."""
++    up: list[str] = []
++    down: list[str] = []
++
++    # whole-table creates / drops
++    creates = [o for o in ops if isinstance(o, CreateTable)]
++    drops = [o for o in ops if isinstance(o, DropTable)]
++
++    for op in creates:
++        up.append(_create_table_ddl(op.table))
++        for idx in op.table.indexes:
++            up.append(_create_index_ddl(op.table.name, idx))
++        down.insert(0, f"DROP TABLE IF EXISTS {op.table.name};")
++
++    for op in drops:
++        up.append(f"DROP TABLE IF EXISTS {op.table.name};")
++        down.insert(0, _create_table_ddl(op.table))
++        for idx in op.table.indexes:
++            down.insert(1, _create_index_ddl(op.table.name, idx))
++
++    # group remaining ops by table
++    by_table: dict[str, list[DiffOp]] = defaultdict(list)
++    for op in ops:
++        if isinstance(op, (CreateTable, DropTable)):
++            continue
++        by_table[getattr(op, "table_name")].append(op)
++
++    for tname, tops in sorted(by_table.items()):
++        needs_recreate = any(isinstance(o, _NEEDS_RECREATE) for o in tops)
++        if needs_recreate:
++            u, d = _recreate_table(
++                old_schema.tables[tname], new_schema.tables[tname]
++            )
++            up.append(u)
++            down.append(d)
++        else:
++            for op in tops:
++                if isinstance(op, AddColumn):
++                    up.append(_add_column_ddl(op.table_name, op.column))
++                    down.append(
++                        _drop_column_ddl(op.table_name, op.column.name)
++                    )
++                elif isinstance(op, AddIndex):
++                    up.append(_create_index_ddl(op.table_name, op.index))
++                    down.append(f"DROP INDEX IF EXISTS {op.index.name};")
++                elif isinstance(op, DropIndex):
++                    up.append(f"DROP INDEX IF EXISTS {op.index.name};")
++                    down.append(_create_index_ddl(op.table_name, op.index))
++
++    return "\n\n".join(up), "\n\n".join(down)
++
++
++# ---------------------------------------------------------------------------
++# DDL helpers
++# ---------------------------------------------------------------------------
++
++def _fmt_default(value: str) -> str:
++    upper = value.upper()
++    if upper in ("NULL", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME", "TRUE", "FALSE"):
++        return value
++    try:
++        float(value)
++        return value
++    except ValueError:
++        return f"'{value}'"
++
++
++def _col_def(col: Column) -> str:
++    parts = [f"{col.name} {col.type}"]
++    if not col.nullable:
++        parts.append("NOT NULL")
++    if col.default is not None:
++        parts.append(f"DEFAULT {_fmt_default(col.default)}")
++    if col.unique:
++        parts.append("UNIQUE")
++    return " ".join(parts)
++
++
++def _create_table_ddl(table: Table) -> str:
++    lines: list[str] = []
++    for col in table.columns:
++        lines.append(f"    {_col_def(col)}")
++    if table.primary_key:
++        lines.append(f"    PRIMARY KEY ({', '.join(table.primary_key)})")
++    for fk in table.foreign_keys:
++        fk_sql = (
++            f"    FOREIGN KEY ({', '.join(fk.columns)}) "
++            f"REFERENCES {fk.references_table} "
++            f"({', '.join(fk.references_columns)})"
++        )
++        if fk.on_delete and fk.on_delete != "NO ACTION":
++            fk_sql += f" ON DELETE {fk.on_delete}"
++        lines.append(fk_sql)
++    for chk in table.checks:
++        lines.append(f"    CONSTRAINT {chk.name} CHECK ({chk.expression})")
++    return f"CREATE TABLE {table.name} (\n" + ",\n".join(lines) + "\n);"
++
++
++def _create_index_ddl(table_name: str, idx: Index) -> str:
++    unique = "UNIQUE " if idx.unique else ""
++    cols = ", ".join(idx.columns)
++    return f"CREATE {unique}INDEX {idx.name} ON {table_name} ({cols});"
++
++
++def _add_column_ddl(table: str, col: Column) -> str:
++    return f"ALTER TABLE {table} ADD COLUMN {_col_def(col)};"
++
++
++def _drop_column_ddl(table: str, col_name: str) -> str:
++    return f"ALTER TABLE {table} DROP COLUMN {col_name};"
++
++
++# ---------------------------------------------------------------------------
++# Table recreation (required for many ALTER operations in SQLite)
++# ---------------------------------------------------------------------------
++
++def _recreate_table(old: Table, new: Table) -> tuple[str, str]:
++    """Use the SQLite-recommended recreation pattern: create NEW temp table,
++    copy data from the original, drop original, rename temp to original.
++
++    This avoids the problem where ``ALTER TABLE x RENAME TO tmp`` causes
++    SQLite to rewrite FK references in *other* tables to point at ``tmp``.
++    """
++    old_names = [c.name for c in old.columns]
++    new_names = [c.name for c in new.columns]
++    common = [n for n in old_names if n in new_names]
++    cols_csv = ", ".join(common)
++    tmp = f"_vijaybase_new_{new.name}"
++
++    # UP: old schema -> new schema
++    up_lines = [
++        f"-- Recreate table {new.name}",
++        f"PRAGMA foreign_keys = OFF;",
++        _create_table_ddl(new).replace(
++            f"CREATE TABLE {new.name} (", f"CREATE TABLE {tmp} (", 1
++        ),
++    ]
++    if common:
++        up_lines.append(
++            f"INSERT INTO {tmp} ({cols_csv}) SELECT {cols_csv} FROM {new.name};"
++        )
++    up_lines.append(f"DROP TABLE {new.name};")
++    up_lines.append(f"ALTER TABLE {tmp} RENAME TO {new.name};")
++    for idx in new.indexes:
++        up_lines.append(_create_index_ddl(new.name, idx))
++    up_lines.append("PRAGMA foreign_keys = ON;")
++
++    # DOWN: new schema -> old schema
++    down_lines = [
++        f"-- Reverse-recreate table {old.name}",
++        f"PRAGMA foreign_keys = OFF;",
++        _create_table_ddl(old).replace(
++            f"CREATE TABLE {old.name} (", f"CREATE TABLE {tmp} (", 1
++        ),
++    ]
++    if common:
++        down_lines.append(
++            f"INSERT INTO {tmp} ({cols_csv}) SELECT {cols_csv} FROM {old.name};"
++        )
++    down_lines.append(f"DROP TABLE {old.name};")
++    down_lines.append(f"ALTER TABLE {tmp} RENAME TO {old.name};")
++    for idx in old.indexes:
++        down_lines.append(_create_index_ddl(old.name, idx))
++    down_lines.append("PRAGMA foreign_keys = ON;")
++
++    return "\n".join(up_lines), "\n".join(down_lines)
