@@ -1,0 +1,3502 @@
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..f284517
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,21 @@
++[build-system]
++requires = ["setuptools>=68.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "schemav"
++version = "0.1.0"
++description = "A CLI database schema migration and versioning tool for SQLite"
++requires-python = ">=3.11"
++license = {text = "MIT"}
++readme = "README.md"
++
++[project.scripts]
++schemav = "schemav.cli:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
++pythonpath = ["src"]
+diff --git a/src/schemav/__init__.py b/src/schemav/__init__.py
+new file mode 100644
+index 0000000..cec78f2
+--- /dev/null
++++ b/src/schemav/__init__.py
+@@ -0,0 +1,3 @@
++"""schemav - A CLI database schema migration and versioning tool for SQLite."""
++
++__version__ = "0.1.0"
+diff --git a/src/schemav/cli.py b/src/schemav/cli.py
+new file mode 100644
+index 0000000..4f7d25b
+--- /dev/null
++++ b/src/schemav/cli.py
+@@ -0,0 +1,635 @@
++"""CLI entry point for schemav."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++import yaml
++from pathlib import Path
++
++from schemav import __version__
++from schemav.conflict_detector import (
++    create_merge_migration,
++    detect_conflicts,
++    detect_diamond_patterns,
++    get_migration_order,
++)
++from schemav.diff_engine import diff_schemas
++from schemav.migration_generator import (
++    generate_migration,
++    has_lossy_operations,
++    load_all_migrations,
++)
++from schemav.models import DiffOp, DiffOpType, Schema
++from schemav.schema_parser import load_schema
++from schemav.state_tracker import (
++    apply_migration,
++    get_applied_migrations,
++    get_connection,
++    get_latest_applied_id,
++    rollback_migration,
++    verify_checksums,
++)
++
++EXIT_SUCCESS = 0
++EXIT_VALIDATION_ERROR = 1
++EXIT_MIGRATION_FAILURE = 2
++EXIT_CONFLICT = 3
++
++DEFAULT_CONFIG = {
++    "database": "schemav.db",
++    "schema_dir": "schema",
++    "migrations_dir": "migrations",
++}
++
++
++def _load_config(config_path: Path) -> dict:
++    if not config_path.exists():
++        print(f"Error: Config file '{config_path}' not found. Run 'schemav init' first.", file=sys.stderr)
++        sys.exit(EXIT_VALIDATION_ERROR)
++
++    with open(config_path, "r") as f:
++        data = yaml.safe_load(f) or {}
++
++    config = dict(DEFAULT_CONFIG)
++    config.update(data)
++    return config
++
++
++def _resolve_paths(config: dict, base: Path) -> tuple[Path, Path, str]:
++    schema_dir = base / config["schema_dir"]
++    migrations_dir = base / config["migrations_dir"]
++    db_path = str(base / config["database"])
++    return schema_dir, migrations_dir, db_path
++
++
++def cmd_init(args: argparse.Namespace) -> int:
++    base = Path.cwd()
++    schema_dir = base / "schema"
++    migrations_dir = base / "migrations"
++    config_path = base / "schemav.yaml"
++
++    schema_dir.mkdir(exist_ok=True)
++    migrations_dir.mkdir(exist_ok=True)
++
++    if not config_path.exists():
++        config_path.write_text(
++            yaml.dump(DEFAULT_CONFIG, default_flow_style=False, sort_keys=False),
++            encoding="utf-8",
++        )
++        print(f"Created config: {config_path}")
++    else:
++        print(f"Config already exists: {config_path}")
++
++    print(f"Created directories: {schema_dir}, {migrations_dir}")
++    print("Project initialized. Add your table definitions as YAML files in schema/.")
++    return EXIT_SUCCESS
++
++
++def cmd_validate(args: argparse.Namespace) -> int:
++    base = Path.cwd()
++    config = _load_config(base / "schemav.yaml")
++    schema_dir, migrations_dir, _ = _resolve_paths(config, base)
++
++    all_errors: list[str] = []
++
++    # Validate schema files
++    schema, schema_errors = load_schema(schema_dir)
++    all_errors.extend(schema_errors)
++
++    # Validate migration files
++    migrations, mig_errors = load_all_migrations(migrations_dir)
++    all_errors.extend(mig_errors)
++
++    # Validate migration dependency chain
++    if migrations:
++        for mid, mig in migrations.items():
++            if mig.depends_on is not None and mig.depends_on not in migrations:
++                all_errors.append(
++                    f"Migration '{mid}': depends_on '{mig.depends_on}' not found"
++                )
++
++        # Check for cycles
++        try:
++            get_migration_order(migrations)
++        except ValueError as e:
++            all_errors.append(str(e))
++
++    if all_errors:
++        print("Validation errors:", file=sys.stderr)
++        for err in all_errors:
++            print(f"  - {err}", file=sys.stderr)
++        return EXIT_VALIDATION_ERROR
++
++    print(f"Validation passed: {len(schema.tables)} table(s), {len(migrations)} migration(s)")
++    return EXIT_SUCCESS
++
++
++def cmd_generate(args: argparse.Namespace) -> int:
++    base = Path.cwd()
++    config = _load_config(base / "schemav.yaml")
++    schema_dir, migrations_dir, db_path = _resolve_paths(config, base)
++
++    # Load desired schema
++    new_schema, schema_errors = load_schema(schema_dir)
++    if schema_errors:
++        print("Schema validation errors:", file=sys.stderr)
++        for err in schema_errors:
++            print(f"  - {err}", file=sys.stderr)
++        return EXIT_VALIDATION_ERROR
++
++    # Load migrations on disk to build "current" schema state
++    migrations, mig_errors = load_all_migrations(migrations_dir)
++    if mig_errors:
++        print("Migration file errors:", file=sys.stderr)
++        for err in mig_errors:
++            print(f"  - {err}", file=sys.stderr)
++        return EXIT_VALIDATION_ERROR
++
++    # Build the old schema from the chain of applied up_sql
++    # For simplicity, the "old schema" is derived from actually applied migrations' schema
++    # We reconstruct from the database's actual state
++    conn = get_connection(db_path)
++    old_schema = _introspect_db_schema(conn)
++    conn.close()
++
++    # Compute diff
++    ops = diff_schemas(old_schema, new_schema)
++
++    if not ops:
++        print("No schema changes detected.")
++        return EXIT_SUCCESS
++
++    # Check for potential renames and interactive mode
++    rename_ops = [op for op in ops if op.op_type == DiffOpType.POTENTIAL_RENAME_COLUMN]
++    if rename_ops and args.interactive:
++        confirmed_renames = []
++        for op in rename_ops:
++            old_name = op.details["old_name"]
++            new_name = op.details["new_name"]
++            table = op.table_name
++            answer = input(
++                f"Column '{old_name}' in table '{table}' appears to have been renamed to "
++                f"'{new_name}'. Treat as rename? [y/N]: "
++            )
++            if answer.strip().lower() == "y":
++                confirmed_renames.append(op)
++            else:
++                # Replace rename op with drop + add
++                ops.remove(op)
++                drop_col = op.details["old_column"]
++                add_col = op.details["new_column"]
++                ops.append(DiffOp(
++                    op_type=DiffOpType.DROP_COLUMN,
++                    table_name=table,
++                    details={"column_name": drop_col.name, "column": drop_col},
++                    lossy=True,
++                ))
++                ops.append(DiffOp(
++                    op_type=DiffOpType.ADD_COLUMN,
++                    table_name=table,
++                    details={"column_name": add_col.name, "column": add_col},
++                ))
++    elif rename_ops and not args.interactive:
++        print("WARNING: Potential column renames detected:", file=sys.stderr)
++        for op in rename_ops:
++            print(
++                f"  - '{op.details['old_name']}' -> '{op.details['new_name']}' "
++                f"in table '{op.table_name}'",
++                file=sys.stderr,
++            )
++        print(
++            "Use --interactive to confirm renames, or they will be treated as renames by default.",
++            file=sys.stderr,
++        )
++
++    # Determine parent migration
++    latest_id = None
++    if migrations:
++        try:
++            order = get_migration_order(migrations)
++            latest_id = order[-1] if order else None
++        except ValueError:
++            # If cycle, just pick the last one alphabetically
++            latest_id = sorted(migrations.keys())[-1]
++
++    description = args.description
++    migration = generate_migration(description, ops, latest_id, migrations_dir)
++
++    print(f"Generated migration: {migration.migration_id}")
++    print("Changes detected:")
++    for op in ops:
++        lossy_tag = " [LOSSY]" if op.lossy else ""
++        print(f"  - {op.description}{lossy_tag}")
++
++    if has_lossy_operations(ops):
++        print(
++            "\nWARNING: This migration includes lossy operations. "
++            "Rollback will not fully restore data.",
++            file=sys.stderr,
++        )
++
++    return EXIT_SUCCESS
++
++
++def cmd_apply(args: argparse.Namespace) -> int:
++    base = Path.cwd()
++    config = _load_config(base / "schemav.yaml")
++    schema_dir, migrations_dir, db_path = _resolve_paths(config, base)
++
++    migrations, mig_errors = load_all_migrations(migrations_dir)
++    if mig_errors:
++        print("Migration file errors:", file=sys.stderr)
++        for err in mig_errors:
++            print(f"  - {err}", file=sys.stderr)
++        return EXIT_VALIDATION_ERROR
++
++    if not migrations:
++        print("No migrations found.")
++        return EXIT_SUCCESS
++
++    # Detect conflicts
++    conflicts = detect_conflicts(migrations)
++    if conflicts:
++        print("Migration conflicts detected! Resolve before applying:", file=sys.stderr)
++        for conflict in conflicts:
++            parent = conflict.parent_id or "(root)"
++            print(
++                f"  - Parent '{parent}' has multiple children: {conflict.branch_ids}",
++                file=sys.stderr,
++            )
++        print("Run 'schemav merge' to create a merge migration.", file=sys.stderr)
++        return EXIT_CONFLICT
++
++    # Get ordered list
++    try:
++        order = get_migration_order(migrations)
++    except ValueError as e:
++        print(f"Error: {e}", file=sys.stderr)
++        return EXIT_VALIDATION_ERROR
++
++    conn = get_connection(db_path)
++
++    # Verify checksums
++    warnings = verify_checksums(conn, migrations, migrations_dir)
++    for w in warnings:
++        print(f"WARNING: {w}", file=sys.stderr)
++
++    # Determine what needs to be applied
++    applied = get_applied_migrations(conn)
++    applied_ids = {e.migration_id for e in applied}
++
++    target_id = args.target
++    to_apply: list[str] = []
++    for mid in order:
++        if mid not in applied_ids:
++            to_apply.append(mid)
++        if target_id and mid == target_id:
++            break
++
++    if not to_apply:
++        print("All migrations are already applied.")
++        conn.close()
++        return EXIT_SUCCESS
++
++    print(f"Applying {len(to_apply)} migration(s)...")
++
++    for mid in to_apply:
++        mig = migrations[mid]
++        mig_path = migrations_dir / f"{mid}.yaml"
++        try:
++            apply_migration(conn, mig, mig_path, dry_run=args.dry_run)
++            status = "[DRY RUN] " if args.dry_run else ""
++            print(f"  {status}Applied: {mid}")
++        except Exception as e:
++            print(f"Error applying migration '{mid}': {e}", file=sys.stderr)
++            conn.close()
++            return EXIT_MIGRATION_FAILURE
++
++    conn.close()
++    return EXIT_SUCCESS
++
++
++def cmd_rollback(args: argparse.Namespace) -> int:
++    base = Path.cwd()
++    config = _load_config(base / "schemav.yaml")
++    schema_dir, migrations_dir, db_path = _resolve_paths(config, base)
++
++    migrations, mig_errors = load_all_migrations(migrations_dir)
++    if mig_errors:
++        for err in mig_errors:
++            print(f"WARNING: {err}", file=sys.stderr)
++
++    conn = get_connection(db_path)
++    applied = get_applied_migrations(conn)
++
++    if not applied:
++        print("No migrations to rollback.")
++        conn.close()
++        return EXIT_SUCCESS
++
++    steps = args.steps
++    to_rollback = list(reversed(applied[-steps:]))
++
++    print(f"Rolling back {len(to_rollback)} migration(s)...")
++
++    for entry in to_rollback:
++        mid = entry.migration_id
++        if mid not in migrations:
++            print(f"Error: Migration file for '{mid}' not found on disk.", file=sys.stderr)
++            conn.close()
++            return EXIT_MIGRATION_FAILURE
++
++        mig = migrations[mid]
++        mig_path = migrations_dir / f"{mid}.yaml"
++        try:
++            rollback_migration(
++                conn, mig, mig_path,
++                dry_run=args.dry_run,
++                force=args.force,
++            )
++            status = "[DRY RUN] " if args.dry_run else ""
++            print(f"  {status}Rolled back: {mid}")
++        except ValueError as e:
++            print(f"Error: {e}", file=sys.stderr)
++            conn.close()
++            return EXIT_MIGRATION_FAILURE
++        except Exception as e:
++            print(f"Error rolling back migration '{mid}': {e}", file=sys.stderr)
++            conn.close()
++            return EXIT_MIGRATION_FAILURE
++
++    conn.close()
++    return EXIT_SUCCESS
++
++
++def cmd_status(args: argparse.Namespace) -> int:
++    base = Path.cwd()
++    config = _load_config(base / "schemav.yaml")
++    schema_dir, migrations_dir, db_path = _resolve_paths(config, base)
++
++    migrations, mig_errors = load_all_migrations(migrations_dir)
++    if mig_errors:
++        for err in mig_errors:
++            print(f"WARNING: {err}", file=sys.stderr)
++
++    conn = get_connection(db_path)
++    applied = get_applied_migrations(conn)
++    applied_ids = {e.migration_id for e in applied}
++
++    # Check conflicts
++    conflicts = detect_conflicts(migrations)
++    diamonds = detect_diamond_patterns(migrations)
++
++    # Checksums
++    warnings = verify_checksums(conn, migrations, migrations_dir)
++    conn.close()
++
++    # Display
++    print(f"{'Migration ID':<45} {'Status':<12} {'Depends On'}")
++    print("-" * 90)
++
++    try:
++        order = get_migration_order(migrations)
++    except ValueError:
++        order = sorted(migrations.keys())
++
++    for mid in order:
++        mig = migrations[mid]
++        status = "applied" if mid in applied_ids else "pending"
++        dep = mig.depends_on or "(root)"
++        print(f"{mid:<45} {status:<12} {dep}")
++
++    if conflicts:
++        print(f"\n⚠ CONFLICTS DETECTED ({len(conflicts)}):")
++        for c in conflicts:
++            parent = c.parent_id or "(root)"
++            print(f"  Parent '{parent}' has branches: {c.branch_ids}")
++
++    if diamonds:
++        print(f"\n⚠ DIAMOND PATTERNS DETECTED ({len(diamonds)}):")
++        for d in diamonds:
++            print(
++                f"  Diverges at '{d['diverge_at']}', "
++                f"branches {d['branches']}, converges at '{d['converge_at']}'"
++            )
++
++    if warnings:
++        print(f"\n⚠ CHECKSUM WARNINGS ({len(warnings)}):")
++        for w in warnings:
++            print(f"  {w}")
++
++    return EXIT_SUCCESS
++
++
++def cmd_merge(args: argparse.Namespace) -> int:
++    base = Path.cwd()
++    config = _load_config(base / "schemav.yaml")
++    _, migrations_dir, _ = _resolve_paths(config, base)
++
++    migrations, mig_errors = load_all_migrations(migrations_dir)
++    if mig_errors:
++        for err in mig_errors:
++            print(f"WARNING: {err}", file=sys.stderr)
++
++    conflicts = detect_conflicts(migrations)
++    if not conflicts:
++        print("No conflicts detected. Nothing to merge.")
++        return EXIT_SUCCESS
++
++    try:
++        merge_mig = create_merge_migration(migrations, migrations_dir)
++    except ValueError as e:
++        print(f"Error: {e}", file=sys.stderr)
++        return EXIT_VALIDATION_ERROR
++
++    print(f"Created merge migration: {merge_mig.migration_id}")
++    print(f"Description: {merge_mig.description}")
++    print(
++        "\nNext steps: run 'schemav generate <description>' to generate a new "
++        "migration from the merged state."
++    )
++    return EXIT_SUCCESS
++
++
++def _introspect_db_schema(conn) -> Schema:
++    """Introspect the current SQLite database to build a Schema object.
++
++    This is used as the 'old' schema when generating diffs."""
++    from schemav.models import (
++        CheckConstraint,
++        Column,
++        ColumnType,
++        ForeignKey,
++        Index,
++        OnDeleteAction,
++        Schema,
++        Table,
++    )
++
++    tables: dict[str, Table] = {}
++
++    cursor = conn.execute(
++        "SELECT name FROM sqlite_master WHERE type='table' AND name != ? AND name NOT LIKE 'sqlite_%' ORDER BY name",
++        ("_schemav_history",),
++    )
++    table_names = [row[0] for row in cursor]
++
++    type_map = {
++        "TEXT": ColumnType.TEXT,
++        "INTEGER": ColumnType.INTEGER,
++        "REAL": ColumnType.REAL,
++        "BLOB": ColumnType.BLOB,
++    }
++
++    for table_name in table_names:
++        columns: list[Column] = []
++        pk_columns: list[str] = []
++
++        # Get column info
++        col_cursor = conn.execute(f'PRAGMA table_info("{table_name}")')
++        for row in col_cursor:
++            cid, col_name, col_type, notnull, default_val, is_pk = row
++            ct = type_map.get(col_type.upper(), ColumnType.TEXT) if col_type else ColumnType.TEXT
++            # Check if the original type was BOOLEAN or DATETIME
++            if col_type and "BOOLEAN" in col_type.upper():
++                ct = ColumnType.BOOLEAN
++            elif col_type and "DATETIME" in col_type.upper():
++                ct = ColumnType.DATETIME
++
++            default_str = str(default_val) if default_val is not None else None
++            columns.append(Column(
++                name=col_name,
++                type=ct,
++                nullable=not bool(notnull),
++                default=default_str,
++                unique=False,  # We'll patch this from index info
++            ))
++            if is_pk:
++                pk_columns.append(col_name)
++
++        # Get indexes
++        indexes: list[Index] = []
++        idx_cursor = conn.execute(f'PRAGMA index_list("{table_name}")')
++        for row in idx_cursor:
++            idx_name = row[1]
++            idx_unique = bool(row[2])
++            # Skip auto-generated indexes
++            if idx_name.startswith("sqlite_"):
++                continue
++            idx_info = conn.execute(f'PRAGMA index_info("{idx_name}")')
++            idx_cols = tuple(r[2] for r in idx_info)
++            indexes.append(Index(name=idx_name, columns=idx_cols, unique=idx_unique))
++
++        # Get foreign keys
++        foreign_keys: list[ForeignKey] = []
++        fk_cursor = conn.execute(f'PRAGMA foreign_key_list("{table_name}")')
++        # Group by id
++        fk_groups: dict[int, dict] = {}
++        for row in fk_cursor:
++            fk_id = row[0]
++            if fk_id not in fk_groups:
++                fk_groups[fk_id] = {
++                    "ref_table": row[2],
++                    "local_cols": [],
++                    "ref_cols": [],
++                    "on_delete": row[6] if len(row) > 6 else "NO ACTION",
++                }
++            fk_groups[fk_id]["local_cols"].append(row[3])
++            fk_groups[fk_id]["ref_cols"].append(row[4])
++
++        for fk_data in fk_groups.values():
++            on_del_str = (fk_data.get("on_delete") or "NO ACTION").upper()
++            try:
++                on_del = OnDeleteAction(on_del_str)
++            except ValueError:
++                on_del = OnDeleteAction.NO_ACTION
++            foreign_keys.append(ForeignKey(
++                columns=tuple(fk_data["local_cols"]),
++                references_table=fk_data["ref_table"],
++                references_columns=tuple(fk_data["ref_cols"]),
++                on_delete=on_del,
++            ))
++
++        tables[table_name] = Table(
++            name=table_name,
++            columns=columns,
++            primary_key=pk_columns,
++            indexes=indexes,
++            foreign_keys=foreign_keys,
++            constraints=[],  # SQLite doesn't expose CHECK constraints via PRAGMA
++        )
++
++    return Schema(tables=tables)
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="schemav",
++        description="Database schema migration and versioning tool for SQLite",
++    )
++    parser.add_argument("--version", action="version", version=f"schemav {__version__}")
++    subparsers = parser.add_subparsers(dest="command", help="Available commands")
++
++    # init
++    subparsers.add_parser("init", help="Initialize a new schemav project")
++
++    # validate
++    subparsers.add_parser("validate", help="Validate schema and migration files")
++
++    # generate
++    gen_parser = subparsers.add_parser("generate", help="Generate a new migration from schema diff")
++    gen_parser.add_argument("description", help="Short description for the migration")
++    gen_parser.add_argument(
++        "--interactive", "-i", action="store_true",
++        help="Interactively confirm potential column renames",
++    )
++
++    # apply
++    apply_parser = subparsers.add_parser("apply", help="Apply pending migrations")
++    apply_parser.add_argument("--dry-run", action="store_true", help="Show SQL without executing")
++    apply_parser.add_argument("--target", default=None, help="Apply up to this migration ID")
++
++    # rollback
++    rb_parser = subparsers.add_parser("rollback", help="Roll back applied migrations")
++    rb_parser.add_argument("--dry-run", action="store_true", help="Show SQL without executing")
++    rb_parser.add_argument("--steps", type=int, default=1, help="Number of migrations to roll back")
++    rb_parser.add_argument("--force", action="store_true", help="Force rollback even for lossy ops")
++
++    # status
++    subparsers.add_parser("status", help="Show migration status")
++
++    # merge
++    subparsers.add_parser("merge", help="Create a merge migration for conflicting branches")
++
++    return parser
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = build_parser()
++    args = parser.parse_args(argv)
++
++    if not args.command:
++        parser.print_help()
++        return EXIT_SUCCESS
++
++    commands = {
++        "init": cmd_init,
++        "validate": cmd_validate,
++        "generate": cmd_generate,
++        "apply": cmd_apply,
++        "rollback": cmd_rollback,
++        "status": cmd_status,
++        "merge": cmd_merge,
++    }
++
++    handler = commands.get(args.command)
++    if handler is None:
++        parser.print_help()
++        return EXIT_VALIDATION_ERROR
++
++    return handler(args)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/schemav/conflict_detector.py b/src/schemav/conflict_detector.py
+new file mode 100644
+index 0000000..98f8f55
+--- /dev/null
++++ b/src/schemav/conflict_detector.py
+@@ -0,0 +1,208 @@
++"""Conflict detector — builds migration DAG, detects branches, diamonds, and creates merge migrations."""
++
++from __future__ import annotations
++
++import datetime
++from collections import defaultdict
++from pathlib import Path
++
++from schemav.models import Migration
++from schemav.migration_generator import write_migration_file
++
++
++class MigrationConflict:
++    def __init__(self, parent_id: str | None, branch_ids: list[str]):
++        self.parent_id = parent_id
++        self.branch_ids = branch_ids
++
++    def __repr__(self) -> str:
++        return f"MigrationConflict(parent={self.parent_id!r}, branches={self.branch_ids})"
++
++
++def build_dependency_graph(
++    migrations: dict[str, Migration],
++) -> tuple[dict[str | None, list[str]], dict[str, str | None]]:
++    """Build parent->children and child->parent mappings.
++
++    Returns:
++        children_of: mapping from parent_id (or None for roots) to list of child migration IDs
++        parent_of: mapping from migration_id to its parent_id (or None)
++    """
++    children_of: dict[str | None, list[str]] = defaultdict(list)
++    parent_of: dict[str, str | None] = {}
++
++    for mid, mig in migrations.items():
++        parent_of[mid] = mig.depends_on
++        children_of[mig.depends_on].append(mid)
++
++    return dict(children_of), parent_of
++
++
++def find_leaf_migrations(
++    migrations: dict[str, Migration],
++    children_of: dict[str | None, list[str]],
++) -> list[str]:
++    """Find migration IDs that have no children (leaf nodes)."""
++    all_ids = set(migrations.keys())
++    has_children = set()
++    for parent, kids in children_of.items():
++        if parent is not None:
++            has_children.update(kid for kid in kids if kid in all_ids)
++        # The parent itself has children
++    # A leaf is a migration that is never a parent
++    parents_with_children = set()
++    for kids in children_of.values():
++        for kid in kids:
++            if kid in all_ids:
++                parent = migrations[kid].depends_on
++                if parent is not None:
++                    parents_with_children.add(parent)
++
++    # Leaf = not a parent of anyone
++    non_leaf = set()
++    for kids in children_of.values():
++        for kid in kids:
++            parent = migrations.get(kid)
++            if parent:
++                dep = parent.depends_on
++                if dep:
++                    non_leaf.add(dep)
++
++    leaves = [mid for mid in all_ids if mid not in non_leaf]
++    return sorted(leaves)
++
++
++def detect_conflicts(migrations: dict[str, Migration]) -> list[MigrationConflict]:
++    """Detect branch points where multiple migrations share the same depends_on parent."""
++    children_of, _ = build_dependency_graph(migrations)
++    conflicts: list[MigrationConflict] = []
++
++    for parent_id, children in children_of.items():
++        # Filter to only children that actually exist in our migrations set
++        existing_children = [c for c in children if c in migrations]
++        if len(existing_children) > 1:
++            conflicts.append(MigrationConflict(
++                parent_id=parent_id,
++                branch_ids=sorted(existing_children),
++            ))
++
++    return conflicts
++
++
++def detect_diamond_patterns(migrations: dict[str, Migration]) -> list[dict]:
++    """Detect diamond patterns: two branches that diverge from a common ancestor
++    and independently converge on a common descendant.
++
++    Returns list of dicts with 'diverge_at', 'branches', 'converge_at'."""
++    children_of, parent_of = build_dependency_graph(migrations)
++    diamonds: list[dict] = []
++
++    # Find all fork points
++    fork_points: dict[str | None, list[str]] = {}
++    for parent_id, children in children_of.items():
++        existing = [c for c in children if c in migrations]
++        if len(existing) > 1:
++            fork_points[parent_id] = existing
++
++    # For each fork point, trace each branch to see if they converge
++    for fork_id, branches in fork_points.items():
++        # Build all descendants for each branch
++        branch_descendants: dict[str, set[str]] = {}
++        for branch_root in branches:
++            descendants: set[str] = set()
++            queue = [branch_root]
++            while queue:
++                current = queue.pop(0)
++                descendants.add(current)
++                for child in children_of.get(current, []):
++                    if child in migrations and child not in descendants:
++                        queue.append(child)
++            branch_descendants[branch_root] = descendants
++
++        # Check if any migration appears in multiple branch descendant sets
++        all_descendants: dict[str, list[str]] = defaultdict(list)
++        for branch_root, descs in branch_descendants.items():
++            for d in descs:
++                if d != branch_root:
++                    all_descendants[d].append(branch_root)
++
++        for convergence_point, from_branches in all_descendants.items():
++            if len(from_branches) > 1:
++                diamonds.append({
++                    "diverge_at": fork_id,
++                    "branches": sorted(from_branches),
++                    "converge_at": convergence_point,
++                })
++
++    return diamonds
++
++
++def get_migration_order(migrations: dict[str, Migration]) -> list[str]:
++    """Topological sort of migrations by dependency order.
++    Raises ValueError if cycles are detected."""
++    children_of, parent_of = build_dependency_graph(migrations)
++
++    # Kahn's algorithm
++    in_degree: dict[str, int] = {mid: 0 for mid in migrations}
++    for mid in migrations:
++        if parent_of[mid] is not None and parent_of[mid] in migrations:
++            in_degree[mid] = 1
++
++    queue = sorted([mid for mid, deg in in_degree.items() if deg == 0])
++    result: list[str] = []
++
++    while queue:
++        current = queue.pop(0)
++        result.append(current)
++        for child in sorted(children_of.get(current, [])):
++            if child in migrations:
++                in_degree[child] -= 1
++                if in_degree[child] == 0:
++                    queue.append(child)
++
++    if len(result) != len(migrations):
++        missing = set(migrations) - set(result)
++        raise ValueError(
++            f"Cycle detected in migration dependencies among: {sorted(missing)}"
++        )
++
++    return result
++
++
++def create_merge_migration(
++    migrations: dict[str, Migration],
++    migrations_dir: Path,
++    description: str = "merge_branches",
++) -> Migration:
++    """Create a merge migration that depends on all current leaf migrations.
++
++    The merge migration has empty up/down SQL — it's a structural bookmark."""
++    children_of, _ = build_dependency_graph(migrations)
++    leaves = find_leaf_migrations(migrations, children_of)
++
++    if len(leaves) < 2:
++        raise ValueError("No conflicting branches to merge (fewer than 2 leaf migrations)")
++
++    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
++    slug = Migration.slug_from_description(description)
++    migration_id = f"{timestamp}_{slug}"
++
++    # The merge migration depends on the first leaf (primary parent).
++    # We store all leaf dependencies as a note in the description.
++    merge_mig = Migration(
++        migration_id=migration_id,
++        description=f"Merge migration: depends on {', '.join(leaves)}",
++        depends_on=leaves[0],  # primary parent
++        up_sql=[
++            f"-- Merge migration: structural bookmark merging branches: {', '.join(leaves)}",
++            "-- This migration has no SQL statements.",
++            "-- Generate a new migration from the merged state to bring the schema up to date.",
++        ],
++        down_sql=[
++            f"-- Undo merge: this was a structural bookmark for branches: {', '.join(leaves)}",
++            "-- No SQL statements to reverse.",
++        ],
++    )
++
++    write_migration_file(merge_mig, migrations_dir)
++    return merge_mig
+diff --git a/src/schemav/diff_engine.py b/src/schemav/diff_engine.py
+new file mode 100644
+index 0000000..a17b032
+--- /dev/null
++++ b/src/schemav/diff_engine.py
+@@ -0,0 +1,232 @@
++"""Schema diff engine — compares old and new schemas to produce a list of DiffOps."""
++
++from __future__ import annotations
++
++from schemav.models import (
++    CheckConstraint,
++    Column,
++    DiffOp,
++    DiffOpType,
++    ForeignKey,
++    Index,
++    Schema,
++    Table,
++)
++
++
++def _fk_key(fk: ForeignKey) -> tuple:
++    return (fk.columns, fk.references_table, fk.references_columns)
++
++
++def _detect_potential_renames(
++    old_table: Table, new_table: Table, dropped: list[Column], added: list[Column]
++) -> list[tuple[Column, Column]]:
++    """Heuristic: if a dropped and added column have the same type, same position
++    index, and same nullability, flag as a potential rename."""
++    renames: list[tuple[Column, Column]] = []
++    used_old: set[str] = set()
++    used_new: set[str] = set()
++
++    old_positions = {c.name: i for i, c in enumerate(old_table.columns)}
++    new_positions = {c.name: i for i, c in enumerate(new_table.columns)}
++
++    for old_col in dropped:
++        for new_col in added:
++            if new_col.name in used_new or old_col.name in used_old:
++                continue
++            same_type = old_col.type == new_col.type
++            same_nullable = old_col.nullable == new_col.nullable
++            same_position = old_positions.get(old_col.name) == new_positions.get(new_col.name)
++            if same_type and same_nullable and same_position:
++                renames.append((old_col, new_col))
++                used_old.add(old_col.name)
++                used_new.add(new_col.name)
++
++    return renames
++
++
++def diff_tables(old_table: Table, new_table: Table) -> list[DiffOp]:
++    ops: list[DiffOp] = []
++    old_col_names = {c.name for c in old_table.columns}
++    new_col_names = {c.name for c in new_table.columns}
++
++    dropped_cols = [c for c in old_table.columns if c.name not in new_col_names]
++    added_cols = [c for c in new_table.columns if c.name not in old_col_names]
++
++    # Detect potential renames before emitting drop+add
++    potential_renames = _detect_potential_renames(old_table, new_table, dropped_cols, added_cols)
++    rename_old_names = {r[0].name for r in potential_renames}
++    rename_new_names = {r[1].name for r in potential_renames}
++
++    for old_col, new_col in potential_renames:
++        ops.append(DiffOp(
++            op_type=DiffOpType.POTENTIAL_RENAME_COLUMN,
++            table_name=old_table.name,
++            details={
++                "old_name": old_col.name,
++                "new_name": new_col.name,
++                "old_column": old_col,
++                "new_column": new_col,
++            },
++        ))
++
++    # Dropped columns (exclude those flagged as potential renames)
++    for col in dropped_cols:
++        if col.name not in rename_old_names:
++            ops.append(DiffOp(
++                op_type=DiffOpType.DROP_COLUMN,
++                table_name=old_table.name,
++                details={"column_name": col.name, "column": col},
++                lossy=True,
++            ))
++
++    # Added columns (exclude those flagged as potential renames)
++    for col in added_cols:
++        if col.name not in rename_new_names:
++            ops.append(DiffOp(
++                op_type=DiffOpType.ADD_COLUMN,
++                table_name=new_table.name,
++                details={"column_name": col.name, "column": col},
++            ))
++
++    # Altered columns (same name, different attributes)
++    for col_name in old_col_names & new_col_names:
++        old_col = old_table.column_by_name(col_name)
++        new_col = new_table.column_by_name(col_name)
++        if old_col and new_col and old_col != new_col:
++            changes: dict[str, tuple] = {}
++            if old_col.type != new_col.type:
++                changes["type"] = (old_col.type.value, new_col.type.value)
++            if old_col.nullable != new_col.nullable:
++                changes["nullable"] = (old_col.nullable, new_col.nullable)
++            if old_col.default != new_col.default:
++                changes["default"] = (old_col.default, new_col.default)
++            if old_col.unique != new_col.unique:
++                changes["unique"] = (old_col.unique, new_col.unique)
++            if changes:
++                ops.append(DiffOp(
++                    op_type=DiffOpType.ALTER_COLUMN,
++                    table_name=old_table.name,
++                    details={
++                        "column_name": col_name,
++                        "changes": changes,
++                        "old_column": old_col,
++                        "new_column": new_col,
++                    },
++                ))
++
++    # Indexes
++    old_indexes = {idx.name: idx for idx in old_table.indexes}
++    new_indexes = {idx.name: idx for idx in new_table.indexes}
++
++    for name in set(old_indexes) - set(new_indexes):
++        ops.append(DiffOp(
++            op_type=DiffOpType.DROP_INDEX,
++            table_name=old_table.name,
++            details={"index_name": name, "index": old_indexes[name]},
++        ))
++
++    for name in set(new_indexes) - set(old_indexes):
++        ops.append(DiffOp(
++            op_type=DiffOpType.ADD_INDEX,
++            table_name=new_table.name,
++            details={"index_name": name, "index": new_indexes[name]},
++        ))
++
++    # Changed indexes (same name, different definition)
++    for name in set(old_indexes) & set(new_indexes):
++        if old_indexes[name] != new_indexes[name]:
++            ops.append(DiffOp(
++                op_type=DiffOpType.DROP_INDEX,
++                table_name=old_table.name,
++                details={"index_name": name, "index": old_indexes[name]},
++            ))
++            ops.append(DiffOp(
++                op_type=DiffOpType.ADD_INDEX,
++                table_name=new_table.name,
++                details={"index_name": name, "index": new_indexes[name]},
++            ))
++
++    # Foreign keys (keyed by local columns + ref table + ref columns)
++    old_fks = {_fk_key(fk): fk for fk in old_table.foreign_keys}
++    new_fks = {_fk_key(fk): fk for fk in new_table.foreign_keys}
++
++    for key in set(old_fks) - set(new_fks):
++        fk = old_fks[key]
++        ops.append(DiffOp(
++            op_type=DiffOpType.DROP_FOREIGN_KEY,
++            table_name=old_table.name,
++            details={"columns": fk.columns, "fk": fk},
++        ))
++
++    for key in set(new_fks) - set(old_fks):
++        fk = new_fks[key]
++        ops.append(DiffOp(
++            op_type=DiffOpType.ADD_FOREIGN_KEY,
++            table_name=new_table.name,
++            details={"columns": fk.columns, "fk": fk},
++        ))
++
++    # Check constraints
++    old_cons = {c.name: c for c in old_table.constraints}
++    new_cons = {c.name: c for c in new_table.constraints}
++
++    for name in set(old_cons) - set(new_cons):
++        ops.append(DiffOp(
++            op_type=DiffOpType.DROP_CONSTRAINT,
++            table_name=old_table.name,
++            details={"constraint_name": name, "constraint": old_cons[name]},
++        ))
++
++    for name in set(new_cons) - set(old_cons):
++        ops.append(DiffOp(
++            op_type=DiffOpType.ADD_CONSTRAINT,
++            table_name=new_table.name,
++            details={"constraint_name": name, "constraint": new_cons[name]},
++        ))
++
++    # Changed constraints
++    for name in set(old_cons) & set(new_cons):
++        if old_cons[name] != new_cons[name]:
++            ops.append(DiffOp(
++                op_type=DiffOpType.DROP_CONSTRAINT,
++                table_name=old_table.name,
++                details={"constraint_name": name, "constraint": old_cons[name]},
++            ))
++            ops.append(DiffOp(
++                op_type=DiffOpType.ADD_CONSTRAINT,
++                table_name=new_table.name,
++                details={"constraint_name": name, "constraint": new_cons[name]},
++            ))
++
++    return ops
++
++
++def diff_schemas(old_schema: Schema, new_schema: Schema) -> list[DiffOp]:
++    ops: list[DiffOp] = []
++    old_tables = set(old_schema.tables)
++    new_tables = set(new_schema.tables)
++
++    # Dropped tables
++    for name in sorted(old_tables - new_tables):
++        ops.append(DiffOp(
++            op_type=DiffOpType.DROP_TABLE,
++            table_name=name,
++            details={"table": old_schema.tables[name]},
++            lossy=True,
++        ))
++
++    # New tables
++    for name in sorted(new_tables - old_tables):
++        ops.append(DiffOp(
++            op_type=DiffOpType.CREATE_TABLE,
++            table_name=name,
++            details={"table": new_schema.tables[name]},
++        ))
++
++    # Modified tables
++    for name in sorted(old_tables & new_tables):
++        table_ops = diff_tables(old_schema.tables[name], new_schema.tables[name])
++        ops.extend(table_ops)
++
++    return ops
+diff --git a/src/schemav/migration_generator.py b/src/schemav/migration_generator.py
+new file mode 100644
+index 0000000..2f4d95f
+--- /dev/null
++++ b/src/schemav/migration_generator.py
+@@ -0,0 +1,375 @@
++"""Migration file generator — turns DiffOps into migration YAML files with up/down SQL."""
++
++from __future__ import annotations
++
++import datetime
++import yaml
++from collections import defaultdict
++from pathlib import Path
++
++from schemav.models import (
++    DiffOp,
++    DiffOpType,
++    Migration,
++    Table,
++)
++
++
++def _table_create_sql(table: Table) -> str:
++    parts: list[str] = []
++    for col in table.columns:
++        parts.append(f"  {col.to_sql_fragment()}")
++
++    if table.primary_key:
++        pk_cols = ", ".join(f'"{c}"' for c in table.primary_key)
++        parts.append(f"  PRIMARY KEY ({pk_cols})")
++
++    for fk in table.foreign_keys:
++        parts.append(f"  {fk.to_sql_fragment()}")
++
++    for con in table.constraints:
++        parts.append(f"  {con.to_sql_fragment()}")
++
++    body = ",\n".join(parts)
++    return f'CREATE TABLE "{table.name}" (\n{body}\n);'
++
++
++def _table_drop_sql(table_name: str) -> str:
++    return f'DROP TABLE IF EXISTS "{table_name}";'
++
++
++def _topological_sort_tables(tables: list[Table]) -> list[Table]:
++    """Sort tables by foreign key dependencies so referenced tables are created first.
++    Raises ValueError if circular foreign key dependencies are detected."""
++    table_map = {t.name: t for t in tables}
++    # Build adjacency: table -> set of tables it depends on
++    deps: dict[str, set[str]] = defaultdict(set)
++    for t in tables:
++        deps.setdefault(t.name, set())
++        for fk in t.foreign_keys:
++            if fk.references_table in table_map and fk.references_table != t.name:
++                deps[t.name].add(fk.references_table)
++
++    # Kahn's algorithm
++    in_degree: dict[str, int] = {t.name: 0 for t in tables}
++    # Build reverse map: if A depends on B, then B has an edge to A
++    reverse: dict[str, set[str]] = defaultdict(set)
++    for t_name, t_deps in deps.items():
++        for dep in t_deps:
++            reverse[dep].add(t_name)
++            in_degree[t_name] = in_degree.get(t_name, 0)  # ensure key exists
++
++    # Recount in_degree properly
++    for t_name in in_degree:
++        in_degree[t_name] = len(deps.get(t_name, set()))
++
++    queue = [t for t in in_degree if in_degree[t] == 0]
++    queue.sort()  # deterministic ordering
++    result: list[str] = []
++
++    while queue:
++        current = queue.pop(0)
++        result.append(current)
++        for dependent in sorted(reverse.get(current, set())):
++            in_degree[dependent] -= 1
++            if in_degree[dependent] == 0:
++                queue.append(dependent)
++
++    if len(result) != len(tables):
++        missing = set(t.name for t in tables) - set(result)
++        raise ValueError(
++            f"Circular foreign key dependency detected among tables: {sorted(missing)}. "
++            "Manual intervention required — break the cycle or use deferred constraints."
++        )
++
++    return [table_map[name] for name in result]
++
++
++def _generate_up_sql(ops: list[DiffOp]) -> list[str]:
++    stmts: list[str] = []
++
++    # Collect CREATE TABLE ops for topological sorting
++    create_table_ops = [op for op in ops if op.op_type == DiffOpType.CREATE_TABLE]
++    other_ops = [op for op in ops if op.op_type != DiffOpType.CREATE_TABLE]
++
++    # Topologically sort new tables by FK deps
++    if create_table_ops:
++        tables_to_create = [op.details["table"] for op in create_table_ops]
++        try:
++            sorted_tables = _topological_sort_tables(tables_to_create)
++        except ValueError as e:
++            stmts.append(f"-- ERROR: {e}")
++            sorted_tables = tables_to_create
++
++        for table in sorted_tables:
++            stmts.append(_table_create_sql(table))
++            for idx in table.indexes:
++                stmts.append(idx.to_sql(table.name))
++
++    for op in other_ops:
++        match op.op_type:
++            case DiffOpType.DROP_TABLE:
++                stmts.append(_table_drop_sql(op.table_name))
++
++            case DiffOpType.ADD_COLUMN:
++                col = op.details["column"]
++                stmts.append(
++                    f'ALTER TABLE "{op.table_name}" ADD COLUMN {col.to_sql_fragment()};'
++                )
++
++            case DiffOpType.DROP_COLUMN:
++                stmts.append(
++                    f'ALTER TABLE "{op.table_name}" DROP COLUMN "{op.details["column_name"]}";'
++                )
++
++            case DiffOpType.ALTER_COLUMN:
++                # SQLite doesn't support ALTER COLUMN natively.
++                # For type/nullability/default changes we need table rebuild.
++                new_col = op.details["new_column"]
++                changes = op.details["changes"]
++                desc_parts = []
++                for attr, (old_val, new_val) in changes.items():
++                    desc_parts.append(f"{attr}: {old_val} -> {new_val}")
++                desc = ", ".join(desc_parts)
++                stmts.append(
++                    f"-- ALTER COLUMN '{op.details['column_name']}' in '{op.table_name}': {desc}"
++                )
++                stmts.append(
++                    f"-- SQLite does not support ALTER COLUMN. Table rebuild required."
++                )
++                stmts.append(
++                    f"-- Use: CREATE TABLE new -> INSERT INTO new SELECT ... FROM old -> DROP old -> ALTER TABLE new RENAME TO old"
++                )
++
++            case DiffOpType.POTENTIAL_RENAME_COLUMN:
++                old_name = op.details["old_name"]
++                new_name = op.details["new_name"]
++                stmts.append(
++                    f'ALTER TABLE "{op.table_name}" RENAME COLUMN "{old_name}" TO "{new_name}";'
++                )
++
++            case DiffOpType.ADD_INDEX:
++                idx = op.details["index"]
++                stmts.append(idx.to_sql(op.table_name))
++
++            case DiffOpType.DROP_INDEX:
++                idx = op.details["index"]
++                stmts.append(idx.drop_sql())
++
++            case DiffOpType.ADD_FOREIGN_KEY:
++                stmts.append(
++                    f"-- Adding foreign key to existing table '{op.table_name}' "
++                    f"requires table rebuild in SQLite."
++                )
++
++            case DiffOpType.DROP_FOREIGN_KEY:
++                stmts.append(
++                    f"-- Dropping foreign key from existing table '{op.table_name}' "
++                    f"requires table rebuild in SQLite."
++                )
++
++            case DiffOpType.ADD_CONSTRAINT:
++                stmts.append(
++                    f"-- Adding CHECK constraint '{op.details['constraint_name']}' "
++                    f"to existing table '{op.table_name}' requires table rebuild in SQLite."
++                )
++
++            case DiffOpType.DROP_CONSTRAINT:
++                stmts.append(
++                    f"-- Dropping CHECK constraint '{op.details['constraint_name']}' "
++                    f"from existing table '{op.table_name}' requires table rebuild in SQLite."
++                )
++
++    return stmts
++
++
++def _generate_down_sql(ops: list[DiffOp]) -> list[str]:
++    stmts: list[str] = []
++
++    for op in reversed(ops):
++        match op.op_type:
++            case DiffOpType.CREATE_TABLE:
++                stmts.append(_table_drop_sql(op.table_name))
++
++            case DiffOpType.DROP_TABLE:
++                table = op.details["table"]
++                stmts.append(
++                    "-- WARNING: Lossy rollback — re-creating table structure "
++                    f"but original data in '{op.table_name}' cannot be restored."
++                )
++                stmts.append(_table_create_sql(table))
++                for idx in table.indexes:
++                    stmts.append(idx.to_sql(table.name))
++
++            case DiffOpType.ADD_COLUMN:
++                stmts.append(
++                    f'ALTER TABLE "{op.table_name}" DROP COLUMN "{op.details["column_name"]}";'
++                )
++
++            case DiffOpType.DROP_COLUMN:
++                col = op.details["column"]
++                stmts.append(
++                    "-- WARNING: Lossy rollback — re-adding column "
++                    f"'{col.name}' but original data cannot be restored."
++                )
++                stmts.append(
++                    f'ALTER TABLE "{op.table_name}" ADD COLUMN {col.to_sql_fragment()};'
++                )
++
++            case DiffOpType.ALTER_COLUMN:
++                stmts.append(
++                    f"-- Reversing ALTER COLUMN '{op.details['column_name']}' "
++                    f"in '{op.table_name}' requires table rebuild."
++                )
++
++            case DiffOpType.POTENTIAL_RENAME_COLUMN:
++                old_name = op.details["old_name"]
++                new_name = op.details["new_name"]
++                stmts.append(
++                    f'ALTER TABLE "{op.table_name}" RENAME COLUMN "{new_name}" TO "{old_name}";'
++                )
++
++            case DiffOpType.ADD_INDEX:
++                idx = op.details["index"]
++                stmts.append(idx.drop_sql())
++
++            case DiffOpType.DROP_INDEX:
++                idx = op.details["index"]
++                stmts.append(idx.to_sql(op.table_name))
++
++            case DiffOpType.ADD_FOREIGN_KEY:
++                stmts.append(
++                    f"-- Reversing FK addition on '{op.table_name}' "
++                    f"requires table rebuild in SQLite."
++                )
++
++            case DiffOpType.DROP_FOREIGN_KEY:
++                stmts.append(
++                    f"-- Reversing FK removal on '{op.table_name}' "
++                    f"requires table rebuild in SQLite."
++                )
++
++            case DiffOpType.ADD_CONSTRAINT:
++                stmts.append(
++                    f"-- Reversing constraint '{op.details['constraint_name']}' "
++                    f"addition on '{op.table_name}' requires table rebuild."
++                )
++
++            case DiffOpType.DROP_CONSTRAINT:
++                stmts.append(
++                    f"-- Reversing constraint '{op.details['constraint_name']}' "
++                    f"removal on '{op.table_name}' requires table rebuild."
++                )
++
++    return stmts
++
++
++def has_lossy_operations(ops: list[DiffOp]) -> bool:
++    return any(op.lossy for op in ops)
++
++
++def generate_migration(
++    description: str,
++    ops: list[DiffOp],
++    depends_on: str | None,
++    migrations_dir: Path,
++) -> Migration:
++    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
++    slug = Migration.slug_from_description(description)
++    migration_id = f"{timestamp}_{slug}"
++
++    up_sql = _generate_up_sql(ops)
++    down_sql = _generate_down_sql(ops)
++
++    migration = Migration(
++        migration_id=migration_id,
++        description=description,
++        depends_on=depends_on,
++        up_sql=up_sql,
++        down_sql=down_sql,
++    )
++
++    write_migration_file(migration, migrations_dir)
++    return migration
++
++
++def write_migration_file(migration: Migration, migrations_dir: Path) -> Path:
++    migrations_dir.mkdir(parents=True, exist_ok=True)
++    filepath = migrations_dir / f"{migration.migration_id}.yaml"
++
++    data = {
++        "migration_id": migration.migration_id,
++        "description": migration.description,
++        "depends_on": migration.depends_on,
++        "up": migration.up_sql,
++        "down": migration.down_sql,
++    }
++
++    filepath.write_text(
++        yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True),
++        encoding="utf-8",
++    )
++    return filepath
++
++
++def load_migration_file(path: Path) -> tuple[Migration | None, list[str]]:
++    errors: list[str] = []
++    try:
++        content = path.read_text(encoding="utf-8")
++    except OSError as e:
++        return None, [f"Cannot read migration file '{path}': {e}"]
++
++    try:
++        data = yaml.safe_load(content)
++    except yaml.YAMLError as e:
++        return None, [f"Invalid YAML in migration file '{path}': {e}"]
++
++    if not isinstance(data, dict):
++        return None, [f"Migration file '{path}': expected a mapping"]
++
++    mid = data.get("migration_id")
++    if not mid:
++        errors.append(f"Migration file '{path}': missing 'migration_id'")
++
++    desc = data.get("description", "")
++
++    depends_on = data.get("depends_on")
++    up = data.get("up", [])
++    down = data.get("down", [])
++
++    if not isinstance(up, list):
++        errors.append(f"Migration '{mid}': 'up' must be a list of SQL strings")
++        up = []
++    if not isinstance(down, list):
++        errors.append(f"Migration '{mid}': 'down' must be a list of SQL strings")
++        down = []
++
++    if errors:
++        return None, errors
++
++    return Migration(
++        migration_id=mid,
++        description=desc,
++        depends_on=depends_on,
++        up_sql=[str(s) for s in up],
++        down_sql=[str(s) for s in down],
++    ), []
++
++
++def load_all_migrations(migrations_dir: Path) -> tuple[dict[str, Migration], list[str]]:
++    all_errors: list[str] = []
++    migrations: dict[str, Migration] = {}
++
++    if not migrations_dir.is_dir():
++        return migrations, []
++
++    for path in sorted(migrations_dir.glob("*.yaml")):
++        mig, errs = load_migration_file(path)
++        all_errors.extend(errs)
++        if mig:
++            if mig.migration_id in migrations:
++                all_errors.append(f"Duplicate migration ID '{mig.migration_id}'")
++            else:
++                migrations[mig.migration_id] = mig
++
++    return migrations, all_errors
+diff --git a/src/schemav/models.py b/src/schemav/models.py
+new file mode 100644
+index 0000000..8d53c74
+--- /dev/null
++++ b/src/schemav/models.py
+@@ -0,0 +1,193 @@
++"""Data models for schemav."""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++from enum import Enum
++
++
++class ColumnType(Enum):
++    TEXT = "TEXT"
++    INTEGER = "INTEGER"
++    REAL = "REAL"
++    BLOB = "BLOB"
++    BOOLEAN = "BOOLEAN"
++    DATETIME = "DATETIME"
++
++    @property
++    def sql_type(self) -> str:
++        if self == ColumnType.BOOLEAN:
++            return "INTEGER"  # SQLite stores booleans as integers
++        if self == ColumnType.DATETIME:
++            return "TEXT"  # SQLite stores datetimes as text
++        return self.value
++
++
++class OnDeleteAction(Enum):
++    CASCADE = "CASCADE"
++    SET_NULL = "SET NULL"
++    RESTRICT = "RESTRICT"
++    NO_ACTION = "NO ACTION"
++
++
++@dataclass(frozen=True)
++class Column:
++    name: str
++    type: ColumnType
++    nullable: bool = True
++    default: str | None = None
++    unique: bool = False
++
++    def to_sql_fragment(self) -> str:
++        parts = [f'"{self.name}" {self.type.sql_type}']
++        if not self.nullable:
++            parts.append("NOT NULL")
++        if self.unique:
++            parts.append("UNIQUE")
++        if self.default is not None:
++            parts.append(f"DEFAULT {self.default}")
++        return " ".join(parts)
++
++
++@dataclass(frozen=True)
++class Index:
++    name: str
++    columns: tuple[str, ...]
++    unique: bool = False
++
++    def to_sql(self, table_name: str) -> str:
++        unique = "UNIQUE " if self.unique else ""
++        cols = ", ".join(f'"{c}"' for c in self.columns)
++        return f'CREATE {unique}INDEX "{self.name}" ON "{table_name}" ({cols});'
++
++    def drop_sql(self) -> str:
++        return f'DROP INDEX IF EXISTS "{self.name}";'
++
++
++@dataclass(frozen=True)
++class ForeignKey:
++    columns: tuple[str, ...]
++    references_table: str
++    references_columns: tuple[str, ...]
++    on_delete: OnDeleteAction = OnDeleteAction.NO_ACTION
++
++    def to_sql_fragment(self) -> str:
++        local_cols = ", ".join(f'"{c}"' for c in self.columns)
++        ref_cols = ", ".join(f'"{c}"' for c in self.references_columns)
++        return (
++            f'FOREIGN KEY ({local_cols}) REFERENCES "{self.references_table}" '
++            f"({ref_cols}) ON DELETE {self.on_delete.value}"
++        )
++
++
++@dataclass(frozen=True)
++class CheckConstraint:
++    name: str
++    expression: str
++
++    def to_sql_fragment(self) -> str:
++        return f"CONSTRAINT \"{self.name}\" CHECK ({self.expression})"
++
++
++@dataclass
++class Table:
++    name: str
++    columns: list[Column] = field(default_factory=list)
++    primary_key: list[str] = field(default_factory=list)
++    indexes: list[Index] = field(default_factory=list)
++    foreign_keys: list[ForeignKey] = field(default_factory=list)
++    constraints: list[CheckConstraint] = field(default_factory=list)
++
++    def column_by_name(self, name: str) -> Column | None:
++        for col in self.columns:
++            if col.name == name:
++                return col
++        return None
++
++
++@dataclass
++class Schema:
++    tables: dict[str, Table] = field(default_factory=dict)
++
++
++@dataclass
++class Migration:
++    migration_id: str
++    description: str
++    depends_on: str | None
++    up_sql: list[str] = field(default_factory=list)
++    down_sql: list[str] = field(default_factory=list)
++
++    @staticmethod
++    def slug_from_description(description: str) -> str:
++        slug = re.sub(r"[^a-zA-Z0-9]+", "_", description.strip().lower())
++        return slug.strip("_")[:60]
++
++
++@dataclass
++class MigrationHistoryEntry:
++    migration_id: str
++    applied_at: str
++    direction: str  # "up" or "down"
++    checksum: str
++
++
++# --- Diff result types ---
++
++class DiffOpType(Enum):
++    CREATE_TABLE = "create_table"
++    DROP_TABLE = "drop_table"
++    ADD_COLUMN = "add_column"
++    DROP_COLUMN = "drop_column"
++    ALTER_COLUMN = "alter_column"
++    ADD_INDEX = "add_index"
++    DROP_INDEX = "drop_index"
++    ADD_FOREIGN_KEY = "add_foreign_key"
++    DROP_FOREIGN_KEY = "drop_foreign_key"
++    ADD_CONSTRAINT = "add_constraint"
++    DROP_CONSTRAINT = "drop_constraint"
++    POTENTIAL_RENAME_COLUMN = "potential_rename_column"
++
++
++@dataclass
++class DiffOp:
++    op_type: DiffOpType
++    table_name: str
++    details: dict = field(default_factory=dict)
++    lossy: bool = False
++
++    @property
++    def description(self) -> str:
++        match self.op_type:
++            case DiffOpType.CREATE_TABLE:
++                return f"Create table '{self.table_name}'"
++            case DiffOpType.DROP_TABLE:
++                return f"Drop table '{self.table_name}'"
++            case DiffOpType.ADD_COLUMN:
++                return f"Add column '{self.details['column_name']}' to '{self.table_name}'"
++            case DiffOpType.DROP_COLUMN:
++                return f"Drop column '{self.details['column_name']}' from '{self.table_name}'"
++            case DiffOpType.ALTER_COLUMN:
++                return f"Alter column '{self.details['column_name']}' in '{self.table_name}'"
++            case DiffOpType.ADD_INDEX:
++                return f"Add index '{self.details['index_name']}' on '{self.table_name}'"
++            case DiffOpType.DROP_INDEX:
++                return f"Drop index '{self.details['index_name']}' from '{self.table_name}'"
++            case DiffOpType.ADD_FOREIGN_KEY:
++                cols = self.details.get("columns", ())
++                return f"Add foreign key ({', '.join(cols)}) on '{self.table_name}'"
++            case DiffOpType.DROP_FOREIGN_KEY:
++                cols = self.details.get("columns", ())
++                return f"Drop foreign key ({', '.join(cols)}) from '{self.table_name}'"
++            case DiffOpType.ADD_CONSTRAINT:
++                return f"Add constraint '{self.details['constraint_name']}' on '{self.table_name}'"
++            case DiffOpType.DROP_CONSTRAINT:
++                return f"Drop constraint '{self.details['constraint_name']}' from '{self.table_name}'"
++            case DiffOpType.POTENTIAL_RENAME_COLUMN:
++                return (
++                    f"Potential rename: '{self.details['old_name']}' -> "
++                    f"'{self.details['new_name']}' in '{self.table_name}'"
++                )
++            case _:
++                return str(self.op_type)
+diff --git a/src/schemav/schema_parser.py b/src/schemav/schema_parser.py
+new file mode 100644
+index 0000000..914ef7f
+--- /dev/null
++++ b/src/schemav/schema_parser.py
+@@ -0,0 +1,266 @@
++"""YAML schema file parser and validator for schemav."""
++
++from __future__ import annotations
++
++import re
++import yaml
++from pathlib import Path
++
++from schemav.models import (
++    CheckConstraint,
++    Column,
++    ColumnType,
++    ForeignKey,
++    Index,
++    OnDeleteAction,
++    Schema,
++    Table,
++)
++
++VALID_COLUMN_TYPES = {ct.value for ct in ColumnType}
++VALID_ON_DELETE = {a.value for a in OnDeleteAction}
++STEP_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
++
++
++class SchemaValidationError(Exception):
++    def __init__(self, errors: list[str]):
++        self.errors = errors
++        super().__init__(f"Schema validation failed with {len(errors)} error(s)")
++
++
++def _validate_column(col_data: dict, table_name: str, idx: int) -> tuple[Column | None, list[str]]:
++    errors: list[str] = []
++    name = col_data.get("name")
++    if not name or not isinstance(name, str):
++        errors.append(f"Table '{table_name}', column {idx}: 'name' is required and must be a string")
++        return None, errors
++
++    raw_type = col_data.get("type")
++    if not raw_type or str(raw_type).upper() not in VALID_COLUMN_TYPES:
++        errors.append(
++            f"Table '{table_name}', column '{name}': "
++            f"'type' must be one of {sorted(VALID_COLUMN_TYPES)}, got '{raw_type}'"
++        )
++        return None, errors
++
++    col_type = ColumnType(str(raw_type).upper())
++    nullable = col_data.get("nullable", True)
++    if not isinstance(nullable, bool):
++        errors.append(f"Table '{table_name}', column '{name}': 'nullable' must be a boolean")
++        return None, errors
++
++    unique = col_data.get("unique", False)
++    if not isinstance(unique, bool):
++        errors.append(f"Table '{table_name}', column '{name}': 'unique' must be a boolean")
++        return None, errors
++
++    default = col_data.get("default")
++    if default is not None:
++        default = str(default)
++
++    return Column(name=name, type=col_type, nullable=nullable, default=default, unique=unique), errors
++
++
++def _validate_index(idx_data: dict, table_name: str, col_names: set[str], i: int) -> tuple[Index | None, list[str]]:
++    errors: list[str] = []
++    name = idx_data.get("name")
++    if not name or not isinstance(name, str):
++        errors.append(f"Table '{table_name}', index {i}: 'name' is required")
++        return None, errors
++
++    columns = idx_data.get("columns", [])
++    if not isinstance(columns, list) or len(columns) == 0:
++        errors.append(f"Table '{table_name}', index '{name}': 'columns' must be a non-empty list")
++        return None, errors
++
++    for c in columns:
++        if c not in col_names:
++            errors.append(f"Table '{table_name}', index '{name}': references unknown column '{c}'")
++
++    unique = idx_data.get("unique", False)
++    if not isinstance(unique, bool):
++        errors.append(f"Table '{table_name}', index '{name}': 'unique' must be a boolean")
++
++    if errors:
++        return None, errors
++    return Index(name=name, columns=tuple(columns), unique=unique), errors
++
++
++def _validate_foreign_key(
++    fk_data: dict, table_name: str, col_names: set[str], i: int
++) -> tuple[ForeignKey | None, list[str]]:
++    errors: list[str] = []
++
++    columns = fk_data.get("columns", [])
++    if not isinstance(columns, list) or len(columns) == 0:
++        errors.append(f"Table '{table_name}', foreign_key {i}: 'columns' must be a non-empty list")
++        return None, errors
++
++    for c in columns:
++        if c not in col_names:
++            errors.append(f"Table '{table_name}', foreign_key {i}: references unknown local column '{c}'")
++
++    ref_table = fk_data.get("references_table")
++    if not ref_table or not isinstance(ref_table, str):
++        errors.append(f"Table '{table_name}', foreign_key {i}: 'references_table' is required")
++        return None, errors
++
++    ref_columns = fk_data.get("references_columns", [])
++    if not isinstance(ref_columns, list) or len(ref_columns) == 0:
++        errors.append(f"Table '{table_name}', foreign_key {i}: 'references_columns' must be a non-empty list")
++        return None, errors
++
++    on_delete_raw = fk_data.get("on_delete", "NO ACTION")
++    if str(on_delete_raw).upper() not in VALID_ON_DELETE:
++        errors.append(
++            f"Table '{table_name}', foreign_key {i}: "
++            f"'on_delete' must be one of {sorted(VALID_ON_DELETE)}, got '{on_delete_raw}'"
++        )
++        return None, errors
++
++    if errors:
++        return None, errors
++
++    return ForeignKey(
++        columns=tuple(columns),
++        references_table=ref_table,
++        references_columns=tuple(ref_columns),
++        on_delete=OnDeleteAction(str(on_delete_raw).upper()),
++    ), errors
++
++
++def _validate_table(name: str, table_data: dict) -> tuple[Table | None, list[str]]:
++    errors: list[str] = []
++
++    if not STEP_NAME_RE.match(name):
++        errors.append(f"Table name '{name}' is invalid — must match [a-zA-Z_][a-zA-Z0-9_]*")
++
++    # --- columns ---
++    raw_columns = table_data.get("columns", [])
++    if not isinstance(raw_columns, list) or len(raw_columns) == 0:
++        errors.append(f"Table '{name}': must have at least one column")
++        return None, errors
++
++    columns: list[Column] = []
++    col_names: set[str] = set()
++    for i, col_data in enumerate(raw_columns):
++        col, col_errs = _validate_column(col_data, name, i)
++        errors.extend(col_errs)
++        if col:
++            if col.name in col_names:
++                errors.append(f"Table '{name}': duplicate column name '{col.name}'")
++            col_names.add(col.name)
++            columns.append(col)
++
++    # --- primary key ---
++    pk_raw = table_data.get("primary_key")
++    primary_key: list[str] = []
++    if pk_raw is not None:
++        if isinstance(pk_raw, str):
++            primary_key = [pk_raw]
++        elif isinstance(pk_raw, list):
++            primary_key = pk_raw
++        else:
++            errors.append(f"Table '{name}': 'primary_key' must be a string or list of strings")
++
++        for pk_col in primary_key:
++            if pk_col not in col_names:
++                errors.append(f"Table '{name}': primary_key references unknown column '{pk_col}'")
++
++    # --- indexes ---
++    indexes: list[Index] = []
++    for i, idx_data in enumerate(table_data.get("indexes", [])):
++        idx, idx_errs = _validate_index(idx_data, name, col_names, i)
++        errors.extend(idx_errs)
++        if idx:
++            indexes.append(idx)
++
++    # --- foreign keys ---
++    foreign_keys: list[ForeignKey] = []
++    for i, fk_data in enumerate(table_data.get("foreign_keys", [])):
++        fk, fk_errs = _validate_foreign_key(fk_data, name, col_names, i)
++        errors.extend(fk_errs)
++        if fk:
++            foreign_keys.append(fk)
++
++    # --- constraints ---
++    constraints: list[CheckConstraint] = []
++    for i, con_data in enumerate(table_data.get("constraints", [])):
++        con_name = con_data.get("name")
++        expression = con_data.get("expression")
++        if not con_name or not isinstance(con_name, str):
++            errors.append(f"Table '{name}', constraint {i}: 'name' is required")
++            continue
++        if not expression or not isinstance(expression, str):
++            errors.append(f"Table '{name}', constraint '{con_name}': 'expression' is required")
++            continue
++        constraints.append(CheckConstraint(name=con_name, expression=expression))
++
++    if errors:
++        return None, errors
++
++    return Table(
++        name=name,
++        columns=columns,
++        primary_key=primary_key,
++        indexes=indexes,
++        foreign_keys=foreign_keys,
++        constraints=constraints,
++    ), errors
++
++
++def parse_schema_file(path: Path) -> tuple[dict[str, Table], list[str]]:
++    errors: list[str] = []
++    tables: dict[str, Table] = {}
++
++    try:
++        content = path.read_text(encoding="utf-8")
++    except OSError as e:
++        return tables, [f"Cannot read '{path}': {e}"]
++
++    try:
++        data = yaml.safe_load(content)
++    except yaml.YAMLError as e:
++        return tables, [f"Invalid YAML in '{path}': {e}"]
++
++    if not isinstance(data, dict):
++        return tables, [f"'{path}': expected a mapping of table names to definitions"]
++
++    # Support both top-level tables directly, or under a "tables" key
++    table_defs = data.get("tables", data)
++    if not isinstance(table_defs, dict):
++        return tables, [f"'{path}': 'tables' must be a mapping"]
++
++    for table_name, table_data in table_defs.items():
++        if not isinstance(table_data, dict):
++            errors.append(f"'{path}': table '{table_name}' must be a mapping")
++            continue
++        table, tbl_errs = _validate_table(table_name, table_data)
++        errors.extend(tbl_errs)
++        if table:
++            tables[table_name] = table
++
++    return tables, errors
++
++
++def load_schema(schema_dir: Path) -> tuple[Schema, list[str]]:
++    errors: list[str] = []
++    all_tables: dict[str, Table] = {}
++
++    if not schema_dir.is_dir():
++        return Schema(), [f"Schema directory '{schema_dir}' does not exist"]
++
++    yaml_files = sorted(schema_dir.glob("*.yaml")) + sorted(schema_dir.glob("*.yml"))
++    if not yaml_files:
++        return Schema(), [f"No YAML files found in '{schema_dir}'"]
++
++    for path in yaml_files:
++        tables, file_errors = parse_schema_file(path)
++        errors.extend(file_errors)
++        for tname, table in tables.items():
++            if tname in all_tables:
++                errors.append(f"Duplicate table '{tname}' defined in '{path}' (already defined elsewhere)")
++            else:
++                all_tables[tname] = table
++
++    return Schema(tables=all_tables), errors
+diff --git a/src/schemav/state_tracker.py b/src/schemav/state_tracker.py
+new file mode 100644
+index 0000000..fd69e82
+--- /dev/null
++++ b/src/schemav/state_tracker.py
+@@ -0,0 +1,214 @@
++"""Migration state tracker — manages _schemav_history table and migration execution."""
++
++from __future__ import annotations
++
++import datetime
++import hashlib
++import sqlite3
++import sys
++from pathlib import Path
++
++from schemav.models import Migration, MigrationHistoryEntry
++
++HISTORY_TABLE = "_schemav_history"
++
++CREATE_HISTORY_SQL = f"""
++CREATE TABLE IF NOT EXISTS "{HISTORY_TABLE}" (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    migration_id TEXT NOT NULL,
++    applied_at TEXT NOT NULL,
++    direction TEXT NOT NULL CHECK (direction IN ('up', 'down')),
++    checksum TEXT NOT NULL
++);
++"""
++
++
++def compute_checksum(migration_path: Path) -> str:
++    raw_bytes = migration_path.read_bytes()
++    return hashlib.sha256(raw_bytes).hexdigest()
++
++
++def _ensure_history_table(conn: sqlite3.Connection) -> None:
++    conn.execute(CREATE_HISTORY_SQL)
++    conn.commit()
++
++
++def get_connection(db_path: str) -> sqlite3.Connection:
++    conn = sqlite3.connect(db_path)
++    conn.execute("PRAGMA foreign_keys = ON;")
++    _ensure_history_table(conn)
++    return conn
++
++
++def get_applied_migrations(conn: sqlite3.Connection) -> list[MigrationHistoryEntry]:
++    """Return the list of applied migrations in order, accounting for rollbacks.
++
++    We replay the history log: an 'up' entry means the migration is applied,
++    a 'down' entry means it was rolled back. We return only the currently-applied set."""
++    cursor = conn.execute(
++        f'SELECT migration_id, applied_at, direction, checksum FROM "{HISTORY_TABLE}" ORDER BY id ASC'
++    )
++    applied: dict[str, MigrationHistoryEntry] = {}
++
++    for row in cursor:
++        entry = MigrationHistoryEntry(
++            migration_id=row[0],
++            applied_at=row[1],
++            direction=row[2],
++            checksum=row[3],
++        )
++        if entry.direction == "up":
++            applied[entry.migration_id] = entry
++        elif entry.direction == "down":
++            applied.pop(entry.migration_id, None)
++
++    return list(applied.values())
++
++
++def get_latest_applied_id(conn: sqlite3.Connection) -> str | None:
++    applied = get_applied_migrations(conn)
++    if not applied:
++        return None
++    return applied[-1].migration_id
++
++
++def apply_migration(
++    conn: sqlite3.Connection,
++    migration: Migration,
++    migration_path: Path,
++    dry_run: bool = False,
++) -> None:
++    checksum = compute_checksum(migration_path)
++    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
++
++    if dry_run:
++        print(f"[DRY RUN] Would apply migration: {migration.migration_id}")
++        for stmt in migration.up_sql:
++            print(f"  {stmt}")
++        return
++
++    # Execute within a single transaction
++    try:
++        conn.execute("BEGIN IMMEDIATE;")
++        for stmt in migration.up_sql:
++            # Skip comments
++            stripped = stmt.strip()
++            if stripped.startswith("--"):
++                continue
++            conn.execute(stripped)
++
++        conn.execute(
++            f'INSERT INTO "{HISTORY_TABLE}" (migration_id, applied_at, direction, checksum) '
++            "VALUES (?, ?, 'up', ?)",
++            (migration.migration_id, now, checksum),
++        )
++        conn.execute("COMMIT;")
++    except Exception:
++        try:
++            conn.execute("ROLLBACK;")
++        except Exception:
++            pass
++        raise
++
++
++def rollback_migration(
++    conn: sqlite3.Connection,
++    migration: Migration,
++    migration_path: Path,
++    dry_run: bool = False,
++    force: bool = False,
++) -> None:
++    checksum = compute_checksum(migration_path)
++    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
++
++    # Verify checksum
++    applied = get_applied_migrations(conn)
++    for entry in applied:
++        if entry.migration_id == migration.migration_id:
++            if entry.checksum != checksum:
++                msg = (
++                    f"Checksum mismatch for migration '{migration.migration_id}': "
++                    f"applied checksum={entry.checksum}, current file checksum={checksum}. "
++                    "The migration file may have been modified after it was applied."
++                )
++                if not force:
++                    raise ValueError(msg)
++                print(f"WARNING: {msg}", file=sys.stderr)
++            break
++
++    # Check for lossy operations
++    has_lossy = any(
++        s.strip().startswith("-- WARNING: Lossy rollback")
++        for s in migration.down_sql
++    )
++
++    if dry_run:
++        print(f"[DRY RUN] Would rollback migration: {migration.migration_id}")
++        if has_lossy:
++            print("  WARNING: This rollback contains lossy operations (data loss possible)")
++        for stmt in migration.down_sql:
++            print(f"  {stmt}")
++        return
++
++    if has_lossy and not force:
++        print(
++            f"WARNING: Rolling back '{migration.migration_id}' involves lossy operations "
++            "(data may be permanently lost). Use --force to proceed.",
++            file=sys.stderr,
++        )
++        raise ValueError(
++            f"Rollback of '{migration.migration_id}' requires --force due to lossy operations"
++        )
++
++    try:
++        conn.execute("BEGIN IMMEDIATE;")
++        for stmt in migration.down_sql:
++            stripped = stmt.strip()
++            if stripped.startswith("--"):
++                continue
++            conn.execute(stripped)
++
++        conn.execute(
++            f'INSERT INTO "{HISTORY_TABLE}" (migration_id, applied_at, direction, checksum) '
++            "VALUES (?, ?, 'down', ?)",
++            (migration.migration_id, now, checksum),
++        )
++        conn.execute("COMMIT;")
++    except Exception:
++        try:
++            conn.execute("ROLLBACK;")
++        except Exception:
++            pass
++        raise
++
++
++def verify_checksums(
++    conn: sqlite3.Connection,
++    migrations: dict[str, Migration],
++    migrations_dir: Path,
++) -> list[str]:
++    warnings: list[str] = []
++    applied = get_applied_migrations(conn)
++
++    for entry in applied:
++        if entry.migration_id not in migrations:
++            warnings.append(
++                f"Migration '{entry.migration_id}' was applied but its file is missing from disk"
++            )
++            continue
++
++        path = migrations_dir / f"{entry.migration_id}.yaml"
++        if not path.exists():
++            warnings.append(
++                f"Migration file for '{entry.migration_id}' not found at '{path}'"
++            )
++            continue
++
++        current_checksum = compute_checksum(path)
++        if current_checksum != entry.checksum:
++            warnings.append(
++                f"Checksum mismatch for '{entry.migration_id}': "
++                f"applied={entry.checksum[:12]}..., current={current_checksum[:12]}..."
++            )
++
++    return warnings
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/__pycache__/__init__.cpython-313.pyc b/tests/__pycache__/__init__.cpython-313.pyc
+new file mode 100644
+index 0000000..06b4953
+Binary files /dev/null and b/tests/__pycache__/__init__.cpython-313.pyc differ
+diff --git a/tests/__pycache__/test_conflict_detector.cpython-313-pytest-8.4.2.pyc b/tests/__pycache__/test_conflict_detector.cpython-313-pytest-8.4.2.pyc
+new file mode 100644
+index 0000000..114c6fa
+Binary files /dev/null and b/tests/__pycache__/test_conflict_detector.cpython-313-pytest-8.4.2.pyc differ
+diff --git a/tests/__pycache__/test_diff_engine.cpython-313-pytest-8.4.2.pyc b/tests/__pycache__/test_diff_engine.cpython-313-pytest-8.4.2.pyc
+new file mode 100644
+index 0000000..bc1dd44
+Binary files /dev/null and b/tests/__pycache__/test_diff_engine.cpython-313-pytest-8.4.2.pyc differ
+diff --git a/tests/__pycache__/test_integration.cpython-313-pytest-8.4.2.pyc b/tests/__pycache__/test_integration.cpython-313-pytest-8.4.2.pyc
+new file mode 100644
+index 0000000..32b85a1
+Binary files /dev/null and b/tests/__pycache__/test_integration.cpython-313-pytest-8.4.2.pyc differ
+diff --git a/tests/__pycache__/test_migration_generator.cpython-313-pytest-8.4.2.pyc b/tests/__pycache__/test_migration_generator.cpython-313-pytest-8.4.2.pyc
+new file mode 100644
+index 0000000..46a5713
+Binary files /dev/null and b/tests/__pycache__/test_migration_generator.cpython-313-pytest-8.4.2.pyc differ
+diff --git a/tests/__pycache__/test_schema_parser.cpython-313-pytest-8.4.2.pyc b/tests/__pycache__/test_schema_parser.cpython-313-pytest-8.4.2.pyc
+new file mode 100644
+index 0000000..9e0e23b
+Binary files /dev/null and b/tests/__pycache__/test_schema_parser.cpython-313-pytest-8.4.2.pyc differ
+diff --git a/tests/__pycache__/test_state_tracker.cpython-313-pytest-8.4.2.pyc b/tests/__pycache__/test_state_tracker.cpython-313-pytest-8.4.2.pyc
+new file mode 100644
+index 0000000..f0d7f02
+Binary files /dev/null and b/tests/__pycache__/test_state_tracker.cpython-313-pytest-8.4.2.pyc differ
+diff --git a/tests/test_conflict_detector.py b/tests/test_conflict_detector.py
+new file mode 100644
+index 0000000..0f134b0
+--- /dev/null
++++ b/tests/test_conflict_detector.py
+@@ -0,0 +1,204 @@
++"""Tests for conflict detector — DAG building, branch detection, diamonds, merge."""
++
++import pytest
++
++from schemav.conflict_detector import (
++    build_dependency_graph,
++    create_merge_migration,
++    detect_conflicts,
++    detect_diamond_patterns,
++    find_leaf_migrations,
++    get_migration_order,
++)
++from schemav.models import Migration
++
++
++def _mig(mid: str, depends_on: str | None = None) -> Migration:
++    return Migration(
++        migration_id=mid,
++        description=f"desc_{mid}",
++        depends_on=depends_on,
++        up_sql=[],
++        down_sql=[],
++    )
++
++
++class TestBuildDependencyGraph:
++    def test_linear_chain(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "b"),
++        }
++        children_of, parent_of = build_dependency_graph(migs)
++        assert parent_of["a"] is None
++        assert parent_of["b"] == "a"
++        assert parent_of["c"] == "b"
++        assert "b" in children_of["a"]
++        assert "c" in children_of["b"]
++
++    def test_fork(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "a"),
++        }
++        children_of, _ = build_dependency_graph(migs)
++        assert set(children_of["a"]) == {"b", "c"}
++
++
++class TestDetectConflicts:
++    def test_no_conflict_linear(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "b"),
++        }
++        conflicts = detect_conflicts(migs)
++        assert len(conflicts) == 0
++
++    def test_simple_fork_conflict(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "a"),
++        }
++        conflicts = detect_conflicts(migs)
++        assert len(conflicts) == 1
++        assert conflicts[0].parent_id == "a"
++        assert set(conflicts[0].branch_ids) == {"b", "c"}
++
++    def test_triple_fork(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "a"),
++            "d": _mig("d", "a"),
++        }
++        conflicts = detect_conflicts(migs)
++        assert len(conflicts) == 1
++        assert len(conflicts[0].branch_ids) == 3
++
++    def test_two_independent_forks(self):
++        migs = {
++            "root": _mig("root", None),
++            "b1": _mig("b1", "root"),
++            "b2": _mig("b2", "root"),
++            "b1_child1": _mig("b1_child1", "b1"),
++            "b1_child2": _mig("b1_child2", "b1"),
++        }
++        conflicts = detect_conflicts(migs)
++        assert len(conflicts) == 2
++
++    def test_root_fork(self):
++        """Two migrations with depends_on=None -> root fork."""
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", None),
++        }
++        conflicts = detect_conflicts(migs)
++        assert len(conflicts) == 1
++        assert conflicts[0].parent_id is None
++
++
++class TestDetectDiamondPatterns:
++    def test_simple_diamond(self):
++        """a -> b, a -> c, b -> d, c -> d => diamond"""
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "a"),
++            "d": _mig("d", "b"),  # d also logically depends on c but can only have 1 parent in our model
++        }
++        # In our model, d can only have one parent. So a true diamond
++        # requires d to be in both branches' descendant sets via its parent chain.
++        # Actually, our diamond detection traces descendants from fork point.
++        # d is a descendant of b (one of the branches from fork at a).
++        # d is NOT a descendant of c.
++        # So this isn't a diamond in our model. Let's test what we actually detect.
++        diamonds = detect_diamond_patterns(migs)
++        # d only descends from b, not c. So no diamond.
++        assert len(diamonds) == 0
++
++    def test_no_diamond_in_linear(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "b"),
++        }
++        diamonds = detect_diamond_patterns(migs)
++        assert len(diamonds) == 0
++
++
++class TestFindLeafMigrations:
++    def test_linear(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "b"),
++        }
++        children_of, _ = build_dependency_graph(migs)
++        leaves = find_leaf_migrations(migs, children_of)
++        assert leaves == ["c"]
++
++    def test_fork_two_leaves(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "a"),
++        }
++        children_of, _ = build_dependency_graph(migs)
++        leaves = find_leaf_migrations(migs, children_of)
++        assert set(leaves) == {"b", "c"}
++
++
++class TestGetMigrationOrder:
++    def test_linear(self):
++        migs = {
++            "c": _mig("c", "b"),
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++        }
++        order = get_migration_order(migs)
++        assert order == ["a", "b", "c"]
++
++    def test_fork(self):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "a"),
++        }
++        order = get_migration_order(migs)
++        assert order[0] == "a"
++        assert set(order[1:]) == {"b", "c"}
++
++    def test_cycle_raises(self):
++        migs = {
++            "a": _mig("a", "b"),
++            "b": _mig("b", "a"),
++        }
++        with pytest.raises(ValueError, match="Cycle"):
++            get_migration_order(migs)
++
++
++class TestCreateMergeMigration:
++    def test_creates_merge(self, tmp_path):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++            "c": _mig("c", "a"),
++        }
++        merge = create_merge_migration(migs, tmp_path)
++        assert "merge" in merge.migration_id
++        assert merge.depends_on in {"b", "c"}
++        # Verify file created
++        path = tmp_path / f"{merge.migration_id}.yaml"
++        assert path.exists()
++
++    def test_no_conflict_raises(self, tmp_path):
++        migs = {
++            "a": _mig("a", None),
++            "b": _mig("b", "a"),
++        }
++        with pytest.raises(ValueError, match="fewer than 2"):
++            create_merge_migration(migs, tmp_path)
+diff --git a/tests/test_diff_engine.py b/tests/test_diff_engine.py
+new file mode 100644
+index 0000000..7fff0cb
+--- /dev/null
++++ b/tests/test_diff_engine.py
+@@ -0,0 +1,182 @@
++"""Tests for the diff engine."""
++
++import pytest
++
++from schemav.diff_engine import diff_schemas, diff_tables
++from schemav.models import (
++    CheckConstraint,
++    Column,
++    ColumnType,
++    DiffOpType,
++    ForeignKey,
++    Index,
++    OnDeleteAction,
++    Schema,
++    Table,
++)
++
++
++def _make_table(name, columns, **kwargs):
++    return Table(name=name, columns=columns, **kwargs)
++
++
++class TestDiffTables:
++    def test_add_column(self):
++        old = _make_table("t", [Column("id", ColumnType.INTEGER)])
++        new = _make_table("t", [Column("id", ColumnType.INTEGER), Column("name", ColumnType.TEXT)])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.ADD_COLUMN
++        assert ops[0].details["column_name"] == "name"
++
++    def test_drop_column(self):
++        old = _make_table("t", [Column("id", ColumnType.INTEGER), Column("name", ColumnType.TEXT)])
++        new = _make_table("t", [Column("id", ColumnType.INTEGER)])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.DROP_COLUMN
++        assert ops[0].details["column_name"] == "name"
++        assert ops[0].lossy is True
++
++    def test_alter_column_type(self):
++        old = _make_table("t", [Column("val", ColumnType.INTEGER)])
++        new = _make_table("t", [Column("val", ColumnType.TEXT)])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.ALTER_COLUMN
++        assert "type" in ops[0].details["changes"]
++
++    def test_alter_column_nullability(self):
++        old = _make_table("t", [Column("val", ColumnType.TEXT, nullable=True)])
++        new = _make_table("t", [Column("val", ColumnType.TEXT, nullable=False)])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.ALTER_COLUMN
++        assert "nullable" in ops[0].details["changes"]
++
++    def test_alter_column_default(self):
++        old = _make_table("t", [Column("val", ColumnType.TEXT, default=None)])
++        new = _make_table("t", [Column("val", ColumnType.TEXT, default="'hello'")])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.ALTER_COLUMN
++
++    def test_add_index(self):
++        idx = Index("idx_val", ("val",), unique=False)
++        old = _make_table("t", [Column("val", ColumnType.TEXT)])
++        new = _make_table("t", [Column("val", ColumnType.TEXT)], indexes=[idx])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.ADD_INDEX
++
++    def test_drop_index(self):
++        idx = Index("idx_val", ("val",), unique=False)
++        old = _make_table("t", [Column("val", ColumnType.TEXT)], indexes=[idx])
++        new = _make_table("t", [Column("val", ColumnType.TEXT)])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.DROP_INDEX
++
++    def test_add_foreign_key(self):
++        fk = ForeignKey(("user_id",), "users", ("id",), OnDeleteAction.CASCADE)
++        old = _make_table("t", [Column("user_id", ColumnType.INTEGER)])
++        new = _make_table("t", [Column("user_id", ColumnType.INTEGER)], foreign_keys=[fk])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.ADD_FOREIGN_KEY
++
++    def test_drop_foreign_key(self):
++        fk = ForeignKey(("user_id",), "users", ("id",), OnDeleteAction.CASCADE)
++        old = _make_table("t", [Column("user_id", ColumnType.INTEGER)], foreign_keys=[fk])
++        new = _make_table("t", [Column("user_id", ColumnType.INTEGER)])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.DROP_FOREIGN_KEY
++
++    def test_add_constraint(self):
++        con = CheckConstraint("chk_pos", "val > 0")
++        old = _make_table("t", [Column("val", ColumnType.INTEGER)])
++        new = _make_table("t", [Column("val", ColumnType.INTEGER)], constraints=[con])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.ADD_CONSTRAINT
++
++    def test_drop_constraint(self):
++        con = CheckConstraint("chk_pos", "val > 0")
++        old = _make_table("t", [Column("val", ColumnType.INTEGER)], constraints=[con])
++        new = _make_table("t", [Column("val", ColumnType.INTEGER)])
++        ops = diff_tables(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.DROP_CONSTRAINT
++
++    def test_potential_rename_detection(self):
++        """Same type, same position, different name -> potential rename."""
++        old = _make_table("t", [
++            Column("id", ColumnType.INTEGER),
++            Column("old_name", ColumnType.TEXT),
++        ])
++        new = _make_table("t", [
++            Column("id", ColumnType.INTEGER),
++            Column("new_name", ColumnType.TEXT),
++        ])
++        ops = diff_tables(old, new)
++        rename_ops = [o for o in ops if o.op_type == DiffOpType.POTENTIAL_RENAME_COLUMN]
++        assert len(rename_ops) == 1
++        assert rename_ops[0].details["old_name"] == "old_name"
++        assert rename_ops[0].details["new_name"] == "new_name"
++
++    def test_no_false_rename_different_type(self):
++        """Different type at same position -> NOT a rename, just drop+add."""
++        old = _make_table("t", [
++            Column("id", ColumnType.INTEGER),
++            Column("old_name", ColumnType.TEXT),
++        ])
++        new = _make_table("t", [
++            Column("id", ColumnType.INTEGER),
++            Column("new_name", ColumnType.INTEGER),
++        ])
++        ops = diff_tables(old, new)
++        rename_ops = [o for o in ops if o.op_type == DiffOpType.POTENTIAL_RENAME_COLUMN]
++        assert len(rename_ops) == 0
++
++    def test_no_changes(self):
++        cols = [Column("id", ColumnType.INTEGER), Column("name", ColumnType.TEXT)]
++        old = _make_table("t", cols)
++        new = _make_table("t", cols)
++        ops = diff_tables(old, new)
++        assert len(ops) == 0
++
++
++class TestDiffSchemas:
++    def test_add_table(self):
++        old = Schema(tables={})
++        new = Schema(tables={"users": _make_table("users", [Column("id", ColumnType.INTEGER)])})
++        ops = diff_schemas(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.CREATE_TABLE
++
++    def test_drop_table(self):
++        old = Schema(tables={"users": _make_table("users", [Column("id", ColumnType.INTEGER)])})
++        new = Schema(tables={})
++        ops = diff_schemas(old, new)
++        assert len(ops) == 1
++        assert ops[0].op_type == DiffOpType.DROP_TABLE
++        assert ops[0].lossy is True
++
++    def test_combined_add_drop_modify(self):
++        old = Schema(tables={
++            "users": _make_table("users", [Column("id", ColumnType.INTEGER)]),
++            "old_table": _make_table("old_table", [Column("x", ColumnType.TEXT)]),
++        })
++        new = Schema(tables={
++            "users": _make_table("users", [
++                Column("id", ColumnType.INTEGER),
++                Column("email", ColumnType.TEXT),
++            ]),
++            "new_table": _make_table("new_table", [Column("y", ColumnType.TEXT)]),
++        })
++        ops = diff_schemas(old, new)
++        op_types = {o.op_type for o in ops}
++        assert DiffOpType.DROP_TABLE in op_types
++        assert DiffOpType.CREATE_TABLE in op_types
++        assert DiffOpType.ADD_COLUMN in op_types
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+new file mode 100644
+index 0000000..021beac
+--- /dev/null
++++ b/tests/test_integration.py
+@@ -0,0 +1,196 @@
++"""Integration test — full workflow: init, generate, apply, modify schema, generate, apply, rollback."""
++
++import sqlite3
++import yaml
++import pytest
++from pathlib import Path
++from unittest.mock import patch
++
++from schemav.cli import main
++
++
++@pytest.fixture
++def project_dir(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    return tmp_path
++
++
++class TestFullWorkflow:
++    def test_init_creates_structure(self, project_dir):
++        result = main(["init"])
++        assert result == 0
++        assert (project_dir / "schema").is_dir()
++        assert (project_dir / "migrations").is_dir()
++        assert (project_dir / "schemav.yaml").exists()
++
++    def test_validate_empty_project(self, project_dir):
++        main(["init"])
++        # No schema files yet -> error
++        result = main(["validate"])
++        assert result == 1
++
++    def test_full_lifecycle(self, project_dir):
++        # 1. Init
++        assert main(["init"]) == 0
++
++        # 2. Create initial schema
++        schema_dir = project_dir / "schema"
++        (schema_dir / "users.yaml").write_text(yaml.dump({
++            "tables": {
++                "users": {
++                    "columns": [
++                        {"name": "id", "type": "INTEGER", "nullable": False},
++                        {"name": "email", "type": "TEXT", "nullable": False, "unique": True},
++                        {"name": "created_at", "type": "DATETIME"},
++                    ],
++                    "primary_key": "id",
++                }
++            }
++        }), encoding="utf-8")
++
++        # 3. Validate
++        assert main(["validate"]) == 0
++
++        # 4. Generate migration
++        assert main(["generate", "create_users_table"]) == 0
++        migration_files = list((project_dir / "migrations").glob("*.yaml"))
++        assert len(migration_files) == 1
++
++        # 5. Apply migration
++        assert main(["apply"]) == 0
++
++        # Verify the table exists in SQLite
++        config = yaml.safe_load((project_dir / "schemav.yaml").read_text())
++        db_path = str(project_dir / config["database"])
++        conn = sqlite3.connect(db_path)
++        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
++        assert cursor.fetchone() is not None
++
++        # Verify columns
++        cursor = conn.execute("PRAGMA table_info('users')")
++        cols = {row[1]: row[2] for row in cursor}
++        assert "id" in cols
++        assert "email" in cols
++        assert "created_at" in cols
++        conn.close()
++
++        # 6. Modify schema — add a column
++        (schema_dir / "users.yaml").write_text(yaml.dump({
++            "tables": {
++                "users": {
++                    "columns": [
++                        {"name": "id", "type": "INTEGER", "nullable": False},
++                        {"name": "email", "type": "TEXT", "nullable": False, "unique": True},
++                        {"name": "display_name", "type": "TEXT"},
++                        {"name": "created_at", "type": "DATETIME"},
++                    ],
++                    "primary_key": "id",
++                }
++            }
++        }), encoding="utf-8")
++
++        # 7. Generate second migration
++        assert main(["generate", "add_display_name"]) == 0
++        migration_files = list((project_dir / "migrations").glob("*.yaml"))
++        assert len(migration_files) == 2
++
++        # 8. Apply second migration
++        assert main(["apply"]) == 0
++
++        conn = sqlite3.connect(db_path)
++        cursor = conn.execute("PRAGMA table_info('users')")
++        cols = {row[1] for row in cursor}
++        assert "display_name" in cols
++        conn.close()
++
++        # 9. Check status
++        assert main(["status"]) == 0
++
++        # 10. Rollback the last migration
++        assert main(["rollback", "--force"]) == 0
++
++        conn = sqlite3.connect(db_path)
++        cursor = conn.execute("PRAGMA table_info('users')")
++        cols = {row[1] for row in cursor}
++        assert "display_name" not in cols
++        conn.close()
++
++    def test_apply_dry_run(self, project_dir, capsys):
++        main(["init"])
++        schema_dir = project_dir / "schema"
++        (schema_dir / "items.yaml").write_text(yaml.dump({
++            "tables": {
++                "items": {
++                    "columns": [
++                        {"name": "id", "type": "INTEGER", "nullable": False},
++                        {"name": "name", "type": "TEXT"},
++                    ],
++                    "primary_key": "id",
++                }
++            }
++        }), encoding="utf-8")
++
++        main(["generate", "create_items"])
++        result = main(["apply", "--dry-run"])
++        assert result == 0
++
++        captured = capsys.readouterr()
++        assert "DRY RUN" in captured.out
++
++        # Table should NOT exist
++        config = yaml.safe_load((project_dir / "schemav.yaml").read_text())
++        db_path = str(project_dir / config["database"])
++        conn = sqlite3.connect(db_path)
++        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='items'")
++        assert cursor.fetchone() is None
++        conn.close()
++
++    def test_conflict_detection_blocks_apply(self, project_dir):
++        main(["init"])
++        mig_dir = project_dir / "migrations"
++
++        # Create two migrations with the same parent (None)
++        from schemav.migration_generator import write_migration_file
++        from schemav.models import Migration
++
++        m1 = Migration("20240101_branch_a", "branch a", None, ["SELECT 1;"], ["SELECT 1;"])
++        m2 = Migration("20240101_branch_b", "branch b", None, ["SELECT 1;"], ["SELECT 1;"])
++        write_migration_file(m1, mig_dir)
++        write_migration_file(m2, mig_dir)
++
++        result = main(["apply"])
++        assert result == 3  # EXIT_CONFLICT
++
++    def test_merge_resolves_conflict(self, project_dir):
++        main(["init"])
++        mig_dir = project_dir / "migrations"
++
++        from schemav.migration_generator import write_migration_file
++        from schemav.models import Migration
++
++        m_root = Migration("20240101_root", "root", None, ["SELECT 1;"], ["SELECT 1;"])
++        m_a = Migration("20240102_branch_a", "branch a", "20240101_root", ["SELECT 1;"], ["SELECT 1;"])
++        m_b = Migration("20240102_branch_b", "branch b", "20240101_root", ["SELECT 1;"], ["SELECT 1;"])
++        write_migration_file(m_root, mig_dir)
++        write_migration_file(m_a, mig_dir)
++        write_migration_file(m_b, mig_dir)
++
++        # Confirm conflict
++        conflicts_result = main(["apply"])
++        assert conflicts_result == 3
++
++        # Merge
++        merge_result = main(["merge"])
++        assert merge_result == 0
++
++        migrations = list(mig_dir.glob("*.yaml"))
++        assert len(migrations) == 4  # root + a + b + merge
++
++    def test_cli_version(self, capsys):
++        with pytest.raises(SystemExit) as exc_info:
++            main(["--version"])
++        assert exc_info.value.code == 0
++
++    def test_no_command_shows_help(self, capsys):
++        result = main([])
++        assert result == 0
+diff --git a/tests/test_migration_generator.py b/tests/test_migration_generator.py
+new file mode 100644
+index 0000000..09d9733
+--- /dev/null
++++ b/tests/test_migration_generator.py
+@@ -0,0 +1,178 @@
++"""Tests for migration generator — SQL generation, topological sort, file I/O."""
++
++import pytest
++from pathlib import Path
++
++from schemav.migration_generator import (
++    _topological_sort_tables,
++    generate_migration,
++    has_lossy_operations,
++    load_migration_file,
++    load_all_migrations,
++)
++from schemav.models import (
++    Column,
++    ColumnType,
++    DiffOp,
++    DiffOpType,
++    ForeignKey,
++    Index,
++    OnDeleteAction,
++    Table,
++)
++
++
++class TestTopologicalSortTables:
++    def test_no_foreign_keys(self):
++        t1 = Table(name="a", columns=[Column("id", ColumnType.INTEGER)])
++        t2 = Table(name="b", columns=[Column("id", ColumnType.INTEGER)])
++        result = _topological_sort_tables([t1, t2])
++        names = [t.name for t in result]
++        assert set(names) == {"a", "b"}
++
++    def test_simple_dependency(self):
++        t_users = Table(name="users", columns=[Column("id", ColumnType.INTEGER)])
++        t_orders = Table(
++            name="orders",
++            columns=[Column("id", ColumnType.INTEGER), Column("user_id", ColumnType.INTEGER)],
++            foreign_keys=[ForeignKey(("user_id",), "users", ("id",))],
++        )
++        result = _topological_sort_tables([t_orders, t_users])
++        names = [t.name for t in result]
++        assert names.index("users") < names.index("orders")
++
++    def test_chain_dependency(self):
++        t_a = Table(name="a", columns=[Column("id", ColumnType.INTEGER)])
++        t_b = Table(
++            name="b",
++            columns=[Column("id", ColumnType.INTEGER), Column("a_id", ColumnType.INTEGER)],
++            foreign_keys=[ForeignKey(("a_id",), "a", ("id",))],
++        )
++        t_c = Table(
++            name="c",
++            columns=[Column("id", ColumnType.INTEGER), Column("b_id", ColumnType.INTEGER)],
++            foreign_keys=[ForeignKey(("b_id",), "b", ("id",))],
++        )
++        result = _topological_sort_tables([t_c, t_b, t_a])
++        names = [t.name for t in result]
++        assert names.index("a") < names.index("b") < names.index("c")
++
++    def test_circular_dependency_raises(self):
++        t_a = Table(
++            name="a",
++            columns=[Column("id", ColumnType.INTEGER), Column("b_id", ColumnType.INTEGER)],
++            foreign_keys=[ForeignKey(("b_id",), "b", ("id",))],
++        )
++        t_b = Table(
++            name="b",
++            columns=[Column("id", ColumnType.INTEGER), Column("a_id", ColumnType.INTEGER)],
++            foreign_keys=[ForeignKey(("a_id",), "a", ("id",))],
++        )
++        with pytest.raises(ValueError, match="Circular"):
++            _topological_sort_tables([t_a, t_b])
++
++    def test_self_referencing_excluded(self):
++        t = Table(
++            name="categories",
++            columns=[Column("id", ColumnType.INTEGER), Column("parent_id", ColumnType.INTEGER)],
++            foreign_keys=[ForeignKey(("parent_id",), "categories", ("id",))],
++        )
++        result = _topological_sort_tables([t])
++        assert len(result) == 1
++
++
++class TestGenerateMigration:
++    def test_generates_file(self, tmp_path):
++        ops = [DiffOp(
++            op_type=DiffOpType.CREATE_TABLE,
++            table_name="users",
++            details={"table": Table(
++                name="users",
++                columns=[
++                    Column("id", ColumnType.INTEGER, nullable=False),
++                    Column("email", ColumnType.TEXT, nullable=False, unique=True),
++                ],
++                primary_key=["id"],
++            )},
++        )]
++        mig = generate_migration("add_users_table", ops, None, tmp_path)
++        assert mig.migration_id.endswith("_add_users_table")
++        assert len(mig.up_sql) > 0
++        assert len(mig.down_sql) > 0
++
++        # Verify file was written
++        path = tmp_path / f"{mig.migration_id}.yaml"
++        assert path.exists()
++
++    def test_lossy_detection(self):
++        ops = [DiffOp(
++            op_type=DiffOpType.DROP_TABLE,
++            table_name="old",
++            details={"table": Table("old", [Column("id", ColumnType.INTEGER)])},
++            lossy=True,
++        )]
++        assert has_lossy_operations(ops) is True
++
++        ops2 = [DiffOp(
++            op_type=DiffOpType.ADD_COLUMN,
++            table_name="t",
++            details={"column_name": "x", "column": Column("x", ColumnType.TEXT)},
++        )]
++        assert has_lossy_operations(ops2) is False
++
++
++class TestLoadMigrationFile:
++    def test_roundtrip(self, tmp_path):
++        ops = [DiffOp(
++            op_type=DiffOpType.CREATE_TABLE,
++            table_name="t",
++            details={"table": Table("t", [Column("id", ColumnType.INTEGER)])},
++        )]
++        mig = generate_migration("test_migration", ops, None, tmp_path)
++        path = tmp_path / f"{mig.migration_id}.yaml"
++        loaded, errors = load_migration_file(path)
++        assert not errors
++        assert loaded is not None
++        assert loaded.migration_id == mig.migration_id
++        assert loaded.depends_on is None
++        assert len(loaded.up_sql) > 0
++
++    def test_invalid_file(self, tmp_path):
++        path = tmp_path / "bad.yaml"
++        path.write_text(": invalid [", encoding="utf-8")
++        loaded, errors = load_migration_file(path)
++        assert loaded is None
++        assert len(errors) > 0
++
++    def test_missing_migration_id(self, tmp_path):
++        path = tmp_path / "noid.yaml"
++        path.write_text("up: []\ndown: []\n", encoding="utf-8")
++        loaded, errors = load_migration_file(path)
++        assert len(errors) > 0
++
++
++class TestLoadAllMigrations:
++    def test_loads_multiple(self, tmp_path):
++        ops1 = [DiffOp(
++            op_type=DiffOpType.CREATE_TABLE,
++            table_name="a",
++            details={"table": Table("a", [Column("id", ColumnType.INTEGER)])},
++        )]
++        ops2 = [DiffOp(
++            op_type=DiffOpType.CREATE_TABLE,
++            table_name="b",
++            details={"table": Table("b", [Column("id", ColumnType.INTEGER)])},
++        )]
++        m1 = generate_migration("first", ops1, None, tmp_path)
++        m2 = generate_migration("second", ops2, m1.migration_id, tmp_path)
++
++        migrations, errors = load_all_migrations(tmp_path)
++        assert not errors
++        assert len(migrations) == 2
++        assert m2.migration_id in migrations
++        assert migrations[m2.migration_id].depends_on == m1.migration_id
++
++    def test_empty_dir(self, tmp_path):
++        migrations, errors = load_all_migrations(tmp_path)
++        assert not errors
++        assert len(migrations) == 0
+diff --git a/tests/test_schema_parser.py b/tests/test_schema_parser.py
+new file mode 100644
+index 0000000..a3b4894
+--- /dev/null
++++ b/tests/test_schema_parser.py
+@@ -0,0 +1,264 @@
++"""Tests for the schema parser."""
++
++import tempfile
++from pathlib import Path
++
++import pytest
++
++from schemav.schema_parser import load_schema, parse_schema_file
++
++
++def _write_yaml(tmpdir: Path, filename: str, content: str) -> Path:
++    path = tmpdir / filename
++    path.write_text(content, encoding="utf-8")
++    return path
++
++
++class TestParseSchemaFile:
++    def test_valid_single_table(self, tmp_path):
++        content = """
++tables:
++  users:
++    columns:
++      - name: id
++        type: INTEGER
++        nullable: false
++      - name: email
++        type: TEXT
++        nullable: false
++        unique: true
++      - name: created_at
++        type: DATETIME
++    primary_key: id
++"""
++        path = _write_yaml(tmp_path, "users.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert not errors
++        assert "users" in tables
++        t = tables["users"]
++        assert len(t.columns) == 3
++        assert t.primary_key == ["id"]
++        assert t.columns[1].unique is True
++        assert t.columns[0].nullable is False
++
++    def test_valid_composite_primary_key(self, tmp_path):
++        content = """
++tables:
++  order_items:
++    columns:
++      - name: order_id
++        type: INTEGER
++        nullable: false
++      - name: product_id
++        type: INTEGER
++        nullable: false
++      - name: quantity
++        type: INTEGER
++    primary_key:
++      - order_id
++      - product_id
++"""
++        path = _write_yaml(tmp_path, "order_items.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert not errors
++        assert tables["order_items"].primary_key == ["order_id", "product_id"]
++
++    def test_valid_with_indexes(self, tmp_path):
++        content = """
++tables:
++  users:
++    columns:
++      - name: id
++        type: INTEGER
++      - name: email
++        type: TEXT
++    indexes:
++      - name: idx_users_email
++        columns: [email]
++        unique: true
++"""
++        path = _write_yaml(tmp_path, "users.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert not errors
++        assert len(tables["users"].indexes) == 1
++        assert tables["users"].indexes[0].unique is True
++
++    def test_valid_with_foreign_keys(self, tmp_path):
++        content = """
++tables:
++  orders:
++    columns:
++      - name: id
++        type: INTEGER
++      - name: user_id
++        type: INTEGER
++    foreign_keys:
++      - columns: [user_id]
++        references_table: users
++        references_columns: [id]
++        on_delete: CASCADE
++"""
++        path = _write_yaml(tmp_path, "orders.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert not errors
++        fk = tables["orders"].foreign_keys[0]
++        assert fk.references_table == "users"
++        assert fk.on_delete.value == "CASCADE"
++
++    def test_valid_with_check_constraint(self, tmp_path):
++        content = """
++tables:
++  products:
++    columns:
++      - name: id
++        type: INTEGER
++      - name: price
++        type: REAL
++    constraints:
++      - name: chk_price_positive
++        expression: "price > 0"
++"""
++        path = _write_yaml(tmp_path, "products.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert not errors
++        assert tables["products"].constraints[0].name == "chk_price_positive"
++
++    def test_invalid_column_type(self, tmp_path):
++        content = """
++tables:
++  bad:
++    columns:
++      - name: id
++        type: BADTYPE
++"""
++        path = _write_yaml(tmp_path, "bad.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert len(errors) > 0
++        assert "BADTYPE" in errors[0]
++
++    def test_duplicate_column_name(self, tmp_path):
++        content = """
++tables:
++  bad:
++    columns:
++      - name: id
++        type: INTEGER
++      - name: id
++        type: TEXT
++"""
++        path = _write_yaml(tmp_path, "bad.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert any("duplicate" in e.lower() for e in errors)
++
++    def test_missing_columns(self, tmp_path):
++        content = """
++tables:
++  bad:
++    columns: []
++"""
++        path = _write_yaml(tmp_path, "bad.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert len(errors) > 0
++
++    def test_pk_references_unknown_column(self, tmp_path):
++        content = """
++tables:
++  bad:
++    columns:
++      - name: id
++        type: INTEGER
++    primary_key: nonexistent
++"""
++        path = _write_yaml(tmp_path, "bad.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert any("nonexistent" in e for e in errors)
++
++    def test_index_references_unknown_column(self, tmp_path):
++        content = """
++tables:
++  bad:
++    columns:
++      - name: id
++        type: INTEGER
++    indexes:
++      - name: idx_bad
++        columns: [nonexistent]
++"""
++        path = _write_yaml(tmp_path, "bad.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert any("nonexistent" in e for e in errors)
++
++    def test_fk_references_unknown_local_column(self, tmp_path):
++        content = """
++tables:
++  bad:
++    columns:
++      - name: id
++        type: INTEGER
++    foreign_keys:
++      - columns: [ghost]
++        references_table: other
++        references_columns: [id]
++"""
++        path = _write_yaml(tmp_path, "bad.yaml", content)
++        tables, errors = parse_schema_file(path)
++        assert any("ghost" in e for e in errors)
++
++    def test_invalid_yaml(self, tmp_path):
++        path = _write_yaml(tmp_path, "bad.yaml", ": : : not yaml [[[")
++        tables, errors = parse_schema_file(path)
++        assert len(errors) > 0
++
++
++class TestLoadSchema:
++    def test_loads_multiple_files(self, tmp_path):
++        schema_dir = tmp_path / "schema"
++        schema_dir.mkdir()
++        _write_yaml(schema_dir, "users.yaml", """
++tables:
++  users:
++    columns:
++      - name: id
++        type: INTEGER
++""")
++        _write_yaml(schema_dir, "orders.yaml", """
++tables:
++  orders:
++    columns:
++      - name: id
++        type: INTEGER
++""")
++        schema, errors = load_schema(schema_dir)
++        assert not errors
++        assert "users" in schema.tables
++        assert "orders" in schema.tables
++
++    def test_duplicate_table_across_files(self, tmp_path):
++        schema_dir = tmp_path / "schema"
++        schema_dir.mkdir()
++        _write_yaml(schema_dir, "a.yaml", """
++tables:
++  users:
++    columns:
++      - name: id
++        type: INTEGER
++""")
++        _write_yaml(schema_dir, "b.yaml", """
++tables:
++  users:
++    columns:
++      - name: id
++        type: TEXT
++""")
++        schema, errors = load_schema(schema_dir)
++        assert any("duplicate" in e.lower() for e in errors)
++
++    def test_missing_directory(self, tmp_path):
++        schema, errors = load_schema(tmp_path / "nope")
++        assert len(errors) > 0
++
++    def test_empty_directory(self, tmp_path):
++        schema_dir = tmp_path / "schema"
++        schema_dir.mkdir()
++        schema, errors = load_schema(schema_dir)
++        assert any("No YAML" in e for e in errors)
+diff --git a/tests/test_state_tracker.py b/tests/test_state_tracker.py
+new file mode 100644
+index 0000000..2a0edce
+--- /dev/null
++++ b/tests/test_state_tracker.py
+@@ -0,0 +1,210 @@
++"""Tests for state tracker — apply, rollback, checksums, history tracking."""
++
++import sqlite3
++import pytest
++from pathlib import Path
++
++from schemav.migration_generator import generate_migration
++from schemav.models import (
++    Column,
++    ColumnType,
++    DiffOp,
++    DiffOpType,
++    Migration,
++    Table,
++)
++from schemav.state_tracker import (
++    apply_migration,
++    compute_checksum,
++    get_applied_migrations,
++    get_connection,
++    get_latest_applied_id,
++    rollback_migration,
++    verify_checksums,
++)
++
++
++def _create_table_op(name: str) -> DiffOp:
++    return DiffOp(
++        op_type=DiffOpType.CREATE_TABLE,
++        table_name=name,
++        details={"table": Table(name, [Column("id", ColumnType.INTEGER, nullable=False)], primary_key=["id"])},
++    )
++
++
++def _setup_migration(tmp_path: Path, description: str, depends_on: str | None = None) -> Migration:
++    ops = [_create_table_op(description)]
++    return generate_migration(description, ops, depends_on, tmp_path / "migrations")
++
++
++class TestApplyMigration:
++    def test_apply_creates_table(self, tmp_path):
++        mig = _setup_migration(tmp_path, "users")
++        mig_path = tmp_path / "migrations" / f"{mig.migration_id}.yaml"
++        db_path = str(tmp_path / "test.db")
++        conn = get_connection(db_path)
++
++        apply_migration(conn, mig, mig_path)
++
++        # Verify table exists
++        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
++        assert cursor.fetchone() is not None
++
++        # Verify history entry
++        applied = get_applied_migrations(conn)
++        assert len(applied) == 1
++        assert applied[0].migration_id == mig.migration_id
++        assert applied[0].direction == "up"
++        conn.close()
++
++    def test_apply_dry_run_no_changes(self, tmp_path, capsys):
++        mig = _setup_migration(tmp_path, "users")
++        mig_path = tmp_path / "migrations" / f"{mig.migration_id}.yaml"
++        db_path = str(tmp_path / "test.db")
++        conn = get_connection(db_path)
++
++        apply_migration(conn, mig, mig_path, dry_run=True)
++
++        # Table should NOT exist
++        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
++        assert cursor.fetchone() is None
++
++        # No history
++        applied = get_applied_migrations(conn)
++        assert len(applied) == 0
++
++        captured = capsys.readouterr()
++        assert "DRY RUN" in captured.out
++        conn.close()
++
++    def test_apply_failure_rolls_back(self, tmp_path):
++        """A migration with intentionally bad SQL should fail and roll back."""
++        mig = Migration(
++            migration_id="bad_migration",
++            description="bad",
++            depends_on=None,
++            up_sql=["CREATE TABLE good (id INTEGER);", "INVALID SQL STATEMENT;"],
++            down_sql=["DROP TABLE good;"],
++        )
++        mig_dir = tmp_path / "migrations"
++        mig_dir.mkdir()
++        from schemav.migration_generator import write_migration_file
++        write_migration_file(mig, mig_dir)
++        mig_path = mig_dir / f"{mig.migration_id}.yaml"
++
++        db_path = str(tmp_path / "test.db")
++        conn = get_connection(db_path)
++
++        with pytest.raises(Exception):
++            apply_migration(conn, mig, mig_path)
++
++        # "good" table should NOT exist since we rolled back
++        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='good'")
++        assert cursor.fetchone() is None
++
++        applied = get_applied_migrations(conn)
++        assert len(applied) == 0
++        conn.close()
++
++
++class TestRollbackMigration:
++    def test_rollback_removes_table(self, tmp_path):
++        mig = _setup_migration(tmp_path, "users_rb")
++        mig_path = tmp_path / "migrations" / f"{mig.migration_id}.yaml"
++        db_path = str(tmp_path / "test.db")
++        conn = get_connection(db_path)
++
++        apply_migration(conn, mig, mig_path)
++        assert get_latest_applied_id(conn) == mig.migration_id
++
++        rollback_migration(conn, mig, mig_path, force=True)
++
++        applied = get_applied_migrations(conn)
++        assert len(applied) == 0
++        conn.close()
++
++    def test_multi_step_rollback(self, tmp_path):
++        m1 = _setup_migration(tmp_path, "table_a")
++        m1_path = tmp_path / "migrations" / f"{m1.migration_id}.yaml"
++
++        import time; time.sleep(0.01)  # ensure different timestamps
++
++        m2 = _setup_migration(tmp_path, "table_b", depends_on=m1.migration_id)
++        m2_path = tmp_path / "migrations" / f"{m2.migration_id}.yaml"
++
++        db_path = str(tmp_path / "test.db")
++        conn = get_connection(db_path)
++
++        apply_migration(conn, m1, m1_path)
++        apply_migration(conn, m2, m2_path)
++        assert len(get_applied_migrations(conn)) == 2
++
++        # Rollback m2
++        rollback_migration(conn, m2, m2_path, force=True)
++        assert len(get_applied_migrations(conn)) == 1
++        assert get_latest_applied_id(conn) == m1.migration_id
++
++        # Rollback m1
++        rollback_migration(conn, m1, m1_path, force=True)
++        assert len(get_applied_migrations(conn)) == 0
++        conn.close()
++
++    def test_rollback_dry_run(self, tmp_path, capsys):
++        mig = _setup_migration(tmp_path, "drytest")
++        mig_path = tmp_path / "migrations" / f"{mig.migration_id}.yaml"
++        db_path = str(tmp_path / "test.db")
++        conn = get_connection(db_path)
++
++        apply_migration(conn, mig, mig_path)
++        rollback_migration(conn, mig, mig_path, dry_run=True)
++
++        # Still applied
++        assert len(get_applied_migrations(conn)) == 1
++
++        captured = capsys.readouterr()
++        assert "DRY RUN" in captured.out
++        conn.close()
++
++
++class TestChecksums:
++    def test_checksum_consistency(self, tmp_path):
++        mig = _setup_migration(tmp_path, "chk")
++        mig_path = tmp_path / "migrations" / f"{mig.migration_id}.yaml"
++        c1 = compute_checksum(mig_path)
++        c2 = compute_checksum(mig_path)
++        assert c1 == c2
++
++    def test_checksum_mismatch_detected(self, tmp_path):
++        mig = _setup_migration(tmp_path, "tamper")
++        mig_path = tmp_path / "migrations" / f"{mig.migration_id}.yaml"
++        db_path = str(tmp_path / "test.db")
++        conn = get_connection(db_path)
++
++        apply_migration(conn, mig, mig_path)
++
++        # Tamper with the file
++        original = mig_path.read_text()
++        mig_path.write_text(original + "\n# tampered", encoding="utf-8")
++
++        from schemav.migration_generator import load_all_migrations
++        migrations, _ = load_all_migrations(tmp_path / "migrations")
++        warnings = verify_checksums(conn, migrations, tmp_path / "migrations")
++        assert len(warnings) == 1
++        assert "mismatch" in warnings[0].lower()
++        conn.close()
++
++    def test_rollback_checksum_mismatch_blocks_without_force(self, tmp_path):
++        mig = _setup_migration(tmp_path, "blocktest")
++        mig_path = tmp_path / "migrations" / f"{mig.migration_id}.yaml"
++        db_path = str(tmp_path / "test.db")
++        conn = get_connection(db_path)
++
++        apply_migration(conn, mig, mig_path)
++
++        # Tamper
++        original = mig_path.read_text()
++        mig_path.write_text(original + "\n# tampered", encoding="utf-8")
++
++        with pytest.raises(ValueError, match="Checksum mismatch"):
++            rollback_migration(conn, mig, mig_path, force=False)
++        conn.close()
