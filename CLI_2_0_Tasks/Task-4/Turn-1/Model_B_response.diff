@@ -1,0 +1,1709 @@
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClient.java b/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClient.java
+new file mode 100644
+index 0000000..4688636
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClient.java
+@@ -0,0 +1,28 @@
++package com.piggymetrics.account.client;
++
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetEvaluation;
++import org.springframework.cloud.openfeign.FeignClient;
++import org.springframework.http.MediaType;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.RequestBody;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestMethod;
++
++import java.util.List;
++
++/**
++ * Delegates budget evaluation (actual-vs-limit computation with
++ * currency / period normalization) to statistics-service.
++ */
++@FeignClient(name = "statistics-service", contextId = "budget-evaluation",
++		fallback = BudgetEvaluationClientFallback.class)
++public interface BudgetEvaluationClient {
++
++	@RequestMapping(method = RequestMethod.POST,
++			value = "/statistics/budgets/evaluate/{accountName}",
++			consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
++	List<BudgetEvaluation> evaluate(@PathVariable("accountName") String accountName,
++									@RequestBody List<Budget> budgets);
++
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClientFallback.java b/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClientFallback.java
+new file mode 100644
+index 0000000..ab51c81
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClientFallback.java
+@@ -0,0 +1,27 @@
++package com.piggymetrics.account.client;
++
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetEvaluation;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Component;
++
++import java.util.Collections;
++import java.util.List;
++
++/**
++ * Fallback returns an empty evaluation list so that callers
++ * (UI, notification cron) degrade gracefully when
++ * statistics-service is unavailable.
++ */
++@Component
++public class BudgetEvaluationClientFallback implements BudgetEvaluationClient {
++
++	private static final Logger LOGGER = LoggerFactory.getLogger(BudgetEvaluationClientFallback.class);
++
++	@Override
++	public List<BudgetEvaluation> evaluate(String accountName, List<Budget> budgets) {
++		LOGGER.error("statistics-service unavailable, returning empty budget evaluations for account: {}", accountName);
++		return Collections.emptyList();
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/controller/BudgetController.java b/account-service/src/main/java/com/piggymetrics/account/controller/BudgetController.java
+new file mode 100644
+index 0000000..13780e4
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/controller/BudgetController.java
+@@ -0,0 +1,73 @@
++package com.piggymetrics.account.controller;
++
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetEvaluation;
++import com.piggymetrics.account.service.BudgetService;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.http.ResponseEntity;
++import org.springframework.security.access.prepost.PreAuthorize;
++import org.springframework.web.bind.annotation.*;
++
++import javax.validation.Valid;
++import java.security.Principal;
++import java.util.List;
++
++/**
++ * Budget CRUD for end users plus an internal read endpoint
++ * used by notification-service (server scope only).
++ */
++@RestController
++@RequestMapping("/budgets")
++public class BudgetController {
++
++	@Autowired
++	private BudgetService budgetService;
++
++	// ---- User-scoped endpoints -------------------------------------------------
++
++	@RequestMapping(path = "/current", method = RequestMethod.GET)
++	public List<Budget> listCurrent(Principal principal) {
++		return budgetService.findAll(principal.getName());
++	}
++
++	@RequestMapping(path = "/current", method = RequestMethod.POST)
++	public Budget createCurrent(Principal principal, @Valid @RequestBody Budget budget) {
++		return budgetService.create(principal.getName(), budget);
++	}
++
++	@RequestMapping(path = "/current/{budgetId}", method = RequestMethod.PUT)
++	public Budget updateCurrent(Principal principal,
++								@PathVariable String budgetId,
++								@Valid @RequestBody Budget budget) {
++		return budgetService.update(principal.getName(), budgetId, budget);
++	}
++
++	@RequestMapping(path = "/current/{budgetId}", method = RequestMethod.DELETE)
++	public ResponseEntity<Void> deleteCurrent(Principal principal, @PathVariable String budgetId) {
++		budgetService.softDelete(principal.getName(), budgetId);
++		return ResponseEntity.noContent().build();
++	}
++
++	@RequestMapping(path = "/current/status", method = RequestMethod.GET)
++	public List<BudgetEvaluation> currentStatus(Principal principal) {
++		return budgetService.evaluate(principal.getName());
++	}
++
++	// ---- Server-scoped endpoints (internal) -----------------------------------
++
++	/**
++	 * Returns active budgets for the given account.
++	 * Restricted to service-to-service calls (notification cron).
++	 */
++	@PreAuthorize("#oauth2.hasScope('server')")
++	@RequestMapping(path = "/{accountName}/active", method = RequestMethod.GET)
++	public List<Budget> listActive(@PathVariable String accountName) {
++		return budgetService.findActive(accountName);
++	}
++
++	@PreAuthorize("#oauth2.hasScope('server')")
++	@RequestMapping(path = "/{accountName}/status", method = RequestMethod.GET)
++	public List<BudgetEvaluation> statusFor(@PathVariable String accountName) {
++		return budgetService.evaluate(accountName);
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java b/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
+new file mode 100644
+index 0000000..5e7301b
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
+@@ -0,0 +1,175 @@
++package com.piggymetrics.account.domain;
++
++import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import org.hibernate.validator.constraints.Length;
++import org.hibernate.validator.constraints.NotBlank;
++import org.springframework.data.annotation.Id;
++import org.springframework.data.mongodb.core.index.CompoundIndex;
++import org.springframework.data.mongodb.core.index.CompoundIndexes;
++import org.springframework.data.mongodb.core.mapping.Document;
++
++import javax.validation.constraints.DecimalMax;
++import javax.validation.constraints.DecimalMin;
++import javax.validation.constraints.NotNull;
++import java.math.BigDecimal;
++import java.util.Date;
++
++/**
++ * Spending limit for a category of expenses, owned by an account.
++ *
++ * Soft deletion is used ({@code deleted} flag) so that historical
++ * alerts and evaluations remain explainable.
++ *
++ * Uniqueness of <i>active</i> budgets per {@code (accountName, category, period)}
++ * is enforced at the service layer, since Mongo unique indexes cannot
++ * express partial conditions on pre-3.2 server versions consistently.
++ */
++@Document(collection = "budgets")
++@CompoundIndexes({
++		@CompoundIndex(name = "idx_account_active",
++				def = "{'accountName': 1, 'active': 1, 'deleted': 1}")
++})
++@JsonIgnoreProperties(ignoreUnknown = true)
++public class Budget {
++
++	/** Reserved category that matches the sum of all expenses. */
++	public static final String TOTAL_CATEGORY = "_TOTAL";
++
++	public static final double DEFAULT_WARNING_THRESHOLD = 0.80;
++
++	@Id
++	private String id;
++
++	// Set by the service from the authenticated principal; not part of
++	// the client payload. No @NotBlank so @Valid on request bodies
++	// doesn't reject user submissions that omit it.
++	private String accountName;
++
++	@NotBlank
++	@Length(min = 1, max = 40)
++	private String category;
++
++	@NotNull
++	@DecimalMin(value = "0.0", inclusive = false)
++	private BigDecimal limit;
++
++	@NotNull
++	private Currency currency;
++
++	@NotNull
++	private BudgetPeriod period;
++
++	/** Fraction of limit at which {@link BudgetStatus#WARNING} fires. */
++	@DecimalMin("0.0")
++	@DecimalMax("1.0")
++	private Double warningThreshold;
++
++	// Boxed so callers can omit the field on partial updates (null = unchanged).
++	private Boolean active = Boolean.TRUE;
++
++	private Boolean deleted = Boolean.FALSE;
++
++	private Date createdAt;
++
++	private Date updatedAt;
++
++	public String getId() {
++		return id;
++	}
++
++	public void setId(String id) {
++		this.id = id;
++	}
++
++	public String getAccountName() {
++		return accountName;
++	}
++
++	public void setAccountName(String accountName) {
++		this.accountName = accountName;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public Currency getCurrency() {
++		return currency;
++	}
++
++	public void setCurrency(Currency currency) {
++		this.currency = currency;
++	}
++
++	public BudgetPeriod getPeriod() {
++		return period;
++	}
++
++	public void setPeriod(BudgetPeriod period) {
++		this.period = period;
++	}
++
++	public Double getWarningThreshold() {
++		return warningThreshold;
++	}
++
++	public void setWarningThreshold(Double warningThreshold) {
++		this.warningThreshold = warningThreshold;
++	}
++
++	public double getEffectiveWarningThreshold() {
++		return warningThreshold == null ? DEFAULT_WARNING_THRESHOLD : warningThreshold;
++	}
++
++	public Boolean getActive() {
++		return active;
++	}
++
++	public boolean isActive() {
++		return Boolean.TRUE.equals(active);
++	}
++
++	public void setActive(Boolean active) {
++		this.active = active;
++	}
++
++	public Boolean getDeleted() {
++		return deleted;
++	}
++
++	public boolean isDeleted() {
++		return Boolean.TRUE.equals(deleted);
++	}
++
++	public void setDeleted(Boolean deleted) {
++		this.deleted = deleted;
++	}
++
++	public Date getCreatedAt() {
++		return createdAt;
++	}
++
++	public void setCreatedAt(Date createdAt) {
++		this.createdAt = createdAt;
++	}
++
++	public Date getUpdatedAt() {
++		return updatedAt;
++	}
++
++	public void setUpdatedAt(Date updatedAt) {
++		this.updatedAt = updatedAt;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java
+new file mode 100644
+index 0000000..a63d1e9
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java
+@@ -0,0 +1,86 @@
++package com.piggymetrics.account.domain;
++
++import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++
++import java.math.BigDecimal;
++
++/**
++ * DTO returned by statistics-service describing how a {@link Budget}
++ * compares to actual spending in its period.
++ */
++@JsonIgnoreProperties(ignoreUnknown = true)
++public class BudgetEvaluation {
++
++	private String budgetId;
++	private String category;
++	private BudgetPeriod period;
++	private Currency currency;
++	private BigDecimal limit;
++	private BigDecimal actual;
++	private double percentUsed;
++	private BudgetStatus status;
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BudgetPeriod getPeriod() {
++		return period;
++	}
++
++	public void setPeriod(BudgetPeriod period) {
++		this.period = period;
++	}
++
++	public Currency getCurrency() {
++		return currency;
++	}
++
++	public void setCurrency(Currency currency) {
++		this.currency = currency;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public BigDecimal getActual() {
++		return actual;
++	}
++
++	public void setActual(BigDecimal actual) {
++		this.actual = actual;
++	}
++
++	public double getPercentUsed() {
++		return percentUsed;
++	}
++
++	public void setPercentUsed(double percentUsed) {
++		this.percentUsed = percentUsed;
++	}
++
++	public BudgetStatus getStatus() {
++		return status;
++	}
++
++	public void setStatus(BudgetStatus status) {
++		this.status = status;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetPeriod.java b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetPeriod.java
+new file mode 100644
+index 0000000..9cb1648
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetPeriod.java
+@@ -0,0 +1,11 @@
++package com.piggymetrics.account.domain;
++
++/**
++ * Budgets are evaluated over a calendar-aligned period.
++ * Distinct from {@link TimePeriod} which models item recurrence.
++ */
++public enum BudgetPeriod {
++
++	MONTH, QUARTER, YEAR
++
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetStatus.java b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetStatus.java
+new file mode 100644
+index 0000000..0960eeb
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetStatus.java
+@@ -0,0 +1,10 @@
++package com.piggymetrics.account.domain;
++
++/**
++ * Result of evaluating a {@link Budget} against actual spending.
++ */
++public enum BudgetStatus {
++
++	UNDER_BUDGET, WARNING, EXCEEDED
++
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/repository/BudgetRepository.java b/account-service/src/main/java/com/piggymetrics/account/repository/BudgetRepository.java
+new file mode 100644
+index 0000000..37efa49
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/repository/BudgetRepository.java
+@@ -0,0 +1,21 @@
++package com.piggymetrics.account.repository;
++
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetPeriod;
++import org.springframework.data.mongodb.repository.MongoRepository;
++import org.springframework.stereotype.Repository;
++
++import java.util.List;
++import java.util.Optional;
++
++@Repository
++public interface BudgetRepository extends MongoRepository<Budget, String> {
++
++	List<Budget> findByAccountNameAndDeletedFalse(String accountName);
++
++	List<Budget> findByAccountNameAndActiveTrueAndDeletedFalse(String accountName);
++
++	Optional<Budget> findByAccountNameAndCategoryAndPeriodAndActiveTrueAndDeletedFalse(
++			String accountName, String category, BudgetPeriod period);
++
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/BudgetService.java b/account-service/src/main/java/com/piggymetrics/account/service/BudgetService.java
+new file mode 100644
+index 0000000..bfe44c5
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/BudgetService.java
+@@ -0,0 +1,46 @@
++package com.piggymetrics.account.service;
++
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetEvaluation;
++
++import java.util.List;
++
++public interface BudgetService {
++
++	/**
++	 * Creates a new budget for the given account.
++	 * Rejects duplicates of active budgets in the same (category, period).
++	 */
++	Budget create(String accountName, Budget budget);
++
++	/**
++	 * Returns all non-deleted budgets for the account.
++	 */
++	List<Budget> findAll(String accountName);
++
++	/**
++	 * Returns all active, non-deleted budgets for the account.
++	 * Used by evaluation and notification flows.
++	 */
++	List<Budget> findActive(String accountName);
++
++	/**
++	 * Applies mutable field updates to an existing budget.
++	 * Enforces ownership and re-checks duplicate constraint.
++	 */
++	Budget update(String accountName, String budgetId, Budget update);
++
++	/**
++	 * Soft-deletes the budget. History is preserved for audit
++	 * and so that cooldowns on already-sent alerts remain meaningful.
++	 */
++	void softDelete(String accountName, String budgetId);
++
++	/**
++	 * Evaluates all active budgets for the account by delegating to
++	 * statistics-service. Returns an empty list if the downstream
++	 * fallback is triggered.
++	 */
++	List<BudgetEvaluation> evaluate(String accountName);
++
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/BudgetServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/BudgetServiceImpl.java
+new file mode 100644
+index 0000000..1d2c2e6
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/BudgetServiceImpl.java
+@@ -0,0 +1,143 @@
++package com.piggymetrics.account.service;
++
++import com.piggymetrics.account.client.BudgetEvaluationClient;
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetEvaluation;
++import com.piggymetrics.account.repository.BudgetRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.util.Assert;
++
++import java.util.Collections;
++import java.util.Date;
++import java.util.List;
++import java.util.Optional;
++
++@Service
++public class BudgetServiceImpl implements BudgetService {
++
++	private final Logger log = LoggerFactory.getLogger(getClass());
++
++	@Autowired
++	private BudgetRepository repository;
++
++	@Autowired
++	private BudgetEvaluationClient evaluationClient;
++
++	@Override
++	public Budget create(String accountName, Budget budget) {
++		Assert.hasLength(accountName);
++		Assert.notNull(budget, "budget must not be null");
++		Assert.notNull(budget.getCategory(), "category must not be null");
++		Assert.notNull(budget.getPeriod(), "period must not be null");
++		Assert.notNull(budget.getLimit(), "limit must not be null");
++		Assert.notNull(budget.getCurrency(), "currency must not be null");
++
++		ensureNoActiveDuplicate(accountName, budget.getCategory(), budget.getPeriod(), null);
++
++		Date now = new Date();
++		budget.setId(null);
++		budget.setAccountName(accountName);
++		budget.setActive(Boolean.TRUE);
++		budget.setDeleted(Boolean.FALSE);
++		budget.setCreatedAt(now);
++		budget.setUpdatedAt(now);
++
++		Budget saved = repository.save(budget);
++		log.info("budget created for {}: category={} period={}", accountName, saved.getCategory(), saved.getPeriod());
++		return saved;
++	}
++
++	@Override
++	public List<Budget> findAll(String accountName) {
++		Assert.hasLength(accountName);
++		return repository.findByAccountNameAndDeletedFalse(accountName);
++	}
++
++	@Override
++	public List<Budget> findActive(String accountName) {
++		Assert.hasLength(accountName);
++		return repository.findByAccountNameAndActiveTrueAndDeletedFalse(accountName);
++	}
++
++	@Override
++	public Budget update(String accountName, String budgetId, Budget update) {
++		Assert.hasLength(accountName);
++		Assert.hasLength(budgetId);
++		Assert.notNull(update, "update payload must not be null");
++
++		Budget existing = loadOwned(accountName, budgetId);
++
++		String newCategory = update.getCategory() != null ? update.getCategory() : existing.getCategory();
++		com.piggymetrics.account.domain.BudgetPeriod newPeriod =
++				update.getPeriod() != null ? update.getPeriod() : existing.getPeriod();
++		// Null = "don't change"; otherwise the caller explicitly toggled it.
++		boolean willBeActive = update.getActive() == null ? existing.isActive() : update.getActive();
++
++		if (willBeActive && (!newCategory.equals(existing.getCategory())
++				|| !newPeriod.equals(existing.getPeriod())
++				|| !existing.isActive())) {
++			ensureNoActiveDuplicate(accountName, newCategory, newPeriod, budgetId);
++		}
++
++		existing.setCategory(newCategory);
++		existing.setPeriod(newPeriod);
++		if (update.getLimit() != null) existing.setLimit(update.getLimit());
++		if (update.getCurrency() != null) existing.setCurrency(update.getCurrency());
++		if (update.getWarningThreshold() != null) existing.setWarningThreshold(update.getWarningThreshold());
++		existing.setActive(willBeActive);
++		existing.setUpdatedAt(new Date());
++
++		Budget saved = repository.save(existing);
++		log.info("budget {} updated for {}", budgetId, accountName);
++		return saved;
++	}
++
++	@Override
++	public void softDelete(String accountName, String budgetId) {
++		Assert.hasLength(accountName);
++		Assert.hasLength(budgetId);
++
++		Budget existing = loadOwned(accountName, budgetId);
++		if (existing.isDeleted()) {
++			return;
++		}
++		existing.setDeleted(Boolean.TRUE);
++		existing.setActive(Boolean.FALSE);
++		existing.setUpdatedAt(new Date());
++		repository.save(existing);
++		log.info("budget {} soft-deleted for {}", budgetId, accountName);
++	}
++
++	@Override
++	public List<BudgetEvaluation> evaluate(String accountName) {
++		Assert.hasLength(accountName);
++		List<Budget> active = findActive(accountName);
++		if (active.isEmpty()) {
++			return Collections.emptyList();
++		}
++		return evaluationClient.evaluate(accountName, active);
++	}
++
++	private Budget loadOwned(String accountName, String budgetId) {
++		Optional<Budget> existing = repository.findById(budgetId);
++		Assert.isTrue(existing.isPresent(), "budget not found: " + budgetId);
++		Budget budget = existing.get();
++		Assert.isTrue(accountName.equals(budget.getAccountName()),
++				"budget does not belong to account: " + accountName);
++		return budget;
++	}
++
++	private void ensureNoActiveDuplicate(String accountName, String category,
++										 com.piggymetrics.account.domain.BudgetPeriod period,
++										 String ignoreId) {
++		Optional<Budget> duplicate = repository
++				.findByAccountNameAndCategoryAndPeriodAndActiveTrueAndDeletedFalse(accountName, category, period);
++		if (duplicate.isPresent() && (ignoreId == null || !ignoreId.equals(duplicate.get().getId()))) {
++			throw new IllegalArgumentException(
++					"active budget already exists for category '" + category + "' and period " + period);
++		}
++	}
++}
+diff --git a/config/src/main/resources/shared/notification-service.yml b/config/src/main/resources/shared/notification-service.yml
+index 4ab5302..55359d0 100644
+--- a/config/src/main/resources/shared/notification-service.yml
++++ b/config/src/main/resources/shared/notification-service.yml
+@@ -12,6 +12,10 @@ server:
+     context-path: /notifications
+   port: 8000
+ 
++feign:
++  hystrix:
++    enabled: true
++
+ remind:
+   cron: 0 0 0 * * *
+   email:
+@@ -25,6 +29,15 @@ backup:
+     subject: PiggyMetrics account backup
+     attachment: backup.json
+ 
++budget:
++  alert:
++    cron: 0 0 * * * *
++    cooldown:
++      hours: 24
++    email:
++      subject: "PiggyMetrics budget alert: {0}"
++      text: "Hey, {0}! Your ''{1}'' budget is at {2,number,percent} of the {3} {4} limit for this {5} (current spend: {6} {4}).\r\n\r\nCheers,\r\nPiggyMetrics team"
++
+ spring:
+   data:
+     mongodb:
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClient.java b/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClient.java
+index dd26ace..77b7be7 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClient.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClient.java
+@@ -1,15 +1,27 @@
+ package com.piggymetrics.notification.client;
+ 
++import com.piggymetrics.notification.domain.BudgetEvaluation;
+ import org.springframework.cloud.openfeign.FeignClient;
+ import org.springframework.http.MediaType;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RequestMethod;
+ 
+-@FeignClient(name = "account-service")
++import java.util.List;
++
++@FeignClient(name = "account-service", fallback = AccountServiceClientFallback.class)
+ public interface AccountServiceClient {
+ 
+ 	@RequestMapping(method = RequestMethod.GET, value = "/accounts/{accountName}", consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
+ 	String getAccount(@PathVariable("accountName") String accountName);
+ 
++	/**
++	 * Returns evaluations for the account's active budgets. Internally,
++	 * account-service orchestrates the call into statistics-service.
++	 */
++	@RequestMapping(method = RequestMethod.GET,
++			value = "/accounts/budgets/{accountName}/status",
++			consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
++	List<BudgetEvaluation> getBudgetStatus(@PathVariable("accountName") String accountName);
++
+ }
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClientFallback.java b/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClientFallback.java
+new file mode 100644
+index 0000000..2f13e7b
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClientFallback.java
+@@ -0,0 +1,38 @@
++package com.piggymetrics.notification.client;
++
++import com.piggymetrics.notification.domain.BudgetEvaluation;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.stereotype.Component;
++
++import java.util.Collections;
++import java.util.List;
++
++/**
++ * Behaviour on failure is per-endpoint:
++ * <ul>
++ *   <li>{@link #getAccount(String)} throws so that the existing
++ *       backup flow's try/catch skips the recipient (no email sent
++ *       without its payload — matches prior behaviour).</li>
++ *   <li>{@link #getBudgetStatus(String)} returns an empty list so
++ *       that the scheduled sweep keeps making progress across
++ *       recipients and only this one is skipped for this run.</li>
++ * </ul>
++ */
++@Component
++public class AccountServiceClientFallback implements AccountServiceClient {
++
++	private static final Logger LOGGER = LoggerFactory.getLogger(AccountServiceClientFallback.class);
++
++	@Override
++	public String getAccount(String accountName) {
++		LOGGER.error("account-service unavailable, cannot fetch backup for {}", accountName);
++		throw new IllegalStateException("account-service unavailable: " + accountName);
++	}
++
++	@Override
++	public List<BudgetEvaluation> getBudgetStatus(String accountName) {
++		LOGGER.error("account-service unavailable, cannot fetch budget status for {}", accountName);
++		return Collections.emptyList();
++	}
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetAlertState.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetAlertState.java
+new file mode 100644
+index 0000000..3b539d3
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetAlertState.java
+@@ -0,0 +1,76 @@
++package com.piggymetrics.notification.domain;
++
++import org.springframework.data.annotation.Id;
++import org.springframework.data.mongodb.core.index.CompoundIndex;
++import org.springframework.data.mongodb.core.index.CompoundIndexes;
++import org.springframework.data.mongodb.core.mapping.Document;
++
++import java.util.Date;
++
++/**
++ * Tracks the last budget alert emitted for a specific
++ * {@code (accountName, budgetId)} pair. The {@code lastAlertedAt}
++ * timestamp drives the cooldown that prevents spamming the user.
++ *
++ * <p>We intentionally key off {@code budgetId} (stable across
++ * category/period edits) rather than {@code category+period} so that
++ * renaming or re-scoping a budget resets the cooldown correctly.
++ */
++@Document(collection = "budgetAlertStates")
++@CompoundIndexes({
++		@CompoundIndex(name = "idx_account_budget", unique = true,
++				def = "{'accountName': 1, 'budgetId': 1}")
++})
++public class BudgetAlertState {
++
++	@Id
++	private String id;
++
++	private String accountName;
++
++	private String budgetId;
++
++	private BudgetStatus lastStatus;
++
++	private Date lastAlertedAt;
++
++	public String getId() {
++		return id;
++	}
++
++	public void setId(String id) {
++		this.id = id;
++	}
++
++	public String getAccountName() {
++		return accountName;
++	}
++
++	public void setAccountName(String accountName) {
++		this.accountName = accountName;
++	}
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public BudgetStatus getLastStatus() {
++		return lastStatus;
++	}
++
++	public void setLastStatus(BudgetStatus lastStatus) {
++		this.lastStatus = lastStatus;
++	}
++
++	public Date getLastAlertedAt() {
++		return lastAlertedAt;
++	}
++
++	public void setLastAlertedAt(Date lastAlertedAt) {
++		this.lastAlertedAt = lastAlertedAt;
++	}
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java
+new file mode 100644
+index 0000000..2368141
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java
+@@ -0,0 +1,86 @@
++package com.piggymetrics.notification.domain;
++
++import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++
++import java.math.BigDecimal;
++
++/**
++ * DTO mirroring statistics-service's budget evaluation result,
++ * used to decide whether to send an alert email.
++ */
++@JsonIgnoreProperties(ignoreUnknown = true)
++public class BudgetEvaluation {
++
++	private String budgetId;
++	private String category;
++	private BudgetPeriod period;
++	private String currency;
++	private BigDecimal limit;
++	private BigDecimal actual;
++	private double percentUsed;
++	private BudgetStatus status;
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BudgetPeriod getPeriod() {
++		return period;
++	}
++
++	public void setPeriod(BudgetPeriod period) {
++		this.period = period;
++	}
++
++	public String getCurrency() {
++		return currency;
++	}
++
++	public void setCurrency(String currency) {
++		this.currency = currency;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public BigDecimal getActual() {
++		return actual;
++	}
++
++	public void setActual(BigDecimal actual) {
++		this.actual = actual;
++	}
++
++	public double getPercentUsed() {
++		return percentUsed;
++	}
++
++	public void setPercentUsed(double percentUsed) {
++		this.percentUsed = percentUsed;
++	}
++
++	public BudgetStatus getStatus() {
++		return status;
++	}
++
++	public void setStatus(BudgetStatus status) {
++		this.status = status;
++	}
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetPeriod.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetPeriod.java
+new file mode 100644
+index 0000000..fd68c70
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetPeriod.java
+@@ -0,0 +1,7 @@
++package com.piggymetrics.notification.domain;
++
++public enum BudgetPeriod {
++
++	MONTH, QUARTER, YEAR
++
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetStatus.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetStatus.java
+new file mode 100644
+index 0000000..f426779
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetStatus.java
+@@ -0,0 +1,7 @@
++package com.piggymetrics.notification.domain;
++
++public enum BudgetStatus {
++
++	UNDER_BUDGET, WARNING, EXCEEDED
++
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/NotificationType.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/NotificationType.java
+index 5c74351..35eadc9 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/domain/NotificationType.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/NotificationType.java
+@@ -3,7 +3,8 @@ package com.piggymetrics.notification.domain;
+ public enum NotificationType {
+ 
+ 	BACKUP("backup.email.subject", "backup.email.text", "backup.email.attachment"),
+-	REMIND("remind.email.subject", "remind.email.text", null);
++	REMIND("remind.email.subject", "remind.email.text", null),
++	BUDGET_ALERT("budget.alert.email.subject", "budget.alert.email.text", null);
+ 
+ 	private String subject;
+ 	private String text;
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/repository/BudgetAlertStateRepository.java b/notification-service/src/main/java/com/piggymetrics/notification/repository/BudgetAlertStateRepository.java
+new file mode 100644
+index 0000000..4aef07d
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/repository/BudgetAlertStateRepository.java
+@@ -0,0 +1,14 @@
++package com.piggymetrics.notification.repository;
++
++import com.piggymetrics.notification.domain.BudgetAlertState;
++import org.springframework.data.mongodb.repository.MongoRepository;
++import org.springframework.stereotype.Repository;
++
++import java.util.Optional;
++
++@Repository
++public interface BudgetAlertStateRepository extends MongoRepository<BudgetAlertState, String> {
++
++	Optional<BudgetAlertState> findByAccountNameAndBudgetId(String accountName, String budgetId);
++
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/repository/RecipientRepository.java b/notification-service/src/main/java/com/piggymetrics/notification/repository/RecipientRepository.java
+index e24fd97..603c029 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/repository/RecipientRepository.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/repository/RecipientRepository.java
+@@ -20,4 +20,12 @@ public interface RecipientRepository extends CrudRepository<Recipient, String> {
+ 			"new Date(new Date().setDate(new Date().getDate() - this.scheduledNotifications.REMIND.frequency ))' }] }")
+ 	List<Recipient> findReadyForRemind();
+ 
++	/**
++	 * Returns recipients who have opted in to budget alerts. Per-budget
++	 * cooldown is tracked separately in {@code budgetAlertStates}; this
++	 * query only checks the recipient-level opt-in flag.
++	 */
++	@Query("{ 'scheduledNotifications.BUDGET_ALERT.active': true }")
++	List<Recipient> findWithBudgetAlertsActive();
++
+ }
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertService.java b/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertService.java
+new file mode 100644
+index 0000000..07170b0
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertService.java
+@@ -0,0 +1,20 @@
++package com.piggymetrics.notification.service;
++
++/**
++ * Runs periodically to evaluate every account's budgets and
++ * notify its recipient when any of them are in
++ * {@link com.piggymetrics.notification.domain.BudgetStatus#WARNING}
++ * or {@link com.piggymetrics.notification.domain.BudgetStatus#EXCEEDED}.
++ *
++ * Uses an async dispatch per recipient and a per-budget cooldown
++ * to avoid re-alerting on unchanged state.
++ */
++public interface BudgetAlertService {
++
++	/**
++	 * Scheduled entry point. Exposed on the interface so it can be
++	 * invoked manually from tests.
++	 */
++	void sendBudgetAlerts();
++
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertServiceImpl.java b/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertServiceImpl.java
+new file mode 100644
+index 0000000..93bb5c3
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertServiceImpl.java
+@@ -0,0 +1,151 @@
++package com.piggymetrics.notification.service;
++
++import com.piggymetrics.notification.client.AccountServiceClient;
++import com.piggymetrics.notification.domain.BudgetAlertState;
++import com.piggymetrics.notification.domain.BudgetEvaluation;
++import com.piggymetrics.notification.domain.BudgetStatus;
++import com.piggymetrics.notification.domain.NotificationType;
++import com.piggymetrics.notification.domain.Recipient;
++import com.piggymetrics.notification.repository.BudgetAlertStateRepository;
++import com.piggymetrics.notification.repository.RecipientRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.cloud.context.config.annotation.RefreshScope;
++import org.springframework.core.env.Environment;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Service;
++
++import java.text.MessageFormat;
++import java.util.Date;
++import java.util.List;
++import java.util.Optional;
++import java.util.concurrent.CompletableFuture;
++import java.util.concurrent.TimeUnit;
++
++/**
++ * Scheduled budget alert sweep.
++ *
++ * <p>For every recipient who has opted in to {@code BUDGET_ALERT},
++ * we asynchronously:
++ * <ol>
++ *   <li>ask account-service for its evaluated budgets (which itself
++ *       delegates to statistics-service via Feign + fallback),</li>
++ *   <li>for each evaluation in WARNING or EXCEEDED that is past the
++ *       configured cooldown, send an email and record the alert
++ *       in {@code budgetAlertStates}.</li>
++ * </ol>
++ *
++ * <p>The cooldown is keyed off {@code (accountName, budgetId)} and
++ * is reset whenever the status transitions (e.g. UNDER_BUDGET →
++ * WARNING should fire regardless of a prior EXCEEDED alert that's
++ * still inside its cooldown window — transitions are more
++ * informative than duplicates, so we treat them as "new" alerts).
++ */
++@Service
++@RefreshScope
++public class BudgetAlertServiceImpl implements BudgetAlertService {
++
++	private final Logger log = LoggerFactory.getLogger(getClass());
++
++	@Autowired
++	private AccountServiceClient accountClient;
++
++	@Autowired
++	private RecipientRepository recipientRepository;
++
++	@Autowired
++	private BudgetAlertStateRepository alertStateRepository;
++
++	@Autowired
++	private EmailService emailService;
++
++	@Autowired
++	private Environment env;
++
++	/** How long to wait before re-alerting on the same status for the same budget. */
++	@Value("${budget.alert.cooldown.hours:24}")
++	private long cooldownHours;
++
++	@Override
++	@Scheduled(cron = "${budget.alert.cron:0 0 * * * *}")
++	public void sendBudgetAlerts() {
++		List<Recipient> recipients = recipientRepository.findWithBudgetAlertsActive();
++		log.info("found {} recipients for budget alerts", recipients.size());
++
++		recipients.forEach(recipient -> CompletableFuture.runAsync(() -> processRecipient(recipient)));
++	}
++
++	private void processRecipient(Recipient recipient) {
++		try {
++			List<BudgetEvaluation> evaluations = accountClient.getBudgetStatus(recipient.getAccountName());
++			for (BudgetEvaluation evaluation : evaluations) {
++				if (shouldAlert(recipient.getAccountName(), evaluation)) {
++					sendAlert(recipient, evaluation);
++				}
++			}
++		} catch (Throwable t) {
++			log.error("an error during budget alert evaluation for {}", recipient, t);
++		}
++	}
++
++	private boolean shouldAlert(String accountName, BudgetEvaluation evaluation) {
++		BudgetStatus status = evaluation.getStatus();
++		if (status != BudgetStatus.WARNING && status != BudgetStatus.EXCEEDED) {
++			return false;
++		}
++
++		Optional<BudgetAlertState> previous = alertStateRepository
++				.findByAccountNameAndBudgetId(accountName, evaluation.getBudgetId());
++		if (!previous.isPresent()) {
++			return true;
++		}
++
++		BudgetAlertState state = previous.get();
++		// Re-alert immediately on status transition (e.g. WARNING -> EXCEEDED).
++		if (state.getLastStatus() != status) {
++			return true;
++		}
++		// Otherwise respect the cooldown window.
++		long cooldownMs = TimeUnit.HOURS.toMillis(cooldownHours);
++		return state.getLastAlertedAt() == null
++				|| System.currentTimeMillis() - state.getLastAlertedAt().getTime() >= cooldownMs;
++	}
++
++	private void sendAlert(Recipient recipient, BudgetEvaluation evaluation) {
++		try {
++			String subjectTemplate = env.getProperty(NotificationType.BUDGET_ALERT.getSubject(),
++					"PiggyMetrics budget alert: {0}");
++			String bodyTemplate = env.getProperty(NotificationType.BUDGET_ALERT.getText(),
++					"Hey, {0}! Your {1} budget is at {2,number,percent} of the {3} {4} limit " +
++							"for this {5} (current spend: {6} {4}).");
++
++			String subject = MessageFormat.format(subjectTemplate, evaluation.getCategory());
++			String body = MessageFormat.format(bodyTemplate,
++					recipient.getAccountName(),
++					evaluation.getCategory(),
++					evaluation.getPercentUsed(),
++					evaluation.getLimit(),
++					evaluation.getCurrency(),
++					evaluation.getPeriod(),
++					evaluation.getActual());
++
++			emailService.sendFormatted(NotificationType.BUDGET_ALERT, recipient, subject, body);
++			recordAlert(recipient.getAccountName(), evaluation);
++		} catch (Throwable t) {
++			log.error("failed to send budget alert to {} for budget {}", recipient, evaluation.getBudgetId(), t);
++		}
++	}
++
++	private void recordAlert(String accountName, BudgetEvaluation evaluation) {
++		BudgetAlertState state = alertStateRepository
++				.findByAccountNameAndBudgetId(accountName, evaluation.getBudgetId())
++				.orElseGet(BudgetAlertState::new);
++		state.setAccountName(accountName);
++		state.setBudgetId(evaluation.getBudgetId());
++		state.setLastStatus(evaluation.getStatus());
++		state.setLastAlertedAt(new Date());
++		alertStateRepository.save(state);
++	}
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/service/EmailService.java b/notification-service/src/main/java/com/piggymetrics/notification/service/EmailService.java
+index 5698419..bf01fd9 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/service/EmailService.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/service/EmailService.java
+@@ -10,4 +10,13 @@ public interface EmailService {
+ 
+ 	void send(NotificationType type, Recipient recipient, String attachment) throws MessagingException, IOException;
+ 
++	/**
++	 * Sends a message whose subject and body text are already fully formatted.
++	 * Used by alert flows (e.g. budget alerts) where the text depends on
++	 * runtime data that doesn't fit the {@link NotificationType} template
++	 * placeholder model.
++	 */
++	void sendFormatted(NotificationType type, Recipient recipient, String subject, String body)
++			throws MessagingException, IOException;
++
+ }
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/service/EmailServiceImpl.java b/notification-service/src/main/java/com/piggymetrics/notification/service/EmailServiceImpl.java
+index 037d230..382a574 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/service/EmailServiceImpl.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/service/EmailServiceImpl.java
+@@ -51,4 +51,19 @@ public class EmailServiceImpl implements EmailService {
+ 
+ 		log.info("{} email notification has been send to {}", type, recipient.getEmail());
+ 	}
++
++	@Override
++	public void sendFormatted(NotificationType type, Recipient recipient, String subject, String body)
++			throws MessagingException, IOException {
++
++		MimeMessage message = mailSender.createMimeMessage();
++		MimeMessageHelper helper = new MimeMessageHelper(message, true);
++		helper.setTo(recipient.getEmail());
++		helper.setSubject(subject);
++		helper.setText(body);
++
++		mailSender.send(message);
++
++		log.info("{} email notification has been sent to {}", type, recipient.getEmail());
++	}
+ }
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/controller/BudgetEvaluationController.java b/statistics-service/src/main/java/com/piggymetrics/statistics/controller/BudgetEvaluationController.java
+new file mode 100644
+index 0000000..a533350
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/controller/BudgetEvaluationController.java
+@@ -0,0 +1,30 @@
++package com.piggymetrics.statistics.controller;
++
++import com.piggymetrics.statistics.domain.Budget;
++import com.piggymetrics.statistics.domain.BudgetEvaluation;
++import com.piggymetrics.statistics.service.BudgetEvaluationService;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.security.access.prepost.PreAuthorize;
++import org.springframework.web.bind.annotation.*;
++
++import java.util.List;
++
++/**
++ * Service-to-service evaluation endpoint. Evaluation is read-only
++ * but aggregates potentially large amounts of per-account data, so
++ * it is restricted to the {@code server} OAuth2 scope.
++ */
++@RestController
++@RequestMapping("/budgets")
++public class BudgetEvaluationController {
++
++	@Autowired
++	private BudgetEvaluationService evaluationService;
++
++	@PreAuthorize("#oauth2.hasScope('server')")
++	@RequestMapping(value = "/evaluate/{accountName}", method = RequestMethod.POST)
++	public List<BudgetEvaluation> evaluate(@PathVariable String accountName,
++										   @RequestBody List<Budget> budgets) {
++		return evaluationService.evaluate(accountName, budgets);
++	}
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java
+new file mode 100644
+index 0000000..d2ec7cf
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java
+@@ -0,0 +1,86 @@
++package com.piggymetrics.statistics.domain;
++
++import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++
++import javax.validation.constraints.NotNull;
++import java.math.BigDecimal;
++
++/**
++ * Budget as received from account-service. Only the fields
++ * required for evaluation are modelled here.
++ */
++@JsonIgnoreProperties(ignoreUnknown = true)
++public class Budget {
++
++	public static final String TOTAL_CATEGORY = "_TOTAL";
++
++	public static final double DEFAULT_WARNING_THRESHOLD = 0.80;
++
++	private String id;
++
++	@NotNull
++	private String category;
++
++	@NotNull
++	private BigDecimal limit;
++
++	@NotNull
++	private Currency currency;
++
++	@NotNull
++	private BudgetPeriod period;
++
++	private Double warningThreshold;
++
++	public String getId() {
++		return id;
++	}
++
++	public void setId(String id) {
++		this.id = id;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public Currency getCurrency() {
++		return currency;
++	}
++
++	public void setCurrency(Currency currency) {
++		this.currency = currency;
++	}
++
++	public BudgetPeriod getPeriod() {
++		return period;
++	}
++
++	public void setPeriod(BudgetPeriod period) {
++		this.period = period;
++	}
++
++	public Double getWarningThreshold() {
++		return warningThreshold;
++	}
++
++	public void setWarningThreshold(Double warningThreshold) {
++		this.warningThreshold = warningThreshold;
++	}
++
++	public double getEffectiveWarningThreshold() {
++		return warningThreshold == null ? DEFAULT_WARNING_THRESHOLD : warningThreshold;
++	}
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluation.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluation.java
+new file mode 100644
+index 0000000..de58b0b
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluation.java
+@@ -0,0 +1,86 @@
++package com.piggymetrics.statistics.domain;
++
++import java.math.BigDecimal;
++
++/**
++ * Immutable result of comparing a {@link Budget} against actual
++ * spending accumulated in the budget's current period.
++ *
++ * Amounts (both {@code limit} and {@code actual}) are expressed
++ * in the budget's own {@link Currency} for direct presentation.
++ */
++public class BudgetEvaluation {
++
++	private String budgetId;
++	private String category;
++	private BudgetPeriod period;
++	private Currency currency;
++	private BigDecimal limit;
++	private BigDecimal actual;
++	private double percentUsed;
++	private BudgetStatus status;
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BudgetPeriod getPeriod() {
++		return period;
++	}
++
++	public void setPeriod(BudgetPeriod period) {
++		this.period = period;
++	}
++
++	public Currency getCurrency() {
++		return currency;
++	}
++
++	public void setCurrency(Currency currency) {
++		this.currency = currency;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public BigDecimal getActual() {
++		return actual;
++	}
++
++	public void setActual(BigDecimal actual) {
++		this.actual = actual;
++	}
++
++	public double getPercentUsed() {
++		return percentUsed;
++	}
++
++	public void setPercentUsed(double percentUsed) {
++		this.percentUsed = percentUsed;
++	}
++
++	public BudgetStatus getStatus() {
++		return status;
++	}
++
++	public void setStatus(BudgetStatus status) {
++		this.status = status;
++	}
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetPeriod.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetPeriod.java
+new file mode 100644
+index 0000000..1ce8851
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetPeriod.java
+@@ -0,0 +1,34 @@
++package com.piggymetrics.statistics.domain;
++
++import java.time.LocalDate;
++import java.time.Month;
++
++/**
++ * Calendar-aligned budget window. Provides helpers to compute
++ * the period-start and period-length in days used for
++ * currency / period-ratio normalization.
++ */
++public enum BudgetPeriod {
++
++	MONTH, QUARTER, YEAR;
++
++	/**
++	 * First day of the current period aligned to the calendar:
++	 * MONTH = first of the current month, QUARTER = first day of
++	 * the current calendar quarter, YEAR = January 1st.
++	 */
++	public LocalDate startOfPeriod(LocalDate today) {
++		switch (this) {
++			case MONTH:
++				return today.withDayOfMonth(1);
++			case QUARTER:
++				int quarterStartMonth = ((today.getMonthValue() - 1) / 3) * 3 + 1;
++				return LocalDate.of(today.getYear(), Month.of(quarterStartMonth), 1);
++			case YEAR:
++				return today.withDayOfYear(1);
++			default:
++				throw new IllegalStateException("unknown period: " + this);
++		}
++	}
++
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetStatus.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetStatus.java
+new file mode 100644
+index 0000000..37f27eb
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetStatus.java
+@@ -0,0 +1,7 @@
++package com.piggymetrics.statistics.domain;
++
++public enum BudgetStatus {
++
++	UNDER_BUDGET, WARNING, EXCEEDED
++
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/repository/DataPointRepository.java b/statistics-service/src/main/java/com/piggymetrics/statistics/repository/DataPointRepository.java
+index 725471f..e007afe 100644
+--- a/statistics-service/src/main/java/com/piggymetrics/statistics/repository/DataPointRepository.java
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/repository/DataPointRepository.java
+@@ -5,6 +5,7 @@ import com.piggymetrics.statistics.domain.timeseries.DataPointId;
+ import org.springframework.data.repository.CrudRepository;
+ import org.springframework.stereotype.Repository;
+ 
++import java.util.Date;
+ import java.util.List;
+ 
+ @Repository
+@@ -12,4 +13,10 @@ public interface DataPointRepository extends CrudRepository<DataPoint, DataPoint
+ 
+ 	List<DataPoint> findByIdAccount(String account);
+ 
++	/**
++	 * Used by budget evaluation to restrict aggregation to the current
++	 * budget period without pulling the full history.
++	 */
++	List<DataPoint> findByIdAccountAndIdDateGreaterThanEqual(String account, Date from);
++
+ }
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationService.java b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationService.java
+new file mode 100644
+index 0000000..969983f
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationService.java
+@@ -0,0 +1,18 @@
++package com.piggymetrics.statistics.service;
++
++import com.piggymetrics.statistics.domain.Budget;
++import com.piggymetrics.statistics.domain.BudgetEvaluation;
++
++import java.util.List;
++
++public interface BudgetEvaluationService {
++
++	/**
++	 * Computes one {@link BudgetEvaluation} per input {@link Budget}
++	 * for the supplied account. Actual spending is aggregated from the
++	 * {@code datapoints} collection and normalised into each budget's
++	 * own currency.
++	 */
++	List<BudgetEvaluation> evaluate(String accountName, List<Budget> budgets);
++
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
+new file mode 100644
+index 0000000..eaa6a09
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
+@@ -0,0 +1,119 @@
++package com.piggymetrics.statistics.service;
++
++import com.piggymetrics.statistics.domain.Budget;
++import com.piggymetrics.statistics.domain.BudgetEvaluation;
++import com.piggymetrics.statistics.domain.Currency;
++import com.piggymetrics.statistics.domain.BudgetStatus;
++import com.piggymetrics.statistics.domain.timeseries.DataPoint;
++import com.piggymetrics.statistics.domain.timeseries.ItemMetric;
++import com.piggymetrics.statistics.repository.DataPointRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.util.Assert;
++
++import java.math.BigDecimal;
++import java.math.RoundingMode;
++import java.time.LocalDate;
++import java.time.ZoneId;
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++
++/**
++ * Aggregates daily datapoints into actual spending and compares it
++ * to a caller-supplied {@link Budget}.
++ *
++ * <p><b>Normalization.</b> Each {@link ItemMetric} is already stored
++ * in base currency (USD) on a per-day ratio (see
++ * {@link StatisticsServiceImpl#createItemMetric}). Summing those
++ * per-day amounts over the days present in the current period
++ * therefore yields the total spent in USD for that period. We then
++ * convert to the budget's own currency so the user sees numbers in
++ * the unit they defined the budget in.
++ */
++@Service
++public class BudgetEvaluationServiceImpl implements BudgetEvaluationService {
++
++	private final Logger log = LoggerFactory.getLogger(getClass());
++
++	@Autowired
++	private DataPointRepository repository;
++
++	@Autowired
++	private ExchangeRatesService ratesService;
++
++	@Override
++	public List<BudgetEvaluation> evaluate(String accountName, List<Budget> budgets) {
++		Assert.hasLength(accountName);
++		if (budgets == null || budgets.isEmpty()) {
++			return new ArrayList<>();
++		}
++
++		LocalDate today = LocalDate.now();
++		List<BudgetEvaluation> results = new ArrayList<>(budgets.size());
++
++		for (Budget budget : budgets) {
++			Assert.notNull(budget.getPeriod(), "budget period must not be null");
++			Assert.notNull(budget.getCurrency(), "budget currency must not be null");
++			Assert.notNull(budget.getLimit(), "budget limit must not be null");
++
++			Date periodStart = Date.from(budget.getPeriod().startOfPeriod(today)
++					.atStartOfDay(ZoneId.systemDefault()).toInstant());
++
++			List<DataPoint> points = repository.findByIdAccountAndIdDateGreaterThanEqual(accountName, periodStart);
++
++			BigDecimal actualInBase = sumMatching(points, budget.getCategory());
++			BigDecimal actual = ratesService
++					.convert(Currency.getBase(), budget.getCurrency(), actualInBase)
++					.setScale(2, RoundingMode.HALF_UP);
++
++			results.add(toEvaluation(budget, actual));
++		}
++
++		log.debug("evaluated {} budgets for {}", results.size(), accountName);
++		return results;
++	}
++
++	private BigDecimal sumMatching(List<DataPoint> points, String category) {
++		boolean matchAll = Budget.TOTAL_CATEGORY.equalsIgnoreCase(category);
++		BigDecimal sum = BigDecimal.ZERO;
++		for (DataPoint point : points) {
++			if (point.getExpenses() == null) continue;
++			for (ItemMetric expense : point.getExpenses()) {
++				if (matchAll || category.equalsIgnoreCase(expense.getTitle())) {
++					sum = sum.add(expense.getAmount());
++				}
++			}
++		}
++		return sum;
++	}
++
++	private BudgetEvaluation toEvaluation(Budget budget, BigDecimal actual) {
++		BigDecimal limit = budget.getLimit();
++		double percent = limit.signum() == 0
++				? 0.0
++				: actual.divide(limit, 4, RoundingMode.HALF_UP).doubleValue();
++
++		BudgetStatus status;
++		if (percent >= 1.0) {
++			status = BudgetStatus.EXCEEDED;
++		} else if (percent >= budget.getEffectiveWarningThreshold()) {
++			status = BudgetStatus.WARNING;
++		} else {
++			status = BudgetStatus.UNDER_BUDGET;
++		}
++
++		BudgetEvaluation evaluation = new BudgetEvaluation();
++		evaluation.setBudgetId(budget.getId());
++		evaluation.setCategory(budget.getCategory());
++		evaluation.setPeriod(budget.getPeriod());
++		evaluation.setCurrency(budget.getCurrency());
++		evaluation.setLimit(limit);
++		evaluation.setActual(actual);
++		evaluation.setPercentUsed(percent);
++		evaluation.setStatus(status);
++		return evaluation;
++	}
++}
