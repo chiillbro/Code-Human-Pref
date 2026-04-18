@@ -1,0 +1,75 @@
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java b/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
+index 5e7301b..7d2589f 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
+@@ -1,6 +1,6 @@
+ package com.piggymetrics.account.domain;
+ 
+-import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ import org.hibernate.validator.constraints.Length;
+ import org.hibernate.validator.constraints.NotBlank;
+ import org.springframework.data.annotation.Id;
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java
+index a63d1e9..0bde091 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java
+@@ -1,6 +1,6 @@
+ package com.piggymetrics.account.domain;
+ 
+-import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ 
+ import java.math.BigDecimal;
+ 
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java
+index 2368141..227bffe 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java
+@@ -1,6 +1,6 @@
+ package com.piggymetrics.notification.domain;
+ 
+-import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ 
+ import java.math.BigDecimal;
+ 
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java
+index d2ec7cf..7c65be7 100644
+--- a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java
+@@ -1,6 +1,6 @@
+ package com.piggymetrics.statistics.domain;
+ 
+-import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ 
+ import javax.validation.constraints.NotNull;
+ import java.math.BigDecimal;
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
+index eaa6a09..d4023f9 100644
+--- a/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
+@@ -64,12 +64,18 @@ public class BudgetEvaluationServiceImpl implements BudgetEvaluationService {
+ 
+ 			List<DataPoint> points = repository.findByIdAccountAndIdDateGreaterThanEqual(accountName, periodStart);
+ 
+-			BigDecimal actualInBase = sumMatching(points, budget.getCategory());
+-			BigDecimal actual = ratesService
+-					.convert(Currency.getBase(), budget.getCurrency(), actualInBase)
++			// Sum per-day amounts across all DataPoints in the period (amounts are in base currency)
++			BigDecimal actualInBaseCurrency = sumMatching(points, budget.getCategory());
++
++			// Convert actual spending from base (USD) to the budget's own currency
++			// so that both actual and limit are expressed in the same unit.
++			Currency budgetCurrency = budget.getCurrency();
++			BigDecimal actualInBudgetCurrency = ratesService
++					.convert(Currency.getBase(), budgetCurrency, actualInBaseCurrency)
+ 					.setScale(2, RoundingMode.HALF_UP);
+ 
+-			results.add(toEvaluation(budget, actual));
++			// limit is already in budgetCurrency (as defined by the user)
++			results.add(toEvaluation(budget, actualInBudgetCurrency));
+ 		}
+ 
+ 		log.debug("evaluated {} budgets for {}", results.size(), accountName);

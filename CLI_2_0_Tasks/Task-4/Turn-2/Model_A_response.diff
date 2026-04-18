@@ -1,0 +1,293 @@
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java b/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
+index 5e7301b..7d2589f 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
+@@ -1,6 +1,6 @@
+ package com.piggymetrics.account.domain;
+ 
+-import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ import org.hibernate.validator.constraints.Length;
+ import org.hibernate.validator.constraints.NotBlank;
+ import org.springframework.data.annotation.Id;
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java
+index a63d1e9..efc2595 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluation.java
+@@ -1,12 +1,17 @@
+ package com.piggymetrics.account.domain;
+ 
+-import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ 
+ import java.math.BigDecimal;
+ 
+ /**
+  * DTO returned by statistics-service describing how a {@link Budget}
+  * compares to actual spending in its period.
++ *
++ * <p><b>Currency invariant:</b> {@link #limitAmount} and {@link #actualAmount}
++ * are always expressed in the same {@link #currency} (the budget's own
++ * currency) so callers can render / compare them directly without any
++ * further conversion.
+  */
+ @JsonIgnoreProperties(ignoreUnknown = true)
+ public class BudgetEvaluation {
+@@ -14,9 +19,16 @@ public class BudgetEvaluation {
+ 	private String budgetId;
+ 	private String category;
+ 	private BudgetPeriod period;
++
++	/** Currency of both {@link #limitAmount} and {@link #actualAmount}. */
+ 	private Currency currency;
+-	private BigDecimal limit;
+-	private BigDecimal actual;
++
++	/** Budget ceiling, verbatim from the user-defined {@link Budget#getLimit()}. */
++	private BigDecimal limitAmount;
++
++	/** Total spent in the current period, converted into {@link #currency}. */
++	private BigDecimal actualAmount;
++
+ 	private double percentUsed;
+ 	private BudgetStatus status;
+ 
+@@ -52,20 +64,20 @@ public class BudgetEvaluation {
+ 		this.currency = currency;
+ 	}
+ 
+-	public BigDecimal getLimit() {
+-		return limit;
++	public BigDecimal getLimitAmount() {
++		return limitAmount;
+ 	}
+ 
+-	public void setLimit(BigDecimal limit) {
+-		this.limit = limit;
++	public void setLimitAmount(BigDecimal limitAmount) {
++		this.limitAmount = limitAmount;
+ 	}
+ 
+-	public BigDecimal getActual() {
+-		return actual;
++	public BigDecimal getActualAmount() {
++		return actualAmount;
+ 	}
+ 
+-	public void setActual(BigDecimal actual) {
+-		this.actual = actual;
++	public void setActualAmount(BigDecimal actualAmount) {
++		this.actualAmount = actualAmount;
+ 	}
+ 
+ 	public double getPercentUsed() {
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java
+index 2368141..8c9ceaa 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetEvaluation.java
+@@ -1,12 +1,15 @@
+ package com.piggymetrics.notification.domain;
+ 
+-import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ 
+ import java.math.BigDecimal;
+ 
+ /**
+  * DTO mirroring statistics-service's budget evaluation result,
+  * used to decide whether to send an alert email.
++ *
++ * <p><b>Currency invariant:</b> {@link #limitAmount} and
++ * {@link #actualAmount} are always in {@link #currency}.
+  */
+ @JsonIgnoreProperties(ignoreUnknown = true)
+ public class BudgetEvaluation {
+@@ -15,8 +18,8 @@ public class BudgetEvaluation {
+ 	private String category;
+ 	private BudgetPeriod period;
+ 	private String currency;
+-	private BigDecimal limit;
+-	private BigDecimal actual;
++	private BigDecimal limitAmount;
++	private BigDecimal actualAmount;
+ 	private double percentUsed;
+ 	private BudgetStatus status;
+ 
+@@ -52,20 +55,20 @@ public class BudgetEvaluation {
+ 		this.currency = currency;
+ 	}
+ 
+-	public BigDecimal getLimit() {
+-		return limit;
++	public BigDecimal getLimitAmount() {
++		return limitAmount;
+ 	}
+ 
+-	public void setLimit(BigDecimal limit) {
+-		this.limit = limit;
++	public void setLimitAmount(BigDecimal limitAmount) {
++		this.limitAmount = limitAmount;
+ 	}
+ 
+-	public BigDecimal getActual() {
+-		return actual;
++	public BigDecimal getActualAmount() {
++		return actualAmount;
+ 	}
+ 
+-	public void setActual(BigDecimal actual) {
+-		this.actual = actual;
++	public void setActualAmount(BigDecimal actualAmount) {
++		this.actualAmount = actualAmount;
+ 	}
+ 
+ 	public double getPercentUsed() {
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertServiceImpl.java b/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertServiceImpl.java
+index 93bb5c3..457f637 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertServiceImpl.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/service/BudgetAlertServiceImpl.java
+@@ -126,10 +126,10 @@ public class BudgetAlertServiceImpl implements BudgetAlertService {
+ 					recipient.getAccountName(),
+ 					evaluation.getCategory(),
+ 					evaluation.getPercentUsed(),
+-					evaluation.getLimit(),
++					evaluation.getLimitAmount(),
+ 					evaluation.getCurrency(),
+ 					evaluation.getPeriod(),
+-					evaluation.getActual());
++					evaluation.getActualAmount());
+ 
+ 			emailService.sendFormatted(NotificationType.BUDGET_ALERT, recipient, subject, body);
+ 			recordAlert(recipient.getAccountName(), evaluation);
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java
+index d2ec7cf..7c65be7 100644
+--- a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/Budget.java
+@@ -1,6 +1,6 @@
+ package com.piggymetrics.statistics.domain;
+ 
+-import org.codehaus.jackson.annotate.JsonIgnoreProperties;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+ 
+ import javax.validation.constraints.NotNull;
+ import java.math.BigDecimal;
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluation.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluation.java
+index de58b0b..825a0e7 100644
+--- a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluation.java
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluation.java
+@@ -3,20 +3,29 @@ package com.piggymetrics.statistics.domain;
+ import java.math.BigDecimal;
+ 
+ /**
+- * Immutable result of comparing a {@link Budget} against actual
+- * spending accumulated in the budget's current period.
++ * Result of comparing a {@link Budget} against actual spending
++ * accumulated in the budget's current period.
+  *
+- * Amounts (both {@code limit} and {@code actual}) are expressed
+- * in the budget's own {@link Currency} for direct presentation.
++ * <p><b>Currency invariant:</b> {@link #limitAmount} and
++ * {@link #actualAmount} are always in {@link #currency} (the budget's
++ * own currency). Callers must never assume base-currency (USD)
++ * values are returned here.
+  */
+ public class BudgetEvaluation {
+ 
+ 	private String budgetId;
+ 	private String category;
+ 	private BudgetPeriod period;
++
++	/** Currency of both {@link #limitAmount} and {@link #actualAmount}. */
+ 	private Currency currency;
+-	private BigDecimal limit;
+-	private BigDecimal actual;
++
++	/** Budget ceiling (copied from the input {@link Budget#getLimit()}). */
++	private BigDecimal limitAmount;
++
++	/** Total spent in the period, converted from base (USD) into {@link #currency}. */
++	private BigDecimal actualAmount;
++
+ 	private double percentUsed;
+ 	private BudgetStatus status;
+ 
+@@ -52,20 +61,20 @@ public class BudgetEvaluation {
+ 		this.currency = currency;
+ 	}
+ 
+-	public BigDecimal getLimit() {
+-		return limit;
++	public BigDecimal getLimitAmount() {
++		return limitAmount;
+ 	}
+ 
+-	public void setLimit(BigDecimal limit) {
+-		this.limit = limit;
++	public void setLimitAmount(BigDecimal limitAmount) {
++		this.limitAmount = limitAmount;
+ 	}
+ 
+-	public BigDecimal getActual() {
+-		return actual;
++	public BigDecimal getActualAmount() {
++		return actualAmount;
+ 	}
+ 
+-	public void setActual(BigDecimal actual) {
+-		this.actual = actual;
++	public void setActualAmount(BigDecimal actualAmount) {
++		this.actualAmount = actualAmount;
+ 	}
+ 
+ 	public double getPercentUsed() {
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
+index eaa6a09..a0d0b62 100644
+--- a/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
+@@ -64,12 +64,17 @@ public class BudgetEvaluationServiceImpl implements BudgetEvaluationService {
+ 
+ 			List<DataPoint> points = repository.findByIdAccountAndIdDateGreaterThanEqual(accountName, periodStart);
+ 
++			// ItemMetric amounts are stored in base (USD) per-day. Summing
++			// across every day present in the current period yields the total
++			// spend in USD for that period. We then re-express it in the
++			// budget's own currency so that limitAmount and actualAmount
++			// downstream are directly comparable numbers.
+ 			BigDecimal actualInBase = sumMatching(points, budget.getCategory());
+-			BigDecimal actual = ratesService
++			BigDecimal actualInBudgetCurrency = ratesService
+ 					.convert(Currency.getBase(), budget.getCurrency(), actualInBase)
+ 					.setScale(2, RoundingMode.HALF_UP);
+ 
+-			results.add(toEvaluation(budget, actual));
++			results.add(toEvaluation(budget, actualInBudgetCurrency));
+ 		}
+ 
+ 		log.debug("evaluated {} budgets for {}", results.size(), accountName);
+@@ -90,11 +95,11 @@ public class BudgetEvaluationServiceImpl implements BudgetEvaluationService {
+ 		return sum;
+ 	}
+ 
+-	private BudgetEvaluation toEvaluation(Budget budget, BigDecimal actual) {
+-		BigDecimal limit = budget.getLimit();
+-		double percent = limit.signum() == 0
++	private BudgetEvaluation toEvaluation(Budget budget, BigDecimal actualInBudgetCurrency) {
++		BigDecimal limitAmount = budget.getLimit();
++		double percent = limitAmount.signum() == 0
+ 				? 0.0
+-				: actual.divide(limit, 4, RoundingMode.HALF_UP).doubleValue();
++				: actualInBudgetCurrency.divide(limitAmount, 4, RoundingMode.HALF_UP).doubleValue();
+ 
+ 		BudgetStatus status;
+ 		if (percent >= 1.0) {
+@@ -110,8 +115,8 @@ public class BudgetEvaluationServiceImpl implements BudgetEvaluationService {
+ 		evaluation.setCategory(budget.getCategory());
+ 		evaluation.setPeriod(budget.getPeriod());
+ 		evaluation.setCurrency(budget.getCurrency());
+-		evaluation.setLimit(limit);
+-		evaluation.setActual(actual);
++		evaluation.setLimitAmount(limitAmount);
++		evaluation.setActualAmount(actualInBudgetCurrency);
+ 		evaluation.setPercentUsed(percent);
+ 		evaluation.setStatus(status);
+ 		return evaluation;
