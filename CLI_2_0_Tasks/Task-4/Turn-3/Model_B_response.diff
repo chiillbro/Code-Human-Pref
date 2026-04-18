@@ -1,0 +1,168 @@
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClient.java b/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClient.java
+deleted file mode 100644
+index 4688636..0000000
+--- a/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClient.java
++++ /dev/null
+@@ -1,28 +0,0 @@
+-package com.piggymetrics.account.client;
+-
+-import com.piggymetrics.account.domain.Budget;
+-import com.piggymetrics.account.domain.BudgetEvaluation;
+-import org.springframework.cloud.openfeign.FeignClient;
+-import org.springframework.http.MediaType;
+-import org.springframework.web.bind.annotation.PathVariable;
+-import org.springframework.web.bind.annotation.RequestBody;
+-import org.springframework.web.bind.annotation.RequestMapping;
+-import org.springframework.web.bind.annotation.RequestMethod;
+-
+-import java.util.List;
+-
+-/**
+- * Delegates budget evaluation (actual-vs-limit computation with
+- * currency / period normalization) to statistics-service.
+- */
+-@FeignClient(name = "statistics-service", contextId = "budget-evaluation",
+-		fallback = BudgetEvaluationClientFallback.class)
+-public interface BudgetEvaluationClient {
+-
+-	@RequestMapping(method = RequestMethod.POST,
+-			value = "/statistics/budgets/evaluate/{accountName}",
+-			consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
+-	List<BudgetEvaluation> evaluate(@PathVariable("accountName") String accountName,
+-									@RequestBody List<Budget> budgets);
+-
+-}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClientFallback.java b/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClientFallback.java
+deleted file mode 100644
+index ab51c81..0000000
+--- a/account-service/src/main/java/com/piggymetrics/account/client/BudgetEvaluationClientFallback.java
++++ /dev/null
+@@ -1,27 +0,0 @@
+-package com.piggymetrics.account.client;
+-
+-import com.piggymetrics.account.domain.Budget;
+-import com.piggymetrics.account.domain.BudgetEvaluation;
+-import org.slf4j.Logger;
+-import org.slf4j.LoggerFactory;
+-import org.springframework.stereotype.Component;
+-
+-import java.util.Collections;
+-import java.util.List;
+-
+-/**
+- * Fallback returns an empty evaluation list so that callers
+- * (UI, notification cron) degrade gracefully when
+- * statistics-service is unavailable.
+- */
+-@Component
+-public class BudgetEvaluationClientFallback implements BudgetEvaluationClient {
+-
+-	private static final Logger LOGGER = LoggerFactory.getLogger(BudgetEvaluationClientFallback.class);
+-
+-	@Override
+-	public List<BudgetEvaluation> evaluate(String accountName, List<Budget> budgets) {
+-		LOGGER.error("statistics-service unavailable, returning empty budget evaluations for account: {}", accountName);
+-		return Collections.emptyList();
+-	}
+-}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
+index 7943fb5..1ede45e 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
++++ b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
+@@ -1,16 +1,31 @@
+ package com.piggymetrics.account.client;
+ 
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetEvaluation;
+ import org.springframework.cloud.openfeign.FeignClient;
+ import org.springframework.http.MediaType;
+ import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RequestMethod;
+ 
++import java.util.List;
++
+ @FeignClient(name = "statistics-service", fallback = StatisticsServiceClientFallback.class)
+ public interface StatisticsServiceClient {
+ 
+ 	@RequestMapping(method = RequestMethod.PUT, value = "/statistics/{accountName}", consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
+ 	void updateStatistics(@PathVariable("accountName") String accountName, Account account);
+ 
++	/**
++	 * Delegates budget evaluation (actual-vs-limit computation with currency
++	 * and period normalisation) to statistics-service.
++	 */
++	@RequestMapping(method = RequestMethod.POST,
++			value = "/statistics/budgets/evaluate/{accountName}",
++			consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
++	List<BudgetEvaluation> evaluateBudgets(@PathVariable("accountName") String accountName,
++										   @RequestBody List<Budget> budgets);
++
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
+index 21c9167..59ff2d3 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
++++ b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
+@@ -1,10 +1,15 @@
+ package com.piggymetrics.account.client;
+ 
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetEvaluation;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Component;
+ 
++import java.util.Collections;
++import java.util.List;
++
+ /**
+  * @author cdov
+  */
+@@ -15,4 +20,14 @@ public class StatisticsServiceClientFallback implements StatisticsServiceClient
+     public void updateStatistics(String accountName, Account account) {
+         LOGGER.error("Error during update statistics for account: {}", accountName);
+     }
++
++    /**
++     * Returns an empty evaluation list so that callers (UI, notification cron)
++     * degrade gracefully when statistics-service is unavailable.
++     */
++    @Override
++    public List<BudgetEvaluation> evaluateBudgets(String accountName, List<Budget> budgets) {
++        LOGGER.error("statistics-service unavailable, returning empty budget evaluations for account: {}", accountName);
++        return Collections.emptyList();
++    }
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/BudgetServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/BudgetServiceImpl.java
+index 1d2c2e6..6019177 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/BudgetServiceImpl.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/BudgetServiceImpl.java
+@@ -1,6 +1,6 @@
+ package com.piggymetrics.account.service;
+ 
+-import com.piggymetrics.account.client.BudgetEvaluationClient;
++import com.piggymetrics.account.client.StatisticsServiceClient;
+ import com.piggymetrics.account.domain.Budget;
+ import com.piggymetrics.account.domain.BudgetEvaluation;
+ import com.piggymetrics.account.repository.BudgetRepository;
+@@ -24,7 +24,7 @@ public class BudgetServiceImpl implements BudgetService {
+ 	private BudgetRepository repository;
+ 
+ 	@Autowired
+-	private BudgetEvaluationClient evaluationClient;
++	private StatisticsServiceClient statisticsClient;
+ 
+ 	@Override
+ 	public Budget create(String accountName, Budget budget) {
+@@ -118,7 +118,7 @@ public class BudgetServiceImpl implements BudgetService {
+ 		if (active.isEmpty()) {
+ 			return Collections.emptyList();
+ 		}
+-		return evaluationClient.evaluate(accountName, active);
++		return statisticsClient.evaluateBudgets(accountName, active);
+ 	}
+ 
+ 	private Budget loadOwned(String accountName, String budgetId) {
