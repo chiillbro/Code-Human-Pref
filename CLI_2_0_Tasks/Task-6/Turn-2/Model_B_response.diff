@@ -1,0 +1,523 @@
+diff --git a/account-service/src/main/java/com/piggymetrics/account/controller/TransactionController.java b/account-service/src/main/java/com/piggymetrics/account/controller/TransactionController.java
+index 18a64fd..4b52e41 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/controller/TransactionController.java
++++ b/account-service/src/main/java/com/piggymetrics/account/controller/TransactionController.java
+@@ -13,7 +13,7 @@ import org.springframework.format.annotation.DateTimeFormat;
+ import org.springframework.web.bind.annotation.DeleteMapping;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+-import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.PutMapping;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RequestParam;
+ import org.springframework.web.bind.annotation.RestController;
+@@ -53,12 +53,12 @@ public class TransactionController {
+ 		return transactionService.get(principal.getName(), id);
+ 	}
+ 
+-	@PostMapping("/{id}/approve")
++	@PutMapping("/{id}/approve")
+ 	public Transaction approve(Principal principal, @PathVariable String id) {
+ 		return transactionService.approve(principal.getName(), id);
+ 	}
+ 
+-	@PostMapping("/{id}/skip")
++	@PutMapping("/{id}/skip")
+ 	public Transaction skip(Principal principal, @PathVariable String id) {
+ 		return transactionService.skip(principal.getName(), id);
+ 	}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/transaction/Transaction.java b/account-service/src/main/java/com/piggymetrics/account/domain/transaction/Transaction.java
+index c2311da..171d6e1 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/transaction/Transaction.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/transaction/Transaction.java
+@@ -2,6 +2,7 @@ package com.piggymetrics.account.domain.transaction;
+ 
+ import com.piggymetrics.account.domain.Currency;
+ import org.springframework.data.annotation.Id;
++import org.springframework.data.mongodb.core.index.CompoundIndex;
+ import org.springframework.data.mongodb.core.index.Indexed;
+ import org.springframework.data.mongodb.core.mapping.Document;
+ 
+@@ -9,6 +10,9 @@ import java.math.BigDecimal;
+ import java.util.Date;
+ 
+ @Document(collection = "transactions")
++@CompoundIndex(name = "uk_account_item_schedule_type",
++		def = "{'accountName': 1, 'sourceItemTitle': 1, 'scheduledDate': 1, 'type': 1}",
++		unique = true)
+ public class Transaction {
+ 
+ 	@Id
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java
+index aa6a595..b9d3a8b 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java
+@@ -7,6 +7,7 @@ import java.time.LocalDate;
+ import java.time.LocalDateTime;
+ import java.time.YearMonth;
+ import java.time.ZoneId;
++import java.time.temporal.ChronoUnit;
+ import java.util.Date;
+ 
+ /**
+@@ -67,22 +68,21 @@ public class RecurrenceService {
+ 	/**
+ 	 * Returns the first occurrence that is strictly after {@code after}.
+ 	 * If {@code after} is null, returns the anchor itself.
++	 *
++	 * <p>Instead of iterating from n=0, we estimate a starting n via
++	 * {@link #estimateN} and walk forward from there, keeping the loop
++	 * to at most a handful of iterations even for HOUR periods spanning
++	 * years.
+ 	 */
+ 	public Date nextAfter(Date anchor, TimePeriod period, Date after) {
+ 		if (after == null) {
+ 			return anchor;
+ 		}
+-		int n = 0;
++		int n = estimateN(anchor, period, after);
+ 		Date candidate = occurrence(anchor, period, n);
+ 		while (!candidate.after(after)) {
+ 			n++;
+ 			candidate = occurrence(anchor, period, n);
+-			// Defensive upper bound to avoid runaway loops on pathological
+-			// inputs (e.g. an anchor far in the past with an HOUR period).
+-			if (n > 1_000_000) {
+-				throw new IllegalStateException(
+-						"could not locate next occurrence within 1,000,000 iterations");
+-			}
+ 		}
+ 		return candidate;
+ 	}
+@@ -96,19 +96,54 @@ public class RecurrenceService {
+ 		if (at == null || !anchor.before(at)) {
+ 			return anchor;
+ 		}
+-		int n = 0;
++		int n = estimateN(anchor, period, at);
+ 		Date candidate = occurrence(anchor, period, n);
+ 		while (candidate.before(at)) {
+ 			n++;
+ 			candidate = occurrence(anchor, period, n);
+-			if (n > 1_000_000) {
+-				throw new IllegalStateException(
+-						"could not locate first occurrence within 1,000,000 iterations");
+-			}
+ 		}
+ 		return candidate;
+ 	}
+ 
++	/**
++	 * Returns a lower-bound estimate for n such that
++	 * {@code occurrence(anchor, period, n)} is near {@code target}. The
++	 * estimate is deliberately conservative (may undershoot by 1-2) so
++	 * the caller's linear scan never overshoots and still converges in a
++	 * small constant number of steps.
++	 */
++	int estimateN(Date anchor, TimePeriod period, Date target) {
++		if (!anchor.before(target)) {
++			return 0;
++		}
++		LocalDateTime anchorDt = LocalDateTime.ofInstant(anchor.toInstant(), zoneId);
++		LocalDateTime targetDt = LocalDateTime.ofInstant(target.toInstant(), zoneId);
++		long estimate;
++		switch (period) {
++			case YEAR:
++				estimate = ChronoUnit.YEARS.between(anchorDt, targetDt);
++				break;
++			case QUARTER:
++				estimate = ChronoUnit.MONTHS.between(anchorDt, targetDt) / 3;
++				break;
++			case MONTH:
++				estimate = ChronoUnit.MONTHS.between(anchorDt, targetDt);
++				break;
++			case DAY:
++				estimate = ChronoUnit.DAYS.between(anchorDt, targetDt);
++				break;
++			case HOUR:
++				estimate = ChronoUnit.HOURS.between(anchorDt, targetDt);
++				break;
++			default:
++				return 0;
++		}
++		// Clamp: conservative lower bound — never go negative, and
++		// subtract 1 to account for month-end clamping effects where
++		// the computed month-diff can be slightly too high.
++		return Math.max(0, (int) Math.min(estimate - 1, Integer.MAX_VALUE));
++	}
++
+ 	/**
+ 	 * Adds {@code months} to the given date-time while preserving the
+ 	 * anchor's day-of-month. If the target month is shorter than the
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java
+index 7224d2f..bb63f96 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java
+@@ -15,6 +15,8 @@ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.beans.factory.annotation.Value;
+ import org.springframework.stereotype.Service;
+ 
++import org.springframework.dao.DuplicateKeyException;
++
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Date;
+@@ -74,50 +76,58 @@ public class RecurringTransactionService {
+ 	}
+ 
+ 	/**
+-	 * Processes a single account. Returns the number of transactions that
+-	 * were created (across all items).
++	 * Processes a single account. Returns the number of new transactions
++	 * that were created (across all items). The account is persisted (to
++	 * advance recurrence cursors) whenever any due dates were processed,
++	 * even if all turned out to be duplicates from a concurrent instance.
+ 	 */
+ 	public int processAccount(Account account, Date now) {
+ 		if (account == null) {
+ 			return 0;
+ 		}
+-		int createdForAccount = 0;
+-		createdForAccount += processItems(account, account.getIncomes(), TransactionType.INCOME, now);
+-		createdForAccount += processItems(account, account.getExpenses(), TransactionType.EXPENSE, now);
+-
+-		if (createdForAccount > 0) {
++		int[] counters = new int[2]; // [0]=processed, [1]=newlyCreated
++		processItems(account, account.getIncomes(), TransactionType.INCOME, now, counters);
++		processItems(account, account.getExpenses(), TransactionType.EXPENSE, now, counters);
++		int processed = counters[0];
++		int newlyCreated = counters[1];
++
++		if (processed > 0) {
++			// Always persist the account so the advanced cursor is saved,
++			// even when all transactions were duplicates.
+ 			accountRepository.save(account);
+ 
+-			// At least one transaction was auto-posted or backfilled; keep
+-			// the statistics service in sync with the new activity.
+-			try {
+-				statisticsClient.updateStatistics(account.getName(), account);
+-			} catch (RuntimeException ex) {
+-				log.warn("failed to update statistics for {} after recurring run",
+-						account.getName(), ex);
++			if (newlyCreated > 0) {
++				// At least one transaction was newly created; keep the
++				// statistics service in sync with the new activity.
++				try {
++					statisticsClient.updateStatistics(account.getName(), account);
++				} catch (RuntimeException ex) {
++					log.warn("failed to update statistics for {} after recurring run",
++							account.getName(), ex);
++				}
+ 			}
+ 		}
+-		return createdForAccount;
++		return newlyCreated;
+ 	}
+ 
+-	private int processItems(Account account, List<Item> items, TransactionType type, Date now) {
++	private void processItems(Account account, List<Item> items, TransactionType type,
++			Date now, int[] counters) {
+ 		if (items == null || items.isEmpty()) {
+-			return 0;
++			return;
+ 		}
+-		int created = 0;
+ 		for (Item item : items) {
+-			created += processItem(account, item, type, now);
++			processItem(account, item, type, now, counters);
+ 		}
+-		return created;
+ 	}
+ 
+-	private int processItem(Account account, Item item, TransactionType type, Date now) {
++	private void processItem(Account account, Item item, TransactionType type,
++			Date now, int[] counters) {
+ 		RecurrenceSettings settings = item.getRecurrence();
+ 		if (settings == null
+ 				|| !Boolean.TRUE.equals(settings.getEnabled())
+ 				|| settings.getAnchorDate() == null
+ 				|| item.getPeriod() == null) {
+-			return 0;
++			return;
+ 		}
+ 
+ 		// Initialise the cursor if the user has just enabled recurrence
+@@ -130,7 +140,7 @@ public class RecurringTransactionService {
+ 
+ 		List<Date> dueDates = collectDueDates(settings, item, now);
+ 		if (dueDates.isEmpty()) {
+-			return 0;
++			return;
+ 		}
+ 
+ 		boolean autoPost = Boolean.TRUE.equals(settings.getAutoPost());
+@@ -138,24 +148,39 @@ public class RecurringTransactionService {
+ 		// occurrence; everything earlier is considered backfill.
+ 		Date current = dueDates.get(dueDates.size() - 1);
+ 
+-		List<Transaction> toSave = new ArrayList<>(dueDates.size());
++		int saved = 0;
++		int skippedDuplicates = 0;
+ 		for (Date scheduled : dueDates) {
+ 			boolean isCurrent = scheduled.equals(current);
+ 			boolean isBackfill = !isCurrent;
+ 			Transaction tx = buildTransaction(account, item, type, scheduled, now,
+ 					autoPost, isBackfill);
+-			toSave.add(tx);
++			try {
++				transactionRepository.save(tx);
++				saved++;
++			} catch (DuplicateKeyException ex) {
++				// Another instance already created this transaction for the
++				// same (account, item, scheduledDate, type) — expected under
++				// multi-instance deployments.  Skip and continue.
++				log.debug("skipping duplicate transaction for account={} item={} scheduled={}",
++						account.getName(), item.getTitle(), scheduled);
++				skippedDuplicates++;
++			}
+ 		}
+-		transactionRepository.saveAll(toSave);
+ 
+-		// Advance the cursor past the latest occurrence we just generated.
++		counters[0] += dueDates.size();
++		counters[1] += saved;
++
++		// Advance the cursor past the latest occurrence we just generated
++		// (or attempted to generate, since duplicates still mean the date
++		// has been covered).
+ 		settings.setLastGeneratedDate(current);
+ 		settings.setNextScheduledDate(
+ 				recurrenceService.nextAfter(settings.getAnchorDate(), item.getPeriod(), current));
+ 
+-		log.debug("generated {} transaction(s) for account={} item={} (backfilled={})",
+-				toSave.size(), account.getName(), item.getTitle(), toSave.size() - 1);
+-		return toSave.size();
++		log.debug("generated {} transaction(s) for account={} item={} (backfilled={}, duplicates={})",
++				saved, account.getName(), item.getTitle(),
++				Math.max(0, dueDates.size() - 1), skippedDuplicates);
+ 	}
+ 
+ 	/**
+diff --git a/account-service/src/test/java/com/piggymetrics/account/controller/TransactionControllerTest.java b/account-service/src/test/java/com/piggymetrics/account/controller/TransactionControllerTest.java
+index b05b8c4..79f9273 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/controller/TransactionControllerTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/controller/TransactionControllerTest.java
+@@ -30,7 +30,7 @@ import static org.mockito.Mockito.when;
+ import static org.mockito.MockitoAnnotations.initMocks;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+-import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
+ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+ 
+@@ -98,7 +98,7 @@ public class TransactionControllerTest {
+ 	public void approveCallsServiceAndReturnsUpdated() throws Exception {
+ 		when(transactionService.approve("demo", "1")).thenReturn(tx("1", TransactionStatus.POSTED));
+ 
+-		mockMvc.perform(post("/current/transactions/1/approve")
++		mockMvc.perform(put("/current/transactions/1/approve")
+ 				.principal(new UserPrincipal("demo")))
+ 				.andExpect(status().isOk())
+ 				.andExpect(jsonPath("$.status").value("POSTED"));
+@@ -109,7 +109,7 @@ public class TransactionControllerTest {
+ 	public void skipCallsService() throws Exception {
+ 		when(transactionService.skip("demo", "1")).thenReturn(tx("1", TransactionStatus.SKIPPED));
+ 
+-		mockMvc.perform(post("/current/transactions/1/skip")
++		mockMvc.perform(put("/current/transactions/1/skip")
+ 				.principal(new UserPrincipal("demo")))
+ 				.andExpect(status().isOk())
+ 				.andExpect(jsonPath("$.status").value("SKIPPED"));
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurrenceServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurrenceServiceTest.java
+index 32f7e14..ee4c9d8 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurrenceServiceTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurrenceServiceTest.java
+@@ -115,4 +115,38 @@ public class RecurrenceServiceTest {
+ 	public void rejectsNullAnchor() {
+ 		service.occurrence(null, TimePeriod.DAY, 1);
+ 	}
++
++	@Test
++	public void nextAfterHandlesLargeHourGapEfficiently() {
++		// An HOUR anchor 2 years in the past would require ~17,520
++		// iterations without the estimateN optimisation.
++		Date anchor = utc(2024, 1, 1, 0, 0);
++		Date after = utc(2026, 1, 1, 0, 0);
++		Date result = service.nextAfter(anchor, TimePeriod.HOUR, after);
++		assertEquals(utc(2026, 1, 1, 1, 0), result);
++	}
++
++	@Test
++	public void estimateNReturnsConservativeLowerBound() {
++		Date anchor = utc(2020, 1, 31, 0, 0);
++		Date target = utc(2026, 6, 15, 0, 0);
++		int n = service.estimateN(anchor, TimePeriod.MONTH, target);
++		// The estimate should be below or equal to the real index so the
++		// linear scan always converges forward, never backwards.
++		Date estimated = service.occurrence(anchor, TimePeriod.MONTH, n);
++		assert !estimated.after(target) :
++				"estimate overshoot: occurrence(" + n + ")=" + estimated + " > target=" + target;
++		// And it should be close — no more than 2 off.
++		Date nPlus2 = service.occurrence(anchor, TimePeriod.MONTH, n + 2);
++		assert !nPlus2.before(target) :
++				"estimate too low: occurrence(" + (n + 2) + ")=" + nPlus2 + " still before target=" + target;
++	}
++
++	@Test
++	public void firstOccurrenceAtOrAfterHandlesLargeHourGap() {
++		Date anchor = utc(2024, 1, 1, 0, 0);
++		Date at = utc(2026, 1, 1, 0, 0);
++		Date result = service.firstOccurrenceAtOrAfter(anchor, TimePeriod.HOUR, at);
++		assertEquals(utc(2026, 1, 1, 0, 0), result);
++	}
+ }
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurringTransactionServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurringTransactionServiceTest.java
+index ba8f81b..fb77dcd 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurringTransactionServiceTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurringTransactionServiceTest.java
+@@ -32,6 +32,8 @@ import static org.junit.Assert.assertFalse;
+ import static org.junit.Assert.assertNotNull;
+ import static org.junit.Assert.assertNull;
+ import static org.junit.Assert.assertTrue;
++import org.springframework.dao.DuplicateKeyException;
++
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyString;
+ import static org.mockito.Mockito.never;
+@@ -98,11 +100,9 @@ public class RecurringTransactionServiceTest {
+ 		int count = service.processAccount(account, utc(2026, 4, 19));
+ 
+ 		assertEquals(1, count);
+-		ArgumentCaptor<List<Transaction>> captor = listCaptor();
+-		verify(transactionRepository, times(1)).saveAll(captor.capture());
+-		List<Transaction> saved = captor.getValue();
+-		assertEquals(1, saved.size());
+-		Transaction tx = saved.get(0);
++		ArgumentCaptor<Transaction> captor = ArgumentCaptor.forClass(Transaction.class);
++		verify(transactionRepository, times(1)).save(captor.capture());
++		Transaction tx = captor.getValue();
+ 		assertEquals(TransactionStatus.POSTED, tx.getStatus());
+ 		assertEquals(TransactionType.INCOME, tx.getType());
+ 		assertEquals("Salary", tx.getSourceItemTitle());
+@@ -129,9 +129,9 @@ public class RecurringTransactionServiceTest {
+ 
+ 		service.processAccount(account, utc(2026, 4, 19));
+ 
+-		ArgumentCaptor<List<Transaction>> captor = listCaptor();
+-		verify(transactionRepository).saveAll(captor.capture());
+-		Transaction tx = captor.getValue().get(0);
++		ArgumentCaptor<Transaction> captor = ArgumentCaptor.forClass(Transaction.class);
++		verify(transactionRepository).save(captor.capture());
++		Transaction tx = captor.getValue();
+ 		assertEquals(TransactionStatus.PENDING_REVIEW, tx.getStatus());
+ 		assertEquals(TransactionType.EXPENSE, tx.getType());
+ 		assertNull(tx.getPostedDate());
+@@ -151,9 +151,9 @@ public class RecurringTransactionServiceTest {
+ 
+ 		service.processAccount(account, utc(2026, 4, 19));
+ 
+-		ArgumentCaptor<List<Transaction>> captor = listCaptor();
+-		verify(transactionRepository).saveAll(captor.capture());
+-		List<Transaction> saved = captor.getValue();
++		ArgumentCaptor<Transaction> captor = ArgumentCaptor.forClass(Transaction.class);
++		verify(transactionRepository, times(5)).save(captor.capture());
++		List<Transaction> saved = captor.getAllValues();
+ 		assertEquals(5, saved.size());
+ 		// The first four are backfill / pending_review:
+ 		for (int i = 0; i < 4; i++) {
+@@ -185,9 +185,9 @@ public class RecurringTransactionServiceTest {
+ 		// recent (Apr 17, 18, 19) and drop older.
+ 		service.processAccount(account, utc(2026, 4, 19));
+ 
+-		ArgumentCaptor<List<Transaction>> captor = listCaptor();
+-		verify(transactionRepository).saveAll(captor.capture());
+-		List<Transaction> saved = captor.getValue();
++		ArgumentCaptor<Transaction> captor = ArgumentCaptor.forClass(Transaction.class);
++		verify(transactionRepository, times(3)).save(captor.capture());
++		List<Transaction> saved = captor.getAllValues();
+ 		assertEquals(3, saved.size());
+ 		assertEquals(utc(2026, 4, 17), saved.get(0).getScheduledDate());
+ 		assertEquals(utc(2026, 4, 18), saved.get(1).getScheduledDate());
+@@ -220,7 +220,7 @@ public class RecurringTransactionServiceTest {
+ 
+ 		int count = service.processAccount(account, utc(2026, 5, 20));
+ 		assertEquals(0, count);
+-		verify(transactionRepository, never()).saveAll(any());
++		verify(transactionRepository, never()).save(any(Transaction.class));
+ 		verify(statisticsClient, never()).updateStatistics(anyString(), any());
+ 	}
+ 
+@@ -235,7 +235,7 @@ public class RecurringTransactionServiceTest {
+ 
+ 		int count = service.processAccount(account, utc(2026, 4, 19));
+ 		assertEquals(0, count);
+-		verify(transactionRepository, never()).saveAll(any());
++		verify(transactionRepository, never()).save(any(Transaction.class));
+ 	}
+ 
+ 	@Test
+@@ -258,8 +258,59 @@ public class RecurringTransactionServiceTest {
+ 		verify(accountRepository, never()).save(b);
+ 	}
+ 
+-	@SuppressWarnings({"unchecked", "rawtypes"})
+-	private ArgumentCaptor<List<Transaction>> listCaptor() {
+-		return ArgumentCaptor.forClass((Class) List.class);
++	@Test
++	public void duplicateKeyExceptionSkipsDuplicateButAdvancesCursorAndSavesAccount() {
++		Account account = new Account();
++		account.setName("demo");
++		Date anchor = utc(2026, 4, 15);
++		Item daily = recurringItem("Coffee", new BigDecimal(4), TimePeriod.DAY,
++				anchor, true, anchor);
++		account.setExpenses(Collections.singletonList(daily));
++
++		// First save succeeds; second and third raise DuplicateKeyException
++		// (simulating a concurrent instance that already persisted those).
++		when(transactionRepository.save(any(Transaction.class)))
++				.thenReturn(new Transaction())                   // Apr 15 — saved
++				.thenThrow(new DuplicateKeyException("dup"))     // Apr 16 — duplicate
++				.thenThrow(new DuplicateKeyException("dup"));    // Apr 17 — duplicate
++
++		ReflectionTestUtils.setField(service, "maxBackfill", 5);
++		int created = service.processAccount(account, utc(2026, 4, 17));
++
++		// Only 1 was newly created; 2 were duplicates.
++		assertEquals(1, created);
++		// save() was called 3 times (once per due date).
++		verify(transactionRepository, times(3)).save(any(Transaction.class));
++		// The account is still persisted so the cursor advances even
++		// though 2 of the 3 transactions were duplicates.
++		verify(accountRepository, times(1)).save(account);
++		// Cursor advanced past the latest due date we processed.
++		assertEquals(utc(2026, 4, 18), daily.getRecurrence().getNextScheduledDate());
++		assertEquals(utc(2026, 4, 17), daily.getRecurrence().getLastGeneratedDate());
++	}
++
++	@Test
++	public void allDuplicatesStillAdvancesCursorButSkipsStatistics() {
++		Account account = new Account();
++		account.setName("demo");
++		Date anchor = utc(2026, 4, 19);
++		Item salary = recurringItem("Salary", new BigDecimal(1000), TimePeriod.MONTH,
++				anchor, true, anchor);
++		account.setIncomes(Collections.singletonList(salary));
++
++		// Every save raises DuplicateKeyException — a concurrent instance
++		// beat us to every transaction.
++		when(transactionRepository.save(any(Transaction.class)))
++				.thenThrow(new DuplicateKeyException("dup"));
++
++		int created = service.processAccount(account, utc(2026, 4, 19));
++
++		assertEquals(0, created);
++		// Account is still saved (cursor must advance).
++		verify(accountRepository, times(1)).save(account);
++		// Statistics are NOT refreshed since nothing new was created.
++		verify(statisticsClient, never()).updateStatistics(anyString(), any(Account.class));
++		// Cursor still advanced.
++		assertEquals(utc(2026, 5, 19), salary.getRecurrence().getNextScheduledDate());
+ 	}
+ }
