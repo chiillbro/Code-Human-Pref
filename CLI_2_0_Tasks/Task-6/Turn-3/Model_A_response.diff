@@ -1,0 +1,648 @@
+diff --git a/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepository.java b/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepository.java
+index 27f4aab..49713d3 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepository.java
++++ b/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepository.java
+@@ -1,10 +1,14 @@
+ package com.piggymetrics.account.repository;
+ 
+ import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
+ import org.springframework.data.mongodb.repository.MongoRepository;
+ import org.springframework.stereotype.Repository;
+ 
+ @Repository
+ public interface TransactionRepository extends MongoRepository<Transaction, String>,
+ 		TransactionRepositoryCustom {
++
++	void deleteByAccountNameAndSourceItemTitleAndStatus(
++			String accountName, String sourceItemTitle, TransactionStatus status);
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
+index 9ffebbf..280afaf 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
+@@ -8,7 +8,9 @@ import com.piggymetrics.account.domain.Item;
+ import com.piggymetrics.account.domain.RecurrenceSettings;
+ import com.piggymetrics.account.domain.Saving;
+ import com.piggymetrics.account.domain.User;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
+ import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.repository.TransactionRepository;
+ import com.piggymetrics.account.service.transaction.RecurrenceService;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+@@ -17,6 +19,7 @@ import org.springframework.stereotype.Service;
+ import org.springframework.util.Assert;
+ 
+ import java.math.BigDecimal;
++import java.util.ArrayList;
+ import java.util.Date;
+ import java.util.List;
+ 
+@@ -37,6 +40,9 @@ public class AccountServiceImpl implements AccountService {
+ 	@Autowired
+ 	private RecurrenceService recurrenceService;
+ 
++	@Autowired
++	private TransactionRepository transactionRepository;
++
+ 	/**
+ 	 * {@inheritDoc}
+ 	 */
+@@ -89,6 +95,16 @@ public class AccountServiceImpl implements AccountService {
+ 		refreshRecurrence(account.getIncomes(), update.getIncomes(), now);
+ 		refreshRecurrence(account.getExpenses(), update.getExpenses(), now);
+ 
++		// Clean up orphaned PENDING_REVIEW transactions for items that
++		// have been removed or had recurrence disabled. POSTED and
++		// SKIPPED transactions are historical records and stay.
++		// We pass ALL updated items so that an item that merely moved
++		// between incomes/expenses is not mistaken for a deletion.
++		cleanupOrphanedPendingTransactions(name,
++				account.getIncomes(), update.getIncomes(), update.getExpenses());
++		cleanupOrphanedPendingTransactions(name,
++				account.getExpenses(), update.getExpenses(), update.getIncomes());
++
+ 		account.setIncomes(update.getIncomes());
+ 		account.setExpenses(update.getExpenses());
+ 		account.setSaving(update.getSaving());
+@@ -158,6 +174,70 @@ public class AccountServiceImpl implements AccountService {
+ 		}
+ 	}
+ 
++	/**
++	 * Deletes {@code PENDING_REVIEW} transactions for every item that
++	 * was either removed entirely from the update, or still present but
++	 * with recurrence disabled (or without recurrence settings at all).
++	 * POSTED and SKIPPED transactions are never touched — they are
++	 * historical records.
++	 *
++	 * <p>{@code otherUpdatedItems} is the complementary list (e.g.
++	 * updated expenses when we're processing existing incomes) so that
++	 * an item that merely moved between incomes and expenses is
++	 * recognised as still present rather than treated as a deletion.
++	 */
++	private void cleanupOrphanedPendingTransactions(String accountName,
++			List<Item> existingItems, List<Item> updatedItems,
++			List<Item> otherUpdatedItems) {
++		List<String> titlesToClean = new ArrayList<>();
++
++		// Case 1: items that existed with recurrence enabled but are
++		// missing from the update (user deleted the item).
++		if (existingItems != null) {
++			for (Item existing : existingItems) {
++				if (!hasRecurrenceEnabled(existing)) {
++					continue;
++				}
++				Item inUpdate = findItemByTitle(updatedItems, existing.getTitle());
++				if (inUpdate == null) {
++					// Before flagging for cleanup, check whether the item
++					// merely moved to the other list (income ↔ expense).
++					Item inOther = findItemByTitle(otherUpdatedItems, existing.getTitle());
++					if (inOther != null && hasRecurrenceEnabled(inOther)) {
++						continue;
++					}
++					titlesToClean.add(existing.getTitle());
++				}
++			}
++		}
++
++		// Case 2: items that still exist in the update but had
++		// recurrence disabled (or recurrence removed).
++		if (updatedItems != null) {
++			for (Item updated : updatedItems) {
++				Item existing = findItemByTitle(existingItems, updated.getTitle());
++				if (existing == null || !hasRecurrenceEnabled(existing)) {
++					continue;
++				}
++				if (!hasRecurrenceEnabled(updated)) {
++					titlesToClean.add(updated.getTitle());
++				}
++			}
++		}
++
++		for (String title : titlesToClean) {
++			transactionRepository.deleteByAccountNameAndSourceItemTitleAndStatus(
++					accountName, title, TransactionStatus.PENDING_REVIEW);
++			log.debug("cleaned up pending-review transactions for account={} item={}",
++					accountName, title);
++		}
++	}
++
++	private boolean hasRecurrenceEnabled(Item item) {
++		return item.getRecurrence() != null
++				&& Boolean.TRUE.equals(item.getRecurrence().getEnabled());
++	}
++
+ 	private Item findItemByTitle(List<Item> items, String title) {
+ 		if (items == null || title == null) {
+ 			return null;
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java
+index b3c3544..5775eec 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java
+@@ -25,7 +25,7 @@ public class RecurrenceService {
+ 		this(ZoneId.systemDefault());
+ 	}
+ 
+-	RecurrenceService(ZoneId zoneId) {
++	public RecurrenceService(ZoneId zoneId) {
+ 		this.zoneId = zoneId;
+ 	}
+ 
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java
+index ee47129..6ab7309 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java
+@@ -63,7 +63,7 @@ public class RecurringTransactionService {
+ 		processAllAccounts(new Date());
+ 	}
+ 
+-	void processAllAccounts(Date now) {
++	public void processAllAccounts(Date now) {
+ 		log.info("starting recurring-transaction run at {}", now);
+ 		int accountsTouched = 0;
+ 		for (Account account : accountRepository.findAll()) {
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
+index 0abad2c..ef2cbbb 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
+@@ -3,7 +3,9 @@ package com.piggymetrics.account.service;
+ import com.piggymetrics.account.client.AuthServiceClient;
+ import com.piggymetrics.account.client.StatisticsServiceClient;
+ import com.piggymetrics.account.domain.*;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
+ import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.repository.TransactionRepository;
+ import com.piggymetrics.account.service.transaction.RecurrenceService;
+ import org.junit.Before;
+ import org.junit.Test;
+@@ -39,6 +41,9 @@ public class AccountServiceTest {
+ 	@Mock
+ 	private AccountRepository repository;
+ 
++	@Mock
++	private TransactionRepository transactionRepository;
++
+ 	@Spy
+ 	private RecurrenceService recurrenceService = new RecurrenceService();
+ 
+@@ -235,4 +240,194 @@ public class AccountServiceTest {
+ 
+ 		assertNull(salary.getRecurrence().getNextScheduledDate());
+ 	}
++
++	@Test
++	public void shouldCleanupPendingTransactionsWhenRecurringItemRemoved() {
++		// Existing account has a recurring Salary item.
++		Item existingSalary = new Item();
++		existingSalary.setTitle("Salary");
++		existingSalary.setAmount(new BigDecimal(9100));
++		existingSalary.setCurrency(Currency.USD);
++		existingSalary.setPeriod(TimePeriod.MONTH);
++		existingSalary.setIcon("wallet");
++		RecurrenceSettings existingSettings = new RecurrenceSettings();
++		existingSettings.setEnabled(true);
++		existingSettings.setAnchorDate(new Date());
++		existingSalary.setRecurrence(existingSettings);
++
++		Saving saving = new Saving();
++		saving.setAmount(new BigDecimal(0));
++		saving.setCurrency(Currency.USD);
++		saving.setInterest(new BigDecimal(0));
++		saving.setDeposit(false);
++		saving.setCapitalization(false);
++
++		Account existing = new Account();
++		existing.setName("test");
++		existing.setIncomes(Collections.singletonList(existingSalary));
++		existing.setSaving(saving);
++
++		// Update removes the item entirely.
++		Account update = new Account();
++		update.setName("test");
++		update.setIncomes(Collections.emptyList());
++		update.setSaving(saving);
++
++		when(repository.findByName("test")).thenReturn(existing);
++
++		accountService.saveChanges("test", update);
++
++		verify(transactionRepository, times(1))
++				.deleteByAccountNameAndSourceItemTitleAndStatus(
++						"test", "Salary", TransactionStatus.PENDING_REVIEW);
++	}
++
++	@Test
++	public void shouldCleanupPendingTransactionsWhenRecurrenceDisabled() {
++		Item existingSalary = new Item();
++		existingSalary.setTitle("Salary");
++		existingSalary.setAmount(new BigDecimal(9100));
++		existingSalary.setCurrency(Currency.USD);
++		existingSalary.setPeriod(TimePeriod.MONTH);
++		existingSalary.setIcon("wallet");
++		RecurrenceSettings existingSettings = new RecurrenceSettings();
++		existingSettings.setEnabled(true);
++		existingSettings.setAnchorDate(new Date());
++		existingSalary.setRecurrence(existingSettings);
++
++		Saving saving = new Saving();
++		saving.setAmount(new BigDecimal(0));
++		saving.setCurrency(Currency.USD);
++		saving.setInterest(new BigDecimal(0));
++		saving.setDeposit(false);
++		saving.setCapitalization(false);
++
++		Account existing = new Account();
++		existing.setName("test");
++		existing.setIncomes(Collections.singletonList(existingSalary));
++		existing.setSaving(saving);
++
++		// Update keeps the item but disables recurrence.
++		Item updatedSalary = new Item();
++		updatedSalary.setTitle("Salary");
++		updatedSalary.setAmount(new BigDecimal(9100));
++		updatedSalary.setCurrency(Currency.USD);
++		updatedSalary.setPeriod(TimePeriod.MONTH);
++		updatedSalary.setIcon("wallet");
++		RecurrenceSettings disabledSettings = new RecurrenceSettings();
++		disabledSettings.setEnabled(false);
++		updatedSalary.setRecurrence(disabledSettings);
++
++		Account update = new Account();
++		update.setName("test");
++		update.setIncomes(Collections.singletonList(updatedSalary));
++		update.setSaving(saving);
++
++		when(repository.findByName("test")).thenReturn(existing);
++
++		accountService.saveChanges("test", update);
++
++		verify(transactionRepository, times(1))
++				.deleteByAccountNameAndSourceItemTitleAndStatus(
++						"test", "Salary", TransactionStatus.PENDING_REVIEW);
++	}
++
++	@Test
++	public void shouldNotCleanupWhenRecurrenceStaysEnabled() {
++		Item existingSalary = makeRecurringItem("Salary", TimePeriod.MONTH, true);
++
++		Account existing = new Account();
++		existing.setName("test");
++		existing.setIncomes(Collections.singletonList(existingSalary));
++		when(repository.findByName("test")).thenReturn(existing);
++
++		Item updatedSalary = makeRecurringItem("Salary", TimePeriod.MONTH, true);
++		Account update = new Account();
++		update.setName("test");
++		update.setIncomes(Collections.singletonList(updatedSalary));
++		update.setSaving(minimalSaving());
++
++		accountService.saveChanges("test", update);
++
++		verify(transactionRepository, never())
++				.deleteByAccountNameAndSourceItemTitleAndStatus(
++						anyString(), anyString(), any(TransactionStatus.class));
++	}
++
++	@Test
++	public void shouldNotCleanupWhenItemWasNeverRecurring() {
++		Item existingRent = makeRecurringItem("Rent", TimePeriod.MONTH, true);
++		existingRent.setRecurrence(null); // never had recurrence
++
++		Account existing = new Account();
++		existing.setName("test");
++		existing.setExpenses(Collections.singletonList(existingRent));
++		when(repository.findByName("test")).thenReturn(existing);
++
++		// Update removes the item — but since it was never recurring,
++		// there can be no pending transactions to clean up.
++		Account update = new Account();
++		update.setName("test");
++		update.setSaving(minimalSaving());
++		update.setExpenses(Collections.emptyList());
++
++		accountService.saveChanges("test", update);
++
++		verify(transactionRepository, never())
++				.deleteByAccountNameAndSourceItemTitleAndStatus(
++						anyString(), anyString(), any(TransactionStatus.class));
++	}
++
++	@Test
++	public void shouldNotCleanupWhenItemMovedBetweenIncomeAndExpense() {
++		// Existing: Coffee is a recurring EXPENSE.
++		Item existingCoffee = makeRecurringItem("Coffee", TimePeriod.DAY, true);
++		Account existing = new Account();
++		existing.setName("test");
++		existing.setExpenses(Collections.singletonList(existingCoffee));
++		when(repository.findByName("test")).thenReturn(existing);
++
++		// Update: Coffee moves to incomes (same title, still recurring).
++		// This is a reclassification, not a deletion — pending stays put.
++		Item updatedCoffee = makeRecurringItem("Coffee", TimePeriod.DAY, true);
++		Account update = new Account();
++		update.setName("test");
++		update.setSaving(minimalSaving());
++		update.setIncomes(Collections.singletonList(updatedCoffee));
++		update.setExpenses(Collections.emptyList());
++
++		accountService.saveChanges("test", update);
++
++		verify(transactionRepository, never())
++				.deleteByAccountNameAndSourceItemTitleAndStatus(
++						anyString(), anyString(), any(TransactionStatus.class));
++	}
++
++	private Item makeRecurringItem(String title, TimePeriod period, boolean enabled) {
++		Item item = new Item();
++		item.setTitle(title);
++		item.setAmount(new BigDecimal(100));
++		item.setCurrency(Currency.USD);
++		item.setPeriod(period);
++		item.setIcon("icon");
++
++		RecurrenceSettings r = new RecurrenceSettings();
++		r.setEnabled(enabled);
++		r.setAnchorDate(Date.from(LocalDateTime.of(2026, 1, 1, 0, 0)
++				.atZone(ZoneOffset.UTC).toInstant()));
++		r.setAutoPost(false);
++		r.setNextScheduledDate(new Date());
++		item.setRecurrence(r);
++		return item;
++	}
++
++	private Saving minimalSaving() {
++		Saving saving = new Saving();
++		saving.setAmount(new BigDecimal(0));
++		saving.setCurrency(Currency.USD);
++		saving.setInterest(new BigDecimal(0));
++		saving.setDeposit(false);
++		saving.setCapitalization(false);
++		return saving;
++	}
+ }
+
+
+
+
+
+package com.piggymetrics.account.repository;
+
+import com.piggymetrics.account.domain.Account;
+import com.piggymetrics.account.domain.Currency;
+import com.piggymetrics.account.domain.Item;
+import com.piggymetrics.account.domain.RecurrenceSettings;
+import com.piggymetrics.account.domain.Saving;
+import com.piggymetrics.account.domain.TimePeriod;
+import com.piggymetrics.account.domain.transaction.Transaction;
+import com.piggymetrics.account.domain.transaction.TransactionStatus;
+import com.piggymetrics.account.domain.transaction.TransactionType;
+import com.piggymetrics.account.client.StatisticsServiceClient;
+import com.piggymetrics.account.service.transaction.RecurrenceService;
+import com.piggymetrics.account.service.transaction.RecurringTransactionService;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.data.mongo.DataMongoTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.context.annotation.Import;
+import org.springframework.dao.DuplicateKeyException;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.test.context.junit4.SpringRunner;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.util.Collections;
+import java.util.Date;
+import java.util.List;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+
+/**
+ * Integration tests that run against the embedded Mongo started by
+ * {@link DataMongoTest}. These verify behaviour that unit-test mocks
+ * cannot: the unique compound index, the derived query for pending
+ * cleanup, and the full end-to-end engine against real persistence.
+ *
+ * <p>{@link RecurringTransactionService} normally gets a
+ * {@link com.piggymetrics.account.client.StatisticsServiceClient}
+ * injected via Feign. Under {@code @DataMongoTest} only Mongo-related
+ * beans are loaded, so we supply the service and its stat-less
+ * dependencies manually via the {@link IntegrationTestConfig} inner
+ * configuration.
+ */
+@RunWith(SpringRunner.class)
+@DataMongoTest
+@Import(TransactionRepositoryIntegrationTest.IntegrationTestConfig.class)
+public class TransactionRepositoryIntegrationTest {
+
+	@Autowired
+	private TransactionRepository transactionRepository;
+
+	@Autowired
+	private AccountRepository accountRepository;
+
+	@Autowired
+	private MongoTemplate mongoTemplate;
+
+	@Autowired
+	private RecurringTransactionService recurringTransactionService;
+
+	/**
+	 * {@code @MockBean} replaces the Feign-generated proxy for
+	 * {@link StatisticsServiceClient} with a Mockito mock, avoiding the
+	 * missing {@code FeignContext} under {@code @DataMongoTest}.
+	 */
+	@MockBean
+	@SuppressWarnings("unused")
+	private StatisticsServiceClient statisticsClient;
+
+	private Date utc(int y, int m, int d) {
+		return Date.from(LocalDateTime.of(y, m, d, 0, 0)
+				.atZone(ZoneOffset.UTC).toInstant());
+	}
+
+	// ---- Unique index ----
+
+	@Test
+	public void uniqueIndexRejectsDuplicateTransaction() {
+		Transaction first = new Transaction();
+		first.setAccountName("idx-test");
+		first.setSourceItemTitle("Salary");
+		first.setScheduledDate(utc(2026, 5, 1));
+		first.setType(TransactionType.INCOME);
+		first.setStatus(TransactionStatus.POSTED);
+		first.setAmount(new BigDecimal(1000));
+		first.setCurrency(Currency.USD);
+		first.setCreatedDate(new Date());
+		transactionRepository.save(first);
+
+		Transaction duplicate = new Transaction();
+		duplicate.setAccountName("idx-test");
+		duplicate.setSourceItemTitle("Salary");
+		duplicate.setScheduledDate(utc(2026, 5, 1));
+		duplicate.setType(TransactionType.INCOME);
+		duplicate.setStatus(TransactionStatus.PENDING_REVIEW);
+		duplicate.setAmount(new BigDecimal(2000));
+		duplicate.setCurrency(Currency.EUR);
+		duplicate.setCreatedDate(new Date());
+
+		DuplicateKeyException thrown = null;
+		try {
+			transactionRepository.save(duplicate);
+		} catch (DuplicateKeyException ex) {
+			thrown = ex;
+		}
+		assertNotNull("expected DuplicateKeyException for same compound key", thrown);
+	}
+
+	@Test
+	public void uniqueIndexAllowsSameDateDifferentType() {
+		Transaction income = new Transaction();
+		income.setAccountName("idx-type");
+		income.setSourceItemTitle("Salary");
+		income.setScheduledDate(utc(2026, 5, 1));
+		income.setType(TransactionType.INCOME);
+		income.setStatus(TransactionStatus.POSTED);
+		income.setAmount(new BigDecimal(1000));
+		income.setCurrency(Currency.USD);
+		income.setCreatedDate(new Date());
+		transactionRepository.save(income);
+
+		Transaction expense = new Transaction();
+		expense.setAccountName("idx-type");
+		expense.setSourceItemTitle("Salary");
+		expense.setScheduledDate(utc(2026, 5, 1));
+		expense.setType(TransactionType.EXPENSE);
+		expense.setStatus(TransactionStatus.POSTED);
+		expense.setAmount(new BigDecimal(500));
+		expense.setCurrency(Currency.USD);
+		expense.setCreatedDate(new Date());
+		// Must not throw: same (accountName, title, date) but different type.
+		transactionRepository.save(expense);
+	}
+
+	// ---- Pending cleanup ----
+
+	@Test
+	public void deleteByAccountNameAndSourceItemTitleAndStatusRemovesOnlyPending() {
+		String acct = "cleanup-test";
+		String item = "Rent";
+
+		Transaction posted = tx(acct, item, TransactionStatus.POSTED, utc(2026, 4, 1));
+		Transaction skipped = tx(acct, item, TransactionStatus.SKIPPED, utc(2026, 4, 2));
+		Transaction pending1 = tx(acct, item, TransactionStatus.PENDING_REVIEW, utc(2026, 4, 3));
+		Transaction pending2 = tx(acct, item, TransactionStatus.PENDING_REVIEW, utc(2026, 4, 4));
+		transactionRepository.save(posted);
+		transactionRepository.save(skipped);
+		transactionRepository.save(pending1);
+		transactionRepository.save(pending2);
+
+		transactionRepository.deleteByAccountNameAndSourceItemTitleAndStatus(
+				acct, item, TransactionStatus.PENDING_REVIEW);
+
+		List<Transaction> remaining = mongoTemplate.findAll(Transaction.class).stream()
+				.filter(t -> acct.equals(t.getAccountName()) && item.equals(t.getSourceItemTitle()))
+				.collect(java.util.stream.Collectors.toList());
+		assertEquals(2, remaining.size());
+		for (Transaction t : remaining) {
+			assertNotNull("remaining should be non-pending",
+					t.getStatus() == TransactionStatus.POSTED
+							|| t.getStatus() == TransactionStatus.SKIPPED
+							? "ok" : null);
+		}
+	}
+
+	// ---- End-to-end engine ----
+
+	@Test
+	public void processAllAccountsGeneratesTransactionsInMongo() {
+		// Seed an account with a daily recurring expense.
+		Saving saving = new Saving();
+		saving.setAmount(BigDecimal.ZERO);
+		saving.setCurrency(Currency.USD);
+		saving.setInterest(BigDecimal.ZERO);
+		saving.setDeposit(false);
+		saving.setCapitalization(false);
+
+		Item coffee = new Item();
+		coffee.setTitle("Coffee");
+		coffee.setAmount(new BigDecimal("4.50"));
+		coffee.setCurrency(Currency.USD);
+		coffee.setPeriod(TimePeriod.DAY);
+		coffee.setIcon("coffee");
+		RecurrenceSettings r = new RecurrenceSettings();
+		r.setEnabled(true);
+		r.setAnchorDate(utc(2026, 6, 1));
+		r.setAutoPost(true);
+		r.setNextScheduledDate(utc(2026, 6, 1));
+		coffee.setRecurrence(r);
+
+		Account account = new Account();
+		account.setName("e2e-test");
+		account.setLastSeen(new Date());
+		account.setSaving(saving);
+		account.setExpenses(Collections.singletonList(coffee));
+		accountRepository.save(account);
+
+		// Run the engine as-of June 3 → due dates: Jun 1, 2, 3.
+		recurringTransactionService.processAllAccounts(utc(2026, 6, 3));
+
+		List<Transaction> txns = mongoTemplate.findAll(Transaction.class).stream()
+				.filter(t -> "e2e-test".equals(t.getAccountName()))
+				.collect(java.util.stream.Collectors.toList());
+		assertEquals(3, txns.size());
+
+		long posted = txns.stream()
+				.filter(t -> t.getStatus() == TransactionStatus.POSTED).count();
+		long pending = txns.stream()
+				.filter(t -> t.getStatus() == TransactionStatus.PENDING_REVIEW).count();
+		// Latest (Jun 3) is auto-posted; the two earlier are backfilled
+		// → PENDING_REVIEW regardless of autoPost.
+		assertEquals(1, posted);
+		assertEquals(2, pending);
+
+		// Cursor must have advanced past the last generated date.
+		Account updated = accountRepository.findByName("e2e-test");
+		Date nextScheduled = updated.getExpenses().get(0)
+				.getRecurrence().getNextScheduledDate();
+		assertEquals(utc(2026, 6, 4), nextScheduled);
+	}
+
+	private Transaction tx(String acct, String item, TransactionStatus status, Date scheduled) {
+		Transaction t = new Transaction();
+		t.setAccountName(acct);
+		t.setSourceItemTitle(item);
+		t.setType(TransactionType.EXPENSE);
+		t.setStatus(status);
+		t.setScheduledDate(scheduled);
+		t.setAmount(BigDecimal.ONE);
+		t.setCurrency(Currency.USD);
+		t.setCreatedDate(new Date());
+		return t;
+	}
+
+	/**
+	 * Provides the non-Mongo beans that {@link RecurringTransactionService}
+	 * needs. {@code @DataMongoTest} only boots the Mongo slice, so
+	 * services are absent. The statistics client is handled by the
+	 * {@code @MockBean} above; here we supply the real
+	 * {@link RecurrenceService} and the engine.
+	 */
+	@org.springframework.boot.test.context.TestConfiguration
+	static class IntegrationTestConfig {
+
+		@org.springframework.context.annotation.Bean
+		public RecurrenceService recurrenceService() {
+			return new RecurrenceService(ZoneOffset.UTC);
+		}
+
+		@org.springframework.context.annotation.Bean
+		public RecurringTransactionService recurringTransactionService() {
+			return new RecurringTransactionService();
+		}
+	}
+}
