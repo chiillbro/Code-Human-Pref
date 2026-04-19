@@ -1,0 +1,2661 @@
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..7f921fb
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,20 @@
++[build-system]
++requires = ["setuptools>=68.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "logpipe"
++version = "0.1.0"
++description = "Multi-format log aggregation and anomaly detection pipeline"
++requires-python = ">=3.11"
++dependencies = ["pyyaml>=6.0"]
++
++[project.scripts]
++logpipe = "logpipe.cli:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
++pythonpath = ["src"]
+diff --git a/src/logpipe/__init__.py b/src/logpipe/__init__.py
+new file mode 100644
+index 0000000..3dc1f76
+--- /dev/null
++++ b/src/logpipe/__init__.py
+@@ -0,0 +1 @@
++__version__ = "0.1.0"
+diff --git a/src/logpipe/__main__.py b/src/logpipe/__main__.py
+new file mode 100644
+index 0000000..ec45b54
+--- /dev/null
++++ b/src/logpipe/__main__.py
+@@ -0,0 +1,4 @@
++from logpipe.cli import main
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/logpipe/aggregator.py b/src/logpipe/aggregator.py
+new file mode 100644
+index 0000000..2f032cf
+--- /dev/null
++++ b/src/logpipe/aggregator.py
+@@ -0,0 +1,76 @@
++from __future__ import annotations
++
++import bisect
++from collections import Counter
++from datetime import datetime, timezone
++
++from logpipe.models import LogEntry, Severity, WindowMetrics
++
++
++def build_windows(
++    entries: list[LogEntry],
++    window_seconds: int,
++    slide_seconds: int,
++    top_n: int = 10,
++) -> list[WindowMetrics]:
++    """Build sliding time windows over entries. Windows use [start, end) boundary semantics.
++
++    An event whose timestamp equals the window start is included; an event whose
++    timestamp equals the window end belongs to the *next* window.
++    """
++    if not entries:
++        return []
++
++    entries.sort(key=lambda e: e.timestamp)
++    timestamps = [e.timestamp for e in entries]
++
++    first_epoch = entries[0].timestamp.timestamp()
++    last_epoch = entries[-1].timestamp.timestamp()
++
++    aligned_start = first_epoch - (first_epoch % slide_seconds)
++
++    windows: list[WindowMetrics] = []
++    current = aligned_start
++
++    while current <= last_epoch:
++        w_start = datetime.fromtimestamp(current, tz=timezone.utc)
++        w_end = datetime.fromtimestamp(current + window_seconds, tz=timezone.utc)
++
++        lo = bisect.bisect_left(timestamps, w_start)
++        hi = bisect.bisect_left(timestamps, w_end)
++        window_entries = entries[lo:hi]
++
++        metrics = _compute_metrics(window_entries, w_start, w_end, window_seconds, top_n)
++        windows.append(metrics)
++
++        current += slide_seconds
++
++    return windows
++
++
++def _compute_metrics(
++    entries: list[LogEntry],
++    start: datetime,
++    end: datetime,
++    window_seconds: int,
++    top_n: int,
++) -> WindowMetrics:
++    total = len(entries)
++
++    severity_counts = Counter(e.severity.name for e in entries)
++    source_counts = Counter(e.source for e in entries)
++    top_sources = source_counts.most_common(top_n)
++
++    error_count = sum(1 for e in entries if e.severity >= Severity.ERROR)
++    error_rate = (error_count / total * 100) if total > 0 else 0.0
++    eps = total / window_seconds if window_seconds > 0 else 0.0
++
++    return WindowMetrics(
++        start=start,
++        end=end,
++        total_count=total,
++        counts_by_severity=dict(severity_counts),
++        top_sources=top_sources,
++        error_rate=round(error_rate, 2),
++        eps=round(eps, 4),
++    )
+diff --git a/src/logpipe/anomaly_detector.py b/src/logpipe/anomaly_detector.py
+new file mode 100644
+index 0000000..3bf239f
+--- /dev/null
++++ b/src/logpipe/anomaly_detector.py
+@@ -0,0 +1,97 @@
++from __future__ import annotations
++
++import statistics
++
++from logpipe.models import AnomalyResult, WindowMetrics
++
++
++def detect_anomalies(
++    windows: list[WindowMetrics],
++    baseline_k: int = 20,
++    sensitivity: float = 2.0,
++) -> list[AnomalyResult]:
++    """Detect anomalous windows using a rolling median + IQR baseline.
++
++    The first *baseline_k* windows are used to build the baseline and are never flagged.
++    """
++    anomalies: list[AnomalyResult] = []
++
++    for i, window in enumerate(windows):
++        if i < baseline_k:
++            continue
++
++        recent = [w.total_count for w in windows[i - baseline_k : i]]
++        median, iqr = _compute_median_iqr(recent)
++
++        count = window.total_count
++
++        if iqr > 0:
++            upper = median + sensitivity * iqr
++            lower = median - sensitivity * iqr
++
++            if count > upper:
++                anomalies.append(
++                    AnomalyResult(
++                        window_start=window.start,
++                        window_end=window.end,
++                        event_count=count,
++                        baseline_median=median,
++                        direction="spike",
++                        magnitude=round((count - median) / iqr, 2),
++                    )
++                )
++            elif count < lower:
++                anomalies.append(
++                    AnomalyResult(
++                        window_start=window.start,
++                        window_end=window.end,
++                        event_count=count,
++                        baseline_median=median,
++                        direction="drop",
++                        magnitude=round((median - count) / iqr, 2),
++                    )
++                )
++        else:
++            # IQR == 0: all baseline windows have the same count.
++            # Any deviation from the median is anomalous.
++            if count != median:
++                direction = "spike" if count > median else "drop"
++                anomalies.append(
++                    AnomalyResult(
++                        window_start=window.start,
++                        window_end=window.end,
++                        event_count=count,
++                        baseline_median=median,
++                        direction=direction,
++                        magnitude=abs(count - median),
++                    )
++                )
++
++    return anomalies
++
++
++def _compute_median_iqr(values: list[int | float]) -> tuple[float, float]:
++    """Compute median and interquartile range (IQR) of a list of numbers."""
++    s = sorted(values)
++    n = len(s)
++
++    if n == 0:
++        return 0.0, 0.0
++
++    median = statistics.median(s)
++
++    if n < 4:
++        return median, 0.0
++
++    mid = n // 2
++    if n % 2 == 0:
++        lower = s[:mid]
++        upper = s[mid:]
++    else:
++        lower = s[:mid]
++        upper = s[mid + 1 :]
++
++    q1 = statistics.median(lower) if lower else median
++    q3 = statistics.median(upper) if upper else median
++
++    return median, q3 - q1
+diff --git a/src/logpipe/cli.py b/src/logpipe/cli.py
+new file mode 100644
+index 0000000..039e1c6
+--- /dev/null
++++ b/src/logpipe/cli.py
+@@ -0,0 +1,193 @@
++from __future__ import annotations
++
++import argparse
++import sys
++
++import logpipe
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        prog="logpipe",
++        description="Multi-format log aggregation & anomaly detection pipeline",
++    )
++    sub = parser.add_subparsers(dest="command")
++
++    # analyze
++    analyze_p = sub.add_parser("analyze", help="Batch analysis mode")
++    analyze_p.add_argument("files", nargs="+", help="Log files to process")
++    analyze_p.add_argument("--config", "-c", help="Path to config YAML")
++    analyze_p.add_argument("--report", "-r", help="Path to write JSON report")
++    analyze_p.add_argument(
++        "--format", "-f", dest="fmt", help="Force log format (json, syslog, custom:<name>)"
++    )
++
++    # tail
++    tail_p = sub.add_parser("tail", help="Streaming monitor mode")
++    tail_p.add_argument("files", nargs="+", help="Log files to monitor")
++    tail_p.add_argument("--config", "-c", help="Path to config YAML")
++    tail_p.add_argument("--refresh", type=float, default=5.0, help="Refresh interval (seconds)")
++    tail_p.add_argument("--format", "-f", dest="fmt", help="Force log format")
++    tail_p.add_argument("--output", "-o", choices=["raw", "json"], default="raw")
++
++    # config
++    config_p = sub.add_parser("config", help="Config management")
++    config_sub = config_p.add_subparsers(dest="config_command")
++    config_sub.add_parser("init", help="Generate starter config file")
++
++    # version
++    sub.add_parser("version", help="Print version")
++
++    args = parser.parse_args()
++
++    if args.command == "analyze":
++        sys.exit(_analyze(args))
++    elif args.command == "tail":
++        sys.exit(_tail(args))
++    elif args.command == "config":
++        if args.config_command == "init":
++            sys.exit(_config_init())
++        else:
++            config_p.print_help()
++            sys.exit(1)
++    elif args.command == "version":
++        print(f"logpipe {logpipe.__version__}")
++        sys.exit(0)
++    else:
++        parser.print_help()
++        sys.exit(1)
++
++
++def _analyze(args) -> int:
++    from logpipe.aggregator import build_windows
++    from logpipe.anomaly_detector import detect_anomalies
++    from logpipe.config import load_config
++    from logpipe.models import AnalysisReport, FilterSummary, IngestionSummary, PipelineConfig
++    from logpipe.parsers import parse_file
++    from logpipe.parsers.detector import detect_format
++    from logpipe.reporter import format_report, write_report
++    from logpipe.rules_engine import apply_filter, apply_transforms
++
++    config = PipelineConfig()
++    if args.config:
++        try:
++            config = load_config(args.config)
++        except Exception as e:
++            print(f"Config error: {e}", file=sys.stderr)
++            return 1
++
++    ingestion = IngestionSummary()
++    filter_summary = FilterSummary()
++    entries = []
++    severity_counts: dict[str, int] = {}
++
++    files_ok = 0
++    for filepath in args.files:
++        try:
++            fmt = args.fmt
++            if fmt is None:
++                fmt = detect_format(filepath, config.custom_patterns or None)
++        except (OSError, ValueError) as e:
++            print(f"Warning: {filepath}: {e}", file=sys.stderr)
++            continue
++
++        file_entries = 0
++        try:
++            for entry, error in parse_file(filepath, format_name=fmt, config=config):
++                if error:
++                    ingestion.malformed_lines += 1
++                    print(f"Warning: {error}", file=sys.stderr)
++                    continue
++
++                ingestion.total_entries += 1
++                filter_summary.entries_before += 1
++                file_entries += 1
++
++                passes, rejected_by = apply_filter(entry, config.filters)
++                if not passes:
++                    filter_summary.dropped_per_filter[rejected_by] = (
++                        filter_summary.dropped_per_filter.get(rejected_by, 0) + 1
++                    )
++                    continue
++
++                entry = apply_transforms(entry, config.transforms)
++                filter_summary.entries_after += 1
++                entries.append(entry)
++
++                sev_name = entry.severity.name
++                severity_counts[sev_name] = severity_counts.get(sev_name, 0) + 1
++
++        except OSError as e:
++            print(f"Error: Cannot read {filepath}: {e}", file=sys.stderr)
++            continue
++
++        if file_entries > 0:
++            files_ok += 1
++            ingestion.entries_per_format[fmt] = (
++                ingestion.entries_per_format.get(fmt, 0) + file_entries
++            )
++
++    ingestion.files_processed = files_ok
++
++    if files_ok == 0:
++        print("Error: No files could be processed.", file=sys.stderr)
++        return 2
++
++    windows = build_windows(
++        entries,
++        config.aggregation.window_seconds,
++        config.aggregation.slide_seconds,
++        config.aggregation.top_n,
++    )
++
++    anomalies = detect_anomalies(
++        windows,
++        config.anomaly.baseline_windows,
++        config.anomaly.sensitivity,
++    )
++
++    report = AnalysisReport(
++        ingestion=ingestion,
++        filter_summary=filter_summary,
++        windows=windows,
++        anomalies=anomalies,
++        severity_breakdown=severity_counts,
++    )
++
++    print(format_report(report))
++
++    if args.report:
++        write_report(report, args.report)
++        print(f"\nReport written to {args.report}")
++
++    return 3 if anomalies else 0
++
++
++def _tail(args) -> int:
++    from logpipe.config import load_config
++    from logpipe.models import PipelineConfig
++    from logpipe.tail import tail_files
++
++    config = PipelineConfig()
++    if args.config:
++        try:
++            config = load_config(args.config)
++        except Exception as e:
++            print(f"Config error: {e}", file=sys.stderr)
++            return 1
++
++    tail_files(
++        args.files,
++        config,
++        format_name=args.fmt,
++        refresh_seconds=args.refresh,
++        output_format=args.output,
++    )
++    return 0
++
++
++def _config_init() -> int:
++    from logpipe.config import CONFIG_TEMPLATE
++
++    print(CONFIG_TEMPLATE)
++    return 0
+diff --git a/src/logpipe/config.py b/src/logpipe/config.py
+new file mode 100644
+index 0000000..a8be0ad
+--- /dev/null
++++ b/src/logpipe/config.py
+@@ -0,0 +1,150 @@
++from __future__ import annotations
++
++import yaml
++
++from logpipe.models import (
++    AggregationConfig,
++    AnomalyConfig,
++    CustomPattern,
++    FilterConfig,
++    PipelineConfig,
++    Severity,
++    TransformRule,
++)
++from logpipe.normalizer import parse_timestamp
++
++
++def load_config(path: str) -> PipelineConfig:
++    with open(path) as f:
++        raw = yaml.safe_load(f)
++
++    if not raw:
++        return PipelineConfig()
++
++    config = PipelineConfig()
++    config.default_timezone = raw.get("default_timezone", "UTC")
++
++    if "filters" in raw:
++        f = raw["filters"]
++        sev_min = None
++        if "severity_min" in f:
++            sev_min = Severity[f["severity_min"].upper()]
++
++        tr_start = None
++        tr_end = None
++        if "time_range" in f and isinstance(f["time_range"], dict):
++            tr = f["time_range"]
++            if "start" in tr:
++                tr_start = parse_timestamp(str(tr["start"]))
++            if "end" in tr:
++                tr_end = parse_timestamp(str(tr["end"]))
++
++        config.filters = FilterConfig(
++            severity_min=sev_min,
++            source_include=f.get("source_include", []),
++            source_exclude=f.get("source_exclude", []),
++            keyword_match=f.get("keyword_match", []),
++            keyword_exclude=f.get("keyword_exclude", []),
++            time_range_start=tr_start,
++            time_range_end=tr_end,
++        )
++
++    if "transforms" in raw:
++        for t in raw["transforms"]:
++            ttype = t["type"]
++            params = {k: v for k, v in t.items() if k != "type"}
++            config.transforms.append(TransformRule(type=ttype, params=params))
++
++    if "aggregation" in raw:
++        a = raw["aggregation"]
++        config.aggregation = AggregationConfig(
++            window_seconds=a.get("window_seconds", 300),
++            slide_seconds=a.get("slide_seconds", 60),
++            top_n=a.get("top_n", 10),
++        )
++
++    if "anomaly" in raw:
++        an = raw["anomaly"]
++        config.anomaly = AnomalyConfig(
++            baseline_windows=an.get("baseline_windows", 20),
++            sensitivity=an.get("sensitivity", 2.0),
++        )
++
++    if "custom_patterns" in raw:
++        for cp in raw["custom_patterns"]:
++            config.custom_patterns.append(
++                CustomPattern(
++                    name=cp["name"],
++                    pattern=cp["pattern"],
++                    timestamp_format=cp["timestamp_format"],
++                )
++            )
++
++    return config
++
++
++CONFIG_TEMPLATE = """\
++# logpipe configuration file
++# All sections are optional — defaults are used for missing values.
++
++# Default timezone for timestamps without timezone info
++default_timezone: UTC
++
++# Filter rules — entries must pass ALL active filters
++filters:
++  # Minimum severity: DEBUG, INFO, WARNING, ERROR, CRITICAL
++  # severity_min: INFO
++
++  # Only include entries from sources matching these globs
++  # source_include:
++  #   - "*.log"
++
++  # Exclude entries from sources matching these globs (takes priority over include)
++  # source_exclude:
++  #   - "debug*"
++
++  # Entries must contain at least one of these keywords
++  # keyword_match:
++  #   - "error"
++  #   - "failed"
++
++  # Drop entries containing any of these keywords
++  # keyword_exclude:
++  #   - "test"
++
++  # Only include entries within this time range
++  # time_range:
++  #   start: "2024-01-01T00:00:00Z"
++  #   end: "2024-12-31T23:59:59Z"
++
++# Transform rules — applied in order after filtering
++transforms: []
++  # - type: extract_fields
++  #   pattern: "user=(?P<user>\\\\w+)"
++  # - type: rename_field
++  #   from: old_name
++  #   to: new_name
++  # - type: add_static_field
++  #   key: environment
++  #   value: production
++  # - type: drop_fields
++  #   fields:
++  #     - internal_id
++
++# Aggregation settings
++aggregation:
++  window_seconds: 300    # 5-minute windows
++  slide_seconds: 60      # slide every 1 minute
++  top_n: 10              # top N sources per window
++
++# Anomaly detection settings
++anomaly:
++  baseline_windows: 20   # number of windows for baseline
++  sensitivity: 2.0       # IQR multiplier for anomaly threshold
++
++# Custom log format patterns
++# custom_patterns:
++#   - name: apache
++#     pattern: '(?P<source>\\\\S+) - - \\\\[(?P<timestamp>[^\\\\]]+)\\\\] "(?P<message>[^"]+)"'
++#     timestamp_format: "%d/%b/%Y:%H:%M:%S %z"
++"""
+diff --git a/src/logpipe/models.py b/src/logpipe/models.py
+new file mode 100644
+index 0000000..4d81641
+--- /dev/null
++++ b/src/logpipe/models.py
+@@ -0,0 +1,163 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import datetime
++from enum import IntEnum
++from typing import Any
++
++
++class Severity(IntEnum):
++    DEBUG = 0
++    INFO = 1
++    WARNING = 2
++    ERROR = 3
++    CRITICAL = 4
++
++
++SEVERITY_NAMES: dict[str, Severity] = {s.name: s for s in Severity}
++
++
++@dataclass
++class LogEntry:
++    timestamp: datetime
++    severity: Severity
++    source: str
++    message: str
++    metadata: dict[str, Any] = field(default_factory=dict)
++
++
++@dataclass
++class FilterConfig:
++    severity_min: Severity | None = None
++    source_include: list[str] = field(default_factory=list)
++    source_exclude: list[str] = field(default_factory=list)
++    keyword_match: list[str] = field(default_factory=list)
++    keyword_exclude: list[str] = field(default_factory=list)
++    time_range_start: datetime | None = None
++    time_range_end: datetime | None = None
++
++
++@dataclass
++class TransformRule:
++    type: str
++    params: dict[str, Any] = field(default_factory=dict)
++
++
++@dataclass
++class AggregationConfig:
++    window_seconds: int = 300
++    slide_seconds: int = 60
++    top_n: int = 10
++
++
++@dataclass
++class AnomalyConfig:
++    baseline_windows: int = 20
++    sensitivity: float = 2.0
++
++
++@dataclass
++class CustomPattern:
++    name: str
++    pattern: str
++    timestamp_format: str
++
++
++@dataclass
++class PipelineConfig:
++    default_timezone: str = "UTC"
++    filters: FilterConfig = field(default_factory=FilterConfig)
++    transforms: list[TransformRule] = field(default_factory=list)
++    aggregation: AggregationConfig = field(default_factory=AggregationConfig)
++    anomaly: AnomalyConfig = field(default_factory=AnomalyConfig)
++    custom_patterns: list[CustomPattern] = field(default_factory=list)
++
++
++@dataclass
++class WindowMetrics:
++    start: datetime
++    end: datetime
++    total_count: int
++    counts_by_severity: dict[str, int]
++    top_sources: list[tuple[str, int]]
++    error_rate: float
++    eps: float
++
++    def to_dict(self) -> dict:
++        return {
++            "start": self.start.isoformat(),
++            "end": self.end.isoformat(),
++            "total_count": self.total_count,
++            "counts_by_severity": self.counts_by_severity,
++            "top_sources": [{"source": s, "count": c} for s, c in self.top_sources],
++            "error_rate": self.error_rate,
++            "eps": self.eps,
++        }
++
++
++@dataclass
++class AnomalyResult:
++    window_start: datetime
++    window_end: datetime
++    event_count: int
++    baseline_median: float
++    direction: str  # "spike" or "drop"
++    magnitude: float
++
++    def to_dict(self) -> dict:
++        return {
++            "window_start": self.window_start.isoformat(),
++            "window_end": self.window_end.isoformat(),
++            "event_count": self.event_count,
++            "baseline_median": self.baseline_median,
++            "direction": self.direction,
++            "magnitude": round(self.magnitude, 2),
++        }
++
++
++@dataclass
++class IngestionSummary:
++    files_processed: int = 0
++    total_entries: int = 0
++    entries_per_format: dict[str, int] = field(default_factory=dict)
++    malformed_lines: int = 0
++
++    def to_dict(self) -> dict:
++        return {
++            "files_processed": self.files_processed,
++            "total_entries": self.total_entries,
++            "entries_per_format": self.entries_per_format,
++            "malformed_lines": self.malformed_lines,
++        }
++
++
++@dataclass
++class FilterSummary:
++    entries_before: int = 0
++    entries_after: int = 0
++    dropped_per_filter: dict[str, int] = field(default_factory=dict)
++
++    def to_dict(self) -> dict:
++        return {
++            "entries_before": self.entries_before,
++            "entries_after": self.entries_after,
++            "dropped_per_filter": self.dropped_per_filter,
++        }
++
++
++@dataclass
++class AnalysisReport:
++    ingestion: IngestionSummary
++    filter_summary: FilterSummary
++    windows: list[WindowMetrics]
++    anomalies: list[AnomalyResult]
++    severity_breakdown: dict[str, int] = field(default_factory=dict)
++
++    def to_dict(self) -> dict:
++        return {
++            "ingestion": self.ingestion.to_dict(),
++            "filter_summary": self.filter_summary.to_dict(),
++            "windows": [w.to_dict() for w in self.windows],
++            "anomalies": [a.to_dict() for a in self.anomalies],
++            "severity_breakdown": self.severity_breakdown,
++        }
+diff --git a/src/logpipe/normalizer.py b/src/logpipe/normalizer.py
+new file mode 100644
+index 0000000..17d919e
+--- /dev/null
++++ b/src/logpipe/normalizer.py
+@@ -0,0 +1,73 @@
++from __future__ import annotations
++
++import re
++from datetime import datetime, timedelta, timezone
++from zoneinfo import ZoneInfo
++
++from logpipe.models import Severity
++
++_SYSLOG_TS_RE = re.compile(r"^(\w{3})\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})$")
++
++SYSLOG_SEVERITY_MAP: dict[int, Severity] = {
++    0: Severity.CRITICAL,   # Emergency
++    1: Severity.CRITICAL,   # Alert
++    2: Severity.CRITICAL,   # Critical
++    3: Severity.ERROR,      # Error
++    4: Severity.WARNING,    # Warning
++    5: Severity.INFO,       # Notice
++    6: Severity.INFO,       # Informational
++    7: Severity.DEBUG,      # Debug
++}
++
++
++def resolve_default_tz(tz_name: str) -> timezone | ZoneInfo:
++    if tz_name == "UTC":
++        return timezone.utc
++    try:
++        return ZoneInfo(tz_name)
++    except (KeyError, ImportError):
++        return timezone.utc
++
++
++def parse_timestamp(
++    raw: str,
++    fmt: str | None = None,
++    default_tz: timezone | ZoneInfo = timezone.utc,
++    reference_year: int | None = None,
++) -> datetime:
++    """Parse a timestamp string into a timezone-aware UTC datetime.
++
++    Handles ISO 8601 variants (Z, numeric offsets, fractional seconds, T or space separator),
++    syslog format (Mon DD HH:MM:SS with year inference), and custom strptime formats.
++    """
++    raw = raw.strip()
++
++    if fmt:
++        dt = datetime.strptime(raw, fmt)
++        if dt.tzinfo is None:
++            dt = dt.replace(tzinfo=default_tz)
++        return dt.astimezone(timezone.utc)
++
++    # ISO 8601 via fromisoformat (Python 3.11+ handles Z and numeric offsets)
++    try:
++        dt = datetime.fromisoformat(raw)
++        if dt.tzinfo is None:
++            dt = dt.replace(tzinfo=default_tz)
++        return dt.astimezone(timezone.utc)
++    except ValueError:
++        pass
++
++    # Syslog timestamp: "Mon DD HH:MM:SS" (no year)
++    m = _SYSLOG_TS_RE.match(raw)
++    if m:
++        month_str, day_str, time_str = m.group(1), m.group(2), m.group(3)
++        year = reference_year or datetime.now(timezone.utc).year
++        dt_str = f"{month_str} {int(day_str)} {time_str} {year}"
++        dt = datetime.strptime(dt_str, "%b %d %H:%M:%S %Y")
++        dt = dt.replace(tzinfo=default_tz)
++        # If >1 day in the future, assume previous year (Dec→Jan boundary)
++        if dt.astimezone(timezone.utc) > datetime.now(timezone.utc) + timedelta(days=1):
++            dt = dt.replace(year=year - 1)
++        return dt.astimezone(timezone.utc)
++
++    raise ValueError(f"Unable to parse timestamp: {raw!r}")
+diff --git a/src/logpipe/parsers/__init__.py b/src/logpipe/parsers/__init__.py
+new file mode 100644
+index 0000000..b3d859a
+--- /dev/null
++++ b/src/logpipe/parsers/__init__.py
+@@ -0,0 +1,67 @@
++from __future__ import annotations
++
++import os
++from datetime import datetime, timezone
++from typing import Generator
++
++from logpipe.models import CustomPattern, LogEntry, PipelineConfig
++from logpipe.normalizer import resolve_default_tz
++from logpipe.parsers.detector import detect_format
++from logpipe.parsers.json_parser import parse_json_line
++from logpipe.parsers.pattern_parser import parse_pattern_line
++from logpipe.parsers.syslog_parser import parse_syslog_line
++
++
++def parse_file(
++    filepath: str,
++    format_name: str | None = None,
++    config: PipelineConfig | None = None,
++) -> Generator[tuple[LogEntry | None, str | None], None, None]:
++    """Stream log entries from a file. Yields (entry, None) or (None, error_string)."""
++    default_tz = resolve_default_tz(config.default_timezone if config else "UTC")
++    custom_patterns = config.custom_patterns if config else []
++
++    if format_name is None:
++        format_name = detect_format(filepath, custom_patterns or None)
++
++    reference_year = None
++    if format_name == "syslog":
++        try:
++            stat = os.stat(filepath)
++            reference_year = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).year
++        except OSError:
++            reference_year = datetime.now(timezone.utc).year
++
++    custom_pattern = None
++    custom_ts_fmt = None
++    if format_name.startswith("custom:"):
++        pname = format_name.split(":", 1)[1]
++        for cp in custom_patterns:
++            if cp.name == pname:
++                custom_pattern = cp.pattern
++                custom_ts_fmt = cp.timestamp_format
++                break
++        if custom_pattern is None:
++            yield None, f"Custom pattern '{pname}' not found in config"
++            return
++
++    with open(filepath, errors="replace") as f:
++        for lineno, raw_line in enumerate(f, 1):
++            line = raw_line.rstrip("\n\r")
++            if not line.strip():
++                continue
++            try:
++                if format_name == "json":
++                    entry = parse_json_line(line, filepath, default_tz)
++                elif format_name == "syslog":
++                    entry = parse_syslog_line(line, filepath, default_tz, reference_year)
++                elif custom_pattern:
++                    entry = parse_pattern_line(
++                        line, custom_pattern, custom_ts_fmt, filepath, default_tz
++                    )
++                else:
++                    yield None, f"{filepath}:{lineno}: unknown format '{format_name}'"
++                    continue
++                yield entry, None
++            except (ValueError, KeyError) as e:
++                yield None, f"{filepath}:{lineno}: {e}"
+diff --git a/src/logpipe/parsers/detector.py b/src/logpipe/parsers/detector.py
+new file mode 100644
+index 0000000..4b444a8
+--- /dev/null
++++ b/src/logpipe/parsers/detector.py
+@@ -0,0 +1,79 @@
++from __future__ import annotations
++
++import json
++import math
++import re
++
++from logpipe.models import CustomPattern
++
++
++def _classify_line(line: str) -> str | None:
++    stripped = line.strip()
++    if not stripped:
++        return None
++    if stripped.startswith("{"):
++        try:
++            json.loads(stripped)
++            return "json"
++        except json.JSONDecodeError:
++            return None
++    if re.match(r"<\d{1,3}>", stripped):
++        return "syslog"
++    return None
++
++
++def detect_format(
++    filepath: str, custom_patterns: list[CustomPattern] | None = None
++) -> str:
++    """Auto-detect log format by examining first 10 non-empty lines.
++
++    Requires >= 70% of sampled lines to match a single format.
++    """
++    votes: dict[str, int] = {}
++    lines_checked = 0
++
++    with open(filepath, errors="replace") as f:
++        for raw_line in f:
++            line = raw_line.strip()
++            if not line:
++                continue
++            fmt = _classify_line(line)
++            if fmt:
++                votes[fmt] = votes.get(fmt, 0) + 1
++            lines_checked += 1
++            if lines_checked >= 10:
++                break
++
++    if lines_checked == 0:
++        raise ValueError(f"File is empty or contains only blank lines: {filepath}")
++
++    threshold = math.ceil(lines_checked * 0.7)
++
++    for fmt, count in sorted(votes.items(), key=lambda x: -x[1]):
++        if count >= threshold:
++            return fmt
++
++    if custom_patterns:
++        for cp in custom_patterns:
++            pattern = re.compile(cp.pattern)
++            matches = 0
++            checked = 0
++            with open(filepath, errors="replace") as f:
++                for raw_line in f:
++                    line = raw_line.strip()
++                    if not line:
++                        continue
++                    if pattern.match(line):
++                        matches += 1
++                    checked += 1
++                    if checked >= 10:
++                        break
++            cp_threshold = math.ceil(checked * 0.7)
++            if matches >= cp_threshold:
++                return f"custom:{cp.name}"
++
++    raise ValueError(
++        f"Could not auto-detect format for {filepath}. "
++        f"Checked {lines_checked} lines, results: {votes}. "
++        f"Use --format to specify explicitly."
++    )
+diff --git a/src/logpipe/parsers/json_parser.py b/src/logpipe/parsers/json_parser.py
+new file mode 100644
+index 0000000..f096703
+--- /dev/null
++++ b/src/logpipe/parsers/json_parser.py
+@@ -0,0 +1,37 @@
++from __future__ import annotations
++
++import json
++from datetime import timezone
++
++from logpipe.models import LogEntry, Severity, SEVERITY_NAMES
++from logpipe.normalizer import parse_timestamp
++
++
++def parse_json_line(
++    line: str, source: str, default_tz: timezone = timezone.utc
++) -> LogEntry:
++    data = json.loads(line)
++
++    ts_raw = data.get("timestamp")
++    if not ts_raw:
++        raise ValueError("Missing 'timestamp' field")
++
++    timestamp = parse_timestamp(str(ts_raw), default_tz=default_tz)
++    message = str(data.get("message", ""))
++
++    severity_raw = data.get("severity", data.get("level", "INFO"))
++    severity = SEVERITY_NAMES.get(str(severity_raw).upper(), Severity.INFO)
++
++    metadata = {
++        k: v
++        for k, v in data.items()
++        if k not in ("timestamp", "message", "severity", "level")
++    }
++
++    return LogEntry(
++        timestamp=timestamp,
++        severity=severity,
++        source=source,
++        message=message,
++        metadata=metadata,
++    )
+diff --git a/src/logpipe/parsers/pattern_parser.py b/src/logpipe/parsers/pattern_parser.py
+new file mode 100644
+index 0000000..30a540e
+--- /dev/null
++++ b/src/logpipe/parsers/pattern_parser.py
+@@ -0,0 +1,44 @@
++from __future__ import annotations
++
++import re
++from datetime import timezone
++
++from logpipe.models import LogEntry, Severity, SEVERITY_NAMES
++from logpipe.normalizer import parse_timestamp
++
++
++def parse_pattern_line(
++    line: str,
++    pattern: str,
++    ts_format: str,
++    source: str,
++    default_tz: timezone = timezone.utc,
++) -> LogEntry:
++    m = re.match(pattern, line)
++    if not m:
++        raise ValueError(f"Does not match custom pattern")
++
++    groups = m.groupdict()
++
++    ts_raw = groups.pop("timestamp", None)
++    if not ts_raw:
++        raise ValueError("Custom pattern must capture a 'timestamp' group")
++
++    timestamp = parse_timestamp(ts_raw, fmt=ts_format, default_tz=default_tz)
++    message = groups.pop("message", "")
++
++    severity_raw = groups.pop("severity", None)
++    if severity_raw:
++        severity = SEVERITY_NAMES.get(severity_raw.upper(), Severity.INFO)
++    else:
++        severity = Severity.INFO
++
++    src = groups.pop("source", source)
++
++    return LogEntry(
++        timestamp=timestamp,
++        severity=severity,
++        source=src,
++        message=message,
++        metadata=groups,
++    )
+diff --git a/src/logpipe/parsers/syslog_parser.py b/src/logpipe/parsers/syslog_parser.py
+new file mode 100644
+index 0000000..f1ec187
+--- /dev/null
++++ b/src/logpipe/parsers/syslog_parser.py
+@@ -0,0 +1,59 @@
++from __future__ import annotations
++
++import re
++from datetime import timezone
++
++from logpipe.models import LogEntry, Severity
++from logpipe.normalizer import SYSLOG_SEVERITY_MAP, parse_timestamp
++
++SYSLOG_RE = re.compile(
++    r"<(\d{1,3})>"
++    r"(\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
++    r"(\S+)\s+"  # hostname
++    r"(.*)"  # rest
++)
++
++MSG_RE = re.compile(r"(\S+?)(?:\[(\d+)\])?:\s*(.*)", re.DOTALL)
++
++
++def parse_syslog_line(
++    line: str,
++    source: str,
++    default_tz: timezone = timezone.utc,
++    reference_year: int | None = None,
++) -> LogEntry:
++    m = SYSLOG_RE.match(line)
++    if not m:
++        raise ValueError("Does not match syslog format")
++
++    priority = int(m.group(1))
++    ts_raw = m.group(2)
++    hostname = m.group(3)
++    rest = m.group(4)
++
++    facility = priority >> 3
++    severity_num = priority & 0x07
++    severity = SYSLOG_SEVERITY_MAP.get(severity_num, Severity.INFO)
++
++    timestamp = parse_timestamp(ts_raw, default_tz=default_tz, reference_year=reference_year)
++
++    metadata: dict = {"hostname": hostname, "facility": facility, "priority": priority}
++
++    msg_match = MSG_RE.match(rest)
++    if msg_match:
++        process = msg_match.group(1)
++        pid = msg_match.group(2)
++        message = msg_match.group(3)
++        metadata["process"] = process
++        if pid:
++            metadata["pid"] = int(pid)
++    else:
++        message = rest
++
++    return LogEntry(
++        timestamp=timestamp,
++        severity=severity,
++        source=hostname,
++        message=message,
++        metadata=metadata,
++    )
+diff --git a/src/logpipe/reporter.py b/src/logpipe/reporter.py
+new file mode 100644
+index 0000000..bb180a2
+--- /dev/null
++++ b/src/logpipe/reporter.py
+@@ -0,0 +1,65 @@
++from __future__ import annotations
++
++import json
++
++from logpipe.models import AnalysisReport
++
++
++def write_report(report: AnalysisReport, path: str) -> None:
++    with open(path, "w") as f:
++        json.dump(report.to_dict(), f, indent=2)
++
++
++def load_report(path: str) -> dict:
++    with open(path) as f:
++        return json.load(f)
++
++
++def format_report(report: AnalysisReport) -> str:
++    lines: list[str] = []
++    lines.append("=== Log Analysis Report ===")
++    lines.append("")
++
++    ing = report.ingestion
++    lines.append("Ingestion:")
++    lines.append(f"  Files processed:   {ing.files_processed}")
++    lines.append(f"  Total entries:     {ing.total_entries}")
++    lines.append(f"  Malformed lines:   {ing.malformed_lines}")
++    if ing.entries_per_format:
++        fmt_str = ", ".join(f"{k}={v}" for k, v in sorted(ing.entries_per_format.items()))
++        lines.append(f"  By format:         {fmt_str}")
++    lines.append("")
++
++    fs = report.filter_summary
++    lines.append("Filtering:")
++    lines.append(f"  Before: {fs.entries_before}")
++    lines.append(f"  After:  {fs.entries_after}")
++    if fs.dropped_per_filter:
++        for name, count in sorted(fs.dropped_per_filter.items()):
++            lines.append(f"    {name}: -{count}")
++    lines.append("")
++
++    if report.severity_breakdown:
++        lines.append("Severity Breakdown:")
++        for sev in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
++            if sev in report.severity_breakdown:
++                lines.append(f"  {sev:<10} {report.severity_breakdown[sev]}")
++        lines.append("")
++
++    lines.append(f"Windows: {len(report.windows)}")
++    lines.append(f"Anomalies: {len(report.anomalies)}")
++
++    if report.anomalies:
++        lines.append("")
++        top = sorted(report.anomalies, key=lambda a: a.magnitude, reverse=True)[:5]
++        lines.append("Top Anomalies:")
++        for a in top:
++            lines.append(
++                f"  {a.window_start.strftime('%Y-%m-%d %H:%M')} - "
++                f"{a.window_end.strftime('%H:%M')}  "
++                f"{a.direction:<5}  count={a.event_count}  "
++                f"baseline={a.baseline_median:.0f}  "
++                f"magnitude={a.magnitude:.2f}"
++            )
++
++    return "\n".join(lines)
+diff --git a/src/logpipe/rules_engine.py b/src/logpipe/rules_engine.py
+new file mode 100644
+index 0000000..aa46f24
+--- /dev/null
++++ b/src/logpipe/rules_engine.py
+@@ -0,0 +1,60 @@
++from __future__ import annotations
++
++import fnmatch
++import re
++
++from logpipe.models import FilterConfig, LogEntry, TransformRule
++
++
++def apply_filter(entry: LogEntry, config: FilterConfig) -> tuple[bool, str | None]:
++    """Check whether an entry passes all filters. Returns (passes, rejected_by_name)."""
++    if config.severity_min is not None and entry.severity < config.severity_min:
++        return False, "severity_min"
++
++    if config.source_exclude:
++        for pattern in config.source_exclude:
++            if fnmatch.fnmatch(entry.source, pattern):
++                return False, "source_exclude"
++
++    if config.source_include:
++        if not any(fnmatch.fnmatch(entry.source, p) for p in config.source_include):
++            return False, "source_include"
++
++    if config.keyword_exclude:
++        msg_lower = entry.message.lower()
++        for kw in config.keyword_exclude:
++            if kw.lower() in msg_lower:
++                return False, "keyword_exclude"
++
++    if config.keyword_match:
++        msg_lower = entry.message.lower()
++        if not any(kw.lower() in msg_lower for kw in config.keyword_match):
++            return False, "keyword_match"
++
++    if config.time_range_start and entry.timestamp < config.time_range_start:
++        return False, "time_range"
++
++    if config.time_range_end and entry.timestamp >= config.time_range_end:
++        return False, "time_range"
++
++    return True, None
++
++
++def apply_transforms(entry: LogEntry, transforms: list[TransformRule]) -> LogEntry:
++    """Apply transform rules in order. Mutates and returns the entry."""
++    for rule in transforms:
++        if rule.type == "extract_fields":
++            m = re.search(rule.params["pattern"], entry.message)
++            if m:
++                entry.metadata.update(m.groupdict())
++        elif rule.type == "rename_field":
++            old = rule.params["from"]
++            new = rule.params["to"]
++            if old in entry.metadata:
++                entry.metadata[new] = entry.metadata.pop(old)
++        elif rule.type == "add_static_field":
++            entry.metadata[rule.params["key"]] = rule.params["value"]
++        elif rule.type == "drop_fields":
++            for f in rule.params["fields"]:
++                entry.metadata.pop(f, None)
++    return entry
+diff --git a/src/logpipe/tail.py b/src/logpipe/tail.py
+new file mode 100644
+index 0000000..17941ff
+--- /dev/null
++++ b/src/logpipe/tail.py
+@@ -0,0 +1,151 @@
++from __future__ import annotations
++
++import json
++import os
++import sys
++import time
++from datetime import timezone
++
++from logpipe.models import PipelineConfig
++from logpipe.normalizer import resolve_default_tz
++from logpipe.parsers.detector import detect_format
++from logpipe.parsers.json_parser import parse_json_line
++from logpipe.parsers.pattern_parser import parse_pattern_line
++from logpipe.parsers.syslog_parser import parse_syslog_line
++from logpipe.rules_engine import apply_filter, apply_transforms
++
++
++class FileMonitor:
++    """Monitor a single file for new content with rotation detection via inode check."""
++
++    def __init__(self, filepath: str, format_name: str, config: PipelineConfig):
++        self.filepath = filepath
++        self.format_name = format_name
++        self.config = config
++        self.file = None
++        self.inode: int | None = None
++        self._open(seek_end=True)
++
++    def _open(self, seek_end: bool = False) -> None:
++        self.file = open(self.filepath, errors="replace")
++        stat = os.stat(self.filepath)
++        self.inode = stat.st_ino
++        if seek_end:
++            self.file.seek(0, 2)
++
++    def check_rotation(self) -> bool:
++        try:
++            stat = os.stat(self.filepath)
++            if stat.st_ino != self.inode:
++                self.file.close()
++                self._open(seek_end=False)
++                return True
++        except FileNotFoundError:
++            pass
++        return False
++
++    def read_new_lines(self) -> list[str]:
++        lines: list[str] = []
++        while True:
++            line = self.file.readline()
++            if not line:
++                break
++            lines.append(line.rstrip("\n\r"))
++        return lines
++
++    def close(self) -> None:
++        if self.file and not self.file.closed:
++            self.file.close()
++
++
++def tail_files(
++    paths: list[str],
++    config: PipelineConfig,
++    format_name: str | None = None,
++    refresh_seconds: float = 5.0,
++    output_format: str = "raw",
++) -> None:
++    default_tz = resolve_default_tz(config.default_timezone)
++    monitors: list[FileMonitor] = []
++
++    for p in paths:
++        try:
++            fmt = format_name or detect_format(p, config.custom_patterns or None)
++            monitors.append(FileMonitor(p, fmt, config))
++        except (OSError, ValueError) as e:
++            print(f"Warning: {p}: {e}", file=sys.stderr)
++
++    if not monitors:
++        print("Error: No files could be opened for monitoring.", file=sys.stderr)
++        return
++
++    entry_count = 0
++    last_refresh = time.monotonic()
++
++    try:
++        while True:
++            for mon in monitors:
++                mon.check_rotation()
++                lines = mon.read_new_lines()
++
++                for line in lines:
++                    if not line.strip():
++                        continue
++                    entry = _parse_line(line, mon, default_tz)
++                    if entry is None:
++                        continue
++
++                    passes, _ = apply_filter(entry, config.filters)
++                    if not passes:
++                        continue
++
++                    entry = apply_transforms(entry, config.transforms)
++                    entry_count += 1
++
++                    if output_format == "json":
++                        print(
++                            json.dumps(
++                                {
++                                    "timestamp": entry.timestamp.isoformat(),
++                                    "severity": entry.severity.name,
++                                    "source": entry.source,
++                                    "message": entry.message,
++                                    "metadata": entry.metadata,
++                                }
++                            )
++                        )
++                    else:
++                        print(
++                            f"{entry.timestamp.isoformat()} [{entry.severity.name}] "
++                            f"{entry.source}: {entry.message}"
++                        )
++
++            now = time.monotonic()
++            if now - last_refresh >= refresh_seconds:
++                print(f"\n--- {entry_count} entries processed ---", file=sys.stderr)
++                last_refresh = now
++
++            time.sleep(0.25)
++
++    except KeyboardInterrupt:
++        pass
++    finally:
++        for mon in monitors:
++            mon.close()
++
++
++def _parse_line(line, mon, default_tz):
++    try:
++        if mon.format_name == "json":
++            return parse_json_line(line, mon.filepath, default_tz)
++        elif mon.format_name == "syslog":
++            return parse_syslog_line(line, mon.filepath, default_tz)
++        elif mon.format_name.startswith("custom:"):
++            pname = mon.format_name.split(":", 1)[1]
++            cp = next((c for c in mon.config.custom_patterns if c.name == pname), None)
++            if not cp:
++                return None
++            return parse_pattern_line(line, cp.pattern, cp.timestamp_format, mon.filepath, default_tz)
++    except (ValueError, KeyError):
++        return None
++    return None
+diff --git a/tests/test_aggregator.py b/tests/test_aggregator.py
+new file mode 100644
+index 0000000..971931b
+--- /dev/null
++++ b/tests/test_aggregator.py
+@@ -0,0 +1,128 @@
++from datetime import datetime, timezone
++
++import pytest
++
++from logpipe.aggregator import build_windows, _compute_metrics
++from logpipe.models import LogEntry, Severity
++
++
++def _entry(ts_str, severity=Severity.INFO, source="host-a"):
++    return LogEntry(
++        timestamp=datetime.fromisoformat(ts_str),
++        severity=severity,
++        source=source,
++        message="msg",
++    )
++
++
++class TestBuildWindows:
++    def test_empty(self):
++        assert build_windows([], 300, 60) == []
++
++    def test_single_entry(self):
++        entries = [_entry("2024-01-15T10:00:30Z")]
++        windows = build_windows(entries, 300, 60)
++        assert len(windows) >= 1
++        assert any(w.total_count == 1 for w in windows)
++
++    def test_boundary_inclusive_start(self):
++        """Event exactly at window start should be included in that window."""
++        # Window [10:00:00, 10:05:00)
++        entries = [
++            _entry("2024-01-15T10:00:00Z"),
++            _entry("2024-01-15T10:04:59Z"),
++        ]
++        windows = build_windows(entries, 300, 300)
++        assert len(windows) == 1
++        assert windows[0].total_count == 2
++
++    def test_boundary_exclusive_end(self):
++        """Event exactly at window end should NOT be in that window [start, end)."""
++        entries = [
++            _entry("2024-01-15T10:00:00Z"),
++            _entry("2024-01-15T10:05:00Z"),  # exactly at end of first window
++        ]
++        windows = build_windows(entries, 300, 300)
++        # First window: [10:00:00, 10:05:00) → 1 entry
++        # Second window: [10:05:00, 10:10:00) → 1 entry
++        assert len(windows) == 2
++        assert windows[0].total_count == 1
++        assert windows[1].total_count == 1
++
++    def test_sliding_overlap(self):
++        """With slide < window, entries can appear in multiple windows."""
++        entries = [
++            _entry("2024-01-15T10:00:30Z"),
++            _entry("2024-01-15T10:04:30Z"),
++        ]
++        # 300s window, 60s slide → entries should appear in multiple windows
++        windows = build_windows(entries, 300, 60)
++        total_hits = sum(w.total_count for w in windows)
++        # With overlapping windows, total hits across all windows > number of entries
++        assert total_hits > 2
++
++    def test_no_gaps_with_slide(self):
++        """Windows should cover the full range without gaps."""
++        entries = [
++            _entry("2024-01-15T10:00:00Z"),
++            _entry("2024-01-15T10:10:00Z"),
++        ]
++        windows = build_windows(entries, 300, 60)
++        # Check windows are contiguous in terms of slide
++        for i in range(1, len(windows)):
++            prev_start = windows[i - 1].start.timestamp()
++            curr_start = windows[i].start.timestamp()
++            assert curr_start - prev_start == 60
++
++    def test_top_n_sources(self):
++        entries = [
++            _entry("2024-01-15T10:00:00Z", source="a"),
++            _entry("2024-01-15T10:00:01Z", source="a"),
++            _entry("2024-01-15T10:00:02Z", source="b"),
++        ]
++        windows = build_windows(entries, 300, 300, top_n=1)
++        assert len(windows) == 1
++        # top_n=1 should only report top source
++        assert len(windows[0].top_sources) == 1
++        assert windows[0].top_sources[0][0] == "a"
++
++    def test_error_rate(self):
++        entries = [
++            _entry("2024-01-15T10:00:00Z", severity=Severity.INFO),
++            _entry("2024-01-15T10:00:01Z", severity=Severity.ERROR),
++            _entry("2024-01-15T10:00:02Z", severity=Severity.CRITICAL),
++            _entry("2024-01-15T10:00:03Z", severity=Severity.INFO),
++        ]
++        windows = build_windows(entries, 300, 300)
++        assert len(windows) == 1
++        # 2 out of 4 are ERROR or CRITICAL = 50%
++        assert windows[0].error_rate == 50.0
++
++    def test_eps(self):
++        entries = [_entry(f"2024-01-15T10:00:0{i}Z") for i in range(5)]
++        windows = build_windows(entries, 300, 300)
++        assert len(windows) == 1
++        # 5 events / 300 seconds
++        assert abs(windows[0].eps - 5 / 300) < 0.001
++
++    def test_severity_counts(self):
++        entries = [
++            _entry("2024-01-15T10:00:00Z", severity=Severity.INFO),
++            _entry("2024-01-15T10:00:01Z", severity=Severity.INFO),
++            _entry("2024-01-15T10:00:02Z", severity=Severity.ERROR),
++        ]
++        windows = build_windows(entries, 300, 300)
++        assert windows[0].counts_by_severity["INFO"] == 2
++        assert windows[0].counts_by_severity["ERROR"] == 1
++
++
++class TestComputeMetrics:
++    def test_empty_window(self):
++        start = datetime(2024, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
++        end = datetime(2024, 1, 15, 10, 5, 0, tzinfo=timezone.utc)
++        m = _compute_metrics([], start, end, 300, 10)
++        assert m.total_count == 0
++        assert m.error_rate == 0.0
++        assert m.eps == 0.0
++        assert m.counts_by_severity == {}
++        assert m.top_sources == []
+diff --git a/tests/test_anomaly.py b/tests/test_anomaly.py
+new file mode 100644
+index 0000000..668de7c
+--- /dev/null
++++ b/tests/test_anomaly.py
+@@ -0,0 +1,148 @@
++from datetime import datetime, timezone
++
++import pytest
++
++from logpipe.anomaly_detector import detect_anomalies, _compute_median_iqr
++from logpipe.models import WindowMetrics
++
++
++def _window(start_minute, count):
++    start = datetime(2024, 1, 15, 10, start_minute, 0, tzinfo=timezone.utc)
++    end = datetime(2024, 1, 15, 10, start_minute + 5, 0, tzinfo=timezone.utc)
++    return WindowMetrics(
++        start=start,
++        end=end,
++        total_count=count,
++        counts_by_severity={},
++        top_sources=[],
++        error_rate=0.0,
++        eps=0.0,
++    )
++
++
++class TestComputeMedianIqr:
++    def test_empty(self):
++        median, iqr = _compute_median_iqr([])
++        assert median == 0.0
++        assert iqr == 0.0
++
++    def test_single(self):
++        median, iqr = _compute_median_iqr([10])
++        assert median == 10
++        assert iqr == 0.0
++
++    def test_two_values(self):
++        median, iqr = _compute_median_iqr([10, 20])
++        assert median == 15.0
++        assert iqr == 0.0  # n < 4
++
++    def test_four_values(self):
++        median, iqr = _compute_median_iqr([1, 2, 3, 4])
++        # sorted: [1, 2, 3, 4]
++        # lower: [1, 2] → Q1 = 1.5
++        # upper: [3, 4] → Q3 = 3.5
++        assert median == 2.5
++        assert iqr == 2.0
++
++    def test_odd_values(self):
++        median, iqr = _compute_median_iqr([1, 2, 3, 4, 5])
++        # sorted: [1, 2, 3, 4, 5]
++        # median = 3
++        # lower: [1, 2] → Q1 = 1.5
++        # upper: [4, 5] → Q3 = 4.5
++        assert median == 3
++        assert iqr == 3.0
++
++    def test_uniform(self):
++        median, iqr = _compute_median_iqr([5, 5, 5, 5, 5])
++        assert median == 5
++        assert iqr == 0.0
++
++
++class TestDetectAnomalies:
++    def test_first_k_windows_not_flagged(self):
++        windows = [_window(i, 10) for i in range(25)]
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        # All have count=10, no anomalies
++        assert len(anomalies) == 0
++
++    def test_spike_detected(self):
++        # 20 baseline windows with count=10, then one with count=100
++        windows = [_window(i, 10) for i in range(20)]
++        windows.append(_window(20, 100))
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        assert len(anomalies) == 1
++        assert anomalies[0].direction == "spike"
++        assert anomalies[0].event_count == 100
++        assert anomalies[0].baseline_median == 10
++
++    def test_drop_detected(self):
++        # 20 baseline windows with count=100, then one with count=0
++        windows = [_window(i, 100) for i in range(20)]
++        windows.append(_window(20, 0))
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        assert len(anomalies) == 1
++        assert anomalies[0].direction == "drop"
++
++    def test_no_anomaly_within_bounds(self):
++        # Varying counts within normal range
++        counts = [10, 12, 11, 13, 10, 14, 11, 12, 10, 13,
++                  11, 12, 10, 14, 13, 11, 12, 10, 13, 11, 12]
++        windows = [_window(i, c) for i, c in enumerate(counts)]
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        assert len(anomalies) == 0
++
++    def test_iqr_zero_spike(self):
++        # All baseline=10, current=15 → IQR is 0, 15 != 10 → spike
++        windows = [_window(i, 10) for i in range(20)]
++        windows.append(_window(20, 15))
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        assert len(anomalies) == 1
++        assert anomalies[0].direction == "spike"
++        assert anomalies[0].magnitude == 5  # abs(15 - 10)
++
++    def test_iqr_zero_drop(self):
++        windows = [_window(i, 10) for i in range(20)]
++        windows.append(_window(20, 5))
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        assert len(anomalies) == 1
++        assert anomalies[0].direction == "drop"
++        assert anomalies[0].magnitude == 5
++
++    def test_iqr_zero_no_anomaly(self):
++        windows = [_window(i, 10) for i in range(21)]
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        assert len(anomalies) == 0
++
++    def test_exactly_at_boundary_not_flagged(self):
++        # baseline: mix of 8 and 12 → median=10, IQR=4
++        # upper = 10 + 2*4 = 18, lower = 10 - 2*4 = 2
++        counts = [8, 12] * 10  # 20 values
++        windows = [_window(i, c) for i, c in enumerate(counts)]
++        # Add one at exactly upper=18
++        windows.append(_window(20, 18))
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        assert len(anomalies) == 0  # exactly at boundary → not anomalous
++
++    def test_sensitivity_parameter(self):
++        # Low sensitivity should flag more
++        counts = [10, 12] * 10
++        windows = [_window(i, c) for i, c in enumerate(counts)]
++        windows.append(_window(20, 14))  # slight increase
++        # With sensitivity=0.5: upper = 11 + 0.5*2 = 12, 14 > 12 → spike
++        anomalies_low = detect_anomalies(windows, baseline_k=20, sensitivity=0.5)
++        # With sensitivity=5: upper = 11 + 5*2 = 21, 14 < 21 → no anomaly
++        anomalies_high = detect_anomalies(windows, baseline_k=20, sensitivity=5.0)
++        assert len(anomalies_low) >= 1
++        assert len(anomalies_high) == 0
++
++    def test_rolling_baseline(self):
++        # First 20 windows: count=10. Then 5 windows with count=50.
++        # By window 25, the baseline is windows 5-24 which includes some 50s.
++        windows = [_window(i, 10) for i in range(20)]
++        for i in range(20, 26):
++            windows.append(_window(i, 50))
++        anomalies = detect_anomalies(windows, baseline_k=20, sensitivity=2.0)
++        # Window 20 (count=50) uses baseline from windows 0-19 (all count=10)
++        # This should be flagged as spike
++        assert any(a.event_count == 50 and a.direction == "spike" for a in anomalies)
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+new file mode 100644
+index 0000000..0705130
+--- /dev/null
++++ b/tests/test_integration.py
+@@ -0,0 +1,225 @@
++import json
++import os
++import subprocess
++import sys
++import tempfile
++
++import pytest
++import yaml
++
++
++def _write_temp(content, suffix=".log"):
++    f = tempfile.NamedTemporaryFile(mode="w", suffix=suffix, delete=False)
++    f.write(content)
++    f.close()
++    return f.name
++
++
++def _run_logpipe(*args, input_text=None):
++    cmd = [sys.executable, "-m", "logpipe"] + list(args)
++    result = subprocess.run(
++        cmd,
++        capture_output=True,
++        text=True,
++        timeout=30,
++        input=input_text,
++    )
++    return result
++
++
++class TestAnalyzeCommand:
++    def test_json_file(self):
++        lines = "\n".join(
++            json.dumps({"timestamp": f"2024-01-15T10:{i:02d}:00Z", "message": f"msg{i}"})
++            for i in range(20)
++        )
++        log_path = _write_temp(lines)
++        report_path = _write_temp("", suffix=".json")
++        try:
++            r = _run_logpipe("analyze", log_path, "--report", report_path)
++            assert r.returncode == 0
++            with open(report_path) as f:
++                data = json.load(f)
++            assert data["ingestion"]["total_entries"] == 20
++            assert data["ingestion"]["files_processed"] == 1
++        finally:
++            os.unlink(log_path)
++            os.unlink(report_path)
++
++    def test_syslog_file(self):
++        lines = "\n".join(
++            f"<14>Jan 15 10:{i:02d}:00 myhost app[100]: log entry {i}"
++            for i in range(10)
++        )
++        log_path = _write_temp(lines)
++        report_path = _write_temp("", suffix=".json")
++        try:
++            r = _run_logpipe("analyze", log_path, "--format", "syslog", "--report", report_path)
++            assert r.returncode == 0
++            with open(report_path) as f:
++                data = json.load(f)
++            assert data["ingestion"]["total_entries"] == 10
++        finally:
++            os.unlink(log_path)
++            os.unlink(report_path)
++
++    def test_with_config(self):
++        lines = "\n".join(
++            json.dumps({
++                "timestamp": f"2024-01-15T10:{i:02d}:00Z",
++                "message": "error occurred" if i % 3 == 0 else "info msg",
++                "severity": "ERROR" if i % 3 == 0 else "INFO",
++            })
++            for i in range(15)
++        )
++        log_path = _write_temp(lines)
++        config = {
++            "filters": {"severity_min": "ERROR"},
++            "aggregation": {"window_seconds": 300, "slide_seconds": 300},
++        }
++        config_path = _write_temp(yaml.dump(config), suffix=".yaml")
++        report_path = _write_temp("", suffix=".json")
++        try:
++            r = _run_logpipe("analyze", log_path, "--config", config_path, "--report", report_path)
++            assert r.returncode == 0
++            with open(report_path) as f:
++                data = json.load(f)
++            # Only ERROR entries should pass (every 3rd entry: 0,3,6,9,12 = 5)
++            assert data["filter_summary"]["entries_after"] == 5
++        finally:
++            os.unlink(log_path)
++            os.unlink(config_path)
++            os.unlink(report_path)
++
++    def test_missing_file(self):
++        r = _run_logpipe("analyze", "/tmp/nonexistent_12345.log")
++        assert r.returncode == 2
++
++    def test_bad_config(self):
++        log_path = _write_temp(json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "x"}))
++        try:
++            r = _run_logpipe("analyze", log_path, "--config", "/tmp/nonexistent_config_12345.yaml")
++            assert r.returncode == 1
++        finally:
++            os.unlink(log_path)
++
++    def test_anomaly_exit_code(self):
++        # Create data with a big spike after steady baseline
++        lines = []
++        for i in range(25):
++            count = 2 if i < 22 else 50
++            day = 15 + i // 14
++            hour = i % 14
++            for j in range(count):
++                lines.append(json.dumps({
++                    "timestamp": f"2024-01-{day:02d}T{hour:02d}:{j:02d}:00Z",
++                    "message": f"msg",
++                }))
++        log_path = _write_temp("\n".join(lines))
++        config = {
++            "aggregation": {"window_seconds": 3600, "slide_seconds": 3600},
++            "anomaly": {"baseline_windows": 5, "sensitivity": 1.5},
++        }
++        config_path = _write_temp(yaml.dump(config), suffix=".yaml")
++        try:
++            r = _run_logpipe("analyze", log_path, "--config", config_path)
++            assert r.returncode == 3  # anomalies detected
++        finally:
++            os.unlink(log_path)
++            os.unlink(config_path)
++
++    def test_malformed_lines_counted(self):
++        lines = [
++            json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "ok"}),
++            "not json at all",
++            "also broken",
++            json.dumps({"timestamp": "2024-01-15T10:01:00Z", "message": "ok2"}),
++        ]
++        log_path = _write_temp("\n".join(lines))
++        report_path = _write_temp("", suffix=".json")
++        try:
++            r = _run_logpipe("analyze", log_path, "--format", "json", "--report", report_path)
++            assert r.returncode == 0
++            with open(report_path) as f:
++                data = json.load(f)
++            assert data["ingestion"]["malformed_lines"] == 2
++            assert data["ingestion"]["total_entries"] == 2
++        finally:
++            os.unlink(log_path)
++            os.unlink(report_path)
++
++
++class TestConfigInit:
++    def test_prints_template(self):
++        r = _run_logpipe("config", "init")
++        assert r.returncode == 0
++        assert "default_timezone" in r.stdout
++        assert "filters" in r.stdout
++        assert "aggregation" in r.stdout
++
++
++class TestVersion:
++    def test_version(self):
++        r = _run_logpipe("version")
++        assert r.returncode == 0
++        assert "0.1.0" in r.stdout
++
++
++class TestMultipleFiles:
++    def test_mixed_formats(self):
++        json_lines = "\n".join(
++            json.dumps({"timestamp": f"2024-01-15T10:{i:02d}:00Z", "message": f"json{i}"})
++            for i in range(5)
++        )
++        syslog_lines = "\n".join(
++            f"<14>Jan 15 10:{i:02d}:00 host app[1]: syslog{i}"
++            for i in range(5)
++        )
++        json_path = _write_temp(json_lines, suffix=".json.log")
++        syslog_path = _write_temp(syslog_lines, suffix=".syslog.log")
++        report_path = _write_temp("", suffix=".json")
++        try:
++            r = _run_logpipe("analyze", json_path, syslog_path, "--report", report_path)
++            assert r.returncode in (0, 3)  # 3 if anomalies detected
++            with open(report_path) as f:
++                data = json.load(f)
++            assert data["ingestion"]["files_processed"] == 2
++            assert data["ingestion"]["total_entries"] == 10
++        finally:
++            os.unlink(json_path)
++            os.unlink(syslog_path)
++            os.unlink(report_path)
++
++
++class TestCustomPattern:
++    def test_custom_format_end_to_end(self):
++        lines = "\n".join(
++            f"2024-01-15 10:{i:02d}:00 [INFO] custom message {i}"
++            for i in range(10)
++        )
++        log_path = _write_temp(lines)
++        config = {
++            "custom_patterns": [{
++                "name": "mylog",
++                "pattern": r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(?P<severity>\w+)\] (?P<message>.*)",
++                "timestamp_format": "%Y-%m-%d %H:%M:%S",
++            }],
++            "aggregation": {"window_seconds": 300, "slide_seconds": 300},
++        }
++        config_path = _write_temp(yaml.dump(config), suffix=".yaml")
++        report_path = _write_temp("", suffix=".json")
++        try:
++            r = _run_logpipe(
++                "analyze", log_path,
++                "--config", config_path,
++                "--format", "custom:mylog",
++                "--report", report_path,
++            )
++            assert r.returncode == 0
++            with open(report_path) as f:
++                data = json.load(f)
++            assert data["ingestion"]["total_entries"] == 10
++        finally:
++            os.unlink(log_path)
++            os.unlink(config_path)
++            os.unlink(report_path)
+diff --git a/tests/test_normalizer.py b/tests/test_normalizer.py
+new file mode 100644
+index 0000000..96f0d74
+--- /dev/null
++++ b/tests/test_normalizer.py
+@@ -0,0 +1,101 @@
++from datetime import datetime, timezone, timedelta
++from zoneinfo import ZoneInfo
++
++import pytest
++
++from logpipe.normalizer import parse_timestamp, resolve_default_tz, SYSLOG_SEVERITY_MAP
++from logpipe.models import Severity
++
++
++class TestResolveDefaultTz:
++    def test_utc(self):
++        tz = resolve_default_tz("UTC")
++        assert tz == timezone.utc
++
++    def test_named_zone(self):
++        tz = resolve_default_tz("America/New_York")
++        assert isinstance(tz, ZoneInfo)
++
++    def test_unknown_zone_falls_back_to_utc(self):
++        tz = resolve_default_tz("Not/A/Zone")
++        assert tz == timezone.utc
++
++
++class TestParseTimestamp:
++    def test_iso_with_z(self):
++        dt = parse_timestamp("2024-01-15T10:30:00Z")
++        assert dt == datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
++
++    def test_iso_with_offset(self):
++        dt = parse_timestamp("2024-01-15T10:30:00+05:30")
++        expected = datetime(2024, 1, 15, 5, 0, 0, tzinfo=timezone.utc)
++        assert dt == expected
++
++    def test_iso_space_separator(self):
++        dt = parse_timestamp("2024-01-15 10:30:00")
++        assert dt == datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
++
++    def test_iso_fractional_seconds(self):
++        dt = parse_timestamp("2024-01-15T10:30:00.123456Z")
++        assert dt.microsecond == 123456
++        assert dt.tzinfo == timezone.utc
++
++    def test_iso_fractional_with_offset(self):
++        dt = parse_timestamp("2024-01-15T10:30:00.500+00:00")
++        assert dt.microsecond == 500000
++
++    def test_no_timezone_uses_default(self):
++        eastern = ZoneInfo("America/New_York")
++        dt = parse_timestamp("2024-07-15 12:00:00", default_tz=eastern)
++        # July in EDT = UTC-4
++        assert dt.tzinfo == timezone.utc
++        assert dt.hour == 16
++
++    def test_syslog_format(self):
++        dt = parse_timestamp("Jan 15 10:30:00", reference_year=2024)
++        assert dt.month == 1
++        assert dt.day == 15
++        assert dt.hour == 10
++        assert dt.minute == 30
++
++    def test_syslog_single_digit_day(self):
++        dt = parse_timestamp("Jan  5 08:00:00", reference_year=2024)
++        assert dt.day == 5
++
++    def test_syslog_year_inference_future_wraps(self):
++        # Use a month far in the future to trigger year rollback
++        future_month = datetime.now(timezone.utc) + timedelta(days=400)
++        month_str = future_month.strftime("%b")
++        ts = f"{month_str} 15 10:00:00"
++        dt = parse_timestamp(ts)
++        # Should not be >1 day in the future
++        assert dt <= datetime.now(timezone.utc) + timedelta(days=1)
++
++    def test_custom_format(self):
++        dt = parse_timestamp("15/Jan/2024:10:30:00 +0000", fmt="%d/%b/%Y:%H:%M:%S %z")
++        assert dt == datetime(2024, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
++
++    def test_custom_format_no_tz(self):
++        dt = parse_timestamp("2024-01-15 10:30:00", fmt="%Y-%m-%d %H:%M:%S")
++        assert dt.tzinfo == timezone.utc
++
++    def test_invalid_raises(self):
++        with pytest.raises(ValueError, match="Unable to parse"):
++            parse_timestamp("not-a-timestamp")
++
++
++class TestSyslogSeverityMap:
++    def test_emergency_is_critical(self):
++        assert SYSLOG_SEVERITY_MAP[0] == Severity.CRITICAL
++
++    def test_error(self):
++        assert SYSLOG_SEVERITY_MAP[3] == Severity.ERROR
++
++    def test_warning(self):
++        assert SYSLOG_SEVERITY_MAP[4] == Severity.WARNING
++
++    def test_notice_is_info(self):
++        assert SYSLOG_SEVERITY_MAP[5] == Severity.INFO
++
++    def test_debug(self):
++        assert SYSLOG_SEVERITY_MAP[7] == Severity.DEBUG
+diff --git a/tests/test_parsers.py b/tests/test_parsers.py
+new file mode 100644
+index 0000000..cceb1be
+--- /dev/null
++++ b/tests/test_parsers.py
+@@ -0,0 +1,271 @@
++import json
++import os
++import tempfile
++from datetime import datetime, timezone
++
++import pytest
++
++from logpipe.models import Severity, CustomPattern, PipelineConfig
++from logpipe.parsers.json_parser import parse_json_line
++from logpipe.parsers.syslog_parser import parse_syslog_line
++from logpipe.parsers.pattern_parser import parse_pattern_line
++from logpipe.parsers.detector import detect_format
++from logpipe.parsers import parse_file
++
++
++class TestJsonParser:
++    def test_basic(self):
++        line = json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "hello"})
++        entry = parse_json_line(line, "/test.log")
++        assert entry.message == "hello"
++        assert entry.severity == Severity.INFO
++        assert entry.source == "/test.log"
++        assert entry.timestamp.tzinfo is not None
++
++    def test_with_severity(self):
++        line = json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "err", "severity": "ERROR"})
++        entry = parse_json_line(line, "/test.log")
++        assert entry.severity == Severity.ERROR
++
++    def test_with_level_field(self):
++        line = json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "warn", "level": "WARNING"})
++        entry = parse_json_line(line, "/test.log")
++        assert entry.severity == Severity.WARNING
++
++    def test_extra_fields_in_metadata(self):
++        line = json.dumps({
++            "timestamp": "2024-01-15T10:00:00Z", "message": "hi",
++            "user": "alice", "request_id": "abc123"
++        })
++        entry = parse_json_line(line, "/test.log")
++        assert entry.metadata["user"] == "alice"
++        assert entry.metadata["request_id"] == "abc123"
++        assert "timestamp" not in entry.metadata
++        assert "message" not in entry.metadata
++
++    def test_missing_timestamp_raises(self):
++        line = json.dumps({"message": "no ts"})
++        with pytest.raises(ValueError, match="timestamp"):
++            parse_json_line(line, "/test.log")
++
++    def test_invalid_json_raises(self):
++        with pytest.raises(json.JSONDecodeError):
++            parse_json_line("not json", "/test.log")
++
++    def test_unknown_severity_defaults_to_info(self):
++        line = json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "x", "severity": "UNKNOWN"})
++        entry = parse_json_line(line, "/test.log")
++        assert entry.severity == Severity.INFO
++
++
++class TestSyslogParser:
++    def test_basic_with_pid(self):
++        line = "<34>Jan 15 10:30:00 myhost sshd[1234]: Accepted password for user"
++        entry = parse_syslog_line(line, "/var/log/syslog", reference_year=2024)
++        assert entry.source == "myhost"
++        assert entry.message == "Accepted password for user"
++        assert entry.metadata["process"] == "sshd"
++        assert entry.metadata["pid"] == 1234
++        assert entry.metadata["hostname"] == "myhost"
++        # priority 34 = facility 4, severity 2 (Critical)
++        assert entry.metadata["facility"] == 4
++        assert entry.severity == Severity.CRITICAL
++
++    def test_without_pid(self):
++        line = "<13>Jan 15 10:30:00 myhost kernel: some kernel message"
++        entry = parse_syslog_line(line, "/var/log/syslog", reference_year=2024)
++        assert entry.metadata["process"] == "kernel"
++        assert "pid" not in entry.metadata
++
++    def test_severity_mapping(self):
++        # priority = facility * 8 + severity
++        # <11> = facility 1, severity 3 (Error)
++        line = "<11>Jan 15 10:00:00 host proc[1]: msg"
++        entry = parse_syslog_line(line, "x", reference_year=2024)
++        assert entry.severity == Severity.ERROR
++
++    def test_warning_severity(self):
++        # <12> = facility 1, severity 4 (Warning)
++        line = "<12>Jan 15 10:00:00 host proc: msg"
++        entry = parse_syslog_line(line, "x", reference_year=2024)
++        assert entry.severity == Severity.WARNING
++
++    def test_info_severity(self):
++        # <14> = facility 1, severity 6 (Informational)
++        line = "<14>Jan 15 10:00:00 host proc: msg"
++        entry = parse_syslog_line(line, "x", reference_year=2024)
++        assert entry.severity == Severity.INFO
++
++    def test_invalid_format_raises(self):
++        with pytest.raises(ValueError, match="syslog"):
++            parse_syslog_line("not a syslog line", "x")
++
++    def test_single_digit_day(self):
++        line = "<13>Jan  5 08:00:00 host proc: msg"
++        entry = parse_syslog_line(line, "x", reference_year=2024)
++        assert entry.timestamp.day == 5
++
++
++class TestPatternParser:
++    PATTERN = r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(?P<severity>\w+)\] (?P<message>.*)"
++    TS_FMT = "%Y-%m-%d %H:%M:%S"
++
++    def test_basic(self):
++        line = "2024-01-15 10:30:00 [ERROR] something broke"
++        entry = parse_pattern_line(line, self.PATTERN, self.TS_FMT, "/app.log")
++        assert entry.severity == Severity.ERROR
++        assert entry.message == "something broke"
++        assert entry.source == "/app.log"
++
++    def test_no_match_raises(self):
++        with pytest.raises(ValueError, match="pattern"):
++            parse_pattern_line("nope", self.PATTERN, self.TS_FMT, "/app.log")
++
++    def test_missing_timestamp_group_raises(self):
++        pattern = r"(?P<message>.*)"
++        with pytest.raises(ValueError, match="timestamp"):
++            parse_pattern_line("hello", pattern, "%Y", "/app.log")
++
++    def test_extra_groups_in_metadata(self):
++        pattern = r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (?P<user>\w+) (?P<message>.*)"
++        line = "2024-01-15 10:30:00 alice did stuff"
++        entry = parse_pattern_line(line, pattern, self.TS_FMT, "/app.log")
++        assert entry.metadata["user"] == "alice"
++
++    def test_source_from_pattern(self):
++        pattern = r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (?P<source>\S+) (?P<message>.*)"
++        line = "2024-01-15 10:30:00 web-01 request handled"
++        entry = parse_pattern_line(line, pattern, self.TS_FMT, "/app.log")
++        assert entry.source == "web-01"
++
++    def test_default_severity_is_info(self):
++        pattern = r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (?P<message>.*)"
++        line = "2024-01-15 10:30:00 no severity"
++        entry = parse_pattern_line(line, pattern, self.TS_FMT, "/app.log")
++        assert entry.severity == Severity.INFO
++
++
++class TestDetectFormat:
++    def _write_temp(self, lines):
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False)
++        f.write("\n".join(lines) + "\n")
++        f.close()
++        return f.name
++
++    def test_detect_json(self):
++        lines = [json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": f"msg{i}"}) for i in range(10)]
++        path = self._write_temp(lines)
++        try:
++            assert detect_format(path) == "json"
++        finally:
++            os.unlink(path)
++
++    def test_detect_syslog(self):
++        lines = [f"<13>Jan 15 10:0{i}:00 host proc: msg{i}" for i in range(10)]
++        path = self._write_temp(lines)
++        try:
++            assert detect_format(path) == "syslog"
++        finally:
++            os.unlink(path)
++
++    def test_mixed_format_below_threshold_raises(self):
++        lines = [
++            json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "json"}),
++            "<13>Jan 15 10:00:00 host proc: syslog",
++            "plain text line",
++            json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "json2"}),
++            "<13>Jan 15 10:01:00 host proc: syslog2",
++            "another plain line",
++            json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "json3"}),
++            "<13>Jan 15 10:02:00 host proc: syslog3",
++            "plain again",
++            "more plain",
++        ]
++        path = self._write_temp(lines)
++        try:
++            with pytest.raises(ValueError, match="auto-detect"):
++                detect_format(path)
++        finally:
++            os.unlink(path)
++
++    def test_empty_file_raises(self):
++        path = self._write_temp(["", "   ", ""])
++        try:
++            with pytest.raises(ValueError, match="empty"):
++                detect_format(path)
++        finally:
++            os.unlink(path)
++
++    def test_custom_pattern_detection(self):
++        lines = [f"2024-01-15 10:0{i}:00 [INFO] message {i}" for i in range(10)]
++        path = self._write_temp(lines)
++        cp = CustomPattern(
++            name="myformat",
++            pattern=r"(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(?P<severity>\w+)\] (?P<message>.*)",
++            timestamp_format="%Y-%m-%d %H:%M:%S",
++        )
++        try:
++            assert detect_format(path, [cp]) == "custom:myformat"
++        finally:
++            os.unlink(path)
++
++    def test_few_lines_json(self):
++        lines = [json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": f"m{i}"}) for i in range(3)]
++        path = self._write_temp(lines)
++        try:
++            assert detect_format(path) == "json"
++        finally:
++            os.unlink(path)
++
++
++class TestParseFile:
++    def _write_temp(self, lines):
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False)
++        f.write("\n".join(lines) + "\n")
++        f.close()
++        return f.name
++
++    def test_parse_json_file(self):
++        lines = [
++            json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "a"}),
++            json.dumps({"timestamp": "2024-01-15T10:01:00Z", "message": "b"}),
++        ]
++        path = self._write_temp(lines)
++        try:
++            results = list(parse_file(path, format_name="json"))
++            entries = [e for e, err in results if e is not None]
++            assert len(entries) == 2
++            assert entries[0].message == "a"
++        finally:
++            os.unlink(path)
++
++    def test_malformed_lines_reported(self):
++        lines = [
++            json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "ok"}),
++            "not json",
++            json.dumps({"timestamp": "2024-01-15T10:01:00Z", "message": "ok2"}),
++        ]
++        path = self._write_temp(lines)
++        try:
++            results = list(parse_file(path, format_name="json"))
++            entries = [e for e, _ in results if e is not None]
++            errors = [err for _, err in results if err is not None]
++            assert len(entries) == 2
++            assert len(errors) == 1
++        finally:
++            os.unlink(path)
++
++    def test_blank_lines_skipped(self):
++        lines = [
++            json.dumps({"timestamp": "2024-01-15T10:00:00Z", "message": "a"}),
++            "",
++            "   ",
++            json.dumps({"timestamp": "2024-01-15T10:01:00Z", "message": "b"}),
++        ]
++        path = self._write_temp(lines)
++        try:
++            results = list(parse_file(path, format_name="json"))
++            entries = [e for e, _ in results if e is not None]
++            assert len(entries) == 2
++        finally:
++            os.unlink(path)
+diff --git a/tests/test_reporter.py b/tests/test_reporter.py
+new file mode 100644
+index 0000000..abb6abc
+--- /dev/null
++++ b/tests/test_reporter.py
+@@ -0,0 +1,108 @@
++import json
++import os
++import tempfile
++from datetime import datetime, timezone
++
++from logpipe.models import (
++    AnalysisReport,
++    AnomalyResult,
++    FilterSummary,
++    IngestionSummary,
++    WindowMetrics,
++)
++from logpipe.reporter import format_report, load_report, write_report
++
++
++def _sample_report():
++    return AnalysisReport(
++        ingestion=IngestionSummary(
++            files_processed=2,
++            total_entries=100,
++            entries_per_format={"json": 60, "syslog": 40},
++            malformed_lines=3,
++        ),
++        filter_summary=FilterSummary(
++            entries_before=100,
++            entries_after=80,
++            dropped_per_filter={"severity_min": 15, "keyword_exclude": 5},
++        ),
++        windows=[
++            WindowMetrics(
++                start=datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc),
++                end=datetime(2024, 1, 15, 10, 5, tzinfo=timezone.utc),
++                total_count=50,
++                counts_by_severity={"INFO": 40, "ERROR": 10},
++                top_sources=[("host-a", 30), ("host-b", 20)],
++                error_rate=20.0,
++                eps=0.1667,
++            )
++        ],
++        anomalies=[
++            AnomalyResult(
++                window_start=datetime(2024, 1, 15, 10, 0, tzinfo=timezone.utc),
++                window_end=datetime(2024, 1, 15, 10, 5, tzinfo=timezone.utc),
++                event_count=200,
++                baseline_median=50.0,
++                direction="spike",
++                magnitude=3.5,
++            )
++        ],
++        severity_breakdown={"INFO": 60, "ERROR": 20},
++    )
++
++
++class TestWriteAndLoadReport:
++    def test_roundtrip(self):
++        report = _sample_report()
++        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
++            path = f.name
++        try:
++            write_report(report, path)
++            loaded = load_report(path)
++            assert loaded["ingestion"]["files_processed"] == 2
++            assert loaded["ingestion"]["total_entries"] == 100
++            assert loaded["filter_summary"]["entries_after"] == 80
++            assert len(loaded["windows"]) == 1
++            assert len(loaded["anomalies"]) == 1
++            assert loaded["anomalies"][0]["direction"] == "spike"
++            assert loaded["severity_breakdown"]["INFO"] == 60
++        finally:
++            os.unlink(path)
++
++    def test_json_structure(self):
++        report = _sample_report()
++        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
++            path = f.name
++        try:
++            write_report(report, path)
++            with open(path) as f:
++                data = json.load(f)
++            assert set(data.keys()) == {
++                "ingestion", "filter_summary", "windows", "anomalies", "severity_breakdown"
++            }
++            assert "top_sources" in data["windows"][0]
++        finally:
++            os.unlink(path)
++
++
++class TestFormatReport:
++    def test_contains_key_info(self):
++        report = _sample_report()
++        text = format_report(report)
++        assert "Files processed" in text
++        assert "100" in text  # total entries
++        assert "Anomalies: 1" in text
++        assert "spike" in text
++
++    def test_severity_breakdown(self):
++        report = _sample_report()
++        text = format_report(report)
++        assert "INFO" in text
++        assert "ERROR" in text
++
++    def test_no_anomalies(self):
++        report = _sample_report()
++        report.anomalies = []
++        text = format_report(report)
++        assert "Anomalies: 0" in text
++        assert "Top Anomalies" not in text
+diff --git a/tests/test_rules_engine.py b/tests/test_rules_engine.py
+new file mode 100644
+index 0000000..d228de6
+--- /dev/null
++++ b/tests/test_rules_engine.py
+@@ -0,0 +1,197 @@
++from datetime import datetime, timezone
++
++import pytest
++
++from logpipe.models import FilterConfig, LogEntry, Severity, TransformRule
++from logpipe.rules_engine import apply_filter, apply_transforms
++
++
++def _entry(
++    message="test message",
++    severity=Severity.INFO,
++    source="/app.log",
++    ts="2024-06-15T12:00:00Z",
++    metadata=None,
++):
++    return LogEntry(
++        timestamp=datetime.fromisoformat(ts),
++        severity=severity,
++        source=source,
++        message=message,
++        metadata=metadata or {},
++    )
++
++
++class TestSeverityMinFilter:
++    def test_passes_above(self):
++        config = FilterConfig(severity_min=Severity.WARNING)
++        ok, _ = apply_filter(_entry(severity=Severity.ERROR), config)
++        assert ok
++
++    def test_passes_equal(self):
++        config = FilterConfig(severity_min=Severity.WARNING)
++        ok, _ = apply_filter(_entry(severity=Severity.WARNING), config)
++        assert ok
++
++    def test_rejects_below(self):
++        config = FilterConfig(severity_min=Severity.WARNING)
++        ok, name = apply_filter(_entry(severity=Severity.INFO), config)
++        assert not ok
++        assert name == "severity_min"
++
++
++class TestSourceFilters:
++    def test_include_match(self):
++        config = FilterConfig(source_include=["*.log"])
++        ok, _ = apply_filter(_entry(source="/app.log"), config)
++        assert ok
++
++    def test_include_no_match(self):
++        config = FilterConfig(source_include=["*.log"])
++        ok, name = apply_filter(_entry(source="/app.txt"), config)
++        assert not ok
++        assert name == "source_include"
++
++    def test_exclude_match(self):
++        config = FilterConfig(source_exclude=["debug*"])
++        ok, name = apply_filter(_entry(source="debug.log"), config)
++        assert not ok
++        assert name == "source_exclude"
++
++    def test_exclude_takes_priority(self):
++        config = FilterConfig(source_include=["*.log"], source_exclude=["debug*"])
++        ok, name = apply_filter(_entry(source="debug.log"), config)
++        assert not ok
++        assert name == "source_exclude"
++
++
++class TestKeywordFilters:
++    def test_keyword_match_present(self):
++        config = FilterConfig(keyword_match=["error", "fail"])
++        ok, _ = apply_filter(_entry(message="an error occurred"), config)
++        assert ok
++
++    def test_keyword_match_absent(self):
++        config = FilterConfig(keyword_match=["error", "fail"])
++        ok, name = apply_filter(_entry(message="all good"), config)
++        assert not ok
++        assert name == "keyword_match"
++
++    def test_keyword_match_case_insensitive(self):
++        config = FilterConfig(keyword_match=["ERROR"])
++        ok, _ = apply_filter(_entry(message="an error occurred"), config)
++        assert ok
++
++    def test_keyword_exclude_present(self):
++        config = FilterConfig(keyword_exclude=["test"])
++        ok, name = apply_filter(_entry(message="this is a test"), config)
++        assert not ok
++        assert name == "keyword_exclude"
++
++    def test_keyword_exclude_absent(self):
++        config = FilterConfig(keyword_exclude=["test"])
++        ok, _ = apply_filter(_entry(message="production"), config)
++        assert ok
++
++
++class TestTimeRangeFilter:
++    def test_within_range(self):
++        config = FilterConfig(
++            time_range_start=datetime(2024, 1, 1, tzinfo=timezone.utc),
++            time_range_end=datetime(2024, 12, 31, tzinfo=timezone.utc),
++        )
++        ok, _ = apply_filter(_entry(ts="2024-06-15T12:00:00Z"), config)
++        assert ok
++
++    def test_before_start(self):
++        config = FilterConfig(
++            time_range_start=datetime(2024, 6, 1, tzinfo=timezone.utc),
++        )
++        ok, name = apply_filter(_entry(ts="2024-01-01T00:00:00Z"), config)
++        assert not ok
++        assert name == "time_range"
++
++    def test_at_end_boundary_excluded(self):
++        config = FilterConfig(
++            time_range_end=datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc),
++        )
++        ok, name = apply_filter(_entry(ts="2024-06-15T12:00:00Z"), config)
++        assert not ok
++        assert name == "time_range"
++
++
++class TestCombinedFilters:
++    def test_and_logic(self):
++        config = FilterConfig(
++            severity_min=Severity.WARNING,
++            keyword_match=["critical"],
++        )
++        # Passes severity but not keyword
++        ok, name = apply_filter(_entry(severity=Severity.ERROR, message="other"), config)
++        assert not ok
++        assert name == "keyword_match"
++
++    def test_all_pass(self):
++        config = FilterConfig(
++            severity_min=Severity.WARNING,
++            keyword_match=["critical"],
++        )
++        ok, _ = apply_filter(_entry(severity=Severity.ERROR, message="critical issue"), config)
++        assert ok
++
++    def test_no_filters(self):
++        config = FilterConfig()
++        ok, _ = apply_filter(_entry(), config)
++        assert ok
++
++
++class TestTransforms:
++    def test_extract_fields(self):
++        rule = TransformRule(type="extract_fields", params={"pattern": r"user=(?P<user>\w+)"})
++        entry = _entry(message="login user=alice from 10.0.0.1")
++        result = apply_transforms(entry, [rule])
++        assert result.metadata["user"] == "alice"
++
++    def test_extract_fields_no_match(self):
++        rule = TransformRule(type="extract_fields", params={"pattern": r"user=(?P<user>\w+)"})
++        entry = _entry(message="no user info")
++        result = apply_transforms(entry, [rule])
++        assert "user" not in result.metadata
++
++    def test_rename_field(self):
++        rule = TransformRule(type="rename_field", params={"from": "old", "to": "new"})
++        entry = _entry(metadata={"old": "value"})
++        result = apply_transforms(entry, [rule])
++        assert "new" in result.metadata
++        assert "old" not in result.metadata
++
++    def test_rename_missing_field(self):
++        rule = TransformRule(type="rename_field", params={"from": "nope", "to": "new"})
++        entry = _entry()
++        result = apply_transforms(entry, [rule])
++        assert "new" not in result.metadata
++
++    def test_add_static_field(self):
++        rule = TransformRule(type="add_static_field", params={"key": "env", "value": "prod"})
++        entry = _entry()
++        result = apply_transforms(entry, [rule])
++        assert result.metadata["env"] == "prod"
++
++    def test_drop_fields(self):
++        rule = TransformRule(type="drop_fields", params={"fields": ["secret", "internal"]})
++        entry = _entry(metadata={"secret": "x", "internal": "y", "keep": "z"})
++        result = apply_transforms(entry, [rule])
++        assert "secret" not in result.metadata
++        assert "internal" not in result.metadata
++        assert result.metadata["keep"] == "z"
++
++    def test_transform_order(self):
++        rules = [
++            TransformRule(type="add_static_field", params={"key": "env", "value": "staging"}),
++            TransformRule(type="rename_field", params={"from": "env", "to": "environment"}),
++        ]
++        entry = _entry()
++        result = apply_transforms(entry, rules)
++        assert "environment" in result.metadata
++        assert result.metadata["environment"] == "staging"
++        assert "env" not in result.metadata

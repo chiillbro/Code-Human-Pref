@@ -246,8 +246,60 @@ Even without conditions and SIGINT, there are several areas where models will na
 - The "partial" status for mixed success/failure workflows is a subtle requirement that models often miss.
 - Holding back conditions + SIGINT for Turn 2 is the right call — both are meaty features that naturally emerge from testing.
 
+### Turn 1 Analysis Notes
+
+- **Overall: Model A medium preferred (2)**
+- Model A: 26 tests, .gitignore, clean version control, iterative DFS cycle detection, ThreadPoolExecutor + Condition variable, comprehensive validation
+- Model B: SIGINT handling (nice but unrequested), Kahn's algorithm, src/ layout, max_parallel, cwd — but committed build/ artifacts (7 dup files), no .gitignore, ZERO tests
+- Model B's build artifact issue is a PR blocker — would be caught in first 30 seconds of review
+- Model B uses "skipped" for cancelled downstream (prompt says "cancelled") — semantic mismatch
+- Model B's `_now_iso()` uses local time vs Model A's UTC — minor but Model A is better practice
+
 ### Turn 2 Draft Prompts (for later)
+
+**Conditional steps + SIGINT (combined, refined from below drafts):**
+
+> Hey so I've been testing this more and ran into a couple things. First, I was building a more complex workflow where I need certain steps to only run conditionally based on what happened upstream. Like if a build step succeeded, run deploy, but if it failed, run a cleanup step instead. Right now there's no way to express that — every step either runs or gets cancelled. I need a `condition` field on steps that can check an upstream dependency's status (like `succeeded` or `failed`) or maybe check if a step's stdout contains a specific string. If the condition evaluates to false, the step should be marked `skipped`. And be careful with the downstream propagation — if a downstream step has multiple dependencies and at least one non-skipped dep succeeded, it should still run. Only skip it if ALL its deps are skipped.
+>
+> Second thing — I hit Ctrl+C while a big workflow was running and it just crashed hard without cleaning up. The child processes kept running in the background. This needs proper SIGINT handling: catch the interrupt, kill all running child processes (send SIGTERM to their process groups, then SIGKILL if they don't die), mark running and pending steps as `cancelled`, and still produce a valid JSON report so I can see what happened before the interrupt. Exit code should be 130 for interrupted runs.
+
+**Original drafts:**
 
 **Conditional steps discovery:** "I was testing more complex workflows and realized there's no way to conditionally skip steps based on what happened upstream. I need a `condition` field on steps that can check an upstream dependency's status (succeeded/failed/skipped) or whether its stdout contains a specific substring. If the condition evaluates to false, the step should be marked 'skipped' — and any downstream steps that depend exclusively on skipped steps should also skip. But if a downstream step has multiple deps and at least one non-skipped dep succeeded, it should still run."
 
 **SIGINT discovery:** "I also ran a big workflow and hit Ctrl+C midway. The tool just crashed without cleaning up. It needs to handle SIGINT gracefully — kill all running child processes, mark running steps as cancelled, mark pending steps as cancelled, and still produce a partial execution report. Exit code should be 130 for interrupted runs."
+
+### Turn 2 Analysis Notes
+
+- **Overall: Model A slightly preferred (3)**
+- Both implement conditions + SIGINT correctly — same architectural approach (gate-based scheduling, fixpoint loop, signal handler + process group killing)
+- Model A: `ast.parse` condition parser (157 lines), `RLock` for signal re-entrancy (correct), `threading.Event` for interrupt flag, 3 interrupt tests (programmatic + real SIGINT + child PID kill), 43 total tests
+- Model B: custom tokenizer+recursive-descent parser (281 lines), regular `Lock` (DEADLOCK BUG with signal handler), plain bool for interrupted, 1 interrupt test, 42 total tests
+- **Key issue**: Model B's signal handler acquires `self._cond` (backed by regular Lock). If signal fires while main thread is in `_dispatch_ready()` (lock held) → deadlock hang.
+- Model B's strengths: cleaner `Condition` data model (1 field vs 2), more robust `_kill_process_group()` polling, public `interrupt()` API, `_cancelled_steps` per-step tracking
+- Both fully implement skip propagation rules and the condition use cases from the prompt
+- Neither model has implemented `partial` workflow status (missed from Turn 1 prompt — still outstanding)
+
+### Turn 3 Draft Prompt
+
+> So I ran the conditions example where the build step fails, the deploy step gets skipped (condition false), and the cleanup step succeeds. The report says overall status is "failed". But like, the cleanup DID succeed, and deploy was intentionally skipped — it's not like everything failed. Can you add a "partial" status for when you have a mix of outcomes? Like, "succeeded" should mean every step that actually ran succeeded (skipped is fine), "failed" should mean every step that ran failed, and "partial" should be the in-between — some passed, some didn't. Also, one thing I noticed while looking at the report json — there's no easy way to tell at a glance how long the whole workflow spent on retries vs actual execution. Can you add a total_retry_delay to the summary as well? That'd help me figure out if I need to tune backoff settings.
+
+### Turn 3 Analysis Notes (Final Turn)
+
+- **Overall: Model A minimally preferred (4) — essentially a tie**
+- Both implement `partial` status correctly with the right semantics (skipped/cancelled excluded from classification)
+- Both implement per-step `retry_delay` and `total_retry_delay` in summary with wall-clock measurement
+- Both update pretty-printer (◐ glyph), README, exit codes (2 for partial/failed), tests
+- Model A: 5 new tests (48 total), `if trd is not None:` in printer (correct), `_overall_status()` as Engine method
+- Model B: 4 new tests (47 total), `if trd:` in printer (falsy for 0.0 — minor truthiness bug), `_overall_status()` as free function with `_RAN` constant (slightly cleaner)
+- No meaningful gaps — both delivered clean, focused implementations of a straightforward request
+
+### Task Summary (All 3 Turns)
+
+| Turn | Winner | Rating | Key Differentiator |
+|------|--------|--------|--------------------|
+| 1 | Model A | 2 (medium) | Model B committed build/ artifacts (7 dup files), zero tests |
+| 2 | Model A | 3 (slightly) | Model B has deadlock bug in SIGINT handler (Lock vs RLock) |
+| 3 | Model A | 4 (minimally) | Essentially a tie — one extra test, slightly better printer |
+
+**Overall Task Winner: Model A** — Consistent edge across all three turns, from major engineering hygiene issues in Turn 1, through a real concurrency bug in Turn 2, to a near-tie in Turn 3.
