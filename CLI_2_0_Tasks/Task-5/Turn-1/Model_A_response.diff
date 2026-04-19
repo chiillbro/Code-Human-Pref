@@ -1,0 +1,1903 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..5c30504
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,7 @@
++__pycache__/
++*.py[cod]
++*.egg-info/
++build/
++dist/
++.venv/
++*.report.json
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..a31861d
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,159 @@
++# bujjictl
++
++A lightweight, **local-first workflow orchestration engine** — think a tiny,
++single-machine Airflow / GitHub Actions. Define multi-step workflows in YAML,
++and `bujjictl` will build the dependency graph, run independent steps
++concurrently, handle retries / timeouts / env injection, and produce a
++structured JSON report of exactly what happened.
++
++Pure Python standard library. No runtime dependencies.
++
++---
++
++## Install
++
++```bash
++pip install .
++# or for development:
++pip install -e .
++```
++
++This installs the `bujjictl` console command. You can also run it without
++installing:
++
++```bash
++python -m bujjictl --help
++```
++
++---
++
++## Workflow file format
++
++```yaml
++name: my-workflow            # required
++description: optional text
++
++env:                         # optional: global env vars (merged into every step)
++  FOO: bar
++
++defaults:                    # optional: applied to every step unless overridden
++  timeout: 300               # seconds (float); omit for no timeout
++  retries: 0                 # extra attempts after the first
++  retry_backoff: 1.0         # seconds; exponential: delay * 2^(attempt-1)
++  shell: /bin/sh             # shell used to run `run:`
++
++steps:                       # required, non-empty list
++  - id: build                # required, unique, [A-Za-z_][A-Za-z0-9_-]*
++    name: Build              # optional human label
++    run: |                   # required: shell script (use `|` for multi-line)
++      echo "building"
++      make build
++    depends_on:              # optional list of step ids
++      - fetch
++    env:                     # optional: step-level env (overrides global)
++      MODE: release
++    timeout: 60
++    retries: 2
++    retry_backoff: 0.5
++    shell: /bin/bash
++```
++
++### Injected environment variables
++
++Every step receives, in addition to the process environment + `env:` blocks:
++
++| Variable          | Meaning                              |
++|-------------------|--------------------------------------|
++| `BUJJI_WORKFLOW`  | The workflow `name`                  |
++| `BUJJI_STEP_ID`   | The current step's `id`              |
++| `BUJJI_ATTEMPT`   | 1-based attempt number for this step |
++
++### Execution semantics
++
++* The steps form a DAG via `depends_on`. Steps with no unmet dependencies are
++  scheduled immediately and run **concurrently** (bounded by `--max-workers`).
++* If a step **fails** or **times out** (after exhausting retries), every
++  transitive downstream step is marked `cancelled` and never runs.
++* Retries use exponential backoff: `retry_backoff * 2^(attempt-1)` seconds.
++* On timeout the step's process group is sent `SIGTERM`, then `SIGKILL`.
++
++### Validation
++
++`bujjictl validate` (and the start of every `run`) checks, **before executing
++anything**:
++
++* YAML is parseable (subset: mappings, lists, scalars, `|`/`>` block scalars,
++  comments, quoted strings — no anchors/flow collections).
++* Required fields present, correct types, no unknown keys.
++* Step ids are unique and well-formed.
++* Every `depends_on` references an existing step; no self-dependencies.
++* **No cycles** in the dependency graph.
++
++All problems are collected and reported together — not just the first one.
++
++---
++
++## Commands
++
++```text
++bujjictl validate <file.yaml>
++bujjictl run      <file.yaml> [-o report.json] [-j N] [--quiet] [--no-pretty]
++bujjictl report   <report.json> [--no-output]
++```
++
++* `validate` — parse + validate only. Exit 0 on success, 1 on error.
++* `run` — validate, execute, write a JSON report (default
++  `<name>.report.json`), then pretty-print it. Exit 0 on success, 1 on
++  validation error, 2 if any step did not succeed.
++* `report` — pretty-print a previously written JSON report.
++
++---
++
++## Report format
++
++```jsonc
++{
++  "workflow": { "name": "...", "description": "..." },
++  "status": "succeeded" | "failed",
++  "started_at": "2026-04-19T...Z",
++  "finished_at": "...",
++  "duration": 12.345,
++  "summary": { "succeeded": 4, "failed": 0, "timed_out": 0, "cancelled": 0, "total": 4 },
++  "steps": [
++    {
++      "id": "build",
++      "name": "Build",
++      "status": "succeeded" | "failed" | "timed_out" | "cancelled",
++      "depends_on": ["fetch"],
++      "started_at": "...",
++      "finished_at": "...",
++      "duration": 1.234,
++      "attempt_count": 2,
++      "cancel_reason": null,
++      "attempts": [
++        {
++          "number": 1,
++          "started_at": "...",
++          "finished_at": "...",
++          "duration": 0.61,
++          "exit_code": 1,
++          "timed_out": false,
++          "stdout": "...",
++          "stderr": "...",
++          "error": null
++        }
++      ]
++    }
++  ]
++}
++```
++
++---
++
++## Quick start
++
++```bash
++python -m bujjictl validate examples/hello.yaml
++python -m bujjictl run examples/hello.yaml -o hello.report.json
++python -m bujjictl report hello.report.json
++```
+diff --git a/bujjictl/__init__.py b/bujjictl/__init__.py
+new file mode 100644
+index 0000000..a391144
+--- /dev/null
++++ b/bujjictl/__init__.py
+@@ -0,0 +1,3 @@
++"""bujjictl - a lightweight, local-first workflow orchestration engine."""
++
++__version__ = "0.1.0"
+diff --git a/bujjictl/__main__.py b/bujjictl/__main__.py
+new file mode 100644
+index 0000000..bfdcd0c
+--- /dev/null
++++ b/bujjictl/__main__.py
+@@ -0,0 +1,4 @@
++from .cli import main
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/bujjictl/cli.py b/bujjictl/cli.py
+new file mode 100644
+index 0000000..1425fb0
+--- /dev/null
++++ b/bujjictl/cli.py
+@@ -0,0 +1,115 @@
++"""Command-line interface for bujjictl."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++
++from . import __version__
++from .engine import Engine
++from .model import ValidationError, load_workflow
++from .report import load_report, render
++
++
++def _build_parser() -> argparse.ArgumentParser:
++    p = argparse.ArgumentParser(
++        prog="bujjictl",
++        description="A lightweight, local-first workflow orchestration engine.",
++    )
++    p.add_argument("--version", action="version", version=f"bujjictl {__version__}")
++    sub = p.add_subparsers(dest="command", required=True, metavar="<command>")
++
++    pv = sub.add_parser("validate", help="Validate a workflow YAML file without running it.")
++    pv.add_argument("file", help="Path to the workflow YAML file.")
++
++    pr = sub.add_parser("run", help="Validate and execute a workflow YAML file.")
++    pr.add_argument("file", help="Path to the workflow YAML file.")
++    pr.add_argument("-o", "--report", metavar="PATH",
++                    help="Write the JSON run report to PATH (default: <workflow>.report.json).")
++    pr.add_argument("-j", "--max-workers", type=int, default=None,
++                    help="Maximum number of steps to run concurrently.")
++    pr.add_argument("-q", "--quiet", action="store_true",
++                    help="Suppress progress logging to stderr.")
++    pr.add_argument("--no-pretty", action="store_true",
++                    help="Do not pretty-print the report after the run.")
++
++    pp = sub.add_parser("report", help="Pretty-print a previously generated JSON report.")
++    pp.add_argument("file", help="Path to the JSON report file.")
++    pp.add_argument("--no-output", action="store_true",
++                    help="Hide captured stdout/stderr in the per-step detail.")
++
++    return p
++
++
++def _cmd_validate(args: argparse.Namespace) -> int:
++    try:
++        wf = load_workflow(args.file)
++    except ValidationError as e:
++        print("✘ invalid workflow:", file=sys.stderr)
++        for err in e.errors:
++            print(f"  - {err}", file=sys.stderr)
++        return 1
++    print(f"✔ workflow '{wf.name}' is valid ({len(wf.steps)} steps).")
++    return 0
++
++
++def _cmd_run(args: argparse.Namespace) -> int:
++    try:
++        wf = load_workflow(args.file)
++    except ValidationError as e:
++        print("✘ invalid workflow:", file=sys.stderr)
++        for err in e.errors:
++            print(f"  - {err}", file=sys.stderr)
++        return 1
++
++    logger = (lambda msg: None) if args.quiet else None
++    engine = Engine(wf, max_workers=args.max_workers, logger=logger)
++    result = engine.run()
++    report_dict = result.to_dict()
++
++    out_path = args.report or f"{wf.name}.report.json"
++    try:
++        with open(out_path, "w", encoding="utf-8") as f:
++            json.dump(report_dict, f, indent=2)
++            f.write("\n")
++        print(f"\n→ report written to {out_path}", file=sys.stderr)
++    except OSError as e:
++        print(f"✘ failed to write report to {out_path}: {e}", file=sys.stderr)
++        return 1
++
++    if not args.no_pretty:
++        print(file=sys.stderr)
++        render(report_dict, stream=sys.stdout)
++
++    return 0 if result.status == "succeeded" else 2
++
++
++def _cmd_report(args: argparse.Namespace) -> int:
++    try:
++        data = load_report(args.file)
++    except FileNotFoundError:
++        print(f"✘ report file not found: {args.file}", file=sys.stderr)
++        return 1
++    except json.JSONDecodeError as e:
++        print(f"✘ invalid JSON in {args.file}: {e}", file=sys.stderr)
++        return 1
++    render(data, stream=sys.stdout, show_output=not args.no_output)
++    return 0
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = _build_parser()
++    args = parser.parse_args(argv)
++    if args.command == "validate":
++        return _cmd_validate(args)
++    if args.command == "run":
++        return _cmd_run(args)
++    if args.command == "report":
++        return _cmd_report(args)
++    parser.error(f"unknown command: {args.command}")
++    return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/bujjictl/engine.py b/bujjictl/engine.py
+new file mode 100644
+index 0000000..4b97ef9
+--- /dev/null
++++ b/bujjictl/engine.py
+@@ -0,0 +1,316 @@
++"""Concurrent DAG execution engine."""
++
++from __future__ import annotations
++
++import os
++import signal
++import subprocess
++import sys
++import threading
++import time
++from concurrent.futures import ThreadPoolExecutor
++from dataclasses import dataclass, field
++from datetime import datetime, timezone
++from typing import Callable
++
++from .model import Step, Workflow
++
++
++# ----------------------------------------------------------------------------
++# Result types
++# ----------------------------------------------------------------------------
++
++PENDING = "pending"
++RUNNING = "running"
++SUCCEEDED = "succeeded"
++FAILED = "failed"
++TIMED_OUT = "timed_out"
++CANCELLED = "cancelled"
++
++_TERMINAL = {SUCCEEDED, FAILED, TIMED_OUT, CANCELLED}
++
++
++@dataclass
++class Attempt:
++    number: int
++    started_at: str
++    finished_at: str
++    duration: float
++    exit_code: int | None
++    stdout: str
++    stderr: str
++    timed_out: bool
++    error: str | None = None
++
++    def to_dict(self) -> dict:
++        return {
++            "number": self.number,
++            "started_at": self.started_at,
++            "finished_at": self.finished_at,
++            "duration": round(self.duration, 6),
++            "exit_code": self.exit_code,
++            "timed_out": self.timed_out,
++            "stdout": self.stdout,
++            "stderr": self.stderr,
++            "error": self.error,
++        }
++
++
++@dataclass
++class StepResult:
++    step: Step
++    status: str = PENDING
++    attempts: list[Attempt] = field(default_factory=list)
++    started_at: str | None = None
++    finished_at: str | None = None
++    duration: float = 0.0
++    cancel_reason: str | None = None
++
++    def to_dict(self) -> dict:
++        return {
++            "id": self.step.id,
++            "name": self.step.name,
++            "status": self.status,
++            "depends_on": list(self.step.depends_on),
++            "started_at": self.started_at,
++            "finished_at": self.finished_at,
++            "duration": round(self.duration, 6),
++            "attempt_count": len(self.attempts),
++            "cancel_reason": self.cancel_reason,
++            "attempts": [a.to_dict() for a in self.attempts],
++        }
++
++
++@dataclass
++class RunReport:
++    workflow: Workflow
++    status: str
++    started_at: str
++    finished_at: str
++    duration: float
++    steps: list[StepResult]
++
++    def to_dict(self) -> dict:
++        return {
++            "workflow": {
++                "name": self.workflow.name,
++                "description": self.workflow.description,
++            },
++            "status": self.status,
++            "started_at": self.started_at,
++            "finished_at": self.finished_at,
++            "duration": round(self.duration, 6),
++            "summary": _summarize(self.steps),
++            "steps": [s.to_dict() for s in self.steps],
++        }
++
++
++def _summarize(steps: list[StepResult]) -> dict:
++    counts = {SUCCEEDED: 0, FAILED: 0, TIMED_OUT: 0, CANCELLED: 0}
++    for s in steps:
++        if s.status in counts:
++            counts[s.status] += 1
++    counts["total"] = len(steps)
++    return counts
++
++
++def _now_iso() -> str:
++    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
++
++
++# ----------------------------------------------------------------------------
++# Engine
++# ----------------------------------------------------------------------------
++
++Logger = Callable[[str], None]
++
++
++class Engine:
++    def __init__(self, workflow: Workflow, *, max_workers: int | None = None, logger: Logger | None = None):
++        self.wf = workflow
++        self.max_workers = max_workers or min(32, (os.cpu_count() or 4))
++        self.log = logger or (lambda msg: print(msg, file=sys.stderr, flush=True))
++
++        self._lock = threading.Lock()
++        self._cond = threading.Condition(self._lock)
++        self._results: dict[str, StepResult] = {s.id: StepResult(step=s) for s in workflow.steps}
++        self._remaining_deps: dict[str, set[str]] = {
++            s.id: set(s.depends_on) for s in workflow.steps
++        }
++        self._scheduled: set[str] = set()
++
++    # -- public ------------------------------------------------------------
++
++    def run(self) -> RunReport:
++        t0 = time.monotonic()
++        started_at = _now_iso()
++        self.log(f"▶ workflow '{self.wf.name}' starting ({len(self.wf.steps)} steps, max_workers={self.max_workers})")
++
++        with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="bujji") as pool:
++            with self._cond:
++                self._schedule_ready(pool)
++                while not self._all_terminal():
++                    self._cond.wait()
++                    self._schedule_ready(pool)
++
++        finished_at = _now_iso()
++        duration = time.monotonic() - t0
++        status = SUCCEEDED if all(r.status == SUCCEEDED for r in self._results.values()) else FAILED
++        self.log(f"■ workflow '{self.wf.name}' finished: {status} in {duration:.3f}s")
++
++        ordered = [self._results[s.id] for s in self.wf.steps]
++        return RunReport(
++            workflow=self.wf, status=status,
++            started_at=started_at, finished_at=finished_at,
++            duration=duration, steps=ordered,
++        )
++
++    # -- scheduling --------------------------------------------------------
++
++    def _all_terminal(self) -> bool:
++        return all(r.status in _TERMINAL for r in self._results.values())
++
++    def _schedule_ready(self, pool: ThreadPoolExecutor) -> None:
++        for sid, deps in self._remaining_deps.items():
++            if sid in self._scheduled:
++                continue
++            if self._results[sid].status != PENDING:
++                continue
++            if deps:
++                continue
++            self._scheduled.add(sid)
++            self._results[sid].status = RUNNING
++            pool.submit(self._run_step, sid)
++
++    def _on_step_finished(self, sid: str, status: str) -> None:
++        with self._cond:
++            res = self._results[sid]
++            res.status = status
++            if status == SUCCEEDED:
++                for child in self.wf.dependents.get(sid, ()):
++                    self._remaining_deps[child].discard(sid)
++            else:
++                self._cancel_downstream(sid, reason=f"upstream step '{sid}' {status}")
++            self._cond.notify_all()
++
++    def _cancel_downstream(self, root: str, *, reason: str) -> None:
++        # BFS over dependents; mark anything still pending as cancelled.
++        queue = list(self.wf.dependents.get(root, ()))
++        seen: set[str] = set()
++        while queue:
++            cur = queue.pop()
++            if cur in seen:
++                continue
++            seen.add(cur)
++            res = self._results[cur]
++            if res.status == PENDING:
++                res.status = CANCELLED
++                res.cancel_reason = reason
++                res.finished_at = _now_iso()
++                self.log(f"  ⊘ step '{cur}' cancelled ({reason})")
++            queue.extend(self.wf.dependents.get(cur, ()))
++
++    # -- execution ---------------------------------------------------------
++
++    def _run_step(self, sid: str) -> None:
++        step = self.wf.steps_by_id[sid]
++        res = self._results[sid]
++        res.started_at = _now_iso()
++        t0 = time.monotonic()
++        self.log(f"  ▷ step '{sid}' started")
++
++        env = dict(os.environ)
++        env.update(self.wf.env)
++        env.update(step.env)
++        env["BUJJI_STEP_ID"] = sid
++        env["BUJJI_WORKFLOW"] = self.wf.name
++
++        final_status = FAILED
++        max_attempts = step.retries + 1
++        for n in range(1, max_attempts + 1):
++            env["BUJJI_ATTEMPT"] = str(n)
++            attempt = self._exec_once(step, n, env)
++            res.attempts.append(attempt)
++            if attempt.exit_code == 0 and not attempt.timed_out and attempt.error is None:
++                final_status = SUCCEEDED
++                break
++            if attempt.timed_out:
++                final_status = TIMED_OUT
++            else:
++                final_status = FAILED
++            if n < max_attempts:
++                delay = step.retry_backoff * (2 ** (n - 1))
++                self.log(f"    ↻ step '{sid}' attempt {n} failed; retrying in {delay:.2f}s")
++                time.sleep(delay)
++
++        res.finished_at = _now_iso()
++        res.duration = time.monotonic() - t0
++        glyph = "✔" if final_status == SUCCEEDED else "✘"
++        self.log(f"  {glyph} step '{sid}' {final_status} "
++                 f"({len(res.attempts)} attempt{'s' if len(res.attempts) != 1 else ''}, {res.duration:.3f}s)")
++        self._on_step_finished(sid, final_status)
++
++    def _exec_once(self, step: Step, number: int, env: dict[str, str]) -> Attempt:
++        a_t0 = time.monotonic()
++        a_start = _now_iso()
++        exit_code: int | None = None
++        stdout = ""
++        stderr = ""
++        timed_out = False
++        error: str | None = None
++
++        popen_kwargs: dict = dict(
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            env=env,
++            text=True,
++        )
++        if os.name == "posix":
++            popen_kwargs["start_new_session"] = True  # own process group for clean kill
++
++        try:
++            proc = subprocess.Popen([step.shell, "-c", step.run], **popen_kwargs)
++            try:
++                stdout, stderr = proc.communicate(timeout=step.timeout)
++                exit_code = proc.returncode
++            except subprocess.TimeoutExpired:
++                timed_out = True
++                _kill_process(proc)
++                try:
++                    stdout, stderr = proc.communicate(timeout=5)
++                except subprocess.TimeoutExpired:
++                    proc.kill()
++                    stdout, stderr = proc.communicate()
++                exit_code = proc.returncode
++        except FileNotFoundError as e:
++            error = f"shell not found: {e}"
++        except Exception as e:  # defensive: surface in report rather than crashing the run
++            error = f"{type(e).__name__}: {e}"
++
++        return Attempt(
++            number=number,
++            started_at=a_start,
++            finished_at=_now_iso(),
++            duration=time.monotonic() - a_t0,
++            exit_code=exit_code,
++            stdout=stdout,
++            stderr=stderr,
++            timed_out=timed_out,
++            error=error,
++        )
++
++
++def _kill_process(proc: subprocess.Popen) -> None:
++    try:
++        if os.name == "posix":
++            os.killpg(proc.pid, signal.SIGTERM)
++            time.sleep(0.2)
++            if proc.poll() is None:
++                os.killpg(proc.pid, signal.SIGKILL)
++        else:
++            proc.terminate()
++            time.sleep(0.2)
++            if proc.poll() is None:
++                proc.kill()
++    except ProcessLookupError:
++        pass
+diff --git a/bujjictl/model.py b/bujjictl/model.py
+new file mode 100644
+index 0000000..1046751
+--- /dev/null
++++ b/bujjictl/model.py
+@@ -0,0 +1,311 @@
++"""Workflow and step data model + validation."""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++from typing import Any
++
++from .yaml_parser import load_file, YamlError
++
++
++class ValidationError(Exception):
++    """Raised when a workflow definition is invalid. Carries a list of messages."""
++
++    def __init__(self, errors: list[str]):
++        self.errors = errors
++        super().__init__("workflow validation failed:\n  - " + "\n  - ".join(errors))
++
++
++_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-]*$")
++
++_TOP_KEYS = {"name", "description", "env", "defaults", "steps"}
++_DEFAULT_KEYS = {"timeout", "retries", "retry_backoff", "shell"}
++_STEP_KEYS = {
++    "id", "name", "run", "depends_on", "env",
++    "timeout", "retries", "retry_backoff", "shell",
++}
++
++
++@dataclass
++class Step:
++    id: str
++    run: str
++    name: str | None = None
++    depends_on: list[str] = field(default_factory=list)
++    env: dict[str, str] = field(default_factory=dict)
++    timeout: float | None = None
++    retries: int = 0
++    retry_backoff: float = 1.0
++    shell: str = "/bin/sh"
++
++
++@dataclass
++class Workflow:
++    name: str
++    description: str | None
++    env: dict[str, str]
++    steps: list[Step]
++    steps_by_id: dict[str, Step] = field(default_factory=dict)
++    dependents: dict[str, set[str]] = field(default_factory=dict)  # id -> downstream ids
++
++    def __post_init__(self) -> None:
++        self.steps_by_id = {s.id: s for s in self.steps}
++        self.dependents = {s.id: set() for s in self.steps}
++        for s in self.steps:
++            for dep in s.depends_on:
++                self.dependents[dep].add(s.id)
++
++
++# ----------------------------------------------------------------------------
++# Loading & validation
++# ----------------------------------------------------------------------------
++
++def load_workflow(path: str) -> Workflow:
++    """Load and fully validate a workflow file. Raises ValidationError on any problem."""
++    try:
++        doc = load_file(path)
++    except FileNotFoundError:
++        raise ValidationError([f"file not found: {path}"])
++    except YamlError as e:
++        raise ValidationError([f"YAML parse error: {e}"])
++
++    errors: list[str] = []
++    wf = _validate(doc, errors)
++    if errors:
++        raise ValidationError(errors)
++    assert wf is not None
++    return wf
++
++
++def _validate(doc: Any, errors: list[str]) -> Workflow | None:
++    if not isinstance(doc, dict):
++        errors.append("top-level document must be a mapping")
++        return None
++
++    _check_unknown_keys(doc, _TOP_KEYS, "top-level", errors)
++
++    name = doc.get("name")
++    if not isinstance(name, str) or not name.strip():
++        errors.append("'name' is required and must be a non-empty string")
++        name = "<invalid>"
++
++    description = doc.get("description")
++    if description is not None and not isinstance(description, str):
++        errors.append("'description' must be a string")
++        description = None
++
++    global_env = _validate_env(doc.get("env"), "env", errors)
++
++    defaults = doc.get("defaults") or {}
++    if not isinstance(defaults, dict):
++        errors.append("'defaults' must be a mapping")
++        defaults = {}
++    else:
++        _check_unknown_keys(defaults, _DEFAULT_KEYS, "defaults", errors)
++
++    d_timeout = _validate_number(defaults.get("timeout"), "defaults.timeout", errors, allow_none=True, minimum=0.001)
++    d_retries = _validate_int(defaults.get("retries", 0), "defaults.retries", errors, minimum=0)
++    d_backoff = _validate_number(defaults.get("retry_backoff", 1.0), "defaults.retry_backoff", errors, minimum=0.0)
++    d_shell = defaults.get("shell", "/bin/sh")
++    if not isinstance(d_shell, str) or not d_shell:
++        errors.append("'defaults.shell' must be a non-empty string")
++        d_shell = "/bin/sh"
++
++    raw_steps = doc.get("steps")
++    if not isinstance(raw_steps, list) or not raw_steps:
++        errors.append("'steps' is required and must be a non-empty list")
++        return None
++
++    steps: list[Step] = []
++    seen_ids: set[str] = set()
++    for i, raw in enumerate(raw_steps):
++        loc = f"steps[{i}]"
++        if not isinstance(raw, dict):
++            errors.append(f"{loc}: must be a mapping")
++            continue
++        _check_unknown_keys(raw, _STEP_KEYS, loc, errors)
++
++        sid = raw.get("id")
++        if not isinstance(sid, str) or not sid:
++            errors.append(f"{loc}: 'id' is required and must be a non-empty string")
++            continue
++        if not _ID_RE.match(sid):
++            errors.append(f"{loc}: 'id' '{sid}' must match {_ID_RE.pattern}")
++        if sid in seen_ids:
++            errors.append(f"{loc}: duplicate step id '{sid}'")
++            continue
++        seen_ids.add(sid)
++        loc = f"steps[{i}] (id='{sid}')"
++
++        run = raw.get("run")
++        if not isinstance(run, str) or not run.strip():
++            errors.append(f"{loc}: 'run' is required and must be a non-empty string")
++            run = "false"
++
++        sname = raw.get("name")
++        if sname is not None and not isinstance(sname, str):
++            errors.append(f"{loc}: 'name' must be a string")
++            sname = None
++
++        deps = _validate_depends_on(raw.get("depends_on"), loc, errors)
++        if sid in deps:
++            errors.append(f"{loc}: step cannot depend on itself")
++            deps = [d for d in deps if d != sid]
++
++        senv = _validate_env(raw.get("env"), f"{loc}.env", errors)
++
++        timeout = _validate_number(
++            raw.get("timeout", d_timeout), f"{loc}.timeout", errors,
++            allow_none=True, minimum=0.001,
++        )
++        retries = _validate_int(raw.get("retries", d_retries), f"{loc}.retries", errors, minimum=0)
++        backoff = _validate_number(
++            raw.get("retry_backoff", d_backoff), f"{loc}.retry_backoff", errors, minimum=0.0,
++        )
++        shell = raw.get("shell", d_shell)
++        if not isinstance(shell, str) or not shell:
++            errors.append(f"{loc}: 'shell' must be a non-empty string")
++            shell = d_shell
++
++        steps.append(Step(
++            id=sid, run=run, name=sname, depends_on=deps, env=senv,
++            timeout=timeout, retries=retries or 0, retry_backoff=backoff or 1.0, shell=shell,
++        ))
++
++    # Reference + cycle checks (only meaningful once we have ids).
++    ids = {s.id for s in steps}
++    for s in steps:
++        for dep in s.depends_on:
++            if dep not in ids:
++                errors.append(f"step '{s.id}': depends_on references unknown step '{dep}'")
++
++    cycle = _find_cycle(steps)
++    if cycle:
++        errors.append("dependency cycle detected: " + " -> ".join(cycle))
++
++    if errors:
++        return None
++    return Workflow(name=name, description=description, env=global_env, steps=steps)
++
++
++# ----------------------------------------------------------------------------
++# Field validators
++# ----------------------------------------------------------------------------
++
++def _check_unknown_keys(d: dict, allowed: set[str], loc: str, errors: list[str]) -> None:
++    for k in d:
++        if k not in allowed:
++            errors.append(f"{loc}: unknown key '{k}'")
++
++
++def _validate_env(value: Any, loc: str, errors: list[str]) -> dict[str, str]:
++    if value is None:
++        return {}
++    if not isinstance(value, dict):
++        errors.append(f"'{loc}' must be a mapping of string -> string")
++        return {}
++    out: dict[str, str] = {}
++    for k, v in value.items():
++        if not isinstance(k, str) or not k:
++            errors.append(f"'{loc}': environment variable names must be non-empty strings")
++            continue
++        if v is None:
++            v = ""
++        if isinstance(v, bool):
++            v = "true" if v else "false"
++        if isinstance(v, (int, float)):
++            v = str(v)
++        if not isinstance(v, str):
++            errors.append(f"'{loc}.{k}': value must be a string/number/bool")
++            continue
++        out[k] = v
++    return out
++
++
++def _validate_depends_on(value: Any, loc: str, errors: list[str]) -> list[str]:
++    if value is None:
++        return []
++    if not isinstance(value, list):
++        errors.append(f"{loc}: 'depends_on' must be a list of step ids")
++        return []
++    out: list[str] = []
++    for i, item in enumerate(value):
++        if not isinstance(item, str) or not item:
++            errors.append(f"{loc}.depends_on[{i}]: must be a non-empty string")
++            continue
++        if item in out:
++            errors.append(f"{loc}.depends_on: duplicate dependency '{item}'")
++            continue
++        out.append(item)
++    return out
++
++
++def _validate_number(value: Any, loc: str, errors: list[str], *, allow_none: bool = False, minimum: float | None = None) -> float | None:
++    if value is None:
++        if allow_none:
++            return None
++        errors.append(f"'{loc}' must be a number")
++        return None
++    if isinstance(value, bool) or not isinstance(value, (int, float)):
++        errors.append(f"'{loc}' must be a number")
++        return None
++    f = float(value)
++    if minimum is not None and f < minimum:
++        errors.append(f"'{loc}' must be >= {minimum}")
++        return None
++    return f
++
++
++def _validate_int(value: Any, loc: str, errors: list[str], *, minimum: int | None = None) -> int | None:
++    if isinstance(value, bool) or not isinstance(value, int):
++        errors.append(f"'{loc}' must be an integer")
++        return None
++    if minimum is not None and value < minimum:
++        errors.append(f"'{loc}' must be >= {minimum}")
++        return None
++    return value
++
++
++# ----------------------------------------------------------------------------
++# Cycle detection (iterative DFS so deep graphs don't blow the stack)
++# ----------------------------------------------------------------------------
++
++def _find_cycle(steps: list[Step]) -> list[str] | None:
++    graph = {s.id: [d for d in s.depends_on] for s in steps}
++    WHITE, GRAY, BLACK = 0, 1, 2
++    color = {n: WHITE for n in graph}
++    parent: dict[str, str | None] = {}
++
++    for start in graph:
++        if color[start] != WHITE:
++            continue
++        stack: list[tuple[str, int]] = [(start, 0)]
++        parent[start] = None
++        while stack:
++            node, idx = stack[-1]
++            if idx == 0:
++                color[node] = GRAY
++            children = graph.get(node, [])
++            if idx < len(children):
++                stack[-1] = (node, idx + 1)
++                child = children[idx]
++                if child not in graph:
++                    continue  # unknown ref; reported elsewhere
++                if color[child] == WHITE:
++                    parent[child] = node
++                    stack.append((child, 0))
++                elif color[child] == GRAY:
++                    # reconstruct cycle
++                    cyc = [child]
++                    cur = node
++                    while cur is not None and cur != child:
++                        cyc.append(cur)
++                        cur = parent.get(cur)
++                    cyc.append(child)
++                    cyc.reverse()
++                    return cyc
++            else:
++                color[node] = BLACK
++                stack.pop()
++    return None
+diff --git a/bujjictl/report.py b/bujjictl/report.py
+new file mode 100644
+index 0000000..aa8aef4
+--- /dev/null
++++ b/bujjictl/report.py
+@@ -0,0 +1,129 @@
++"""Pretty-print a JSON run report to the terminal."""
++
++from __future__ import annotations
++
++import json
++import os
++import sys
++import textwrap
++
++
++_STATUS_STYLE = {
++    "succeeded": ("✔", "32"),   # green
++    "failed":    ("✘", "31"),   # red
++    "timed_out": ("⏱", "33"),   # yellow
++    "cancelled": ("⊘", "90"),   # grey
++    "running":   ("▷", "36"),
++    "pending":   ("·", "90"),
++}
++
++
++def _color_enabled(stream) -> bool:
++    if os.environ.get("NO_COLOR"):
++        return False
++    return stream.isatty()
++
++
++def _c(text: str, code: str, *, enabled: bool) -> str:
++    if not enabled:
++        return text
++    return f"\033[{code}m{text}\033[0m"
++
++
++def _fmt_duration(d: float | None) -> str:
++    if d is None:
++        return "-"
++    if d < 1:
++        return f"{d * 1000:.0f}ms"
++    if d < 60:
++        return f"{d:.2f}s"
++    m, s = divmod(d, 60)
++    return f"{int(m)}m{s:04.1f}s"
++
++
++def render(report: dict, *, stream=sys.stdout, show_output: bool = True) -> None:
++    color = _color_enabled(stream)
++
++    def out(s: str = "") -> None:
++        print(s, file=stream)
++
++    wf = report.get("workflow", {})
++    status = report.get("status", "?")
++    glyph, code = _STATUS_STYLE.get(status, ("?", "0"))
++
++    out(_c(f"Workflow: {wf.get('name', '<unnamed>')}", "1", enabled=color))
++    if wf.get("description"):
++        out(f"  {wf['description']}")
++    out(f"  Status:   {_c(glyph + ' ' + status, code, enabled=color)}")
++    out(f"  Started:  {report.get('started_at', '-')}")
++    out(f"  Finished: {report.get('finished_at', '-')}")
++    out(f"  Duration: {_fmt_duration(report.get('duration'))}")
++
++    summary = report.get("summary", {})
++    if summary:
++        parts = []
++        for k in ("succeeded", "failed", "timed_out", "cancelled"):
++            v = summary.get(k, 0)
++            g, cde = _STATUS_STYLE[k]
++            parts.append(_c(f"{g} {v} {k}", cde, enabled=color))
++        out("  Summary:  " + "   ".join(parts) + f"   (total {summary.get('total', 0)})")
++    out()
++
++    steps = report.get("steps", [])
++    if not steps:
++        out("  (no steps)")
++        return
++
++    id_w = max(len(s.get("id", "")) for s in steps)
++    id_w = max(id_w, len("STEP"))
++
++    out(_c(f"  {'STEP':<{id_w}}  {'STATUS':<10}  {'ATTEMPTS':>8}  {'DURATION':>10}  DEPENDS ON",
++           "1", enabled=color))
++    out("  " + "-" * (id_w + 2 + 10 + 2 + 8 + 2 + 10 + 2 + 20))
++    for s in steps:
++        st = s.get("status", "?")
++        g, cde = _STATUS_STYLE.get(st, ("?", "0"))
++        deps = ", ".join(s.get("depends_on") or []) or "-"
++        out("  "
++            + f"{s.get('id', ''):<{id_w}}  "
++            + _c(f"{g} {st:<8}", cde, enabled=color) + "  "
++            + f"{s.get('attempt_count', 0):>8}  "
++            + f"{_fmt_duration(s.get('duration')):>10}  "
++            + deps)
++    out()
++
++    # Per-step detail
++    for s in steps:
++        st = s.get("status", "?")
++        g, cde = _STATUS_STYLE.get(st, ("?", "0"))
++        title = s.get("name") or s.get("id")
++        out(_c(f"• {s.get('id')}", "1", enabled=color)
++            + (f"  —  {title}" if s.get("name") else "")
++            + "   [" + _c(f"{g} {st}", cde, enabled=color) + "]")
++        if s.get("cancel_reason"):
++            out(f"    reason: {s['cancel_reason']}")
++        for a in s.get("attempts", []):
++            ec = a.get("exit_code")
++            tag = "TIMEOUT" if a.get("timed_out") else (f"exit={ec}" if ec is not None else "error")
++            out(f"    attempt #{a.get('number')}  {tag}  "
++                f"({_fmt_duration(a.get('duration'))})  "
++                f"{a.get('started_at', '')} → {a.get('finished_at', '')}")
++            if a.get("error"):
++                out(f"      error: {a['error']}")
++            if show_output:
++                _dump_stream("stdout", a.get("stdout", ""), out)
++                _dump_stream("stderr", a.get("stderr", ""), out)
++        out()
++
++
++def _dump_stream(label: str, content: str, out) -> None:
++    if not content:
++        return
++    out(f"      {label}:")
++    for line in content.rstrip("\n").splitlines() or [""]:
++        out(textwrap.indent(line, "        "))
++
++
++def load_report(path: str) -> dict:
++    with open(path, "r", encoding="utf-8") as f:
++        return json.load(f)
+diff --git a/bujjictl/yaml_parser.py b/bujjictl/yaml_parser.py
+new file mode 100644
+index 0000000..e64157a
+--- /dev/null
++++ b/bujjictl/yaml_parser.py
+@@ -0,0 +1,379 @@
++"""
++A minimal, dependency-free YAML parser.
++
++Supports the subset of YAML needed for workflow definitions:
++  * mappings (key: value)
++  * sequences (- item)
++  * nested structures via indentation
++  * inline scalars: strings, ints, floats, bools, null
++  * single- and double-quoted strings
++  * block scalars: | (literal) and > (folded)
++  * full-line and trailing comments (outside quotes)
++  * blank lines
++
++It deliberately does NOT support anchors/aliases, flow collections,
++multi-document streams, tags, or other advanced YAML features.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++
++class YamlError(Exception):
++    def __init__(self, message: str, line: int | None = None):
++        if line is not None:
++            super().__init__(f"line {line}: {message}")
++        else:
++            super().__init__(message)
++        self.line = line
++
++
++@dataclass
++class _Line:
++    num: int          # 1-based original line number
++    indent: int       # number of leading spaces
++    text: str         # content after indentation (may be empty)
++
++
++# ----------------------------------------------------------------------------
++# Pre-processing
++# ----------------------------------------------------------------------------
++
++def _strip_comment(s: str) -> str:
++    """Remove a trailing comment that is not inside a quoted string."""
++    out = []
++    i = 0
++    n = len(s)
++    in_single = False
++    in_double = False
++    while i < n:
++        ch = s[i]
++        if in_single:
++            out.append(ch)
++            if ch == "'":
++                in_single = False
++            i += 1
++            continue
++        if in_double:
++            out.append(ch)
++            if ch == "\\" and i + 1 < n:
++                out.append(s[i + 1])
++                i += 2
++                continue
++            if ch == '"':
++                in_double = False
++            i += 1
++            continue
++        if ch == "'":
++            in_single = True
++            out.append(ch)
++            i += 1
++            continue
++        if ch == '"':
++            in_double = True
++            out.append(ch)
++            i += 1
++            continue
++        if ch == "#" and (i == 0 or s[i - 1] in (" ", "\t")):
++            break
++        out.append(ch)
++        i += 1
++    return "".join(out).rstrip()
++
++
++def _preprocess(source: str) -> list[_Line]:
++    lines: list[_Line] = []
++    for num, raw in enumerate(source.splitlines(), start=1):
++        if "\t" in raw[: len(raw) - len(raw.lstrip("\t "))]:
++            raise YamlError("tabs are not allowed for indentation", num)
++        stripped_full = raw.rstrip()
++        # Preserve genuinely blank lines for block-scalar handling.
++        if stripped_full == "":
++            lines.append(_Line(num, 0, ""))
++            continue
++        indent = len(raw) - len(raw.lstrip(" "))
++        body = _strip_comment(raw[indent:])
++        if body == "":
++            # whole line was a comment -> treat as blank
++            lines.append(_Line(num, 0, ""))
++            continue
++        lines.append(_Line(num, indent, body))
++    return lines
++
++
++# ----------------------------------------------------------------------------
++# Scalar parsing
++# ----------------------------------------------------------------------------
++
++def _parse_scalar(token: str, line_num: int) -> Any:
++    s = token.strip()
++    if s == "":
++        return None
++    if s[0] == '"' and s[-1] == '"' and len(s) >= 2:
++        return _unescape_double(s[1:-1], line_num)
++    if s[0] == "'" and s[-1] == "'" and len(s) >= 2:
++        return s[1:-1].replace("''", "'")
++    low = s.lower()
++    if low in ("null", "~"):
++        return None
++    if low in ("true", "yes", "on"):
++        return True
++    if low in ("false", "no", "off"):
++        return False
++    # int
++    try:
++        if s.startswith(("0x", "0X")):
++            return int(s, 16)
++        if s.startswith(("0o", "0O")):
++            return int(s, 8)
++        return int(s)
++    except ValueError:
++        pass
++    # float
++    try:
++        return float(s)
++    except ValueError:
++        pass
++    return s
++
++
++def _unescape_double(s: str, line_num: int) -> str:
++    out = []
++    i = 0
++    escapes = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "0": "\0"}
++    while i < len(s):
++        ch = s[i]
++        if ch == "\\":
++            i += 1
++            if i >= len(s):
++                raise YamlError("unterminated escape sequence", line_num)
++            e = s[i]
++            if e in escapes:
++                out.append(escapes[e])
++            else:
++                out.append(e)
++        else:
++            out.append(ch)
++        i += 1
++    return "".join(out)
++
++
++# ----------------------------------------------------------------------------
++# Core recursive parser
++# ----------------------------------------------------------------------------
++
++class _Parser:
++    def __init__(self, lines: list[_Line]):
++        self.lines = lines
++        self.pos = 0
++
++    # -- helpers ------------------------------------------------------------
++
++    def _peek(self) -> _Line | None:
++        while self.pos < len(self.lines) and self.lines[self.pos].text == "":
++            self.pos += 1
++        if self.pos < len(self.lines):
++            return self.lines[self.pos]
++        return None
++
++    def _split_key(self, text: str) -> tuple[str, str] | None:
++        """Split 'key: rest' respecting quotes. Returns (key, rest) or None."""
++        i = 0
++        n = len(text)
++        in_single = False
++        in_double = False
++        while i < n:
++            ch = text[i]
++            if in_single:
++                if ch == "'":
++                    in_single = False
++            elif in_double:
++                if ch == "\\":
++                    i += 1
++                elif ch == '"':
++                    in_double = False
++            elif ch == "'":
++                in_single = True
++            elif ch == '"':
++                in_double = True
++            elif ch == ":" and (i + 1 == n or text[i + 1] in (" ", "\t")):
++                key = text[:i].strip()
++                rest = text[i + 1:].strip()
++                return key, rest
++            i += 1
++        return None
++
++    # -- block scalar -------------------------------------------------------
++
++    def _parse_block_scalar(self, style: str, base_indent: int, line_num: int) -> str:
++        # style is '|' or '>' optionally followed by '-' or '+'
++        chomp = ""
++        if len(style) > 1:
++            chomp = style[1]
++        raw_lines: list[str] = []
++        content_indent: int | None = None
++        # Consume raw lines (do NOT use _peek; blank lines matter here).
++        while self.pos < len(self.lines):
++            ln = self.lines[self.pos]
++            if ln.text == "":
++                raw_lines.append("")
++                self.pos += 1
++                continue
++            if ln.indent <= base_indent:
++                break
++            if content_indent is None:
++                content_indent = ln.indent
++            if ln.indent < content_indent:
++                break
++            raw_lines.append(" " * (ln.indent - content_indent) + ln.text)
++            self.pos += 1
++        # Drop trailing blank entries we speculatively consumed past the block.
++        while raw_lines and raw_lines[-1] == "":
++            raw_lines.pop()
++        if style[0] == "|":
++            body = "\n".join(raw_lines)
++        else:  # '>' folded
++            out: list[str] = []
++            prev_blank = True
++            for r in raw_lines:
++                if r == "":
++                    out.append("\n")
++                    prev_blank = True
++                elif r.startswith(" "):
++                    if out and not out[-1].endswith("\n"):
++                        out.append("\n")
++                    out.append(r)
++                    out.append("\n")
++                    prev_blank = True
++                else:
++                    if not prev_blank:
++                        out.append(" ")
++                    out.append(r)
++                    prev_blank = False
++            body = "".join(out).rstrip("\n")
++        if chomp == "-":
++            return body
++        return body + ("\n" if body else "")
++
++    # -- value / mapping / sequence ----------------------------------------
++
++    def parse_block(self, indent: int) -> Any:
++        ln = self._peek()
++        if ln is None or ln.indent < indent:
++            return None
++        if ln.text.startswith("- ") or ln.text == "-":
++            return self._parse_sequence(ln.indent)
++        if self._split_key(ln.text) is not None:
++            return self._parse_mapping(ln.indent)
++        # bare scalar on its own line
++        self.pos += 1
++        return _parse_scalar(ln.text, ln.num)
++
++    def _parse_sequence(self, indent: int) -> list[Any]:
++        items: list[Any] = []
++        while True:
++            ln = self._peek()
++            if ln is None or ln.indent != indent:
++                break
++            if not (ln.text.startswith("- ") or ln.text == "-"):
++                break
++            self.pos += 1
++            after = ln.text[1:].lstrip(" ")
++            item_indent = indent + (len(ln.text) - len(ln.text[1:].lstrip(" ")))  # indent of content after '-'
++            if not after:
++                # '-' alone: nested block follows
++                items.append(self.parse_block(indent + 1))
++                continue
++            kv = self._split_key(after)
++            if kv is not None:
++                # '- key: value' starts an inline mapping; subsequent keys at item_indent.
++                items.append(self._parse_inline_seq_mapping(kv, item_indent, ln.num))
++            elif after in ("|", ">", "|-", "|+", ">-", ">+"):
++                items.append(self._parse_block_scalar(after, indent, ln.num))
++            else:
++                items.append(_parse_scalar(after, ln.num))
++        return items
++
++    def _parse_inline_seq_mapping(self, first_kv: tuple[str, str], indent: int, line_num: int) -> dict[str, Any]:
++        result: dict[str, Any] = {}
++        key, rest = first_kv
++        key = self._unquote_key(key, line_num)
++        result[key] = self._value_for_key(rest, indent, line_num)
++        # Continue reading sibling keys at `indent`.
++        while True:
++            ln = self._peek()
++            if ln is None or ln.indent != indent:
++                break
++            kv = self._split_key(ln.text)
++            if kv is None or ln.text.startswith("- ") or ln.text == "-":
++                break
++            self.pos += 1
++            k, r = kv
++            k = self._unquote_key(k, ln.num)
++            if k in result:
++                raise YamlError(f"duplicate mapping key '{k}'", ln.num)
++            result[k] = self._value_for_key(r, indent, ln.num)
++        return result
++
++    def _parse_mapping(self, indent: int) -> dict[str, Any]:
++        result: dict[str, Any] = {}
++        while True:
++            ln = self._peek()
++            if ln is None or ln.indent != indent:
++                break
++            if ln.text.startswith("- ") or ln.text == "-":
++                break
++            kv = self._split_key(ln.text)
++            if kv is None:
++                raise YamlError(f"expected 'key: value', got '{ln.text}'", ln.num)
++            self.pos += 1
++            key, rest = kv
++            key = self._unquote_key(key, ln.num)
++            if key in result:
++                raise YamlError(f"duplicate mapping key '{key}'", ln.num)
++            result[key] = self._value_for_key(rest, indent, ln.num)
++        return result
++
++    def _value_for_key(self, rest: str, key_indent: int, line_num: int) -> Any:
++        if rest in ("|", ">", "|-", "|+", ">-", ">+"):
++            return self._parse_block_scalar(rest, key_indent, line_num)
++        if rest:
++            return _parse_scalar(rest, line_num)
++        # No inline value: look at next non-blank line.
++        nxt = self._peek()
++        if nxt is None or nxt.indent <= key_indent:
++            return None
++        return self.parse_block(nxt.indent)
++
++    @staticmethod
++    def _unquote_key(key: str, line_num: int) -> str:
++        if len(key) >= 2 and key[0] == key[-1] and key[0] in ("'", '"'):
++            return str(_parse_scalar(key, line_num))
++        return key
++
++
++# ----------------------------------------------------------------------------
++# Public API
++# ----------------------------------------------------------------------------
++
++def load(source: str) -> Any:
++    """Parse a YAML document from a string."""
++    lines = _preprocess(source)
++    parser = _Parser(lines)
++    first = parser._peek()
++    if first is None:
++        return None
++    if first.indent != 0:
++        raise YamlError("top-level content must not be indented", first.num)
++    value = parser.parse_block(0)
++    trailing = parser._peek()
++    if trailing is not None:
++        raise YamlError(f"unexpected content '{trailing.text}'", trailing.num)
++    return value
++
++
++def load_file(path: str) -> Any:
++    with open(path, "r", encoding="utf-8") as f:
++        return load(f.read())
+diff --git a/examples/failure.yaml b/examples/failure.yaml
+new file mode 100644
+index 0000000..09cd194
+--- /dev/null
++++ b/examples/failure.yaml
+@@ -0,0 +1,30 @@
++name: failure-demo
++description: Shows failure propagation, downstream cancellation, and timeouts.
++
++steps:
++  - id: ok
++    run: 'echo "this one is fine"'
++
++  - id: boom
++    depends_on: 
++      - ok
++    retries: 1
++    retry_backoff: 0.1
++    run: |
++      echo "about to fail" >&2
++      exit 1
++
++  - id: slow
++    depends_on:
++      - ok
++    timeout: 1
++    run: |
++      echo "sleeping..."
++      sleep 5
++      echo "you will never see this"
++
++  - id: downstream
++    depends_on:
++      - boom
++      - slow
++    run: 'echo "should be cancelled"'
+diff --git a/examples/hello.yaml b/examples/hello.yaml
+new file mode 100644
+index 0000000..0b4b17d
+--- /dev/null
++++ b/examples/hello.yaml
+@@ -0,0 +1,57 @@
++# A small demo workflow showing dependencies, concurrency, env vars,
++# retries, and timeouts.
++
++name: hello
++description: Demo workflow for bujjictl
++
++env:
++  GREETING: "hello from bujjictl"
++
++defaults:
++  timeout: 30
++  retries: 0
++  retry_backoff: 0.5
++
++steps:
++  - id: prepare
++    name: Prepare workspace
++    run: |
++      echo "[prepare] $GREETING"
++      sleep 0.2
++
++  - id: lint
++    name: Lint
++    depends_on:
++      - prepare
++    run: |
++      echo "[lint] linting on attempt $BUJJI_ATTEMPT" >&2
++      sleep 0.3
++
++  - id: test
++    name: Test
++    depends_on:
++      - prepare
++    env:
++      TARGET: unit
++    run: |
++      echo "[test] running $TARGET tests"
++      sleep 0.3
++
++  - id: flaky
++    name: Flaky step (succeeds on 2nd try)
++    depends_on:
++      - prepare
++    retries: 2
++    retry_backoff: 0.2
++    run: |
++      echo "[flaky] attempt=$BUJJI_ATTEMPT"
++      test "$BUJJI_ATTEMPT" -ge 2
++
++  - id: package
++    name: Package
++    depends_on:
++      - lint
++      - test
++      - flaky
++    run: |
++      echo "[package] building artifact"
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..21230dc
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,25 @@
++[build-system]
++requires = ["setuptools>=61.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "bujjictl"
++version = "0.1.0"
++description = "A lightweight, local-first workflow orchestration engine."
++readme = "README.md"
++requires-python = ">=3.9"
++license = { text = "MIT" }
++authors = [{ name = "Vijay" }]
++keywords = ["workflow", "orchestration", "dag", "cli"]
++classifiers = [
++  "Programming Language :: Python :: 3",
++  "Environment :: Console",
++  "Operating System :: POSIX",
++]
++dependencies = []
++
++[project.scripts]
++bujjictl = "bujjictl.cli:main"
++
++[tool.setuptools]
++packages = ["bujjictl"]
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_engine.py b/tests/test_engine.py
+new file mode 100644
+index 0000000..cbc2be2
+--- /dev/null
++++ b/tests/test_engine.py
+@@ -0,0 +1,106 @@
++import os
++import tempfile
++import time
++import unittest
++
++from bujjictl.engine import Engine, SUCCEEDED, FAILED, CANCELLED, TIMED_OUT
++from bujjictl.model import load_workflow
++
++
++def _wf(content: str):
++    fd, path = tempfile.mkstemp(suffix=".yaml")
++    with os.fdopen(fd, "w") as f:
++        f.write(content)
++    return load_workflow(path)
++
++
++SILENT = lambda msg: None
++
++
++class TestEngine(unittest.TestCase):
++    def test_simple_success(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    run: 'echo hello'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        self.assertEqual(rep.status, SUCCEEDED)
++        self.assertEqual(rep.steps[0].attempts[0].exit_code, 0)
++        self.assertIn("hello", rep.steps[0].attempts[0].stdout)
++
++    def test_dependency_order(self):
++        d = tempfile.mkdtemp()
++        marker = os.path.join(d, "m")
++        wf = _wf(
++            "name: t\nsteps:\n"
++            f"  - id: a\n    run: 'sleep 0.3 && touch {marker}'\n"
++            f"  - id: b\n    depends_on:\n      - a\n    run: 'test -f {marker}'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        self.assertEqual(rep.status, SUCCEEDED)
++
++    def test_concurrency(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    run: 'sleep 0.5'\n"
++            "  - id: b\n    run: 'sleep 0.5'\n"
++            "  - id: c\n    run: 'sleep 0.5'\n"
++        )
++        t0 = time.monotonic()
++        rep = Engine(wf, max_workers=4, logger=SILENT).run()
++        elapsed = time.monotonic() - t0
++        self.assertEqual(rep.status, SUCCEEDED)
++        self.assertLess(elapsed, 1.2, f"expected concurrent execution, took {elapsed:.2f}s")
++
++    def test_failure_cancels_downstream(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    run: 'exit 1'\n"
++            "  - id: b\n    depends_on:\n      - a\n    run: 'echo nope'\n"
++            "  - id: c\n    depends_on:\n      - b\n    run: 'echo nope'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        self.assertEqual(rep.status, FAILED)
++        by = {s.step.id: s for s in rep.steps}
++        self.assertEqual(by["a"].status, FAILED)
++        self.assertEqual(by["b"].status, CANCELLED)
++        self.assertEqual(by["c"].status, CANCELLED)
++        self.assertEqual(by["b"].attempts, [])
++
++    def test_retries(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n"
++            "    retries: 3\n"
++            "    retry_backoff: 0.05\n"
++            "    run: 'test \"$BUJJI_ATTEMPT\" -ge 3'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        self.assertEqual(rep.status, SUCCEEDED)
++        self.assertEqual(len(rep.steps[0].attempts), 3)
++
++    def test_timeout(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    timeout: 0.4\n    run: 'sleep 5'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        self.assertEqual(rep.steps[0].status, TIMED_OUT)
++        self.assertTrue(rep.steps[0].attempts[0].timed_out)
++
++    def test_env_injection(self):
++        wf = _wf(
++            "name: t\n"
++            "env:\n  G: gee\n"
++            "steps:\n"
++            "  - id: a\n"
++            "    env:\n      L: ell\n"
++            "    run: 'echo \"$G-$L-$BUJJI_STEP_ID-$BUJJI_WORKFLOW\"'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        out = rep.steps[0].attempts[0].stdout.strip()
++        self.assertEqual(out, "gee-ell-a-t")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_model.py b/tests/test_model.py
+new file mode 100644
+index 0000000..e8d9584
+--- /dev/null
++++ b/tests/test_model.py
+@@ -0,0 +1,93 @@
++import os
++import tempfile
++import unittest
++
++from bujjictl.model import ValidationError, load_workflow
++
++
++def _write(content: str) -> str:
++    fd, path = tempfile.mkstemp(suffix=".yaml")
++    with os.fdopen(fd, "w") as f:
++        f.write(content)
++    return path
++
++
++class TestValidation(unittest.TestCase):
++    def test_valid(self):
++        p = _write(
++            "name: wf\n"
++            "steps:\n"
++            "  - id: a\n"
++            "    run: echo hi\n"
++            "  - id: b\n"
++            "    run: echo bye\n"
++            "    depends_on:\n"
++            "      - a\n"
++        )
++        wf = load_workflow(p)
++        self.assertEqual(wf.name, "wf")
++        self.assertEqual([s.id for s in wf.steps], ["a", "b"])
++        self.assertEqual(wf.dependents["a"], {"b"})
++
++    def test_missing_name(self):
++        p = _write("steps:\n  - id: a\n    run: x\n")
++        with self.assertRaises(ValidationError) as ctx:
++            load_workflow(p)
++        self.assertTrue(any("'name'" in e for e in ctx.exception.errors))
++
++    def test_unknown_dep(self):
++        p = _write(
++            "name: wf\nsteps:\n"
++            "  - id: a\n    run: x\n    depends_on:\n      - ghost\n"
++        )
++        with self.assertRaises(ValidationError) as ctx:
++            load_workflow(p)
++        self.assertTrue(any("ghost" in e for e in ctx.exception.errors))
++
++    def test_duplicate_id(self):
++        p = _write(
++            "name: wf\nsteps:\n"
++            "  - id: a\n    run: x\n"
++            "  - id: a\n    run: y\n"
++        )
++        with self.assertRaises(ValidationError):
++            load_workflow(p)
++
++    def test_cycle(self):
++        p = _write(
++            "name: wf\nsteps:\n"
++            "  - id: a\n    run: x\n    depends_on:\n      - b\n"
++            "  - id: b\n    run: y\n    depends_on:\n      - a\n"
++        )
++        with self.assertRaises(ValidationError) as ctx:
++            load_workflow(p)
++        self.assertTrue(any("cycle" in e for e in ctx.exception.errors))
++
++    def test_self_dep(self):
++        p = _write(
++            "name: wf\nsteps:\n"
++            "  - id: a\n    run: x\n    depends_on:\n      - a\n"
++        )
++        with self.assertRaises(ValidationError):
++            load_workflow(p)
++
++    def test_unknown_key(self):
++        p = _write("name: wf\nfoo: bar\nsteps:\n  - id: a\n    run: x\n")
++        with self.assertRaises(ValidationError) as ctx:
++            load_workflow(p)
++        self.assertTrue(any("unknown key 'foo'" in e for e in ctx.exception.errors))
++
++    def test_bad_types(self):
++        p = _write(
++            "name: wf\nsteps:\n"
++            "  - id: a\n    run: x\n    retries: nope\n    timeout: -1\n"
++        )
++        with self.assertRaises(ValidationError) as ctx:
++            load_workflow(p)
++        msgs = " ".join(ctx.exception.errors)
++        self.assertIn("retries", msgs)
++        self.assertIn("timeout", msgs)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_yaml_parser.py b/tests/test_yaml_parser.py
+new file mode 100644
+index 0000000..536c4db
+--- /dev/null
++++ b/tests/test_yaml_parser.py
+@@ -0,0 +1,76 @@
++import unittest
++
++from bujjictl.yaml_parser import load, YamlError
++
++
++class TestYamlParser(unittest.TestCase):
++    def test_scalars(self):
++        self.assertEqual(load("a: 1"), {"a": 1})
++        self.assertEqual(load("a: 1.5"), {"a": 1.5})
++        self.assertEqual(load("a: true"), {"a": True})
++        self.assertEqual(load("a: false"), {"a": False})
++        self.assertEqual(load("a: null"), {"a": None})
++        self.assertEqual(load("a: ~"), {"a": None})
++        self.assertEqual(load("a: hello world"), {"a": "hello world"})
++        self.assertEqual(load("a:"), {"a": None})
++
++    def test_quoted(self):
++        self.assertEqual(load('a: "hi: there"'), {"a": "hi: there"})
++        self.assertEqual(load("a: 'hi: there'"), {"a": "hi: there"})
++        self.assertEqual(load('a: "line\\nbreak"'), {"a": "line\nbreak"})
++        self.assertEqual(load('a: "true"'), {"a": "true"})
++
++    def test_nested_mapping(self):
++        src = "a:\n  b: 1\n  c: 2\n"
++        self.assertEqual(load(src), {"a": {"b": 1, "c": 2}})
++
++    def test_sequence(self):
++        src = "a:\n  - x\n  - y\n"
++        self.assertEqual(load(src), {"a": ["x", "y"]})
++
++    def test_sequence_of_mappings(self):
++        src = (
++            "steps:\n"
++            "  - id: one\n"
++            "    run: echo hi\n"
++            "  - id: two\n"
++            "    run: echo bye\n"
++        )
++        self.assertEqual(load(src), {"steps": [
++            {"id": "one", "run": "echo hi"},
++            {"id": "two", "run": "echo bye"},
++        ]})
++
++    def test_block_scalar_literal(self):
++        src = "run: |\n  line1\n  line2\n"
++        self.assertEqual(load(src), {"run": "line1\nline2\n"})
++
++    def test_block_scalar_strip(self):
++        src = "run: |-\n  line1\n  line2\n"
++        self.assertEqual(load(src), {"run": "line1\nline2"})
++
++    def test_comments_and_blank_lines(self):
++        src = "# top\na: 1  # trailing\n\nb: 2\n"
++        self.assertEqual(load(src), {"a": 1, "b": 2})
++
++    def test_nested_list_under_dash(self):
++        src = (
++            "steps:\n"
++            "  - id: a\n"
++            "    depends_on:\n"
++            "      - x\n"
++            "      - y\n"
++        )
++        self.assertEqual(load(src), {"steps": [{"id": "a", "depends_on": ["x", "y"]}]})
++
++    def test_duplicate_key(self):
++        with self.assertRaises(YamlError):
++            load("a: 1\na: 2\n")
++
++    def test_colon_in_unquoted_value(self):
++        # colon not followed by space should not split
++        self.assertEqual(load("a: http://x"), {"a": "http://x"})
++
++
++if __name__ == "__main__":
++    unittest.main()
