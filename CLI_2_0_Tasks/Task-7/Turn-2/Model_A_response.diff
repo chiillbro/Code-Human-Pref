@@ -1,0 +1,834 @@
+diff --git a/examples/logpipe.yaml b/examples/logpipe.yaml
+index c751109..8ff447b 100644
+--- a/examples/logpipe.yaml
++++ b/examples/logpipe.yaml
+@@ -20,5 +20,6 @@ transforms:
+ 
+ analysis:
+   window_seconds: 60
+-  anomaly_z: 2.0
++  baseline_windows: 20      # rolling history length for anomaly baseline
++  anomaly_sensitivity: 1.5  # bounds = median +/- sensitivity * IQR
+   top_messages: 10
+diff --git a/src/logpipe/analysis.py b/src/logpipe/analysis.py
+index b7ce79a..a7df8e1 100644
+--- a/src/logpipe/analysis.py
++++ b/src/logpipe/analysis.py
+@@ -7,10 +7,15 @@ The analyzer consumes :class:`LogEvent` objects and accumulates:
+   level — this gives event-rate series;
+ * a "top messages" table built on a normalised message signature so that
+   ``error: timeout after 53ms`` and ``error: timeout after 7ms`` collapse;
+-* anomalous windows: buckets whose total count is more than ``anomaly_z``
+-  standard deviations from the mean (spikes *and* drops).
+-
+-Everything is stdlib; ``statistics`` handles mean/stdev.
++* anomalous windows, using a rolling robust baseline: for each window we take
++  the median and IQR of the previous ``baseline_windows`` buckets and flag the
++  current bucket as a *spike* if it exceeds ``median + sensitivity * IQR`` or a
++  *drop* if it falls below ``median - sensitivity * IQR``. The first
++  ``baseline_windows`` buckets are never flagged (insufficient history). Median
++  + IQR is used instead of mean + stdev because a single huge spike would
++  otherwise inflate stdev and mask everything else.
++
++Everything is stdlib; ``statistics`` supplies median/quantiles.
+ """
+ from __future__ import annotations
+ 
+@@ -47,14 +52,14 @@ def _floor(ts: datetime, seconds: int) -> datetime:
+ class Anomaly:
+     window_start: datetime
+     count: int
+-    z_score: float
+-    kind: str  # "spike" or "drop"
++    baseline: float  # median of the trailing K windows
++    kind: str        # "spike" or "drop"
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+             "window_start": self.window_start.isoformat(),
+             "count": self.count,
+-            "z_score": round(self.z_score, 2),
++            "baseline": round(self.baseline, 2),
+             "kind": self.kind,
+         }
+ 
+@@ -171,19 +176,30 @@ class Analyzer:
+         return windows
+ 
+     def _detect_anomalies(self, windows: Dict[datetime, int]) -> List[Anomaly]:
+-        if len(windows) < 3:
+-            return []
++        k = self.cfg.baseline_windows
++        sens = self.cfg.anomaly_sensitivity
+         ordered = sorted(windows.items(), key=lambda kv: kv[0])
+-        counts = [c for _, c in ordered]
+-        mean = statistics.fmean(counts)
+-        stdev = statistics.pstdev(counts)
+-        if stdev == 0:
+-            return []
++        if len(ordered) <= k:
++            return []  # not enough history to say anything
++
+         out: List[Anomaly] = []
+-        for start, c in ordered:
+-            z = (c - mean) / stdev
+-            if z >= self.cfg.anomaly_z:
+-                out.append(Anomaly(start, c, z, "spike"))
+-            elif z <= -self.cfg.anomaly_z:
+-                out.append(Anomaly(start, c, z, "drop"))
++        for i in range(k, len(ordered)):
++            start, count = ordered[i]
++            history = [c for _, c in ordered[i - k : i]]
++            median = statistics.median(history)
++            iqr = _iqr(history)
++            upper = median + sens * iqr
++            lower = median - sens * iqr
++            if count > upper:
++                out.append(Anomaly(start, count, float(median), "spike"))
++            elif count < lower:
++                out.append(Anomaly(start, count, float(median), "drop"))
+         return out
++
++
++def _iqr(values: List[int]) -> float:
++    """Interquartile range using inclusive quantiles (robust for short series)."""
++    if len(values) < 2:
++        return 0.0
++    q1, _, q3 = statistics.quantiles(values, n=4, method="inclusive")
++    return float(q3 - q1)
+diff --git a/src/logpipe/cli.py b/src/logpipe/cli.py
+index 3abbe57..414b2fd 100644
+--- a/src/logpipe/cli.py
++++ b/src/logpipe/cli.py
+@@ -6,7 +6,7 @@ import sys
+ from typing import Sequence
+ 
+ from .analysis import Analyzer
+-from .config import Config
++from .config import Config, ConfigError
+ from .parsers import build_registry, detect_parser
+ from .pipeline import Pipeline
+ from .report import build_report, to_json, to_text
+@@ -99,7 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
+ 
+ def main(argv: Sequence[str] | None = None) -> int:
+     args = build_parser().parse_args(argv)
+-    return args.func(args)
++    try:
++        return args.func(args)
++    except ConfigError as exc:
++        print(f"logpipe: error: {exc}", file=sys.stderr)
++        return 2
+ 
+ 
+ if __name__ == "__main__":  # pragma: no cover
+diff --git a/src/logpipe/config.py b/src/logpipe/config.py
+index 292b9d3..b2fa136 100644
+--- a/src/logpipe/config.py
++++ b/src/logpipe/config.py
+@@ -32,22 +32,34 @@ The config file is YAML and every section is optional::
+ 
+     analysis:
+       window_seconds: 60
+-      anomaly_z: 2.5
++      baseline_windows: 20
++      anomaly_sensitivity: 1.5
+       top_messages: 10
+ """
+ from __future__ import annotations
+ 
+-import sys
+ from dataclasses import dataclass, field
+ from typing import Any, Dict, List, Optional
+ 
+ import yaml
+ 
+ 
++class ConfigError(Exception):
++    """Raised when a user-specified config file cannot be loaded.
++
++    We deliberately do *not* fall back to defaults here: if the user named a
++    config explicitly and it is missing or broken, running with silent defaults
++    is more confusing than refusing to run.
++    """
++
++
+ @dataclass
+ class AnalysisConfig:
+     window_seconds: int = 60
+-    anomaly_z: float = 2.5
++    #: number of trailing windows used as the rolling baseline for anomaly detection
++    baseline_windows: int = 20
++    #: multiplier on the IQR; bounds are median +/- sensitivity * IQR
++    anomaly_sensitivity: float = 1.5
+     top_messages: int = 10
+ 
+ 
+@@ -60,14 +72,24 @@ class Config:
+ 
+     @classmethod
+     def load(cls, path: Optional[str]) -> "Config":
++        """Load *path* or return defaults when *path* is ``None``.
++
++        Raises :class:`ConfigError` if *path* was given but cannot be opened or
++        parsed — never silently falls back.
++        """
+         if not path:
+             return cls()
+         try:
+             with open(path, "r", encoding="utf-8") as fh:
+-                data = yaml.safe_load(fh) or {}
+-        except (OSError, yaml.YAMLError) as exc:
+-            print(f"logpipe: warning: could not load config {path!r}: {exc}", file=sys.stderr)
+-            return cls()
++                raw = fh.read()
++        except OSError as exc:
++            raise ConfigError(f"cannot read config file {path!r}: {exc}") from exc
++        try:
++            data = yaml.safe_load(raw) or {}
++        except yaml.YAMLError as exc:
++            raise ConfigError(f"config file {path!r} is not valid YAML: {exc}") from exc
++        if not isinstance(data, dict):
++            raise ConfigError(f"config file {path!r} must contain a mapping at top level")
+ 
+         an = data.get("analysis") or {}
+         return cls(
+@@ -76,7 +98,8 @@ class Config:
+             custom_parsers=list((data.get("parsers") or {}).get("custom") or []),
+             analysis=AnalysisConfig(
+                 window_seconds=int(an.get("window_seconds", 60)),
+-                anomaly_z=float(an.get("anomaly_z", 2.5)),
++                baseline_windows=int(an.get("baseline_windows", 20)),
++                anomaly_sensitivity=float(an.get("anomaly_sensitivity", 1.5)),
+                 top_messages=int(an.get("top_messages", 10)),
+             ),
+         )
+diff --git a/src/logpipe/report.py b/src/logpipe/report.py
+index d754724..148996a 100644
+--- a/src/logpipe/report.py
++++ b/src/logpipe/report.py
+@@ -88,7 +88,7 @@ def to_text(report: Dict[str, Any]) -> str:
+         for a in an["anomalies"]:
+             lines.append(
+                 f"  {a['kind'].upper():<5} at {a['window_start']}: "
+-                f"{a['count']} events (z={a['z_score']})"
++                f"{a['count']} events (baseline {a['baseline']})"
+             )
+     else:
+         lines.append("")
+diff --git a/src/logpipe/tail.py b/src/logpipe/tail.py
+index 9b2c4ee..e0dd00f 100644
+--- a/src/logpipe/tail.py
++++ b/src/logpipe/tail.py
+@@ -129,6 +129,7 @@ def _print_rolling_summary(analyzer: Analyzer) -> None:
+     )
+     for a in res.anomalies[-3:]:
+         print(
+-            f"    {a.kind.upper()} at {a.window_start.isoformat()} count={a.count} z={a.z_score:.2f}",
++            f"    {a.kind.upper()} at {a.window_start.isoformat()} "
++            f"count={a.count} baseline={a.baseline:g}",
+             file=sys.stderr,
+         )
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+index 9f11f62..9356329 100644
+--- a/tests/test_smoke.py
++++ b/tests/test_smoke.py
+@@ -89,7 +89,7 @@ class PipelineTests(unittest.TestCase):
+     def test_resilience_and_report(self) -> None:
+         cfg = Config(
+             filters=[{"type": "exclude", "field": "message", "pattern": "health"}],
+-            analysis=AnalysisConfig(window_seconds=60, anomaly_z=1.0),
++            analysis=AnalysisConfig(window_seconds=60),
+         )
+         pipe = Pipeline(cfg)
+         with TemporaryDirectory() as d:
+@@ -122,7 +122,7 @@ class PipelineTests(unittest.TestCase):
+         self.assertIn("Severity breakdown", text)
+ 
+     def test_anomaly_spike(self) -> None:
+-        an = Analyzer(AnalysisConfig(window_seconds=60, anomaly_z=1.5))
++        an = Analyzer(AnalysisConfig(window_seconds=60, baseline_windows=5, anomaly_sensitivity=1.5))
+         from datetime import datetime
+         from logpipe.event import LogEvent
+         # 5 quiet windows of 1 event, one window of 20
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+new file mode 100644
+index 0000000..c137056
+--- /dev/null
++++ b/tests/test_analysis.py
+@@ -0,0 +1,115 @@
++"""Unit tests for windowed aggregation and rolling median+IQR anomaly detection."""
++from __future__ import annotations
++
++import unittest
++from datetime import datetime
++
++from logpipe.analysis import Analyzer, _floor
++from logpipe.config import AnalysisConfig
++from logpipe.event import LogEvent
++
++
++def _ev(ts: datetime, level: str = "INFO") -> LogEvent:
++    return LogEvent(timestamp=ts, level=level, message="x", source="s", raw="x")
++
++
++def _feed_series(an: Analyzer, counts: list[int], start: datetime) -> None:
++    """Feed *counts[i]* events into minute *i* starting at *start*."""
++    for minute, n in enumerate(counts):
++        ts = start.replace(minute=start.minute + minute)
++        for _ in range(n):
++            an.feed(_ev(ts))
++
++
++class WindowingTests(unittest.TestCase):
++    def test_floor_exact_boundary(self) -> None:
++        # 10:01:00 with 60s windows is exactly the start of its own bucket.
++        self.assertEqual(_floor(datetime(2026, 4, 19, 10, 1, 0), 60),
++                         datetime(2026, 4, 19, 10, 1, 0))
++        # 10:00:59 belongs to the 10:00:00 bucket.
++        self.assertEqual(_floor(datetime(2026, 4, 19, 10, 0, 59), 60),
++                         datetime(2026, 4, 19, 10, 0, 0))
++
++    def test_event_on_boundary_lands_in_own_bucket(self) -> None:
++        an = Analyzer(AnalysisConfig(window_seconds=60))
++        an.feed(_ev(datetime(2026, 4, 19, 10, 0, 59)))
++        an.feed(_ev(datetime(2026, 4, 19, 10, 1, 0)))   # boundary
++        an.feed(_ev(datetime(2026, 4, 19, 10, 1, 30)))
++        res = an.result()
++        self.assertEqual(res.windows[datetime(2026, 4, 19, 10, 0, 0)], 1)
++        self.assertEqual(res.windows[datetime(2026, 4, 19, 10, 1, 0)], 2)
++
++    def test_gap_filling_inserts_zero_windows(self) -> None:
++        an = Analyzer(AnalysisConfig(window_seconds=60))
++        an.feed(_ev(datetime(2026, 4, 19, 10, 0, 0)))
++        an.feed(_ev(datetime(2026, 4, 19, 10, 3, 0)))
++        res = an.result()
++        self.assertEqual(res.windows[datetime(2026, 4, 19, 10, 1, 0)], 0)
++        self.assertEqual(res.windows[datetime(2026, 4, 19, 10, 2, 0)], 0)
++
++
++class AnomalyTests(unittest.TestCase):
++    BASE = datetime(2026, 4, 19, 10, 0, 0)
++
++    def _analyzer(self, k: int = 5, sens: float = 1.5) -> Analyzer:
++        return Analyzer(
++            AnalysisConfig(window_seconds=60, baseline_windows=k, anomaly_sensitivity=sens)
++        )
++
++    def test_no_flags_without_enough_history(self) -> None:
++        an = self._analyzer(k=5)
++        _feed_series(an, [3, 4, 100, 2, 5], self.BASE)  # only 5 windows == K
++        self.assertEqual(an.result().anomalies, [])
++
++    def test_spike_flagged(self) -> None:
++        an = self._analyzer(k=5)
++        # baseline ~10, then a 100 spike
++        _feed_series(an, [10, 11, 9, 10, 12, 100], self.BASE)
++        res = an.result()
++        self.assertEqual(len(res.anomalies), 1)
++        a = res.anomalies[0]
++        self.assertEqual(a.kind, "spike")
++        self.assertEqual(a.count, 100)
++        self.assertEqual(a.window_start, datetime(2026, 4, 19, 10, 5, 0))
++        self.assertAlmostEqual(a.baseline, 10.0, places=3)
++
++    def test_drop_flagged(self) -> None:
++        an = self._analyzer(k=5)
++        _feed_series(an, [20, 22, 19, 21, 20, 1], self.BASE)
++        res = an.result()
++        self.assertEqual(len(res.anomalies), 1)
++        self.assertEqual(res.anomalies[0].kind, "drop")
++        self.assertEqual(res.anomalies[0].count, 1)
++
++    def test_within_bounds_not_flagged(self) -> None:
++        an = self._analyzer(k=5, sens=1.5)
++        # baseline 8-12 (median 10, IQR 2, bounds 7..13); next value 12 is inside.
++        _feed_series(an, [8, 12, 10, 9, 11, 12], self.BASE)
++        self.assertEqual(an.result().anomalies, [])
++
++    def test_constant_baseline_no_false_positive(self) -> None:
++        an = self._analyzer(k=5)
++        _feed_series(an, [7, 7, 7, 7, 7, 7, 7, 7], self.BASE)
++        self.assertEqual(an.result().anomalies, [])
++
++    def test_constant_baseline_then_change_flags(self) -> None:
++        # IQR is zero so bounds collapse to the median; any deviation is a flag.
++        an = self._analyzer(k=5)
++        _feed_series(an, [7, 7, 7, 7, 7, 8], self.BASE)
++        res = an.result()
++        self.assertEqual(len(res.anomalies), 1)
++        self.assertEqual(res.anomalies[0].kind, "spike")
++
++    def test_spike_in_history_does_not_mask_next_spike(self) -> None:
++        # This is the case mean+stdev got wrong: one earlier spike shouldn't
++        # stretch the bounds enough to hide a second spike, because median/IQR
++        # are robust to a single outlier in the trailing window.
++        an = self._analyzer(k=6, sens=1.5)
++        _feed_series(an, [10, 10, 10, 100, 10, 10, 80], self.BASE)
++        res = an.result()
++        kinds = [(a.window_start.minute, a.kind) for a in res.anomalies]
++        self.assertIn((6, "spike"), kinds)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_config.py b/tests/test_config.py
+new file mode 100644
+index 0000000..f65caa5
+--- /dev/null
++++ b/tests/test_config.py
+@@ -0,0 +1,57 @@
++"""Config.load() must fail fast on a bad explicit path."""
++from __future__ import annotations
++
++import os
++import unittest
++from tempfile import TemporaryDirectory
++
++from logpipe.config import Config, ConfigError
++
++
++class ConfigLoadTests(unittest.TestCase):
++    def test_none_path_returns_defaults(self) -> None:
++        cfg = Config.load(None)
++        self.assertEqual(cfg.filters, [])
++        self.assertEqual(cfg.analysis.baseline_windows, 20)
++
++    def test_missing_file_raises(self) -> None:
++        with self.assertRaises(ConfigError):
++            Config.load("/nonexistent/path/typo.yaml")
++
++    def test_invalid_yaml_raises(self) -> None:
++        with TemporaryDirectory() as d:
++            p = os.path.join(d, "bad.yaml")
++            with open(p, "w") as fh:
++                fh.write("filters: [unclosed\n")
++            with self.assertRaises(ConfigError):
++                Config.load(p)
++
++    def test_non_mapping_top_level_raises(self) -> None:
++        with TemporaryDirectory() as d:
++            p = os.path.join(d, "list.yaml")
++            with open(p, "w") as fh:
++                fh.write("- a\n- b\n")
++            with self.assertRaises(ConfigError):
++                Config.load(p)
++
++    def test_valid_file_loads(self) -> None:
++        with TemporaryDirectory() as d:
++            p = os.path.join(d, "ok.yaml")
++            with open(p, "w") as fh:
++                fh.write(
++                    "filters:\n"
++                    "  - {type: level, min: WARNING}\n"
++                    "analysis:\n"
++                    "  window_seconds: 30\n"
++                    "  baseline_windows: 8\n"
++                    "  anomaly_sensitivity: 2.0\n"
++                )
++            cfg = Config.load(p)
++        self.assertEqual(len(cfg.filters), 1)
++        self.assertEqual(cfg.analysis.window_seconds, 30)
++        self.assertEqual(cfg.analysis.baseline_windows, 8)
++        self.assertEqual(cfg.analysis.anomaly_sensitivity, 2.0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_filters.py b/tests/test_filters.py
+new file mode 100644
+index 0000000..2e4b6cc
+--- /dev/null
++++ b/tests/test_filters.py
+@@ -0,0 +1,123 @@
++"""Unit tests for filter and transform builders."""
++from __future__ import annotations
++
++import unittest
++from datetime import datetime
++
++from logpipe.event import LogEvent
++from logpipe.filters import apply_pipeline, build_filters, build_transforms
++
++
++def _ev(level=None, message="hello", ts=None, **extra) -> LogEvent:
++    return LogEvent(
++        timestamp=ts,
++        level=level,
++        message=message,
++        source="test",
++        raw=message,
++        extra=dict(extra),
++    )
++
++
++class FilterTests(unittest.TestCase):
++    def test_level_floor(self) -> None:
++        [f] = build_filters([{"type": "level", "min": "WARNING"}])
++        self.assertTrue(f(_ev(level="ERROR")))
++        self.assertTrue(f(_ev(level="WARNING")))
++        self.assertFalse(f(_ev(level="INFO")))
++        # unlevelled events drop when a floor is set
++        self.assertFalse(f(_ev(level=None)))
++
++    def test_level_floor_unset_keeps_unlevelled(self) -> None:
++        [f] = build_filters([{"type": "level", "min": None}])
++        self.assertTrue(f(_ev(level=None)))
++
++    def test_match_on_default_field(self) -> None:
++        [f] = build_filters([{"type": "match", "pattern": "timeout"}])
++        self.assertTrue(f(_ev(message="db timeout after 5s")))
++        self.assertFalse(f(_ev(message="all good")))
++
++    def test_match_on_extra_field(self) -> None:
++        [f] = build_filters([{"type": "match", "field": "request", "pattern": "POST"}])
++        self.assertTrue(f(_ev(request="POST /api")))
++        self.assertFalse(f(_ev(request="GET /")))
++        self.assertFalse(f(_ev()))  # field absent
++
++    def test_exclude(self) -> None:
++        [f] = build_filters([{"type": "exclude", "pattern": "healthcheck"}])
++        self.assertFalse(f(_ev(message="GET /healthcheck")))
++        self.assertTrue(f(_ev(message="GET /api")))
++
++    def test_equals(self) -> None:
++        [f] = build_filters([{"type": "equals", "field": "status", "value": 500}])
++        self.assertTrue(f(_ev(status=500)))
++        self.assertFalse(f(_ev(status=200)))
++
++    def test_time_range(self) -> None:
++        [f] = build_filters(
++            [{"type": "time_range", "after": "2026-04-19T10:00:00", "before": "2026-04-19T11:00:00"}]
++        )
++        self.assertTrue(f(_ev(ts=datetime(2026, 4, 19, 10, 30))))
++        self.assertFalse(f(_ev(ts=datetime(2026, 4, 19, 9, 0))))
++        self.assertFalse(f(_ev(ts=datetime(2026, 4, 19, 12, 0))))
++        # timestamp-less events pass through (can't judge them)
++        self.assertTrue(f(_ev(ts=None)))
++
++    def test_unknown_filter_type_skipped(self) -> None:
++        # Should warn (to stderr) and produce no predicate, not crash.
++        out = build_filters([{"type": "nope"}])
++        self.assertEqual(out, [])
++
++    def test_combined_chain(self) -> None:
++        fs = build_filters(
++            [
++                {"type": "level", "min": "INFO"},
++                {"type": "exclude", "pattern": "noise"},
++                {"type": "match", "pattern": "db"},
++            ]
++        )
++        keep = _ev(level="ERROR", message="db down")
++        drop_level = _ev(level="DEBUG", message="db down")
++        drop_excl = _ev(level="ERROR", message="db noise")
++        drop_match = _ev(level="ERROR", message="something else")
++        self.assertIsNotNone(apply_pipeline(keep, fs, []))
++        self.assertIsNone(apply_pipeline(drop_level, fs, []))
++        self.assertIsNone(apply_pipeline(drop_excl, fs, []))
++        self.assertIsNone(apply_pipeline(drop_match, fs, []))
++
++
++class TransformTests(unittest.TestCase):
++    def test_set(self) -> None:
++        [t] = build_transforms([{"type": "set", "field": "env", "value": "prod"}])
++        ev = t(_ev())
++        self.assertEqual(ev.extra["env"], "prod")
++
++    def test_set_core_field(self) -> None:
++        [t] = build_transforms([{"type": "set", "field": "level", "value": "ERROR"}])
++        ev = t(_ev(level="INFO"))
++        self.assertEqual(ev.level, "ERROR")
++
++    def test_drop(self) -> None:
++        [t] = build_transforms([{"type": "drop", "field": "password"}])
++        ev = t(_ev(password="hunter2", keep="yes"))
++        self.assertNotIn("password", ev.extra)
++        self.assertIn("keep", ev.extra)
++
++    def test_rename(self) -> None:
++        [t] = build_transforms([{"type": "rename", "field": "msg", "to": "message"}])
++        ev = t(_ev(msg="renamed"))
++        self.assertEqual(ev.message, "renamed")
++        self.assertNotIn("msg", ev.extra)
++
++    def test_normalize_level(self) -> None:
++        [t] = build_transforms([{"type": "normalize_level", "field": "lvl"}])
++        ev = t(_ev(level=None, lvl="warn"))
++        self.assertEqual(ev.level, "WARNING")
++
++    def test_unknown_transform_skipped(self) -> None:
++        out = build_transforms([{"type": "nope"}])
++        self.assertEqual(out, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+new file mode 100644
+index 0000000..cb00b92
+--- /dev/null
++++ b/tests/test_integration.py
+@@ -0,0 +1,82 @@
++"""Integration test: drive the real CLI entry point against temp files and
++assert on the JSON report it writes."""
++from __future__ import annotations
++
++import json
++import os
++import unittest
++from datetime import datetime, timedelta
++from tempfile import TemporaryDirectory
++
++from logpipe.cli import main
++
++
++def _write_jsonl(path: str, *, baseline: int, spike: int, k: int) -> None:
++    """K windows of *baseline* events/min, then one window of *spike* events."""
++    base = datetime(2026, 4, 19, 10, 0, 0)
++    with open(path, "w") as fh:
++        for minute in range(k):
++            for i in range(baseline):
++                ts = (base + timedelta(minutes=minute, seconds=i)).isoformat() + "Z"
++                fh.write(json.dumps({"ts": ts, "level": "info", "msg": f"req {i}"}) + "\n")
++        for i in range(spike):
++            ts = (base + timedelta(minutes=k, seconds=0)).isoformat() + "Z"
++            fh.write(json.dumps({"ts": ts, "level": "error", "msg": "db timeout"}) + "\n")
++        fh.write("CORRUPT LINE\n")
++
++
++def _write_syslog(path: str) -> None:
++    with open(path, "w") as fh:
++        fh.write("Apr 19 10:00:01 web1 sshd[42]: Accepted publickey\n")
++        fh.write("<11>Apr 19 10:00:30 web1 app[7]: connection refused\n")
++
++
++class AnalyzeCLITests(unittest.TestCase):
++    def test_analyze_writes_valid_json_report(self) -> None:
++        with TemporaryDirectory() as d:
++            jl = os.path.join(d, "app.jsonl")
++            sl = os.path.join(d, "sys.log")
++            cfg = os.path.join(d, "cfg.yaml")
++            out = os.path.join(d, "report.json")
++            _write_jsonl(jl, baseline=10, spike=80, k=6)
++            _write_syslog(sl)
++            with open(cfg, "w") as fh:
++                fh.write(
++                    "analysis:\n"
++                    "  window_seconds: 60\n"
++                    "  baseline_windows: 5\n"
++                    "  anomaly_sensitivity: 1.5\n"
++                )
++
++            rc = main(["analyze", jl, sl, "-c", cfg, "-o", out, "-f", "json"])
++            self.assertEqual(rc, 0)
++            with open(out) as fh:
++                report = json.load(fh)
++
++        ing = report["ingest"]
++        an = report["analysis"]
++
++        self.assertEqual(ing["parsers_used"][jl], "jsonl")
++        self.assertEqual(ing["parsers_used"][sl], "syslog")
++        self.assertGreaterEqual(ing["lines_malformed"], 1)
++        self.assertEqual(len(ing["files_ok"]), 2)
++
++        self.assertGreater(an["total_events"], 0)
++        self.assertIn("ERROR", an["by_level"])
++        self.assertGreaterEqual(len(an["rate_per_window"]), 7)
++
++        spikes = [a for a in an["anomalies"] if a["kind"] == "spike"]
++        self.assertEqual(len(spikes), 1)
++        self.assertEqual(spikes[0]["count"], 80)
++        self.assertIn("baseline", spikes[0])
++
++    def test_missing_config_exits_nonzero(self) -> None:
++        with TemporaryDirectory() as d:
++            jl = os.path.join(d, "app.jsonl")
++            _write_jsonl(jl, baseline=2, spike=2, k=2)
++            rc = main(["analyze", jl, "-c", os.path.join(d, "typo.yaml"), "-f", "json"])
++        self.assertEqual(rc, 2)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_parsers.py b/tests/test_parsers.py
+new file mode 100644
+index 0000000..e5a0617
+--- /dev/null
++++ b/tests/test_parsers.py
+@@ -0,0 +1,174 @@
++"""Unit tests for each parser in isolation."""
++from __future__ import annotations
++
++import unittest
++from datetime import datetime, timezone
++
++from logpipe.parsers import CLFParser, JSONLinesParser, RegexParser, SyslogParser
++
++
++class JSONLinesTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.p = JSONLinesParser()
++
++    def test_full_event(self) -> None:
++        ev = self.p.parse(
++            '{"timestamp": "2026-04-19T10:00:00Z", "level": "error", '
++            '"message": "boom", "host": "web1", "request_id": "abc"}',
++            "src",
++        )
++        assert ev is not None
++        self.assertEqual(ev.level, "ERROR")
++        self.assertEqual(ev.message, "boom")
++        self.assertEqual(ev.host, "web1")
++        self.assertEqual(ev.extra["request_id"], "abc")
++        self.assertEqual(ev.timestamp, datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc))
++
++    def test_missing_fields_fall_back_gracefully(self) -> None:
++        # No level, no message, no timestamp — still produces an event.
++        ev = self.p.parse('{"foo": 1, "bar": 2}', "src")
++        assert ev is not None
++        self.assertIsNone(ev.level)
++        self.assertIsNone(ev.timestamp)
++        # message falls back to the raw line so the event is still useful
++        self.assertIn("foo", ev.message)
++        self.assertEqual(ev.extra, {"foo": 1, "bar": 2})
++
++    def test_epoch_seconds_and_milliseconds(self) -> None:
++        ev_s = self.p.parse('{"ts": 1745056800, "msg": "x"}', "src")
++        ev_ms = self.p.parse('{"ts": 1745056800000, "msg": "x"}', "src")
++        assert ev_s is not None and ev_ms is not None
++        self.assertIsNotNone(ev_s.timestamp)
++        # both should resolve to the same instant
++        self.assertEqual(ev_s.timestamp, ev_ms.timestamp)
++
++    def test_level_aliases(self) -> None:
++        ev = self.p.parse('{"severity": "WARN", "msg": "x"}', "src")
++        assert ev is not None
++        self.assertEqual(ev.level, "WARNING")
++
++    def test_non_dict_json_rejected(self) -> None:
++        self.assertIsNone(self.p.parse("[1, 2, 3]", "src"))
++
++    def test_malformed_json_rejected(self) -> None:
++        self.assertIsNone(self.p.parse('{"broken": ', "src"))
++        self.assertIsNone(self.p.parse("plain text", "src"))
++
++
++class SyslogTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.p = SyslogParser(default_year=2026)
++
++    def test_with_pri_maps_severity(self) -> None:
++        # PRI 11 = facility 1, severity 3 (ERROR)
++        ev = self.p.parse("<11>Apr 19 10:01:02 web1 app[77]: boom", "src")
++        assert ev is not None
++        self.assertEqual(ev.level, "ERROR")
++        self.assertEqual(ev.host, "web1")
++        self.assertEqual(ev.extra["process"], "app")
++        self.assertEqual(ev.extra["pid"], 77)
++        self.assertEqual(ev.extra["facility"], 1)
++        self.assertEqual(ev.timestamp, datetime(2026, 4, 19, 10, 1, 2))
++
++    def test_without_pri(self) -> None:
++        ev = self.p.parse("Apr  5 03:04:05 db1 cron[9]: job ran", "src")
++        assert ev is not None
++        self.assertIsNone(ev.level)  # no PRI -> no derived level
++        self.assertEqual(ev.host, "db1")
++        self.assertEqual(ev.extra["pid"], 9)
++        self.assertNotIn("facility", ev.extra)
++
++    def test_without_pid(self) -> None:
++        ev = self.p.parse("Apr 19 10:00:30 web1 kernel: oom-killer invoked", "src")
++        assert ev is not None
++        self.assertEqual(ev.extra["process"], "kernel")
++        self.assertNotIn("pid", ev.extra)
++
++    def test_malformed_rejected(self) -> None:
++        self.assertIsNone(self.p.parse("not a syslog line at all", "src"))
++
++
++class CLFTests(unittest.TestCase):
++    def setUp(self) -> None:
++        self.p = CLFParser()
++
++    def test_common_variant(self) -> None:
++        line = '127.0.0.1 - - [19/Apr/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 512'
++        ev = self.p.parse(line, "src")
++        assert ev is not None
++        self.assertEqual(ev.level, "INFO")
++        self.assertEqual(ev.extra["status"], 200)
++        self.assertEqual(ev.extra["bytes"], 512)
++        self.assertNotIn("user_agent", ev.extra)
++
++    def test_combined_variant(self) -> None:
++        line = (
++            '10.0.0.5 - bob [19/Apr/2026:10:00:20 +0000] '
++            '"POST /api HTTP/1.1" 500 128 "https://ref" "curl/8"'
++        )
++        ev = self.p.parse(line, "src")
++        assert ev is not None
++        self.assertEqual(ev.level, "ERROR")
++        self.assertEqual(ev.extra["referer"], "https://ref")
++        self.assertEqual(ev.extra["user_agent"], "curl/8")
++
++    def test_status_level_mapping(self) -> None:
++        for status, want in [(200, "INFO"), (302, "INFO"), (404, "WARNING"), (503, "ERROR")]:
++            line = f'1.1.1.1 - - [19/Apr/2026:10:00:00 +0000] "GET /x HTTP/1.1" {status} -'
++            ev = self.p.parse(line, "src")
++            assert ev is not None
++            self.assertEqual(ev.level, want, f"status {status}")
++
++    def test_dash_bytes(self) -> None:
++        line = '1.1.1.1 - - [19/Apr/2026:10:00:00 +0000] "GET /x HTTP/1.1" 304 -'
++        ev = self.p.parse(line, "src")
++        assert ev is not None
++        self.assertEqual(ev.extra["bytes"], 0)
++
++    def test_malformed_rejected(self) -> None:
++        self.assertIsNone(self.p.parse("nonsense", "src"))
++
++
++class RegexParserTests(unittest.TestCase):
++    def test_all_named_groups(self) -> None:
++        p = RegexParser(
++            "myapp",
++            r"^(?P<timestamp>\S+) \[(?P<level>\w+)\] (?P<host>\S+) (?P<message>.*)$",
++            time_format="%Y-%m-%dT%H:%M:%S",
++        )
++        ev = p.parse("2026-04-19T10:00:00 [WARN] web1 disk full", "src")
++        assert ev is not None
++        self.assertEqual(ev.level, "WARNING")
++        self.assertEqual(ev.host, "web1")
++        self.assertEqual(ev.message, "disk full")
++        self.assertEqual(ev.timestamp, datetime(2026, 4, 19, 10, 0, 0))
++
++    def test_missing_optional_groups(self) -> None:
++        # Pattern only captures message + an extra field; ts/level/host absent.
++        p = RegexParser("simple", r"^(?P<module>\w+): (?P<message>.*)$")
++        ev = p.parse("auth: login ok", "src")
++        assert ev is not None
++        self.assertIsNone(ev.timestamp)
++        self.assertIsNone(ev.level)
++        self.assertIsNone(ev.host)
++        self.assertEqual(ev.message, "login ok")
++        self.assertEqual(ev.extra["module"], "auth")
++
++    def test_unparseable_timestamp_is_non_fatal(self) -> None:
++        p = RegexParser(
++            "x",
++            r"^(?P<timestamp>\S+) (?P<message>.*)$",
++            time_format="%Y-%m-%d",
++        )
++        ev = p.parse("not-a-date hello", "src")
++        assert ev is not None
++        self.assertIsNone(ev.timestamp)
++        self.assertEqual(ev.message, "hello")
++
++    def test_no_match_returns_none(self) -> None:
++        p = RegexParser("x", r"^FIXED PREFIX (?P<message>.*)$")
++        self.assertIsNone(p.parse("other prefix oops", "src"))
++
++
++if __name__ == "__main__":
++    unittest.main()
