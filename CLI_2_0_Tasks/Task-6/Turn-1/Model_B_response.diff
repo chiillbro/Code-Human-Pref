@@ -1,0 +1,2014 @@
+diff --git a/account-service/src/main/java/com/piggymetrics/account/AccountApplication.java b/account-service/src/main/java/com/piggymetrics/account/AccountApplication.java
+index a3b68ae..2bc2d8d 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/AccountApplication.java
++++ b/account-service/src/main/java/com/piggymetrics/account/AccountApplication.java
+@@ -5,6 +5,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
+ import org.springframework.cloud.client.circuitbreaker.EnableCircuitBreaker;
+ import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+ import org.springframework.cloud.openfeign.EnableFeignClients;
++import org.springframework.scheduling.annotation.EnableScheduling;
+ import org.springframework.security.config.annotation.method.configuration.EnableGlobalMethodSecurity;
+ import org.springframework.security.oauth2.config.annotation.web.configuration.EnableOAuth2Client;
+ 
+@@ -13,6 +14,7 @@ import org.springframework.security.oauth2.config.annotation.web.configuration.E
+ @EnableOAuth2Client
+ @EnableFeignClients
+ @EnableCircuitBreaker
++@EnableScheduling
+ @EnableGlobalMethodSecurity(prePostEnabled = true)
+ public class AccountApplication {
+ 
+diff --git a/account-service/src/main/java/com/piggymetrics/account/controller/TransactionController.java b/account-service/src/main/java/com/piggymetrics/account/controller/TransactionController.java
+new file mode 100644
+index 0000000..18a64fd
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/controller/TransactionController.java
+@@ -0,0 +1,70 @@
++package com.piggymetrics.account.controller;
++
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.domain.transaction.TransactionType;
++import com.piggymetrics.account.service.transaction.TransactionService;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.data.domain.Page;
++import org.springframework.data.domain.PageRequest;
++import org.springframework.data.domain.Pageable;
++import org.springframework.data.domain.Sort;
++import org.springframework.format.annotation.DateTimeFormat;
++import org.springframework.web.bind.annotation.DeleteMapping;
++import org.springframework.web.bind.annotation.GetMapping;
++import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.PostMapping;
++import org.springframework.web.bind.annotation.RequestMapping;
++import org.springframework.web.bind.annotation.RequestParam;
++import org.springframework.web.bind.annotation.RestController;
++
++import java.security.Principal;
++import java.util.Date;
++
++@RestController
++@RequestMapping("/current/transactions")
++public class TransactionController {
++
++	@Autowired
++	private TransactionService transactionService;
++
++	@GetMapping
++	public Page<Transaction> list(Principal principal,
++			@RequestParam(value = "status", required = false) TransactionStatus status,
++			@RequestParam(value = "type", required = false) TransactionType type,
++			@RequestParam(value = "from", required = false)
++			@DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Date from,
++			@RequestParam(value = "to", required = false)
++			@DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Date to,
++			@RequestParam(value = "page", defaultValue = "0") int page,
++			@RequestParam(value = "size", defaultValue = "20") int size) {
++
++		// Page/size are user-controlled: clamp to sane bounds to avoid
++		// abusive requests and negative pages leaking through into Mongo.
++		int safePage = Math.max(0, page);
++		int safeSize = Math.min(Math.max(1, size), 200);
++		Pageable pageable = PageRequest.of(safePage, safeSize,
++				Sort.by(Sort.Direction.DESC, "scheduledDate"));
++		return transactionService.list(principal.getName(), status, type, from, to, pageable);
++	}
++
++	@GetMapping("/{id}")
++	public Transaction getOne(Principal principal, @PathVariable String id) {
++		return transactionService.get(principal.getName(), id);
++	}
++
++	@PostMapping("/{id}/approve")
++	public Transaction approve(Principal principal, @PathVariable String id) {
++		return transactionService.approve(principal.getName(), id);
++	}
++
++	@PostMapping("/{id}/skip")
++	public Transaction skip(Principal principal, @PathVariable String id) {
++		return transactionService.skip(principal.getName(), id);
++	}
++
++	@DeleteMapping("/{id}")
++	public void delete(Principal principal, @PathVariable String id) {
++		transactionService.delete(principal.getName(), id);
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/Item.java b/account-service/src/main/java/com/piggymetrics/account/domain/Item.java
+index 5670371..eb4a27f 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/Item.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/Item.java
+@@ -23,6 +23,14 @@ public class Item {
+ 	@NotNull
+ 	private String icon;
+ 
++	/**
++	 * Optional per-item recurrence configuration. When {@code null} or
++	 * disabled, this item only contributes to statistics normalisation as
++	 * before and does not generate {@link com.piggymetrics.account.domain.transaction.Transaction}
++	 * records.
++	 */
++	private RecurrenceSettings recurrence;
++
+ 	public String getTitle() {
+ 		return title;
+ 	}
+@@ -62,4 +70,12 @@ public class Item {
+ 	public void setIcon(String icon) {
+ 		this.icon = icon;
+ 	}
++
++	public RecurrenceSettings getRecurrence() {
++		return recurrence;
++	}
++
++	public void setRecurrence(RecurrenceSettings recurrence) {
++		this.recurrence = recurrence;
++	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/RecurrenceSettings.java b/account-service/src/main/java/com/piggymetrics/account/domain/RecurrenceSettings.java
+new file mode 100644
+index 0000000..043a9a2
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/RecurrenceSettings.java
+@@ -0,0 +1,84 @@
++package com.piggymetrics.account.domain;
++
++import java.util.Date;
++
++/**
++ * Per-item recurrence configuration. When {@code enabled} is true and an
++ * {@code anchorDate} is provided, the recurring-transaction job materialises
++ * {@link com.piggymetrics.account.domain.transaction.Transaction} records
++ * on the schedule defined by the item's {@link TimePeriod}.
++ */
++public class RecurrenceSettings {
++
++	/**
++	 * Whether the user opted this item in to transaction generation.
++	 */
++	private Boolean enabled;
++
++	/**
++	 * The date of the first occurrence; every subsequent occurrence is
++	 * computed as {@code anchorDate + n * period}.
++	 */
++	private Date anchorDate;
++
++	/**
++	 * When true, on-time transactions (i.e. not backfilled) are created
++	 * directly in the {@code POSTED} state. When false they land in
++	 * {@code PENDING_REVIEW} for the user to approve or skip.
++	 */
++	private Boolean autoPost;
++
++	/**
++	 * Internal book-keeping field: the next date for which a transaction
++	 * should be generated. Kept on the item so that the job can scan
++	 * accounts efficiently without recomputing history from scratch.
++	 */
++	private Date nextScheduledDate;
++
++	/**
++	 * The scheduled date of the most recent transaction that the job
++	 * generated for this item. Used to resume after settings changes
++	 * without losing the cursor.
++	 */
++	private Date lastGeneratedDate;
++
++	public Boolean getEnabled() {
++		return enabled;
++	}
++
++	public void setEnabled(Boolean enabled) {
++		this.enabled = enabled;
++	}
++
++	public Date getAnchorDate() {
++		return anchorDate;
++	}
++
++	public void setAnchorDate(Date anchorDate) {
++		this.anchorDate = anchorDate;
++	}
++
++	public Boolean getAutoPost() {
++		return autoPost;
++	}
++
++	public void setAutoPost(Boolean autoPost) {
++		this.autoPost = autoPost;
++	}
++
++	public Date getNextScheduledDate() {
++		return nextScheduledDate;
++	}
++
++	public void setNextScheduledDate(Date nextScheduledDate) {
++		this.nextScheduledDate = nextScheduledDate;
++	}
++
++	public Date getLastGeneratedDate() {
++		return lastGeneratedDate;
++	}
++
++	public void setLastGeneratedDate(Date lastGeneratedDate) {
++		this.lastGeneratedDate = lastGeneratedDate;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/transaction/Transaction.java b/account-service/src/main/java/com/piggymetrics/account/domain/transaction/Transaction.java
+new file mode 100644
+index 0000000..c2311da
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/transaction/Transaction.java
+@@ -0,0 +1,143 @@
++package com.piggymetrics.account.domain.transaction;
++
++import com.piggymetrics.account.domain.Currency;
++import org.springframework.data.annotation.Id;
++import org.springframework.data.mongodb.core.index.Indexed;
++import org.springframework.data.mongodb.core.mapping.Document;
++
++import java.math.BigDecimal;
++import java.util.Date;
++
++@Document(collection = "transactions")
++public class Transaction {
++
++	@Id
++	private String id;
++
++	@Indexed
++	private String accountName;
++
++	private TransactionType type;
++
++	private BigDecimal amount;
++
++	private Currency currency;
++
++	/**
++	 * Title of the source {@link com.piggymetrics.account.domain.Item} that
++	 * generated this transaction. Items do not have a stable identifier of
++	 * their own, so the title is used as a soft reference.
++	 */
++	private String sourceItemTitle;
++
++	private TransactionStatus status;
++
++	/**
++	 * Date at which the occurrence was supposed to happen (based on the
++	 * item's recurrence anchor and period).
++	 */
++	private Date scheduledDate;
++
++	/**
++	 * Date at which the transaction was actually posted. Null until the
++	 * transaction leaves the pending state via auto-post or approval.
++	 */
++	private Date postedDate;
++
++	private Date createdDate;
++
++	/**
++	 * True if this transaction was created to backfill a missed schedule.
++	 * Backfilled transactions are always created in {@code PENDING_REVIEW}
++	 * regardless of the item's auto-post flag.
++	 */
++	private boolean backfilled;
++
++	public String getId() {
++		return id;
++	}
++
++	public void setId(String id) {
++		this.id = id;
++	}
++
++	public String getAccountName() {
++		return accountName;
++	}
++
++	public void setAccountName(String accountName) {
++		this.accountName = accountName;
++	}
++
++	public TransactionType getType() {
++		return type;
++	}
++
++	public void setType(TransactionType type) {
++		this.type = type;
++	}
++
++	public BigDecimal getAmount() {
++		return amount;
++	}
++
++	public void setAmount(BigDecimal amount) {
++		this.amount = amount;
++	}
++
++	public Currency getCurrency() {
++		return currency;
++	}
++
++	public void setCurrency(Currency currency) {
++		this.currency = currency;
++	}
++
++	public String getSourceItemTitle() {
++		return sourceItemTitle;
++	}
++
++	public void setSourceItemTitle(String sourceItemTitle) {
++		this.sourceItemTitle = sourceItemTitle;
++	}
++
++	public TransactionStatus getStatus() {
++		return status;
++	}
++
++	public void setStatus(TransactionStatus status) {
++		this.status = status;
++	}
++
++	public Date getScheduledDate() {
++		return scheduledDate;
++	}
++
++	public void setScheduledDate(Date scheduledDate) {
++		this.scheduledDate = scheduledDate;
++	}
++
++	public Date getPostedDate() {
++		return postedDate;
++	}
++
++	public void setPostedDate(Date postedDate) {
++		this.postedDate = postedDate;
++	}
++
++	public Date getCreatedDate() {
++		return createdDate;
++	}
++
++	public void setCreatedDate(Date createdDate) {
++		this.createdDate = createdDate;
++	}
++
++	public boolean isBackfilled() {
++		return backfilled;
++	}
++
++	public void setBackfilled(boolean backfilled) {
++		this.backfilled = backfilled;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/transaction/TransactionStatus.java b/account-service/src/main/java/com/piggymetrics/account/domain/transaction/TransactionStatus.java
+new file mode 100644
+index 0000000..724b606
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/transaction/TransactionStatus.java
+@@ -0,0 +1,7 @@
++package com.piggymetrics.account.domain.transaction;
++
++public enum TransactionStatus {
++
++	POSTED, SKIPPED, PENDING_REVIEW
++
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/transaction/TransactionType.java b/account-service/src/main/java/com/piggymetrics/account/domain/transaction/TransactionType.java
+new file mode 100644
+index 0000000..a231ecf
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/transaction/TransactionType.java
+@@ -0,0 +1,7 @@
++package com.piggymetrics.account.domain.transaction;
++
++public enum TransactionType {
++
++	INCOME, EXPENSE
++
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepository.java b/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepository.java
+new file mode 100644
+index 0000000..27f4aab
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepository.java
+@@ -0,0 +1,10 @@
++package com.piggymetrics.account.repository;
++
++import com.piggymetrics.account.domain.transaction.Transaction;
++import org.springframework.data.mongodb.repository.MongoRepository;
++import org.springframework.stereotype.Repository;
++
++@Repository
++public interface TransactionRepository extends MongoRepository<Transaction, String>,
++		TransactionRepositoryCustom {
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepositoryCustom.java b/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepositoryCustom.java
+new file mode 100644
+index 0000000..438a14a
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepositoryCustom.java
+@@ -0,0 +1,19 @@
++package com.piggymetrics.account.repository;
++
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.domain.transaction.TransactionType;
++import org.springframework.data.domain.Page;
++import org.springframework.data.domain.Pageable;
++
++import java.util.Date;
++
++public interface TransactionRepositoryCustom {
++
++	Page<Transaction> findByFilter(String accountName,
++			TransactionStatus status,
++			TransactionType type,
++			Date from,
++			Date to,
++			Pageable pageable);
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepositoryImpl.java b/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepositoryImpl.java
+new file mode 100644
+index 0000000..9b6acad
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/repository/TransactionRepositoryImpl.java
+@@ -0,0 +1,60 @@
++package com.piggymetrics.account.repository;
++
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.domain.transaction.TransactionType;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.data.domain.Page;
++import org.springframework.data.domain.PageImpl;
++import org.springframework.data.domain.Pageable;
++import org.springframework.data.mongodb.core.MongoTemplate;
++import org.springframework.data.mongodb.core.query.Criteria;
++import org.springframework.data.mongodb.core.query.Query;
++
++import java.util.Date;
++import java.util.List;
++
++public class TransactionRepositoryImpl implements TransactionRepositoryCustom {
++
++	private final MongoTemplate mongoTemplate;
++
++	@Autowired
++	public TransactionRepositoryImpl(MongoTemplate mongoTemplate) {
++		this.mongoTemplate = mongoTemplate;
++	}
++
++	@Override
++	public Page<Transaction> findByFilter(String accountName,
++			TransactionStatus status,
++			TransactionType type,
++			Date from,
++			Date to,
++			Pageable pageable) {
++
++		Criteria criteria = Criteria.where("accountName").is(accountName);
++		if (status != null) {
++			criteria = criteria.and("status").is(status);
++		}
++		if (type != null) {
++			criteria = criteria.and("type").is(type);
++		}
++		if (from != null || to != null) {
++			Criteria dateCriteria = Criteria.where("scheduledDate");
++			if (from != null) {
++				dateCriteria = dateCriteria.gte(from);
++			}
++			if (to != null) {
++				dateCriteria = dateCriteria.lte(to);
++			}
++			criteria.andOperator(dateCriteria);
++		}
++
++		Query query = new Query(criteria);
++		long total = mongoTemplate.count(query, Transaction.class);
++
++		query.with(pageable);
++		List<Transaction> content = mongoTemplate.find(query, Transaction.class);
++
++		return new PageImpl<>(content, pageable, total);
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
+index 8594bf5..9ffebbf 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
+@@ -4,9 +4,12 @@ import com.piggymetrics.account.client.AuthServiceClient;
+ import com.piggymetrics.account.client.StatisticsServiceClient;
+ import com.piggymetrics.account.domain.Account;
+ import com.piggymetrics.account.domain.Currency;
++import com.piggymetrics.account.domain.Item;
++import com.piggymetrics.account.domain.RecurrenceSettings;
+ import com.piggymetrics.account.domain.Saving;
+ import com.piggymetrics.account.domain.User;
+ import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.service.transaction.RecurrenceService;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -15,6 +18,7 @@ import org.springframework.util.Assert;
+ 
+ import java.math.BigDecimal;
+ import java.util.Date;
++import java.util.List;
+ 
+ @Service
+ public class AccountServiceImpl implements AccountService {
+@@ -30,6 +34,9 @@ public class AccountServiceImpl implements AccountService {
+ 	@Autowired
+ 	private AccountRepository repository;
+ 
++	@Autowired
++	private RecurrenceService recurrenceService;
++
+ 	/**
+ 	 * {@inheritDoc}
+ 	 */
+@@ -78,15 +85,88 @@ public class AccountServiceImpl implements AccountService {
+ 		Account account = repository.findByName(name);
+ 		Assert.notNull(account, "can't find account with name " + name);
+ 
++		Date now = new Date();
++		refreshRecurrence(account.getIncomes(), update.getIncomes(), now);
++		refreshRecurrence(account.getExpenses(), update.getExpenses(), now);
++
+ 		account.setIncomes(update.getIncomes());
+ 		account.setExpenses(update.getExpenses());
+ 		account.setSaving(update.getSaving());
+ 		account.setNote(update.getNote());
+-		account.setLastSeen(new Date());
++		account.setLastSeen(now);
+ 		repository.save(account);
+ 
+ 		log.debug("account {} changes has been saved", name);
+ 
+ 		statisticsClient.updateStatistics(name, account);
+ 	}
++
++	/**
++	 * Recomputes {@code nextScheduledDate} for each incoming item whose
++	 * recurrence settings have been added or changed. We preserve the
++	 * existing cursor when the anchor, period and enabled flag are all
++	 * unchanged — otherwise the user would lose their place every time
++	 * they tweak an unrelated field (e.g. amount).
++	 */
++	private void refreshRecurrence(List<Item> existingItems, List<Item> updatedItems, Date now) {
++		if (updatedItems == null) {
++			return;
++		}
++		for (Item updated : updatedItems) {
++			RecurrenceSettings settings = updated.getRecurrence();
++			if (settings == null) {
++				continue;
++			}
++			if (!Boolean.TRUE.equals(settings.getEnabled())) {
++				// Recurrence disabled: clear the derived cursor so the
++				// next re-enable re-anchors cleanly.
++				settings.setNextScheduledDate(null);
++				continue;
++			}
++			Assert.notNull(settings.getAnchorDate(),
++					"anchorDate is required when recurrence is enabled for item: "
++							+ updated.getTitle());
++			Assert.notNull(updated.getPeriod(),
++					"period is required when recurrence is enabled for item: "
++							+ updated.getTitle());
++
++			Item previous = findItemByTitle(existingItems, updated.getTitle());
++			RecurrenceSettings previousSettings = previous == null ? null : previous.getRecurrence();
++			boolean coreChanged = previousSettings == null
++					|| !Boolean.TRUE.equals(previousSettings.getEnabled())
++					|| !java.util.Objects.equals(previousSettings.getAnchorDate(), settings.getAnchorDate())
++					|| !java.util.Objects.equals(previous.getPeriod(), updated.getPeriod());
++
++			if (coreChanged || settings.getNextScheduledDate() == null) {
++				Date from = settings.getLastGeneratedDate() != null
++						? settings.getLastGeneratedDate()
++						: now;
++				settings.setNextScheduledDate(
++						recurrenceService.firstOccurrenceAtOrAfter(
++								settings.getAnchorDate(), updated.getPeriod(), from));
++				if (previousSettings != null && settings.getLastGeneratedDate() == null) {
++					settings.setLastGeneratedDate(previousSettings.getLastGeneratedDate());
++				}
++			} else {
++				// Keep cursor but copy over the last-generated marker to
++				// avoid silently dropping it when the client omits the
++				// field in their update payload.
++				if (settings.getLastGeneratedDate() == null) {
++					settings.setLastGeneratedDate(previousSettings.getLastGeneratedDate());
++				}
++			}
++		}
++	}
++
++	private Item findItemByTitle(List<Item> items, String title) {
++		if (items == null || title == null) {
++			return null;
++		}
++		for (Item item : items) {
++			if (title.equals(item.getTitle())) {
++				return item;
++			}
++		}
++		return null;
++	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java
+new file mode 100644
+index 0000000..aa6a595
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurrenceService.java
+@@ -0,0 +1,128 @@
++package com.piggymetrics.account.service.transaction;
++
++import com.piggymetrics.account.domain.TimePeriod;
++import org.springframework.stereotype.Service;
++
++import java.time.LocalDate;
++import java.time.LocalDateTime;
++import java.time.YearMonth;
++import java.time.ZoneId;
++import java.util.Date;
++
++/**
++ * Computes recurrence schedule dates from a fixed anchor date and a
++ * {@link TimePeriod}. All occurrences are derived from the original anchor
++ * (not iteratively from the previous occurrence) so month-end anchors such
++ * as the 31st snap to the last day of shorter months without drifting.
++ */
++@Service
++public class RecurrenceService {
++
++	private final ZoneId zoneId;
++
++	public RecurrenceService() {
++		this(ZoneId.systemDefault());
++	}
++
++	RecurrenceService(ZoneId zoneId) {
++		this.zoneId = zoneId;
++	}
++
++	/**
++	 * Returns the nth occurrence (n = 0, 1, 2, ...) counting from the
++	 * anchor. Monthly and quarterly schedules saturate to the last day of
++	 * the target month to handle anchors on the 29th, 30th or 31st.
++	 */
++	public Date occurrence(Date anchor, TimePeriod period, int n) {
++		if (anchor == null || period == null) {
++			throw new IllegalArgumentException("anchor and period are required");
++		}
++		if (n < 0) {
++			throw new IllegalArgumentException("n must be non-negative");
++		}
++		LocalDateTime anchorDt = LocalDateTime.ofInstant(anchor.toInstant(), zoneId);
++		LocalDateTime result;
++		switch (period) {
++			case YEAR:
++				result = addMonthsPreservingDay(anchorDt, 12 * n);
++				break;
++			case QUARTER:
++				result = addMonthsPreservingDay(anchorDt, 3 * n);
++				break;
++			case MONTH:
++				result = addMonthsPreservingDay(anchorDt, n);
++				break;
++			case DAY:
++				result = anchorDt.plusDays(n);
++				break;
++			case HOUR:
++				result = anchorDt.plusHours(n);
++				break;
++			default:
++				throw new IllegalStateException("unsupported period: " + period);
++		}
++		return Date.from(result.atZone(zoneId).toInstant());
++	}
++
++	/**
++	 * Returns the first occurrence that is strictly after {@code after}.
++	 * If {@code after} is null, returns the anchor itself.
++	 */
++	public Date nextAfter(Date anchor, TimePeriod period, Date after) {
++		if (after == null) {
++			return anchor;
++		}
++		int n = 0;
++		Date candidate = occurrence(anchor, period, n);
++		while (!candidate.after(after)) {
++			n++;
++			candidate = occurrence(anchor, period, n);
++			// Defensive upper bound to avoid runaway loops on pathological
++			// inputs (e.g. an anchor far in the past with an HOUR period).
++			if (n > 1_000_000) {
++				throw new IllegalStateException(
++						"could not locate next occurrence within 1,000,000 iterations");
++			}
++		}
++		return candidate;
++	}
++
++	/**
++	 * Returns the first occurrence that is greater than or equal to
++	 * {@code at}. Used when (re-)initialising {@code nextScheduledDate}
++	 * after a user updates recurrence settings.
++	 */
++	public Date firstOccurrenceAtOrAfter(Date anchor, TimePeriod period, Date at) {
++		if (at == null || !anchor.before(at)) {
++			return anchor;
++		}
++		int n = 0;
++		Date candidate = occurrence(anchor, period, n);
++		while (candidate.before(at)) {
++			n++;
++			candidate = occurrence(anchor, period, n);
++			if (n > 1_000_000) {
++				throw new IllegalStateException(
++						"could not locate first occurrence within 1,000,000 iterations");
++			}
++		}
++		return candidate;
++	}
++
++	/**
++	 * Adds {@code months} to the given date-time while preserving the
++	 * anchor's day-of-month. If the target month is shorter than the
++	 * anchor's day-of-month (e.g. Jan 31 → Feb), the day is clamped to the
++	 * last day of the target month. Crucially, subsequent occurrences are
++	 * computed from the original anchor so that e.g. Jan 31 → Feb 28 →
++	 * Mar 31 (not Mar 28).
++	 */
++	private LocalDateTime addMonthsPreservingDay(LocalDateTime anchor, int months) {
++		LocalDate anchorDate = anchor.toLocalDate();
++		int anchorDay = anchorDate.getDayOfMonth();
++		YearMonth targetMonth = YearMonth.from(anchorDate).plusMonths(months);
++		int day = Math.min(anchorDay, targetMonth.lengthOfMonth());
++		LocalDate resultDate = targetMonth.atDay(day);
++		return LocalDateTime.of(resultDate, anchor.toLocalTime());
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionJob.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionJob.java
+new file mode 100644
+index 0000000..0b2d6b3
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionJob.java
+@@ -0,0 +1,30 @@
++package com.piggymetrics.account.service.transaction;
++
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.scheduling.annotation.Scheduled;
++import org.springframework.stereotype.Component;
++
++/**
++ * Thin cron entry point for {@link RecurringTransactionService}. The cron
++ * expression is sourced from Spring Cloud Config via the
++ * {@code recurring.cron} property (default: every day at 01:00).
++ */
++@Component
++public class RecurringTransactionJob {
++
++	private final Logger log = LoggerFactory.getLogger(getClass());
++
++	@Autowired
++	private RecurringTransactionService service;
++
++	@Scheduled(cron = "${recurring.cron:0 0 1 * * *}")
++	public void runDaily() {
++		try {
++			service.processAllAccounts();
++		} catch (RuntimeException ex) {
++			log.error("recurring-transaction job failed", ex);
++		}
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java
+new file mode 100644
+index 0000000..7224d2f
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/RecurringTransactionService.java
+@@ -0,0 +1,218 @@
++package com.piggymetrics.account.service.transaction;
++
++import com.piggymetrics.account.client.StatisticsServiceClient;
++import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Item;
++import com.piggymetrics.account.domain.RecurrenceSettings;
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.domain.transaction.TransactionType;
++import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.repository.TransactionRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.stereotype.Service;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Date;
++import java.util.List;
++
++/**
++ * Core engine that materialises {@link Transaction} records from each
++ * account's recurring {@link Item}s. The scheduled entry point is
++ * {@link #processAllAccounts()}; {@link #processAccount(Account, Date)} is
++ * exposed for unit testing and for on-demand processing.
++ */
++@Service
++public class RecurringTransactionService {
++
++	private final Logger log = LoggerFactory.getLogger(getClass());
++
++	@Autowired
++	private AccountRepository accountRepository;
++
++	@Autowired
++	private TransactionRepository transactionRepository;
++
++	@Autowired
++	private RecurrenceService recurrenceService;
++
++	@Autowired
++	private StatisticsServiceClient statisticsClient;
++
++	/**
++	 * Maximum number of missed occurrences that will be backfilled in a
++	 * single run. When the gap between the item's next-scheduled date and
++	 * {@code now} exceeds this many periods, the oldest missed occurrences
++	 * are dropped and the job resumes from the most-recent
++	 * {@code maxBackfill} occurrences.
++	 */
++	@Value("${recurring.maxBackfill:30}")
++	private int maxBackfill;
++
++	/**
++	 * Runs the engine across every account. Invoked by
++	 * {@link RecurringTransactionJob} on a cron schedule, but can also be
++	 * driven manually in tests.
++	 */
++	public void processAllAccounts() {
++		processAllAccounts(new Date());
++	}
++
++	void processAllAccounts(Date now) {
++		log.info("starting recurring-transaction run at {}", now);
++		int accountsTouched = 0;
++		for (Account account : accountRepository.findAll()) {
++			if (processAccount(account, now) > 0) {
++				accountsTouched++;
++			}
++		}
++		log.info("recurring-transaction run complete; {} account(s) touched", accountsTouched);
++	}
++
++	/**
++	 * Processes a single account. Returns the number of transactions that
++	 * were created (across all items).
++	 */
++	public int processAccount(Account account, Date now) {
++		if (account == null) {
++			return 0;
++		}
++		int createdForAccount = 0;
++		createdForAccount += processItems(account, account.getIncomes(), TransactionType.INCOME, now);
++		createdForAccount += processItems(account, account.getExpenses(), TransactionType.EXPENSE, now);
++
++		if (createdForAccount > 0) {
++			accountRepository.save(account);
++
++			// At least one transaction was auto-posted or backfilled; keep
++			// the statistics service in sync with the new activity.
++			try {
++				statisticsClient.updateStatistics(account.getName(), account);
++			} catch (RuntimeException ex) {
++				log.warn("failed to update statistics for {} after recurring run",
++						account.getName(), ex);
++			}
++		}
++		return createdForAccount;
++	}
++
++	private int processItems(Account account, List<Item> items, TransactionType type, Date now) {
++		if (items == null || items.isEmpty()) {
++			return 0;
++		}
++		int created = 0;
++		for (Item item : items) {
++			created += processItem(account, item, type, now);
++		}
++		return created;
++	}
++
++	private int processItem(Account account, Item item, TransactionType type, Date now) {
++		RecurrenceSettings settings = item.getRecurrence();
++		if (settings == null
++				|| !Boolean.TRUE.equals(settings.getEnabled())
++				|| settings.getAnchorDate() == null
++				|| item.getPeriod() == null) {
++			return 0;
++		}
++
++		// Initialise the cursor if the user has just enabled recurrence
++		// without going through saveChanges (defensive).
++		if (settings.getNextScheduledDate() == null) {
++			settings.setNextScheduledDate(
++					recurrenceService.firstOccurrenceAtOrAfter(
++							settings.getAnchorDate(), item.getPeriod(), now));
++		}
++
++		List<Date> dueDates = collectDueDates(settings, item, now);
++		if (dueDates.isEmpty()) {
++			return 0;
++		}
++
++		boolean autoPost = Boolean.TRUE.equals(settings.getAutoPost());
++		// The most-recent due date represents the "current" on-time
++		// occurrence; everything earlier is considered backfill.
++		Date current = dueDates.get(dueDates.size() - 1);
++
++		List<Transaction> toSave = new ArrayList<>(dueDates.size());
++		for (Date scheduled : dueDates) {
++			boolean isCurrent = scheduled.equals(current);
++			boolean isBackfill = !isCurrent;
++			Transaction tx = buildTransaction(account, item, type, scheduled, now,
++					autoPost, isBackfill);
++			toSave.add(tx);
++		}
++		transactionRepository.saveAll(toSave);
++
++		// Advance the cursor past the latest occurrence we just generated.
++		settings.setLastGeneratedDate(current);
++		settings.setNextScheduledDate(
++				recurrenceService.nextAfter(settings.getAnchorDate(), item.getPeriod(), current));
++
++		log.debug("generated {} transaction(s) for account={} item={} (backfilled={})",
++				toSave.size(), account.getName(), item.getTitle(), toSave.size() - 1);
++		return toSave.size();
++	}
++
++	/**
++	 * Returns every occurrence from {@code nextScheduledDate} up to and
++	 * including {@code now}, in chronological order, capped at the
++	 * configured maximum. When the cap is hit, the oldest overflow dates
++	 * are discarded so that the window always ends at the current
++	 * occurrence.
++	 */
++	private List<Date> collectDueDates(RecurrenceSettings settings, Item item, Date now) {
++		Date cursor = settings.getNextScheduledDate();
++		if (cursor == null || cursor.after(now)) {
++			return Collections.emptyList();
++		}
++
++		List<Date> due = new ArrayList<>();
++		Date current = cursor;
++		// Guard against malformed state (e.g. an HOUR period that has been
++		// dormant for years) by stopping after a very large window; the
++		// cap below trims to the real limit.
++		int iterations = 0;
++		while (!current.after(now) && iterations < 10 * maxBackfill + 10) {
++			due.add(current);
++			current = recurrenceService.nextAfter(
++					settings.getAnchorDate(), item.getPeriod(), current);
++			iterations++;
++		}
++
++		if (due.size() > maxBackfill) {
++			// Keep the most recent `maxBackfill` occurrences so that the
++			// current on-time run is always preserved.
++			due = new ArrayList<>(due.subList(due.size() - maxBackfill, due.size()));
++		}
++		return due;
++	}
++
++	private Transaction buildTransaction(Account account, Item item, TransactionType type,
++			Date scheduled, Date now, boolean autoPost, boolean backfilled) {
++		Transaction tx = new Transaction();
++		tx.setAccountName(account.getName());
++		tx.setType(type);
++		tx.setAmount(item.getAmount());
++		tx.setCurrency(item.getCurrency());
++		tx.setSourceItemTitle(item.getTitle());
++		tx.setScheduledDate(scheduled);
++		tx.setCreatedDate(now);
++		tx.setBackfilled(backfilled);
++
++		// Backfilled transactions always require user review regardless of
++		// the item's autoPost flag: the user should confirm historical
++		// posts explicitly rather than having them silently applied.
++		if (backfilled || !autoPost) {
++			tx.setStatus(TransactionStatus.PENDING_REVIEW);
++		} else {
++			tx.setStatus(TransactionStatus.POSTED);
++			tx.setPostedDate(now);
++		}
++		return tx;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/TransactionService.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/TransactionService.java
+new file mode 100644
+index 0000000..246387f
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/TransactionService.java
+@@ -0,0 +1,46 @@
++package com.piggymetrics.account.service.transaction;
++
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.domain.transaction.TransactionType;
++import org.springframework.data.domain.Page;
++import org.springframework.data.domain.Pageable;
++
++import java.util.Date;
++
++public interface TransactionService {
++
++	/**
++	 * Lists transactions for the given account, optionally filtered by
++	 * status, type and scheduled-date range, with pagination.
++	 */
++	Page<Transaction> list(String accountName,
++			TransactionStatus status,
++			TransactionType type,
++			Date from,
++			Date to,
++			Pageable pageable);
++
++	/**
++	 * Returns the transaction with the given id, asserting it belongs to
++	 * the given account.
++	 */
++	Transaction get(String accountName, String id);
++
++	/**
++	 * Approves a pending-review transaction, flipping its status to
++	 * {@code POSTED} and stamping the posted date.
++	 */
++	Transaction approve(String accountName, String id);
++
++	/**
++	 * Marks a pending-review transaction as {@code SKIPPED}.
++	 */
++	Transaction skip(String accountName, String id);
++
++	/**
++	 * Deletes a pending-review transaction. Posted/skipped transactions
++	 * are kept for audit and cannot be deleted via this API.
++	 */
++	void delete(String accountName, String id);
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/transaction/TransactionServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/transaction/TransactionServiceImpl.java
+new file mode 100644
+index 0000000..ea866b1
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/transaction/TransactionServiceImpl.java
+@@ -0,0 +1,103 @@
++package com.piggymetrics.account.service.transaction;
++
++import com.piggymetrics.account.client.StatisticsServiceClient;
++import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.domain.transaction.TransactionType;
++import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.repository.TransactionRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.data.domain.Page;
++import org.springframework.data.domain.Pageable;
++import org.springframework.stereotype.Service;
++import org.springframework.util.Assert;
++
++import java.util.Date;
++import java.util.Optional;
++
++@Service
++public class TransactionServiceImpl implements TransactionService {
++
++	private final Logger log = LoggerFactory.getLogger(getClass());
++
++	@Autowired
++	private TransactionRepository transactionRepository;
++
++	@Autowired
++	private AccountRepository accountRepository;
++
++	@Autowired
++	private StatisticsServiceClient statisticsClient;
++
++	@Override
++	public Page<Transaction> list(String accountName,
++			TransactionStatus status,
++			TransactionType type,
++			Date from,
++			Date to,
++			Pageable pageable) {
++		Assert.hasLength(accountName);
++		return transactionRepository.findByFilter(accountName, status, type, from, to, pageable);
++	}
++
++	@Override
++	public Transaction get(String accountName, String id) {
++		Transaction tx = loadOwned(accountName, id);
++		return tx;
++	}
++
++	@Override
++	public Transaction approve(String accountName, String id) {
++		Transaction tx = loadOwned(accountName, id);
++		Assert.isTrue(tx.getStatus() == TransactionStatus.PENDING_REVIEW,
++				"only pending-review transactions can be approved, got: " + tx.getStatus());
++
++		tx.setStatus(TransactionStatus.POSTED);
++		tx.setPostedDate(new Date());
++		Transaction saved = transactionRepository.save(tx);
++		log.info("transaction {} approved for account {}", saved.getId(), accountName);
++
++		// Approving changes the effective balance for the account, so
++		// refresh statistics as we do on auto-post.
++		Account account = accountRepository.findByName(accountName);
++		if (account != null) {
++			statisticsClient.updateStatistics(accountName, account);
++		}
++		return saved;
++	}
++
++	@Override
++	public Transaction skip(String accountName, String id) {
++		Transaction tx = loadOwned(accountName, id);
++		Assert.isTrue(tx.getStatus() == TransactionStatus.PENDING_REVIEW,
++				"only pending-review transactions can be skipped, got: " + tx.getStatus());
++
++		tx.setStatus(TransactionStatus.SKIPPED);
++		Transaction saved = transactionRepository.save(tx);
++		log.info("transaction {} skipped for account {}", saved.getId(), accountName);
++		return saved;
++	}
++
++	@Override
++	public void delete(String accountName, String id) {
++		Transaction tx = loadOwned(accountName, id);
++		Assert.isTrue(tx.getStatus() == TransactionStatus.PENDING_REVIEW,
++				"only pending-review transactions can be deleted, got: " + tx.getStatus());
++		transactionRepository.delete(tx);
++		log.info("transaction {} deleted for account {}", id, accountName);
++	}
++
++	private Transaction loadOwned(String accountName, String id) {
++		Assert.hasLength(accountName);
++		Assert.hasLength(id);
++		Optional<Transaction> found = transactionRepository.findById(id);
++		Assert.isTrue(found.isPresent(), "transaction not found: " + id);
++		Transaction tx = found.get();
++		Assert.isTrue(accountName.equals(tx.getAccountName()),
++				"transaction does not belong to account: " + accountName);
++		return tx;
++	}
++}
+diff --git a/account-service/src/test/java/com/piggymetrics/account/controller/TransactionControllerTest.java b/account-service/src/test/java/com/piggymetrics/account/controller/TransactionControllerTest.java
+new file mode 100644
+index 0000000..b05b8c4
+--- /dev/null
++++ b/account-service/src/test/java/com/piggymetrics/account/controller/TransactionControllerTest.java
+@@ -0,0 +1,142 @@
++package com.piggymetrics.account.controller;
++
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.domain.transaction.TransactionType;
++import com.piggymetrics.account.service.transaction.TransactionService;
++import com.sun.security.auth.UserPrincipal;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.ArgumentCaptor;
++import org.mockito.InjectMocks;
++import org.mockito.Mock;
++import org.springframework.data.domain.Page;
++import org.springframework.data.domain.PageImpl;
++import org.springframework.data.domain.Pageable;
++import org.springframework.test.context.junit4.SpringRunner;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.util.Collections;
++import java.util.Date;
++
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.eq;
++import static org.mockito.ArgumentMatchers.isNull;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.mockito.MockitoAnnotations.initMocks;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++@RunWith(SpringRunner.class)
++public class TransactionControllerTest {
++
++	@InjectMocks
++	private TransactionController controller;
++
++	@Mock
++	private TransactionService transactionService;
++
++	private MockMvc mockMvc;
++
++	@Before
++	public void setup() {
++		initMocks(this);
++		this.mockMvc = MockMvcBuilders.standaloneSetup(controller).build();
++	}
++
++	private Transaction tx(String id, TransactionStatus status) {
++		Transaction t = new Transaction();
++		t.setId(id);
++		t.setAccountName("demo");
++		t.setType(TransactionType.INCOME);
++		t.setStatus(status);
++		t.setScheduledDate(new Date());
++		return t;
++	}
++
++	@Test
++	public void listReturnsPagedTransactionsForCurrentUser() throws Exception {
++		Page<Transaction> page = new PageImpl<>(Collections.singletonList(tx("1", TransactionStatus.POSTED)));
++		when(transactionService.list(eq("demo"), eq(TransactionStatus.POSTED), eq(TransactionType.INCOME),
++				isNull(), isNull(), any(Pageable.class))).thenReturn(page);
++
++		mockMvc.perform(get("/current/transactions")
++				.param("status", "POSTED")
++				.param("type", "INCOME")
++				.principal(new UserPrincipal("demo")))
++				.andExpect(status().isOk())
++				.andExpect(jsonPath("$.content[0].id").value("1"))
++				.andExpect(jsonPath("$.content[0].status").value("POSTED"));
++
++		ArgumentCaptor<Pageable> captor = ArgumentCaptor.forClass(Pageable.class);
++		verify(transactionService).list(eq("demo"), eq(TransactionStatus.POSTED),
++				eq(TransactionType.INCOME), isNull(), isNull(), captor.capture());
++		// Default page/size applied by controller.
++		assert captor.getValue().getPageNumber() == 0;
++		assert captor.getValue().getPageSize() == 20;
++	}
++
++	@Test
++	public void getOneDelegatesToService() throws Exception {
++		when(transactionService.get("demo", "1")).thenReturn(tx("1", TransactionStatus.PENDING_REVIEW));
++
++		mockMvc.perform(get("/current/transactions/1")
++				.principal(new UserPrincipal("demo")))
++				.andExpect(status().isOk())
++				.andExpect(jsonPath("$.id").value("1"))
++				.andExpect(jsonPath("$.status").value("PENDING_REVIEW"));
++	}
++
++	@Test
++	public void approveCallsServiceAndReturnsUpdated() throws Exception {
++		when(transactionService.approve("demo", "1")).thenReturn(tx("1", TransactionStatus.POSTED));
++
++		mockMvc.perform(post("/current/transactions/1/approve")
++				.principal(new UserPrincipal("demo")))
++				.andExpect(status().isOk())
++				.andExpect(jsonPath("$.status").value("POSTED"));
++		verify(transactionService, times(1)).approve("demo", "1");
++	}
++
++	@Test
++	public void skipCallsService() throws Exception {
++		when(transactionService.skip("demo", "1")).thenReturn(tx("1", TransactionStatus.SKIPPED));
++
++		mockMvc.perform(post("/current/transactions/1/skip")
++				.principal(new UserPrincipal("demo")))
++				.andExpect(status().isOk())
++				.andExpect(jsonPath("$.status").value("SKIPPED"));
++	}
++
++	@Test
++	public void deleteCallsService() throws Exception {
++		mockMvc.perform(delete("/current/transactions/1")
++				.principal(new UserPrincipal("demo")))
++				.andExpect(status().isOk());
++		verify(transactionService, times(1)).delete("demo", "1");
++	}
++
++	@Test
++	public void pageAndSizeAreClampedToSafeBounds() throws Exception {
++		when(transactionService.list(eq("demo"), isNull(), isNull(), isNull(), isNull(), any(Pageable.class)))
++				.thenReturn(new PageImpl<>(Collections.emptyList()));
++
++		mockMvc.perform(get("/current/transactions")
++				.param("page", "-5")
++				.param("size", "99999")
++				.principal(new UserPrincipal("demo")))
++				.andExpect(status().isOk());
++
++		ArgumentCaptor<Pageable> captor = ArgumentCaptor.forClass(Pageable.class);
++		verify(transactionService).list(eq("demo"), isNull(), isNull(), isNull(), isNull(), captor.capture());
++		assert captor.getValue().getPageNumber() == 0;
++		assert captor.getValue().getPageSize() == 200;
++	}
++}
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
+index 675d54c..0abad2c 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
+@@ -4,13 +4,21 @@ import com.piggymetrics.account.client.AuthServiceClient;
+ import com.piggymetrics.account.client.StatisticsServiceClient;
+ import com.piggymetrics.account.domain.*;
+ import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.service.transaction.RecurrenceService;
+ import org.junit.Before;
+ import org.junit.Test;
+ import org.mockito.InjectMocks;
+ import org.mockito.Mock;
++import org.mockito.Spy;
+ 
+ import java.math.BigDecimal;
++import java.time.LocalDateTime;
++import java.time.ZoneOffset;
+ import java.util.Arrays;
++import java.util.Collections;
++import java.util.Date;
++
++import static org.junit.Assert.assertNull;
+ 
+ import static org.junit.Assert.assertEquals;
+ import static org.junit.Assert.assertNotNull;
+@@ -31,6 +39,9 @@ public class AccountServiceTest {
+ 	@Mock
+ 	private AccountRepository repository;
+ 
++	@Spy
++	private RecurrenceService recurrenceService = new RecurrenceService();
++
+ 	@Before
+ 	public void setup() {
+ 		initMocks(this);
+@@ -146,4 +157,82 @@ public class AccountServiceTest {
+ 		when(accountService.findByName("test")).thenReturn(null);
+ 		accountService.saveChanges("test", update);
+ 	}
++
++	@Test
++	public void shouldRecomputeNextScheduledDateWhenRecurrenceNewlyEnabled() {
++		Date anchor = Date.from(LocalDateTime.of(2026, 1, 31, 9, 0)
++				.atZone(ZoneOffset.UTC).toInstant());
++
++		Item salary = new Item();
++		salary.setTitle("Salary");
++		salary.setAmount(new BigDecimal(1000));
++		salary.setCurrency(Currency.USD);
++		salary.setPeriod(TimePeriod.MONTH);
++		salary.setIcon("wallet");
++
++		RecurrenceSettings settings = new RecurrenceSettings();
++		settings.setEnabled(true);
++		settings.setAnchorDate(anchor);
++		settings.setAutoPost(true);
++		// Client does not pre-populate nextScheduledDate; server must.
++		salary.setRecurrence(settings);
++
++		Saving saving = new Saving();
++		saving.setAmount(new BigDecimal(0));
++		saving.setCurrency(Currency.USD);
++		saving.setInterest(new BigDecimal(0));
++		saving.setDeposit(false);
++		saving.setCapitalization(false);
++
++		Account update = new Account();
++		update.setName("test");
++		update.setIncomes(Collections.singletonList(salary));
++		update.setSaving(saving);
++
++		Account existing = new Account();
++		existing.setName("test");
++		when(repository.findByName("test")).thenReturn(existing);
++
++		accountService.saveChanges("test", update);
++
++		assertNotNull(salary.getRecurrence().getNextScheduledDate());
++		// Anchor was in the past so the first occurrence at-or-after now
++		// must be strictly >= the anchor.
++		assert !salary.getRecurrence().getNextScheduledDate().before(anchor);
++	}
++
++	@Test
++	public void shouldClearCursorWhenRecurrenceDisabled() {
++		Item salary = new Item();
++		salary.setTitle("Salary");
++		salary.setAmount(new BigDecimal(1000));
++		salary.setCurrency(Currency.USD);
++		salary.setPeriod(TimePeriod.MONTH);
++		salary.setIcon("wallet");
++
++		RecurrenceSettings settings = new RecurrenceSettings();
++		settings.setEnabled(false);
++		settings.setNextScheduledDate(new Date());
++		salary.setRecurrence(settings);
++
++		Saving saving = new Saving();
++		saving.setAmount(new BigDecimal(0));
++		saving.setCurrency(Currency.USD);
++		saving.setInterest(new BigDecimal(0));
++		saving.setDeposit(false);
++		saving.setCapitalization(false);
++
++		Account update = new Account();
++		update.setName("test");
++		update.setIncomes(Collections.singletonList(salary));
++		update.setSaving(saving);
++
++		Account existing = new Account();
++		existing.setName("test");
++		when(repository.findByName("test")).thenReturn(existing);
++
++		accountService.saveChanges("test", update);
++
++		assertNull(salary.getRecurrence().getNextScheduledDate());
++	}
+ }
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurrenceServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurrenceServiceTest.java
+new file mode 100644
+index 0000000..32f7e14
+--- /dev/null
++++ b/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurrenceServiceTest.java
+@@ -0,0 +1,118 @@
++package com.piggymetrics.account.service.transaction;
++
++import com.piggymetrics.account.domain.TimePeriod;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.time.LocalDateTime;
++import java.time.ZoneId;
++import java.time.ZoneOffset;
++import java.util.Date;
++
++import static org.junit.Assert.assertEquals;
++
++public class RecurrenceServiceTest {
++
++	private RecurrenceService service;
++	private final ZoneId zone = ZoneOffset.UTC;
++
++	@Before
++	public void setup() {
++		service = new RecurrenceService(zone);
++	}
++
++	private Date utc(int year, int month, int day, int hour, int minute) {
++		return Date.from(LocalDateTime.of(year, month, day, hour, minute)
++				.atZone(zone).toInstant());
++	}
++
++	@Test
++	public void monthlyAnchorOn31stSaturatesToLastDayInShorterMonths() {
++		Date anchor = utc(2026, 1, 31, 9, 0);
++
++		// Feb 2026 has 28 days: occurrence 1 must land on Feb 28.
++		assertEquals(utc(2026, 2, 28, 9, 0), service.occurrence(anchor, TimePeriod.MONTH, 1));
++		// Crucially, the following month returns to the 31st (we compute
++		// from the original anchor, not from the previous occurrence).
++		assertEquals(utc(2026, 3, 31, 9, 0), service.occurrence(anchor, TimePeriod.MONTH, 2));
++		// April has 30 days: clamp back down to 30.
++		assertEquals(utc(2026, 4, 30, 9, 0), service.occurrence(anchor, TimePeriod.MONTH, 3));
++		assertEquals(utc(2026, 5, 31, 9, 0), service.occurrence(anchor, TimePeriod.MONTH, 4));
++	}
++
++	@Test
++	public void monthlyAnchorOn31stLeapYearFebruary() {
++		Date anchor = utc(2024, 1, 31, 0, 0);
++		// 2024 is a leap year so February has 29 days.
++		assertEquals(utc(2024, 2, 29, 0, 0), service.occurrence(anchor, TimePeriod.MONTH, 1));
++	}
++
++	@Test
++	public void quarterlyPreservesDayOfMonthWithClamping() {
++		Date anchor = utc(2026, 1, 31, 0, 0);
++		// +3 months = Apr 30 (clamped), +6 months = Jul 31, +9 = Oct 31.
++		assertEquals(utc(2026, 4, 30, 0, 0), service.occurrence(anchor, TimePeriod.QUARTER, 1));
++		assertEquals(utc(2026, 7, 31, 0, 0), service.occurrence(anchor, TimePeriod.QUARTER, 2));
++		assertEquals(utc(2026, 10, 31, 0, 0), service.occurrence(anchor, TimePeriod.QUARTER, 3));
++	}
++
++	@Test
++	public void yearlyAdds12Months() {
++		Date anchor = utc(2026, 3, 15, 12, 0);
++		assertEquals(utc(2027, 3, 15, 12, 0), service.occurrence(anchor, TimePeriod.YEAR, 1));
++	}
++
++	@Test
++	public void dailyAddsOneDay() {
++		Date anchor = utc(2026, 4, 19, 8, 30);
++		assertEquals(utc(2026, 4, 20, 8, 30), service.occurrence(anchor, TimePeriod.DAY, 1));
++		assertEquals(utc(2026, 4, 26, 8, 30), service.occurrence(anchor, TimePeriod.DAY, 7));
++	}
++
++	@Test
++	public void hourlyAddsOneHour() {
++		Date anchor = utc(2026, 4, 19, 8, 30);
++		assertEquals(utc(2026, 4, 19, 9, 30), service.occurrence(anchor, TimePeriod.HOUR, 1));
++	}
++
++	@Test
++	public void nextAfterSkipsPastOccurrencesToFirstStrictlyLater() {
++		Date anchor = utc(2026, 1, 31, 9, 0);
++		Date after = utc(2026, 3, 15, 0, 0);
++		// Next monthly occurrence strictly after Mar 15 is Mar 31.
++		assertEquals(utc(2026, 3, 31, 9, 0), service.nextAfter(anchor, TimePeriod.MONTH, after));
++	}
++
++	@Test
++	public void nextAfterReturnsAnchorWhenAfterIsNull() {
++		Date anchor = utc(2026, 1, 31, 9, 0);
++		assertEquals(anchor, service.nextAfter(anchor, TimePeriod.MONTH, null));
++	}
++
++	@Test
++	public void firstOccurrenceAtOrAfterReturnsAnchorWhenAnchorIsInFuture() {
++		Date anchor = utc(2030, 1, 1, 0, 0);
++		Date at = utc(2026, 4, 19, 0, 0);
++		assertEquals(anchor,
++				service.firstOccurrenceAtOrAfter(anchor, TimePeriod.MONTH, at));
++	}
++
++	@Test
++	public void firstOccurrenceAtOrAfterAdvancesPastAnchorWhenAnchorIsInPast() {
++		Date anchor = utc(2026, 1, 31, 0, 0);
++		Date at = utc(2026, 4, 1, 0, 0);
++		// Next monthly occurrence at-or-after Apr 1 is Apr 30.
++		assertEquals(utc(2026, 4, 30, 0, 0),
++				service.firstOccurrenceAtOrAfter(anchor, TimePeriod.MONTH, at));
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void rejectsNegativeOccurrenceIndex() {
++		service.occurrence(new Date(), TimePeriod.DAY, -1);
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void rejectsNullAnchor() {
++		service.occurrence(null, TimePeriod.DAY, 1);
++	}
++}
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurringTransactionServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurringTransactionServiceTest.java
+new file mode 100644
+index 0000000..ba8f81b
+--- /dev/null
++++ b/account-service/src/test/java/com/piggymetrics/account/service/transaction/RecurringTransactionServiceTest.java
+@@ -0,0 +1,265 @@
++package com.piggymetrics.account.service.transaction;
++
++import com.piggymetrics.account.client.StatisticsServiceClient;
++import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Currency;
++import com.piggymetrics.account.domain.Item;
++import com.piggymetrics.account.domain.RecurrenceSettings;
++import com.piggymetrics.account.domain.TimePeriod;
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.domain.transaction.TransactionType;
++import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.repository.TransactionRepository;
++import org.junit.Before;
++import org.junit.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockito.InjectMocks;
++import org.mockito.Mock;
++import org.mockito.Spy;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.math.BigDecimal;
++import java.time.LocalDateTime;
++import java.time.ZoneOffset;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Date;
++import java.util.List;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.mockito.MockitoAnnotations.initMocks;
++
++public class RecurringTransactionServiceTest {
++
++	@InjectMocks
++	private RecurringTransactionService service;
++
++	@Mock
++	private AccountRepository accountRepository;
++
++	@Mock
++	private TransactionRepository transactionRepository;
++
++	@Mock
++	private StatisticsServiceClient statisticsClient;
++
++	@Spy
++	private RecurrenceService recurrenceService = new RecurrenceService(ZoneOffset.UTC);
++
++	@Before
++	public void setup() {
++		initMocks(this);
++		ReflectionTestUtils.setField(service, "maxBackfill", 5);
++	}
++
++	private Date utc(int y, int m, int d) {
++		return Date.from(LocalDateTime.of(y, m, d, 0, 0).atZone(ZoneOffset.UTC).toInstant());
++	}
++
++	private Item recurringItem(String title, BigDecimal amount, TimePeriod period,
++			Date anchor, Boolean autoPost, Date next) {
++		Item item = new Item();
++		item.setTitle(title);
++		item.setAmount(amount);
++		item.setCurrency(Currency.USD);
++		item.setPeriod(period);
++		item.setIcon("icon");
++
++		RecurrenceSettings r = new RecurrenceSettings();
++		r.setEnabled(true);
++		r.setAnchorDate(anchor);
++		r.setAutoPost(autoPost);
++		r.setNextScheduledDate(next);
++		item.setRecurrence(r);
++		return item;
++	}
++
++	@Test
++	public void generatesSingleTransactionOnDueDateWhenAutoPostEnabled() {
++		Account account = new Account();
++		account.setName("demo");
++
++		Date anchor = utc(2026, 4, 19);
++		Item salary = recurringItem("Salary", new BigDecimal(1000), TimePeriod.MONTH,
++				anchor, true, anchor);
++		account.setIncomes(Collections.singletonList(salary));
++
++		int count = service.processAccount(account, utc(2026, 4, 19));
++
++		assertEquals(1, count);
++		ArgumentCaptor<List<Transaction>> captor = listCaptor();
++		verify(transactionRepository, times(1)).saveAll(captor.capture());
++		List<Transaction> saved = captor.getValue();
++		assertEquals(1, saved.size());
++		Transaction tx = saved.get(0);
++		assertEquals(TransactionStatus.POSTED, tx.getStatus());
++		assertEquals(TransactionType.INCOME, tx.getType());
++		assertEquals("Salary", tx.getSourceItemTitle());
++		assertEquals(utc(2026, 4, 19), tx.getScheduledDate());
++		assertNotNull(tx.getPostedDate());
++		assertFalse(tx.isBackfilled());
++
++		// Cursor advanced to next occurrence and lastGenerated stamped.
++		assertEquals(utc(2026, 5, 19), salary.getRecurrence().getNextScheduledDate());
++		assertEquals(utc(2026, 4, 19), salary.getRecurrence().getLastGeneratedDate());
++
++		// Statistics refreshed because activity was posted.
++		verify(statisticsClient, times(1)).updateStatistics(anyString(), any(Account.class));
++	}
++
++	@Test
++	public void generatesPendingReviewWhenAutoPostDisabled() {
++		Account account = new Account();
++		account.setName("demo");
++		Date anchor = utc(2026, 4, 19);
++		Item rent = recurringItem("Rent", new BigDecimal(500), TimePeriod.MONTH,
++				anchor, false, anchor);
++		account.setExpenses(Collections.singletonList(rent));
++
++		service.processAccount(account, utc(2026, 4, 19));
++
++		ArgumentCaptor<List<Transaction>> captor = listCaptor();
++		verify(transactionRepository).saveAll(captor.capture());
++		Transaction tx = captor.getValue().get(0);
++		assertEquals(TransactionStatus.PENDING_REVIEW, tx.getStatus());
++		assertEquals(TransactionType.EXPENSE, tx.getType());
++		assertNull(tx.getPostedDate());
++	}
++
++	@Test
++	public void backfillsMissedDatesAsPendingReviewEvenWhenAutoPostEnabled() {
++		// Daily item, anchor Apr 15, cursor Apr 15, now Apr 19 → 5 dates
++		// (15, 16, 17, 18, 19). Latest = current (auto-post),
++		// rest = backfill (pending_review).
++		Account account = new Account();
++		account.setName("demo");
++		Date anchor = utc(2026, 4, 15);
++		Item groceries = recurringItem("Groceries", new BigDecimal(10), TimePeriod.DAY,
++				anchor, true, anchor);
++		account.setExpenses(Collections.singletonList(groceries));
++
++		service.processAccount(account, utc(2026, 4, 19));
++
++		ArgumentCaptor<List<Transaction>> captor = listCaptor();
++		verify(transactionRepository).saveAll(captor.capture());
++		List<Transaction> saved = captor.getValue();
++		assertEquals(5, saved.size());
++		// The first four are backfill / pending_review:
++		for (int i = 0; i < 4; i++) {
++			Transaction t = saved.get(i);
++			assertTrue("expected backfilled for " + t.getScheduledDate(), t.isBackfilled());
++			assertEquals(TransactionStatus.PENDING_REVIEW, t.getStatus());
++		}
++		// The last is the current on-time occurrence: auto-posted.
++		Transaction current = saved.get(4);
++		assertFalse(current.isBackfilled());
++		assertEquals(TransactionStatus.POSTED, current.getStatus());
++		assertEquals(utc(2026, 4, 19), current.getScheduledDate());
++
++		// Cursor advanced past the latest we just generated.
++		assertEquals(utc(2026, 4, 20), groceries.getRecurrence().getNextScheduledDate());
++	}
++
++	@Test
++	public void capsBackfillAtConfiguredMaximumDroppingOldestMissed() {
++		ReflectionTestUtils.setField(service, "maxBackfill", 3);
++		Account account = new Account();
++		account.setName("demo");
++		Date anchor = utc(2026, 4, 10);
++		Item daily = recurringItem("Coffee", new BigDecimal(4), TimePeriod.DAY,
++				anchor, true, anchor);
++		account.setExpenses(Collections.singletonList(daily));
++
++		// 10 missed days (Apr 10..Apr 19) but cap is 3: keep the 3 most
++		// recent (Apr 17, 18, 19) and drop older.
++		service.processAccount(account, utc(2026, 4, 19));
++
++		ArgumentCaptor<List<Transaction>> captor = listCaptor();
++		verify(transactionRepository).saveAll(captor.capture());
++		List<Transaction> saved = captor.getValue();
++		assertEquals(3, saved.size());
++		assertEquals(utc(2026, 4, 17), saved.get(0).getScheduledDate());
++		assertEquals(utc(2026, 4, 18), saved.get(1).getScheduledDate());
++		assertEquals(utc(2026, 4, 19), saved.get(2).getScheduledDate());
++		// First two are backfilled pending-review.
++		assertEquals(TransactionStatus.PENDING_REVIEW, saved.get(0).getStatus());
++		assertEquals(TransactionStatus.PENDING_REVIEW, saved.get(1).getStatus());
++		// Latest is the current run and applies auto-post.
++		assertEquals(TransactionStatus.POSTED, saved.get(2).getStatus());
++	}
++
++	@Test
++	public void skipsItemsWithoutRecurrenceOrDisabled() {
++		Account account = new Account();
++		account.setName("demo");
++
++		Item plain = new Item();
++		plain.setTitle("Plain");
++		plain.setAmount(new BigDecimal(1));
++		plain.setCurrency(Currency.USD);
++		plain.setPeriod(TimePeriod.MONTH);
++		plain.setIcon("icon");
++		// no recurrence settings at all
++
++		Item disabled = recurringItem("Disabled", new BigDecimal(1), TimePeriod.MONTH,
++				utc(2026, 4, 19), true, utc(2026, 4, 19));
++		disabled.getRecurrence().setEnabled(false);
++
++		account.setExpenses(Arrays.asList(plain, disabled));
++
++		int count = service.processAccount(account, utc(2026, 5, 20));
++		assertEquals(0, count);
++		verify(transactionRepository, never()).saveAll(any());
++		verify(statisticsClient, never()).updateStatistics(anyString(), any());
++	}
++
++	@Test
++	public void skipsItemsWhoseNextScheduledIsInTheFuture() {
++		Account account = new Account();
++		account.setName("demo");
++		// Cursor is tomorrow relative to "now".
++		Item future = recurringItem("Future", new BigDecimal(1), TimePeriod.DAY,
++				utc(2026, 4, 20), true, utc(2026, 4, 20));
++		account.setIncomes(Collections.singletonList(future));
++
++		int count = service.processAccount(account, utc(2026, 4, 19));
++		assertEquals(0, count);
++		verify(transactionRepository, never()).saveAll(any());
++	}
++
++	@Test
++	public void processAllAccountsIteratesAndSavesEachAccount() {
++		Account a = new Account();
++		a.setName("a");
++		a.setIncomes(Collections.singletonList(
++				recurringItem("Salary", new BigDecimal(100), TimePeriod.DAY,
++						utc(2026, 4, 19), true, utc(2026, 4, 19))));
++
++		Account b = new Account();
++		b.setName("b");
++		// no recurring items: should not be saved.
++
++		when(accountRepository.findAll()).thenReturn(Arrays.asList(a, b));
++
++		service.processAllAccounts(utc(2026, 4, 19));
++
++		verify(accountRepository, times(1)).save(a);
++		verify(accountRepository, never()).save(b);
++	}
++
++	@SuppressWarnings({"unchecked", "rawtypes"})
++	private ArgumentCaptor<List<Transaction>> listCaptor() {
++		return ArgumentCaptor.forClass((Class) List.class);
++	}
++}
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/transaction/TransactionServiceImplTest.java b/account-service/src/test/java/com/piggymetrics/account/service/transaction/TransactionServiceImplTest.java
+new file mode 100644
+index 0000000..7862030
+--- /dev/null
++++ b/account-service/src/test/java/com/piggymetrics/account/service/transaction/TransactionServiceImplTest.java
+@@ -0,0 +1,126 @@
++package com.piggymetrics.account.service.transaction;
++
++import com.piggymetrics.account.client.StatisticsServiceClient;
++import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.transaction.Transaction;
++import com.piggymetrics.account.domain.transaction.TransactionStatus;
++import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.repository.TransactionRepository;
++import org.junit.Before;
++import org.junit.Test;
++import org.mockito.InjectMocks;
++import org.mockito.Mock;
++
++import java.util.Optional;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.never;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++import static org.mockito.MockitoAnnotations.initMocks;
++
++public class TransactionServiceImplTest {
++
++	@InjectMocks
++	private TransactionServiceImpl service;
++
++	@Mock
++	private TransactionRepository transactionRepository;
++
++	@Mock
++	private AccountRepository accountRepository;
++
++	@Mock
++	private StatisticsServiceClient statisticsClient;
++
++	@Before
++	public void setup() {
++		initMocks(this);
++	}
++
++	private Transaction pending() {
++		Transaction t = new Transaction();
++		t.setId("tx-1");
++		t.setAccountName("demo");
++		t.setStatus(TransactionStatus.PENDING_REVIEW);
++		return t;
++	}
++
++	@Test
++	public void approveFlipsToPostedAndRefreshesStatistics() {
++		Transaction tx = pending();
++		Account account = new Account();
++		account.setName("demo");
++		when(transactionRepository.findById("tx-1")).thenReturn(Optional.of(tx));
++		when(accountRepository.findByName("demo")).thenReturn(account);
++		when(transactionRepository.save(tx)).thenReturn(tx);
++
++		Transaction result = service.approve("demo", "tx-1");
++
++		assertEquals(TransactionStatus.POSTED, result.getStatus());
++		assertNotNull(result.getPostedDate());
++		verify(transactionRepository, times(1)).save(tx);
++		verify(statisticsClient, times(1)).updateStatistics("demo", account);
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void approveRejectsAlreadyPosted() {
++		Transaction tx = pending();
++		tx.setStatus(TransactionStatus.POSTED);
++		when(transactionRepository.findById("tx-1")).thenReturn(Optional.of(tx));
++		service.approve("demo", "tx-1");
++	}
++
++	@Test
++	public void skipFlipsToSkipped() {
++		Transaction tx = pending();
++		when(transactionRepository.findById("tx-1")).thenReturn(Optional.of(tx));
++		when(transactionRepository.save(tx)).thenReturn(tx);
++
++		Transaction result = service.skip("demo", "tx-1");
++		assertEquals(TransactionStatus.SKIPPED, result.getStatus());
++		verify(statisticsClient, never()).updateStatistics(anyString(), any());
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void skipRejectsNonPending() {
++		Transaction tx = pending();
++		tx.setStatus(TransactionStatus.SKIPPED);
++		when(transactionRepository.findById("tx-1")).thenReturn(Optional.of(tx));
++		service.skip("demo", "tx-1");
++	}
++
++	@Test
++	public void deleteRemovesPendingTransaction() {
++		Transaction tx = pending();
++		when(transactionRepository.findById("tx-1")).thenReturn(Optional.of(tx));
++		service.delete("demo", "tx-1");
++		verify(transactionRepository, times(1)).delete(tx);
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void deleteRejectsNonPending() {
++		Transaction tx = pending();
++		tx.setStatus(TransactionStatus.POSTED);
++		when(transactionRepository.findById("tx-1")).thenReturn(Optional.of(tx));
++		service.delete("demo", "tx-1");
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void rejectsAccessFromWrongAccount() {
++		Transaction tx = pending();
++		tx.setAccountName("someone-else");
++		when(transactionRepository.findById("tx-1")).thenReturn(Optional.of(tx));
++		service.get("demo", "tx-1");
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void rejectsMissingTransaction() {
++		when(transactionRepository.findById("nope")).thenReturn(Optional.empty());
++		service.get("demo", "nope");
++	}
++}
+diff --git a/account-service/src/test/resources/application.yml b/account-service/src/test/resources/application.yml
+index 78b2cc4..e9ec907 100644
+--- a/account-service/src/test/resources/application.yml
++++ b/account-service/src/test/resources/application.yml
+@@ -2,4 +2,11 @@ spring:
+   data:
+     mongodb:
+       database: piggymetrics
+-      port: 0
+\ No newline at end of file
++      port: 0
++
++recurring:
++  # Fire only once a year on Jan 1 at 01:00 so the scheduled task is a
++  # no-op during the test suite; the engine is exercised directly via
++  # unit tests.
++  cron: 0 0 1 1 1 ?
++  maxBackfill: 30
+\ No newline at end of file
+diff --git a/config/src/main/resources/shared/account-service.yml b/config/src/main/resources/shared/account-service.yml
+index 209425d..3bcfa37 100644
+--- a/config/src/main/resources/shared/account-service.yml
++++ b/config/src/main/resources/shared/account-service.yml
+@@ -23,4 +23,13 @@ server:
+ 
+ feign:
+   hystrix:
+-    enabled: true
+\ No newline at end of file
++    enabled: true
++
++recurring:
++  # Cron expression (Spring style: 6 fields, sec min hour day month weekday)
++  # controlling when the recurring-transaction engine scans all accounts.
++  # Defaults to 01:00 every day; override via Spring Cloud Config.
++  cron: 0 0 1 * * *
++  # Maximum number of missed occurrences that a single run will backfill
++  # per item. Excess dates are dropped oldest-first.
++  maxBackfill: 30
+\ No newline at end of file
