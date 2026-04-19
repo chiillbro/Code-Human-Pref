@@ -1,0 +1,1191 @@
+diff --git a/bujjictl/condition.py b/bujjictl/condition.py
+new file mode 100644
+index 0000000..909635f
+--- /dev/null
++++ b/bujjictl/condition.py
+@@ -0,0 +1,281 @@
++"""
++Tiny condition-expression language for step `condition:` fields.
++
++Grammar (informal):
++
++    expr      := or_expr
++    or_expr   := and_expr ( "or" and_expr )*
++    and_expr  := unary ( "and" unary )*
++    unary     := "not" unary | primary
++    primary   := "(" expr ")" | comparison
++    comparison:=
++          REF.status   ("==" | "!=") STATUS
++        | REF.exit_code("==" | "!=") INT
++        | REF.stdout   "contains"    STRING
++        | REF.stderr   "contains"    STRING
++
++    REF    := <step id>
++    STATUS := succeeded | failed | timed_out | skipped | cancelled
++    STRING := "double-quoted" or 'single-quoted'
++
++The compiled Condition exposes:
++    .references  -> set[str] of step ids referenced
++    .evaluate(lookup) -> bool
++        where lookup(step_id) -> {"status": str, "exit_code": int|None,
++                                  "stdout": str, "stderr": str}
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Any, Callable
++
++
++class ConditionError(Exception):
++    pass
++
++
++_STATUSES = {"succeeded", "failed", "timed_out", "skipped", "cancelled"}
++_FIELDS = {"status", "exit_code", "stdout", "stderr"}
++
++_TOKEN_RE = re.compile(
++    r"""
++    \s*(?:
++        (?P<lparen>\()
++      | (?P<rparen>\))
++      | (?P<op>==|!=)
++      | (?P<dot>\.)
++      | (?P<string>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')
++      | (?P<int>-?\d+)
++      | (?P<ident>[A-Za-z_][A-Za-z0-9_\-]*)
++    )
++    """,
++    re.VERBOSE,
++)
++
++
++@dataclass
++class _Tok:
++    kind: str
++    value: Any
++
++
++def _tokenize(src: str) -> list[_Tok]:
++    pos = 0
++    toks: list[_Tok] = []
++    while pos < len(src):
++        m = _TOKEN_RE.match(src, pos)
++        if not m or m.end() == pos:
++            snippet = src[pos:pos + 12]
++            raise ConditionError(f"unexpected character near '{snippet}'")
++        pos = m.end()
++        for kind in ("lparen", "rparen", "op", "dot", "string", "int", "ident"):
++            v = m.group(kind)
++            if v is None:
++                continue
++            if kind == "string":
++                v = _unquote(v)
++            elif kind == "int":
++                v = int(v)
++            toks.append(_Tok(kind, v))
++            break
++    # trailing whitespace
++    return toks
++
++
++def _unquote(s: str) -> str:
++    q = s[0]
++    body = s[1:-1]
++    if q == '"':
++        return body.encode("utf-8").decode("unicode_escape")
++    return body.replace("\\'", "'")
++
++
++# --- AST ---------------------------------------------------------------------
++
++Lookup = Callable[[str], dict[str, Any]]
++
++
++class _Node:
++    def references(self) -> set[str]:
++        raise NotImplementedError
++
++    def evaluate(self, lookup: Lookup) -> bool:
++        raise NotImplementedError
++
++
++@dataclass
++class _BoolOp(_Node):
++    op: str  # 'and' | 'or'
++    parts: list[_Node]
++
++    def references(self) -> set[str]:
++        out: set[str] = set()
++        for p in self.parts:
++            out |= p.references()
++        return out
++
++    def evaluate(self, lookup: Lookup) -> bool:
++        if self.op == "and":
++            return all(p.evaluate(lookup) for p in self.parts)
++        return any(p.evaluate(lookup) for p in self.parts)
++
++
++@dataclass
++class _Not(_Node):
++    inner: _Node
++
++    def references(self) -> set[str]:
++        return self.inner.references()
++
++    def evaluate(self, lookup: Lookup) -> bool:
++        return not self.inner.evaluate(lookup)
++
++
++@dataclass
++class _Cmp(_Node):
++    step: str
++    field: str
++    op: str       # '==', '!=', 'contains'
++    rhs: Any
++
++    def references(self) -> set[str]:
++        return {self.step}
++
++    def evaluate(self, lookup: Lookup) -> bool:
++        info = lookup(self.step)
++        lhs = info.get(self.field)
++        if self.op == "contains":
++            return isinstance(lhs, str) and str(self.rhs) in lhs
++        if self.op == "==":
++            return lhs == self.rhs
++        if self.op == "!=":
++            return lhs != self.rhs
++        raise ConditionError(f"unknown operator '{self.op}'")
++
++
++# --- Parser ------------------------------------------------------------------
++
++class _Parser:
++    def __init__(self, toks: list[_Tok]):
++        self.toks = toks
++        self.i = 0
++
++    def _peek(self) -> _Tok | None:
++        return self.toks[self.i] if self.i < len(self.toks) else None
++
++    def _eat(self, kind: str, value: Any = None) -> _Tok:
++        t = self._peek()
++        if t is None or t.kind != kind or (value is not None and t.value != value):
++            exp = value if value is not None else kind
++            got = "end of input" if t is None else repr(t.value)
++            raise ConditionError(f"expected {exp}, got {got}")
++        self.i += 1
++        return t
++
++    def _accept_kw(self, word: str) -> bool:
++        t = self._peek()
++        if t and t.kind == "ident" and t.value == word:
++            self.i += 1
++            return True
++        return False
++
++    def parse(self) -> _Node:
++        node = self._or()
++        if self._peek() is not None:
++            raise ConditionError(f"unexpected trailing token {self._peek().value!r}")
++        return node
++
++    def _or(self) -> _Node:
++        parts = [self._and()]
++        while self._accept_kw("or"):
++            parts.append(self._and())
++        return parts[0] if len(parts) == 1 else _BoolOp("or", parts)
++
++    def _and(self) -> _Node:
++        parts = [self._unary()]
++        while self._accept_kw("and"):
++            parts.append(self._unary())
++        return parts[0] if len(parts) == 1 else _BoolOp("and", parts)
++
++    def _unary(self) -> _Node:
++        if self._accept_kw("not"):
++            return _Not(self._unary())
++        return self._primary()
++
++    def _primary(self) -> _Node:
++        t = self._peek()
++        if t and t.kind == "lparen":
++            self.i += 1
++            node = self._or()
++            self._eat("rparen")
++            return node
++        return self._comparison()
++
++    def _comparison(self) -> _Node:
++        step = self._eat("ident").value
++        if step in ("and", "or", "not", "contains"):
++            raise ConditionError(f"expected step id, got keyword '{step}'")
++        self._eat("dot")
++        field = self._eat("ident").value
++        if field not in _FIELDS:
++            raise ConditionError(
++                f"unknown field '{field}' (expected one of: {', '.join(sorted(_FIELDS))})"
++            )
++
++        t = self._peek()
++        if t and t.kind == "op":
++            op = t.value
++            self.i += 1
++            rhs = self._rhs_for(field, op)
++            return _Cmp(step, field, op, rhs)
++        if self._accept_kw("contains"):
++            if field not in ("stdout", "stderr"):
++                raise ConditionError(f"'contains' only valid for stdout/stderr, not '{field}'")
++            rhs = self._eat("string").value
++            return _Cmp(step, field, "contains", rhs)
++        raise ConditionError("expected '==', '!=' or 'contains'")
++
++    def _rhs_for(self, field: str, op: str) -> Any:
++        t = self._peek()
++        if t is None:
++            raise ConditionError(f"expected value after '{op}'")
++        self.i += 1
++        if field == "status":
++            if t.kind != "ident" or t.value not in _STATUSES:
++                raise ConditionError(
++                    f"status must be compared to one of: {', '.join(sorted(_STATUSES))}"
++                )
++            return t.value
++        if field == "exit_code":
++            if t.kind != "int":
++                raise ConditionError("exit_code must be compared to an integer")
++            return t.value
++        # stdout / stderr with == / !=
++        if t.kind != "string":
++            raise ConditionError(f"'{field}' must be compared to a quoted string")
++        return t.value
++
++
++# --- Public ------------------------------------------------------------------
++
++class Condition:
++    def __init__(self, source: str, node: _Node):
++        self.source = source
++        self._node = node
++        self.references = node.references()
++
++    def evaluate(self, lookup: Lookup) -> bool:
++        return self._node.evaluate(lookup)
++
++    def __repr__(self) -> str:
++        return f"Condition({self.source!r})"
++
++
++def compile_condition(source: str) -> Condition:
++    toks = _tokenize(source)
++    if not toks:
++        raise ConditionError("condition is empty")
++    node = _Parser(toks).parse()
++    return Condition(source, node)
+
+
+diff --git a/examples/conditional.yaml b/examples/conditional.yaml
+new file mode 100644
+index 0000000..8908d3e
+--- /dev/null
++++ b/examples/conditional.yaml
+@@ -0,0 +1,38 @@
++name: conditional
++description: Deploy on success, run cleanup on failure; gate a step on stdout.
++
++steps:
++  - id: build
++    run: |
++      echo "building..."
++      # flip to `exit 1` to see the cleanup branch run instead
++      exit 0
++
++  - id: deploy
++    depends_on:
++      - build
++    condition: 'build.status == succeeded'
++    run: 'echo "deploying"'
++
++  - id: cleanup
++    depends_on:
++      - build
++    condition: 'build.status == failed or build.status == timed_out'
++    run: 'echo "cleaning up after failed build"'
++
++  - id: probe
++    run: 'echo "MODE=prod"'
++
++  - id: prod-only
++    depends_on:
++      - probe
++    condition: 'probe.stdout contains "MODE=prod"'
++    run: 'echo "running prod-only step"'
++
++  - id: notify
++    # depends on deploy + cleanup; one of them is always skipped, the other runs.
++    # default rule: at least one non-skipped dep succeeded -> notify still runs.
++    depends_on:
++      - deploy
++      - cleanup
++    run: 'echo "notify: done"'
+
+
+
+diff --git a/tests/test_condition.py b/tests/test_condition.py
+new file mode 100644
+index 0000000..78f05b0
+--- /dev/null
++++ b/tests/test_condition.py
+@@ -0,0 +1,59 @@
++import unittest
++
++from bujjictl.condition import compile_condition, ConditionError
++
++
++def view(**kw):
++    base = {"status": "succeeded", "exit_code": 0, "stdout": "", "stderr": ""}
++    base.update(kw)
++    return base
++
++
++class TestCondition(unittest.TestCase):
++    def test_status_eq(self):
++        c = compile_condition("build.status == succeeded")
++        self.assertEqual(c.references, {"build"})
++        self.assertTrue(c.evaluate(lambda r: view(status="succeeded")))
++        self.assertFalse(c.evaluate(lambda r: view(status="failed")))
++
++    def test_status_ne(self):
++        c = compile_condition("build.status != failed")
++        self.assertTrue(c.evaluate(lambda r: view(status="succeeded")))
++
++    def test_contains(self):
++        c = compile_condition('build.stdout contains "MARK"')
++        self.assertTrue(c.evaluate(lambda r: view(stdout="xxMARKyy")))
++        self.assertFalse(c.evaluate(lambda r: view(stdout="nope")))
++
++    def test_exit_code(self):
++        c = compile_condition("a.exit_code == 7")
++        self.assertTrue(c.evaluate(lambda r: view(exit_code=7)))
++        self.assertFalse(c.evaluate(lambda r: view(exit_code=0)))
++
++    def test_and_or_not_paren(self):
++        c = compile_condition("(a.status == failed or a.status == timed_out) and not b.status == skipped")
++        self.assertEqual(c.references, {"a", "b"})
++        lk = {"a": view(status="failed"), "b": view(status="succeeded")}
++        self.assertTrue(c.evaluate(lambda r: lk[r]))
++        lk["b"] = view(status="skipped")
++        self.assertFalse(c.evaluate(lambda r: lk[r]))
++
++    def test_bad_status_value(self):
++        with self.assertRaises(ConditionError):
++            compile_condition("a.status == winning")
++
++    def test_bad_field(self):
++        with self.assertRaises(ConditionError):
++            compile_condition("a.nope == 1")
++
++    def test_contains_on_status(self):
++        with self.assertRaises(ConditionError):
++            compile_condition('a.status contains "x"')
++
++    def test_trailing(self):
++        with self.assertRaises(ConditionError):
++            compile_condition("a.status == failed junk")
++
++
++if __name__ == "__main__":
++    unittest.main()
+
+
+
+diff --git a/README.md b/README.md
+index a31861d..af53625 100644
+--- a/README.md
++++ b/README.md
+@@ -56,6 +56,7 @@ steps:                       # required, non-empty list
+     retries: 2
+     retry_backoff: 0.5
+     shell: /bin/bash
++    condition: 'fetch.status == succeeded'   # optional, see below
+ ```
+ 
+ ### Injected environment variables
+@@ -70,13 +71,50 @@ Every step receives, in addition to the process environment + `env:` blocks:
+ 
+ ### Execution semantics
+ 
+-* The steps form a DAG via `depends_on`. Steps with no unmet dependencies are
+-  scheduled immediately and run **concurrently** (bounded by `--max-workers`).
+-* If a step **fails** or **times out** (after exhausting retries), every
+-  transitive downstream step is marked `cancelled` and never runs.
++* The steps form a DAG via `depends_on`. A step becomes **ready** once *all*
++  its dependencies have reached a terminal state. Ready, independent steps run
++  **concurrently** (bounded by `--max-workers`).
++* When a step is ready, it is resolved as follows:
++  * **With an explicit `condition:`** — the expression is evaluated; *true* →
++    run, *false* → step is marked `skipped`.
++  * **Without a condition (default)** — if any dependency is
++    `failed`/`timed_out`/`cancelled` the step is `cancelled`; else if it has
++    dependencies and *all* of them are `skipped` the step is `skipped`;
++    otherwise it runs (so a mix of `succeeded` + `skipped` deps still runs).
++* `skipped` steps do **not** fail the workflow; the run is `succeeded` if every
++  step is `succeeded` or `skipped`.
+ * Retries use exponential backoff: `retry_backoff * 2^(attempt-1)` seconds.
+ * On timeout the step's process group is sent `SIGTERM`, then `SIGKILL`.
+ 
++### Conditions
++
++`condition:` is a small boolean expression over the step's **dependencies**
++(referencing any other step is a validation error):
++
++```text
++<dep>.status    == | !=  succeeded | failed | timed_out | skipped | cancelled
++<dep>.exit_code == | !=  <int>
++<dep>.stdout    contains "<string>"
++<dep>.stderr    contains "<string>"
++```
++
++Combine with `and`, `or`, `not`, and parentheses. Examples:
++
++```yaml
++condition: 'build.status == failed or build.status == timed_out'
++condition: 'probe.stdout contains "MODE=prod" and not build.status == skipped'
++```
++
++`stdout`/`stderr`/`exit_code` refer to the dependency's **last attempt**.
++
++### Interrupts (Ctrl-C / SIGTERM)
++
++On `SIGINT`/`SIGTERM` the engine performs a graceful shutdown: every running
++step's process group is sent `SIGTERM` (then `SIGKILL` if it doesn't exit), all
++running and pending steps are marked `cancelled` with reason `run interrupted`,
++and a complete JSON report is still written. `bujjictl run` then exits with
++code **130**.
++
+ ### Validation
+ 
+ `bujjictl validate` (and the start of every `run`) checks, **before executing
+@@ -88,6 +126,8 @@ anything**:
+ * Step ids are unique and well-formed.
+ * Every `depends_on` references an existing step; no self-dependencies.
+ * **No cycles** in the dependency graph.
++* `condition:` expressions parse, use valid fields/status names, and only
++  reference steps listed in `depends_on`.
+ 
+ All problems are collected and reported together — not just the first one.
+ 
+@@ -103,8 +143,8 @@ bujjictl report   <report.json> [--no-output]
+ 
+ * `validate` — parse + validate only. Exit 0 on success, 1 on error.
+ * `run` — validate, execute, write a JSON report (default
+-  `<name>.report.json`), then pretty-print it. Exit 0 on success, 1 on
+-  validation error, 2 if any step did not succeed.
++  `<name>.report.json`), then pretty-print it. Exit **0** on success, **1** on
++  validation error, **2** if any step failed/timed-out, **130** if interrupted.
+ * `report` — pretty-print a previously written JSON report.
+ 
+ ---
+diff --git a/bujjictl/cli.py b/bujjictl/cli.py
+index 1425fb0..ac00581 100644
+--- a/bujjictl/cli.py
++++ b/bujjictl/cli.py
+@@ -82,6 +82,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
+         print(file=sys.stderr)
+         render(report_dict, stream=sys.stdout)
+ 
++    if result.status == "interrupted":
++        return 130
+     return 0 if result.status == "succeeded" else 2
+ 
+ 
+diff --git a/bujjictl/engine.py b/bujjictl/engine.py
+index 4b97ef9..13224bc 100644
+--- a/bujjictl/engine.py
++++ b/bujjictl/engine.py
+@@ -17,7 +17,7 @@ from .model import Step, Workflow
+ 
+ 
+ # ----------------------------------------------------------------------------
+-# Result types
++# Status constants
+ # ----------------------------------------------------------------------------
+ 
+ PENDING = "pending"
+@@ -26,9 +26,17 @@ SUCCEEDED = "succeeded"
+ FAILED = "failed"
+ TIMED_OUT = "timed_out"
+ CANCELLED = "cancelled"
++SKIPPED = "skipped"
++
++INTERRUPTED = "interrupted"  # run-level only
++
++_TERMINAL = {SUCCEEDED, FAILED, TIMED_OUT, CANCELLED, SKIPPED}
++_FAILURE_LIKE = {FAILED, TIMED_OUT, CANCELLED}
+ 
+-_TERMINAL = {SUCCEEDED, FAILED, TIMED_OUT, CANCELLED}
+ 
++# ----------------------------------------------------------------------------
++# Result types
++# ----------------------------------------------------------------------------
+ 
+ @dataclass
+ class Attempt:
+@@ -65,21 +73,34 @@ class StepResult:
+     finished_at: str | None = None
+     duration: float = 0.0
+     cancel_reason: str | None = None
++    skip_reason: str | None = None
+ 
+     def to_dict(self) -> dict:
+         return {
+             "id": self.step.id,
+             "name": self.step.name,
+             "status": self.status,
++            "condition": self.step.condition.source if self.step.condition else None,
+             "depends_on": list(self.step.depends_on),
+             "started_at": self.started_at,
+             "finished_at": self.finished_at,
+             "duration": round(self.duration, 6),
+             "attempt_count": len(self.attempts),
+             "cancel_reason": self.cancel_reason,
++            "skip_reason": self.skip_reason,
+             "attempts": [a.to_dict() for a in self.attempts],
+         }
+ 
++    # View used by condition evaluation on *dependencies*.
++    def as_condition_view(self) -> dict:
++        last = self.attempts[-1] if self.attempts else None
++        return {
++            "status": self.status,
++            "exit_code": last.exit_code if last else None,
++            "stdout": last.stdout if last else "",
++            "stderr": last.stderr if last else "",
++        }
++
+ 
+ @dataclass
+ class RunReport:
+@@ -106,7 +127,7 @@ class RunReport:
+ 
+ 
+ def _summarize(steps: list[StepResult]) -> dict:
+-    counts = {SUCCEEDED: 0, FAILED: 0, TIMED_OUT: 0, CANCELLED: 0}
++    counts = {SUCCEEDED: 0, FAILED: 0, TIMED_OUT: 0, CANCELLED: 0, SKIPPED: 0}
+     for s in steps:
+         if s.status in counts:
+             counts[s.status] += 1
+@@ -138,24 +159,37 @@ class Engine:
+             s.id: set(s.depends_on) for s in workflow.steps
+         }
+         self._scheduled: set[str] = set()
++        self._procs: dict[str, subprocess.Popen] = {}
++        self._interrupted = False
++        self._cancelled_steps: set[str] = set()  # steps whose running proc we force-killed
+ 
+     # -- public ------------------------------------------------------------
+ 
+     def run(self) -> RunReport:
+         t0 = time.monotonic()
+         started_at = _now_iso()
+-        self.log(f"▶ workflow '{self.wf.name}' starting ({len(self.wf.steps)} steps, max_workers={self.max_workers})")
++        self.log(f"▶ workflow '{self.wf.name}' starting "
++                 f"({len(self.wf.steps)} steps, max_workers={self.max_workers})")
+ 
+-        with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="bujji") as pool:
+-            with self._cond:
+-                self._schedule_ready(pool)
+-                while not self._all_terminal():
+-                    self._cond.wait()
+-                    self._schedule_ready(pool)
++        prev_handlers = self._install_signal_handlers()
++        try:
++            with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="bujji") as pool:
++                with self._cond:
++                    self._dispatch_ready(pool)
++                    while not self._all_terminal():
++                        self._cond.wait()
++                        self._dispatch_ready(pool)
++        finally:
++            self._restore_signal_handlers(prev_handlers)
+ 
+         finished_at = _now_iso()
+         duration = time.monotonic() - t0
+-        status = SUCCEEDED if all(r.status == SUCCEEDED for r in self._results.values()) else FAILED
++        if self._interrupted:
++            status = INTERRUPTED
++        elif all(r.status in (SUCCEEDED, SKIPPED) for r in self._results.values()):
++            status = SUCCEEDED
++        else:
++            status = FAILED
+         self.log(f"■ workflow '{self.wf.name}' finished: {status} in {duration:.3f}s")
+ 
+         ordered = [self._results[s.id] for s in self.wf.steps]
+@@ -165,51 +199,145 @@ class Engine:
+             duration=duration, steps=ordered,
+         )
+ 
++    def interrupt(self) -> None:
++        """Request graceful shutdown: kill running procs, cancel pending, unblock run()."""
++        with self._cond:
++            if self._interrupted:
++                return
++            self._interrupted = True
++            procs = list(self._procs.items())
++            for sid, _ in procs:
++                self._cancelled_steps.add(sid)
++            for sid, res in self._results.items():
++                if res.status == PENDING:
++                    res.status = CANCELLED
++                    res.cancel_reason = "run interrupted"
++                    res.finished_at = _now_iso()
++            self._cond.notify_all()
++        self.log("⚠ interrupt received — terminating running steps and cancelling pending ones")
++        # Kill outside the lock so worker threads can finish their bookkeeping.
++        for sid, proc in procs:
++            _kill_process_group(proc)
++
++    # -- signal handling ---------------------------------------------------
++
++    def _install_signal_handlers(self):
++        if threading.current_thread() is not threading.main_thread():
++            return None  # can't install handlers off the main thread
++
++        def _handler(signum, frame):
++            self.interrupt()
++
++        prev = {}
++        for sig in (signal.SIGINT, signal.SIGTERM):
++            try:
++                prev[sig] = signal.signal(sig, _handler)
++            except (ValueError, OSError):
++                pass
++        return prev
++
++    @staticmethod
++    def _restore_signal_handlers(prev) -> None:
++        if not prev:
++            return
++        for sig, h in prev.items():
++            try:
++                signal.signal(sig, h)
++            except (ValueError, OSError):
++                pass
++
+     # -- scheduling --------------------------------------------------------
+ 
+     def _all_terminal(self) -> bool:
+         return all(r.status in _TERMINAL for r in self._results.values())
+ 
+-    def _schedule_ready(self, pool: ThreadPoolExecutor) -> None:
+-        for sid, deps in self._remaining_deps.items():
+-            if sid in self._scheduled:
+-                continue
+-            if self._results[sid].status != PENDING:
+-                continue
+-            if deps:
+-                continue
+-            self._scheduled.add(sid)
+-            self._results[sid].status = RUNNING
+-            pool.submit(self._run_step, sid)
++    def _dispatch_ready(self, pool: ThreadPoolExecutor) -> None:
++        """Called with self._cond held. Resolve any step whose deps are all terminal."""
++        if self._interrupted:
++            return
++        progressed = True
++        while progressed:
++            progressed = False
++            for sid, deps in self._remaining_deps.items():
++                if sid in self._scheduled:
++                    continue
++                if self._results[sid].status != PENDING:
++                    continue
++                if deps:
++                    continue
++                self._scheduled.add(sid)
++                if self._resolve_step(sid, pool):
++                    progressed = True  # a skip/cancel may have unblocked further steps
++
++    def _resolve_step(self, sid: str, pool: ThreadPoolExecutor) -> bool:
++        """Decide run / skip / cancel for a step whose deps are all terminal.
++
++        Returns True if the step reached a terminal state synchronously (skip/cancel),
++        so the caller should re-scan for newly-ready downstream steps.
++        """
++        step = self.wf.steps_by_id[sid]
++        res = self._results[sid]
++        dep_results = {d: self._results[d] for d in step.depends_on}
++
++        if step.condition is not None:
++            try:
++                ok = step.condition.evaluate(lambda ref: dep_results[ref].as_condition_view())
++            except Exception as e:  # defensive: a bad condition shouldn't crash the run
++                res.status = FAILED
++                res.finished_at = _now_iso()
++                res.cancel_reason = f"condition evaluation error: {e}"
++                self.log(f"  ✘ step '{sid}' condition error: {e}")
++                self._propagate_terminal(sid)
++                return True
++            if ok:
++                self._launch(sid, pool)
++                return False
++            res.status = SKIPPED
++            res.skip_reason = f"condition false: {step.condition.source}"
++            res.finished_at = _now_iso()
++            self.log(f"  ⤳ step '{sid}' skipped (condition false)")
++            self._propagate_terminal(sid)
++            return True
++
++        # Default semantics (no explicit condition):
++        #   - any failure-like dep   -> cancelled
++        #   - else if deps exist and all skipped -> skipped
++        #   - else -> run
++        failed_dep = next((d for d, r in dep_results.items() if r.status in _FAILURE_LIKE), None)
++        if failed_dep is not None:
++            res.status = CANCELLED
++            res.cancel_reason = f"upstream step '{failed_dep}' {dep_results[failed_dep].status}"
++            res.finished_at = _now_iso()
++            self.log(f"  ⊘ step '{sid}' cancelled ({res.cancel_reason})")
++            self._propagate_terminal(sid)
++            return True
++        if dep_results and all(r.status == SKIPPED for r in dep_results.values()):
++            res.status = SKIPPED
++            res.skip_reason = "all dependencies were skipped"
++            res.finished_at = _now_iso()
++            self.log(f"  ⤳ step '{sid}' skipped (all dependencies skipped)")
++            self._propagate_terminal(sid)
++            return True
++
++        self._launch(sid, pool)
++        return False
++
++    def _launch(self, sid: str, pool: ThreadPoolExecutor) -> None:
++        self._results[sid].status = RUNNING
++        pool.submit(self._run_step, sid)
++
++    def _propagate_terminal(self, sid: str) -> None:
++        """Dependency `sid` is terminal: clear it from every dependent's remaining set."""
++        for child in self.wf.dependents.get(sid, ()):
++            self._remaining_deps[child].discard(sid)
+ 
+     def _on_step_finished(self, sid: str, status: str) -> None:
+         with self._cond:
+             res = self._results[sid]
+             res.status = status
+-            if status == SUCCEEDED:
+-                for child in self.wf.dependents.get(sid, ()):
+-                    self._remaining_deps[child].discard(sid)
+-            else:
+-                self._cancel_downstream(sid, reason=f"upstream step '{sid}' {status}")
++            self._propagate_terminal(sid)
+             self._cond.notify_all()
+ 
+-    def _cancel_downstream(self, root: str, *, reason: str) -> None:
+-        # BFS over dependents; mark anything still pending as cancelled.
+-        queue = list(self.wf.dependents.get(root, ()))
+-        seen: set[str] = set()
+-        while queue:
+-            cur = queue.pop()
+-            if cur in seen:
+-                continue
+-            seen.add(cur)
+-            res = self._results[cur]
+-            if res.status == PENDING:
+-                res.status = CANCELLED
+-                res.cancel_reason = reason
+-                res.finished_at = _now_iso()
+-                self.log(f"  ⊘ step '{cur}' cancelled ({reason})")
+-            queue.extend(self.wf.dependents.get(cur, ()))
+-
+     # -- execution ---------------------------------------------------------
+ 
+     def _run_step(self, sid: str) -> None:
+@@ -228,29 +356,46 @@ class Engine:
+         final_status = FAILED
+         max_attempts = step.retries + 1
+         for n in range(1, max_attempts + 1):
++            if self._interrupted:
++                final_status = CANCELLED
++                res.cancel_reason = "run interrupted"
++                break
+             env["BUJJI_ATTEMPT"] = str(n)
+-            attempt = self._exec_once(step, n, env)
++            attempt = self._exec_once(sid, step, n, env)
+             res.attempts.append(attempt)
++
++            if sid in self._cancelled_steps:
++                final_status = CANCELLED
++                res.cancel_reason = "run interrupted"
++                break
+             if attempt.exit_code == 0 and not attempt.timed_out and attempt.error is None:
+                 final_status = SUCCEEDED
+                 break
+-            if attempt.timed_out:
+-                final_status = TIMED_OUT
+-            else:
+-                final_status = FAILED
++            final_status = TIMED_OUT if attempt.timed_out else FAILED
+             if n < max_attempts:
+                 delay = step.retry_backoff * (2 ** (n - 1))
+                 self.log(f"    ↻ step '{sid}' attempt {n} failed; retrying in {delay:.2f}s")
+-                time.sleep(delay)
++                if self._sleep_interruptible(delay):
++                    final_status = CANCELLED
++                    res.cancel_reason = "run interrupted"
++                    break
+ 
+         res.finished_at = _now_iso()
+         res.duration = time.monotonic() - t0
+-        glyph = "✔" if final_status == SUCCEEDED else "✘"
++        glyph = "✔" if final_status == SUCCEEDED else ("⊘" if final_status == CANCELLED else "✘")
+         self.log(f"  {glyph} step '{sid}' {final_status} "
+                  f"({len(res.attempts)} attempt{'s' if len(res.attempts) != 1 else ''}, {res.duration:.3f}s)")
+         self._on_step_finished(sid, final_status)
+ 
+-    def _exec_once(self, step: Step, number: int, env: dict[str, str]) -> Attempt:
++    def _sleep_interruptible(self, delay: float) -> bool:
++        """Sleep up to `delay` seconds, waking early on interrupt. Returns True if interrupted."""
++        with self._cond:
++            if self._interrupted:
++                return True
++            self._cond.wait(timeout=delay)
++            return self._interrupted
++
++    def _exec_once(self, sid: str, step: Step, number: int, env: dict[str, str]) -> Attempt:
+         a_t0 = time.monotonic()
+         a_start = _now_iso()
+         exit_code: int | None = None
+@@ -270,22 +415,33 @@ class Engine:
+ 
+         try:
+             proc = subprocess.Popen([step.shell, "-c", step.run], **popen_kwargs)
++        except FileNotFoundError as e:
++            return Attempt(number, a_start, _now_iso(), time.monotonic() - a_t0,
++                           None, "", "", False, error=f"shell not found: {e}")
++        except Exception as e:
++            return Attempt(number, a_start, _now_iso(), time.monotonic() - a_t0,
++                           None, "", "", False, error=f"{type(e).__name__}: {e}")
++
++        with self._lock:
++            self._procs[sid] = proc
++        try:
+             try:
+                 stdout, stderr = proc.communicate(timeout=step.timeout)
+                 exit_code = proc.returncode
+             except subprocess.TimeoutExpired:
+                 timed_out = True
+-                _kill_process(proc)
++                _kill_process_group(proc)
+                 try:
+                     stdout, stderr = proc.communicate(timeout=5)
+                 except subprocess.TimeoutExpired:
+                     proc.kill()
+                     stdout, stderr = proc.communicate()
+                 exit_code = proc.returncode
+-        except FileNotFoundError as e:
+-            error = f"shell not found: {e}"
+-        except Exception as e:  # defensive: surface in report rather than crashing the run
++        except Exception as e:  # defensive
+             error = f"{type(e).__name__}: {e}"
++        finally:
++            with self._lock:
++                self._procs.pop(sid, None)
+ 
+         return Attempt(
+             number=number,
+@@ -300,17 +456,27 @@ class Engine:
+         )
+ 
+ 
+-def _kill_process(proc: subprocess.Popen) -> None:
++def _kill_process_group(proc: subprocess.Popen) -> None:
+     try:
+         if os.name == "posix":
+             os.killpg(proc.pid, signal.SIGTERM)
+-            time.sleep(0.2)
+-            if proc.poll() is None:
+-                os.killpg(proc.pid, signal.SIGKILL)
++            # Give it a brief moment, then SIGKILL the whole group if still alive.
++            for _ in range(10):
++                if proc.poll() is not None:
++                    return
++                time.sleep(0.05)
++            os.killpg(proc.pid, signal.SIGKILL)
+         else:
+             proc.terminate()
+-            time.sleep(0.2)
+-            if proc.poll() is None:
+-                proc.kill()
++            for _ in range(10):
++                if proc.poll() is not None:
++                    return
++                time.sleep(0.05)
++            proc.kill()
+     except ProcessLookupError:
+         pass
++    except Exception:
++        try:
++            proc.kill()
++        except Exception:
++            pass
+diff --git a/bujjictl/model.py b/bujjictl/model.py
+index 1046751..1b5b140 100644
+--- a/bujjictl/model.py
++++ b/bujjictl/model.py
+@@ -6,6 +6,7 @@ import re
+ from dataclasses import dataclass, field
+ from typing import Any
+ 
++from .condition import Condition, ConditionError, compile_condition
+ from .yaml_parser import load_file, YamlError
+ 
+ 
+@@ -23,7 +24,7 @@ _TOP_KEYS = {"name", "description", "env", "defaults", "steps"}
+ _DEFAULT_KEYS = {"timeout", "retries", "retry_backoff", "shell"}
+ _STEP_KEYS = {
+     "id", "name", "run", "depends_on", "env",
+-    "timeout", "retries", "retry_backoff", "shell",
++    "timeout", "retries", "retry_backoff", "shell", "condition",
+ }
+ 
+ 
+@@ -38,6 +39,7 @@ class Step:
+     retries: int = 0
+     retry_backoff: float = 1.0
+     shell: str = "/bin/sh"
++    condition: Condition | None = None
+ 
+ 
+ @dataclass
+@@ -168,9 +170,12 @@ def _validate(doc: Any, errors: list[str]) -> Workflow | None:
+             errors.append(f"{loc}: 'shell' must be a non-empty string")
+             shell = d_shell
+ 
++        cond = _validate_condition(raw.get("condition"), deps, loc, errors)
++
+         steps.append(Step(
+             id=sid, run=run, name=sname, depends_on=deps, env=senv,
+-            timeout=timeout, retries=retries or 0, retry_backoff=backoff or 1.0, shell=shell,
++            timeout=timeout, retries=retries or 0, retry_backoff=backoff or 1.0,
++            shell=shell, condition=cond,
+         ))
+ 
+     # Reference + cycle checks (only meaningful once we have ids).
+@@ -241,6 +246,26 @@ def _validate_depends_on(value: Any, loc: str, errors: list[str]) -> list[str]:
+     return out
+ 
+ 
++def _validate_condition(value: Any, deps: list[str], loc: str, errors: list[str]) -> Condition | None:
++    if value is None:
++        return None
++    if not isinstance(value, str) or not value.strip():
++        errors.append(f"{loc}: 'condition' must be a non-empty string expression")
++        return None
++    try:
++        cond = compile_condition(value)
++    except ConditionError as e:
++        errors.append(f"{loc}: invalid condition: {e}")
++        return None
++    dep_set = set(deps)
++    for ref in cond.references:
++        if ref not in dep_set:
++            errors.append(
++                f"{loc}: condition references step '{ref}' which is not listed in depends_on"
++            )
++    return cond
++
++
+ def _validate_number(value: Any, loc: str, errors: list[str], *, allow_none: bool = False, minimum: float | None = None) -> float | None:
+     if value is None:
+         if allow_none:
+diff --git a/bujjictl/report.py b/bujjictl/report.py
+index aa8aef4..dad5f2b 100644
+--- a/bujjictl/report.py
++++ b/bujjictl/report.py
+@@ -9,12 +9,14 @@ import textwrap
+ 
+ 
+ _STATUS_STYLE = {
+-    "succeeded": ("✔", "32"),   # green
+-    "failed":    ("✘", "31"),   # red
+-    "timed_out": ("⏱", "33"),   # yellow
+-    "cancelled": ("⊘", "90"),   # grey
+-    "running":   ("▷", "36"),
+-    "pending":   ("·", "90"),
++    "succeeded":   ("✔", "32"),   # green
++    "failed":      ("✘", "31"),   # red
++    "timed_out":   ("⏱", "33"),   # yellow
++    "cancelled":   ("⊘", "90"),   # grey
++    "skipped":     ("⤳", "36"),   # cyan
++    "interrupted": ("✘", "31"),
++    "running":     ("▷", "36"),
++    "pending":     ("·", "90"),
+ }
+ 
+ 
+@@ -62,7 +64,7 @@ def render(report: dict, *, stream=sys.stdout, show_output: bool = True) -> None
+     summary = report.get("summary", {})
+     if summary:
+         parts = []
+-        for k in ("succeeded", "failed", "timed_out", "cancelled"):
++        for k in ("succeeded", "failed", "timed_out", "cancelled", "skipped"):
+             v = summary.get(k, 0)
+             g, cde = _STATUS_STYLE[k]
+             parts.append(_c(f"{g} {v} {k}", cde, enabled=color))
+@@ -100,8 +102,12 @@ def render(report: dict, *, stream=sys.stdout, show_output: bool = True) -> None
+         out(_c(f"• {s.get('id')}", "1", enabled=color)
+             + (f"  —  {title}" if s.get("name") else "")
+             + "   [" + _c(f"{g} {st}", cde, enabled=color) + "]")
++        if s.get("condition"):
++            out(f"    condition: {s['condition']}")
++        if s.get("skip_reason"):
++            out(f"    skipped:   {s['skip_reason']}")
+         if s.get("cancel_reason"):
+-            out(f"    reason: {s['cancel_reason']}")
++            out(f"    reason:    {s['cancel_reason']}")
+         for a in s.get("attempts", []):
+             ec = a.get("exit_code")
+             tag = "TIMEOUT" if a.get("timed_out") else (f"exit={ec}" if ec is not None else "error")
+diff --git a/tests/test_engine.py b/tests/test_engine.py
+index cbc2be2..5da40b6 100644
+--- a/tests/test_engine.py
++++ b/tests/test_engine.py
+@@ -104,3 +104,135 @@ class TestEngine(unittest.TestCase):
+ 
+ if __name__ == "__main__":
+     unittest.main()
++
++
++class TestConditions(unittest.TestCase):
++    def test_run_on_failure(self):
++        # deploy runs on success, cleanup runs on failure; build fails.
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: build\n    run: 'exit 1'\n"
++            "  - id: deploy\n"
++            "    depends_on:\n      - build\n"
++            "    condition: 'build.status == succeeded'\n"
++            "    run: 'echo deploy'\n"
++            "  - id: cleanup\n"
++            "    depends_on:\n      - build\n"
++            "    condition: 'build.status == failed'\n"
++            "    run: 'echo cleaning'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        by = {s.step.id: s for s in rep.steps}
++        self.assertEqual(by["build"].status, "failed")
++        self.assertEqual(by["deploy"].status, "skipped")
++        self.assertEqual(by["cleanup"].status, "succeeded")
++        self.assertIn("cleaning", by["cleanup"].attempts[0].stdout)
++        # workflow overall failed because build failed
++        self.assertEqual(rep.status, "failed")
++
++    def test_stdout_contains(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: probe\n    run: 'echo MODE=prod'\n"
++            "  - id: gated\n"
++            "    depends_on:\n      - probe\n"
++            '    condition: \'probe.stdout contains "MODE=prod"\'\n'
++            "    run: 'echo go'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        by = {s.step.id: s for s in rep.steps}
++        self.assertEqual(by["gated"].status, "succeeded")
++
++    def test_skip_propagation_all_skipped(self):
++        # a succeeds; b is skipped via condition; c depends only on b -> c skipped.
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    run: 'true'\n"
++            "  - id: b\n"
++            "    depends_on:\n      - a\n"
++            "    condition: 'a.status == failed'\n"
++            "    run: 'echo never'\n"
++            "  - id: c\n"
++            "    depends_on:\n      - b\n"
++            "    run: 'echo never'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        by = {s.step.id: s for s in rep.steps}
++        self.assertEqual(by["b"].status, "skipped")
++        self.assertEqual(by["c"].status, "skipped")
++        self.assertEqual(by["c"].skip_reason, "all dependencies were skipped")
++        # succeeded + skipped only -> overall succeeded
++        self.assertEqual(rep.status, "succeeded")
++
++    def test_skip_propagation_mixed(self):
++        # c depends on [a (succeeded), b (skipped)] -> c should still RUN.
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    run: 'true'\n"
++            "  - id: b\n"
++            "    depends_on:\n      - a\n"
++            "    condition: 'a.status == failed'\n"
++            "    run: 'echo never'\n"
++            "  - id: c\n"
++            "    depends_on:\n      - a\n      - b\n"
++            "    run: 'echo go'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        by = {s.step.id: s for s in rep.steps}
++        self.assertEqual(by["b"].status, "skipped")
++        self.assertEqual(by["c"].status, "succeeded")
++
++    def test_condition_ref_must_be_in_depends_on(self):
++        from bujjictl.model import ValidationError
++        with self.assertRaises(ValidationError) as ctx:
++            _wf(
++                "name: t\nsteps:\n"
++                "  - id: a\n    run: 'true'\n"
++                "  - id: b\n    run: 'true'\n"
++                "    condition: 'a.status == succeeded'\n"
++            )
++        self.assertTrue(any("not listed in depends_on" in e for e in ctx.exception.errors))
++
++    def test_invalid_condition_syntax(self):
++        from bujjictl.model import ValidationError
++        with self.assertRaises(ValidationError):
++            _wf(
++                "name: t\nsteps:\n"
++                "  - id: a\n    run: 'true'\n"
++                "  - id: b\n    depends_on:\n      - a\n"
++                "    condition: 'a.status == winning'\n"
++                "    run: 'true'\n"
++            )
++
++
++class TestInterrupt(unittest.TestCase):
++    def test_interrupt_kills_and_reports(self):
++        import threading
++        import tempfile
++
++        # Use a sentinel that the child writes after sleeping; it must NOT exist.
++        d = tempfile.mkdtemp()
++        sentinel = os.path.join(d, "done")
++        wf = _wf(
++            "name: t\nsteps:\n"
++            f"  - id: slow\n    run: 'sleep 5 && touch {sentinel}'\n"
++            "  - id: after\n    depends_on:\n      - slow\n    run: 'echo nope'\n"
++        )
++        eng = Engine(wf, logger=SILENT)
++        threading.Timer(0.4, eng.interrupt).start()
++        t0 = time.monotonic()
++        rep = eng.run()
++        elapsed = time.monotonic() - t0
++
++        self.assertLess(elapsed, 3.0, "interrupt should stop the run promptly")
++        self.assertEqual(rep.status, "interrupted")
++        by = {s.step.id: s for s in rep.steps}
++        self.assertEqual(by["slow"].status, "cancelled")
++        self.assertEqual(by["slow"].cancel_reason, "run interrupted")
++        self.assertEqual(by["after"].status, "cancelled")
++        # Child process group must have been killed (sentinel never created).
++        time.sleep(0.3)
++        self.assertFalse(os.path.exists(sentinel))
++        # Report still serializable.
++        import json as _json
++        _json.dumps(rep.to_dict())
