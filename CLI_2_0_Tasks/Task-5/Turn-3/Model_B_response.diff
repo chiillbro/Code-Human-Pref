@@ -1,0 +1,226 @@
+diff --git a/README.md b/README.md
+index 0eb68a0..f9de2e7 100644
+--- a/README.md
++++ b/README.md
+@@ -159,10 +159,14 @@ bujjictl report   <report.json> [--no-output]
+ 
+ * `validate` — parse + validate only. Exit 0 on success, 1 on error.
+ * `run` — validate, execute, write a JSON report (default
+-  `<name>.report.json`), then pretty-print it. Exit 0 on success, 1 on
+-  validation error, 2 if any step failed/timed-out, **130** if interrupted.
++  `<name>.report.json`), then pretty-print it. Exit 0 on `succeeded`, 1 on
++  validation error, 2 on `partial` or `failed`, **130** if interrupted.
+ * `report` — pretty-print a previously written JSON report.
+ 
++The workflow-level **status** is derived from the steps that actually ran
++(skipped/cancelled steps are ignored): `succeeded` if all of them succeeded,
++`failed` if all of them failed/timed-out, and `partial` for any mix.
++
+ ---
+ 
+ ## Report format
+@@ -170,11 +174,15 @@ bujjictl report   <report.json> [--no-output]
+ ```jsonc
+ {
+   "workflow": { "name": "...", "description": "..." },
+-  "status": "succeeded" | "failed" | "interrupted",
++  "status": "succeeded" | "partial" | "failed" | "interrupted",
+   "started_at": "2026-04-19T...Z",
+   "finished_at": "...",
+   "duration": 12.345,
+-  "summary": { "succeeded": 4, "failed": 0, "timed_out": 0, "skipped": 0, "cancelled": 0, "total": 4 },
++  "summary": {
++    "succeeded": 4, "failed": 0, "timed_out": 0, "skipped": 0, "cancelled": 0,
++    "total": 4,
++    "total_retry_delay": 0.0   // seconds spent sleeping between retries (all steps)
++  },
+   "steps": [
+     {
+       "id": "build",
+@@ -185,6 +193,7 @@ bujjictl report   <report.json> [--no-output]
+       "started_at": "...",
+       "finished_at": "...",
+       "duration": 1.234,
++      "retry_delay": 0.5,   // seconds this step spent waiting between retries
+       "attempt_count": 2,
+       "reason": null,       // why skipped/cancelled (if applicable)
+       "attempts": [
+diff --git a/bujjictl/engine.py b/bujjictl/engine.py
+index 5208bd7..8c4afd5 100644
+--- a/bujjictl/engine.py
++++ b/bujjictl/engine.py
+@@ -29,9 +29,12 @@ TIMED_OUT = "timed_out"
+ CANCELLED = "cancelled"
+ SKIPPED = "skipped"
+ INTERRUPTED = "interrupted"  # workflow-level only
++PARTIAL = "partial"          # workflow-level only
+ 
+ _TERMINAL = {SUCCEEDED, FAILED, TIMED_OUT, CANCELLED, SKIPPED}
+ _FAILURE_LIKE = {FAILED, TIMED_OUT, CANCELLED}
++# Statuses of steps that actually executed (used for workflow-level classification).
++_RAN = {SUCCEEDED, FAILED, TIMED_OUT}
+ 
+ 
+ @dataclass
+@@ -68,6 +71,7 @@ class StepResult:
+     started_at: str | None = None
+     finished_at: str | None = None
+     duration: float = 0.0
++    retry_delay: float = 0.0   # total time spent waiting between retries
+     reason: str | None = None  # why it was skipped / cancelled
+ 
+     # -- condition.StepView protocol ---------------------------------------
+@@ -90,6 +94,7 @@ class StepResult:
+             "started_at": self.started_at,
+             "finished_at": self.finished_at,
+             "duration": round(self.duration, 6),
++            "retry_delay": round(self.retry_delay, 6),
+             "attempt_count": len(self.attempts),
+             "reason": self.reason,
+             "attempts": [a.to_dict() for a in self.attempts],
+@@ -126,9 +131,26 @@ def _summarize(steps: list[StepResult]) -> dict:
+         if s.status in counts:
+             counts[s.status] += 1
+     counts["total"] = len(steps)
++    counts["total_retry_delay"] = round(sum(s.retry_delay for s in steps), 6)
+     return counts
+ 
+ 
++def _overall_status(steps: list[StepResult]) -> str:
++    """Classify the workflow by the steps that actually executed.
++
++    skipped/cancelled steps are ignored (they never ran). Of the steps that ran:
++      * all succeeded (or none ran)  -> SUCCEEDED
++      * all failed/timed_out         -> FAILED
++      * mix                          -> PARTIAL
++    """
++    ran = [s.status for s in steps if s.status in _RAN]
++    if all(s == SUCCEEDED for s in ran):
++        return SUCCEEDED
++    if all(s != SUCCEEDED for s in ran):
++        return FAILED
++    return PARTIAL
++
++
+ def _now_iso() -> str:
+     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+ 
+@@ -185,15 +207,13 @@ class Engine:
+ 
+         finished_at = _now_iso()
+         duration = time.monotonic() - t0
++        ordered = [self._results[s.id] for s in self.wf.steps]
+         if self._interrupted.is_set():
+             status = INTERRUPTED
+-        elif all(r.status in (SUCCEEDED, SKIPPED) for r in self._results.values()):
+-            status = SUCCEEDED
+         else:
+-            status = FAILED
++            status = _overall_status(ordered)
+         self.log(f"■ workflow '{self.wf.name}' finished: {status} in {duration:.3f}s")
+ 
+-        ordered = [self._results[s.id] for s in self.wf.steps]
+         return RunReport(
+             workflow=self.wf, status=status,
+             started_at=started_at, finished_at=finished_at,
+@@ -351,7 +371,10 @@ class Engine:
+             if n < max_attempts:
+                 delay = step.retry_backoff * (2 ** (n - 1))
+                 self.log(f"    ↻ step '{sid}' attempt {n} failed; retrying in {delay:.2f}s")
+-                if self._interrupted.wait(delay):
++                w0 = time.monotonic()
++                hit = self._interrupted.wait(delay)
++                res.retry_delay += time.monotonic() - w0
++                if hit:
+                     final_status = CANCELLED
+                     res.reason = "run interrupted"
+                     break
+diff --git a/bujjictl/report.py b/bujjictl/report.py
+index a9b8a76..0457dda 100644
+--- a/bujjictl/report.py
++++ b/bujjictl/report.py
+@@ -14,6 +14,7 @@ _STATUS_STYLE = {
+     "timed_out":   ("⏱", "33"),   # yellow
+     "skipped":     ("↷", "36"),   # cyan
+     "cancelled":   ("⊘", "90"),   # grey
++    "partial":     ("◐", "33"),   # yellow (workflow-level)
+     "interrupted": ("‼", "35"),   # magenta (workflow-level)
+     "running":     ("▷", "36"),
+     "pending":     ("·", "90"),
+@@ -69,6 +70,9 @@ def render(report: dict, *, stream=sys.stdout, show_output: bool = True) -> None
+             g, cde = _STATUS_STYLE[k]
+             parts.append(_c(f"{g} {v} {k}", cde, enabled=color))
+         out("  Summary:  " + "   ".join(parts) + f"   (total {summary.get('total', 0)})")
++        trd = summary.get("total_retry_delay")
++        if trd:
++            out(f"  Retry delay: {_fmt_duration(trd)} total spent waiting between retries")
+     out()
+ 
+     steps = report.get("steps", [])
+diff --git a/tests/test_engine.py b/tests/test_engine.py
+index cbc2be2..caf6785 100644
+--- a/tests/test_engine.py
++++ b/tests/test_engine.py
+@@ -3,7 +3,7 @@ import tempfile
+ import time
+ import unittest
+ 
+-from bujjictl.engine import Engine, SUCCEEDED, FAILED, CANCELLED, TIMED_OUT
++from bujjictl.engine import Engine, SUCCEEDED, FAILED, PARTIAL, CANCELLED, TIMED_OUT
+ from bujjictl.model import load_workflow
+ 
+ 
+@@ -88,6 +88,53 @@ class TestEngine(unittest.TestCase):
+         self.assertEqual(rep.steps[0].status, TIMED_OUT)
+         self.assertTrue(rep.steps[0].attempts[0].timed_out)
+ 
++    def test_overall_status_partial(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    run: 'true'\n"
++            "  - id: b\n    run: 'exit 1'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        self.assertEqual(rep.status, PARTIAL)
++
++    def test_overall_status_failed_when_all_ran_fail(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    run: 'exit 1'\n"
++            "  - id: b\n    depends_on:\n      - a\n    run: 'true'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        # a failed, b cancelled (didn't run) -> only ran step failed -> FAILED
++        self.assertEqual(rep.status, FAILED)
++
++    def test_partial_with_conditional_cleanup(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: build\n    run: 'exit 1'\n"
++            "  - id: deploy\n    depends_on:\n      - build\n"
++            "    condition: \"succeeded('build')\"\n    run: 'true'\n"
++            "  - id: cleanup\n    depends_on:\n      - build\n"
++            "    condition: \"failed('build')\"\n    run: 'true'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        self.assertEqual(rep.status, PARTIAL)
++
++    def test_total_retry_delay(self):
++        wf = _wf(
++            "name: t\nsteps:\n"
++            "  - id: a\n    retries: 2\n    retry_backoff: 0.1\n    run: 'exit 1'\n"
++            "  - id: b\n    run: 'true'\n"
++        )
++        rep = Engine(wf, logger=SILENT).run()
++        d = rep.to_dict()
++        # backoff: 0.1 + 0.2 = 0.3 expected
++        self.assertGreaterEqual(d["summary"]["total_retry_delay"], 0.28)
++        self.assertLess(d["summary"]["total_retry_delay"], 0.6)
++        by = {s["id"]: s for s in d["steps"]}
++        self.assertGreaterEqual(by["a"]["retry_delay"], 0.28)
++        self.assertEqual(by["b"]["retry_delay"], 0.0)
++        self.assertEqual(by["a"]["attempt_count"], 3)
++
+     def test_env_injection(self):
+         wf = _wf(
+             "name: t\n"
