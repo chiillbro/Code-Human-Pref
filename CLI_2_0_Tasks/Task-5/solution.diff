@@ -1,0 +1,2701 @@
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..1ceaa30
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,20 @@
++[build-system]
++requires = ["setuptools>=68.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "flowctl"
++version = "0.1.0"
++description = "Event-driven workflow orchestration engine"
++requires-python = ">=3.11"
++license = {text = "MIT"}
++
++[project.scripts]
++flowctl = "flowctl.cli:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
++pythonpath = ["src"]
+diff --git a/src/flowctl/__init__.py b/src/flowctl/__init__.py
+new file mode 100644
+index 0000000..8c80081
+--- /dev/null
++++ b/src/flowctl/__init__.py
+@@ -0,0 +1,3 @@
++"""flowctl — Event-driven workflow orchestration engine."""
++
++__version__ = "0.1.0"
+diff --git a/src/flowctl/cli.py b/src/flowctl/cli.py
+new file mode 100644
+index 0000000..1032ebc
+--- /dev/null
++++ b/src/flowctl/cli.py
+@@ -0,0 +1,162 @@
++"""CLI entry point for flowctl."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++from flowctl import __version__
++from flowctl.dag import CycleError
++from flowctl.executor import execute_workflow
++from flowctl.parser import ValidationError, parse_workflow_file
++from flowctl.reporter import format_report, load_report, write_report
++
++EXIT_SUCCESS = 0
++EXIT_VALIDATION = 1
++EXIT_FAILURE = 2
++EXIT_INTERRUPTED = 130
++
++
++def _build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="flowctl",
++        description="Event-driven workflow orchestration engine",
++    )
++    sub = parser.add_subparsers(dest="command")
++
++    # validate
++    p_val = sub.add_parser("validate", help="Validate a workflow YAML file")
++    p_val.add_argument("workflow", type=Path, help="Path to workflow YAML file")
++
++    # run
++    p_run = sub.add_parser("run", help="Execute a workflow")
++    p_run.add_argument("workflow", type=Path, help="Path to workflow YAML file")
++    p_run.add_argument(
++        "--report",
++        type=Path,
++        default=Path("flowctl-report.json"),
++        help="Output path for the JSON execution report (default: ./flowctl-report.json)",
++    )
++    p_run.add_argument(
++        "--dry-run",
++        action="store_true",
++        help="Show execution plan without running commands",
++    )
++
++    # report
++    p_rep = sub.add_parser("report", help="Pretty-print an execution report")
++    p_rep.add_argument("report_file", type=Path, help="Path to a JSON report file")
++
++    # version
++    sub.add_parser("version", help="Show flowctl version")
++
++    return parser
++
++
++def cmd_validate(args: argparse.Namespace) -> int:
++    path: Path = args.workflow
++    if not path.exists():
++        print(f"Error: file not found: {path}", file=sys.stderr)
++        return EXIT_VALIDATION
++
++    try:
++        workflow = parse_workflow_file(path)
++    except ValidationError as exc:
++        for err in exc.errors:
++            print(f"  {err}", file=sys.stderr)
++        return EXIT_VALIDATION
++
++    # Also check for cycles
++    from flowctl.dag import topological_sort
++
++    try:
++        topological_sort(workflow.steps)
++    except CycleError as exc:
++        print(f"Cycle detected: {', '.join(exc.cycle_members)}", file=sys.stderr)
++        return EXIT_VALIDATION
++
++    step_count = len(workflow.steps)
++    print(f"Validation passed: {step_count} step(s) in workflow '{workflow.name}'")
++    return EXIT_SUCCESS
++
++
++def cmd_run(args: argparse.Namespace) -> int:
++    path: Path = args.workflow
++    if not path.exists():
++        print(f"Error: file not found: {path}", file=sys.stderr)
++        return EXIT_VALIDATION
++
++    try:
++        workflow = parse_workflow_file(path)
++    except ValidationError as exc:
++        for err in exc.errors:
++            print(f"  {err}", file=sys.stderr)
++        return EXIT_VALIDATION
++
++    try:
++        report = execute_workflow(workflow, dry_run=args.dry_run)
++    except CycleError as exc:
++        print(f"Cycle detected: {', '.join(exc.cycle_members)}", file=sys.stderr)
++        return EXIT_VALIDATION
++    except KeyboardInterrupt:
++        return EXIT_INTERRUPTED
++
++    write_report(report, args.report)
++    print(f"Report written to {args.report}")
++
++    # Determine exit code from report status
++    from flowctl.models import WorkflowStatus
++
++    if report.status == WorkflowStatus.SUCCEEDED:
++        return EXIT_SUCCESS
++    else:
++        return EXIT_FAILURE
++
++
++def cmd_report(args: argparse.Namespace) -> int:
++    path: Path = args.report_file
++    if not path.exists():
++        print(f"Error: file not found: {path}", file=sys.stderr)
++        return EXIT_VALIDATION
++
++    try:
++        data = load_report(path)
++    except Exception as exc:
++        print(f"Error reading report: {exc}", file=sys.stderr)
++        return EXIT_VALIDATION
++
++    print(format_report(data))
++    return EXIT_SUCCESS
++
++
++def cmd_version(_args: argparse.Namespace) -> int:
++    print(f"flowctl {__version__}")
++    return EXIT_SUCCESS
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = _build_parser()
++    args = parser.parse_args(argv)
++
++    if args.command is None:
++        parser.print_help()
++        return EXIT_VALIDATION
++
++    handlers = {
++        "validate": cmd_validate,
++        "run": cmd_run,
++        "report": cmd_report,
++        "version": cmd_version,
++    }
++
++    handler = handlers.get(args.command)
++    if handler is None:
++        parser.print_help()
++        return EXIT_VALIDATION
++
++    return handler(args)
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/flowctl/dag.py b/src/flowctl/dag.py
+new file mode 100644
+index 0000000..085f51a
+--- /dev/null
++++ b/src/flowctl/dag.py
+@@ -0,0 +1,232 @@
++"""DAG construction, cycle detection, topological sort, and subgraph resolution."""
++
++from __future__ import annotations
++
++from collections import deque
++
++from flowctl.models import StepDefinition
++
++
++class CycleError(Exception):
++    """Raised when the dependency graph contains a cycle."""
++
++    def __init__(self, cycle_members: list[str]) -> None:
++        self.cycle_members = cycle_members
++        super().__init__(
++            f"Dependency cycle detected among steps: {', '.join(cycle_members)}"
++        )
++
++
++def build_graph(steps: dict[str, StepDefinition]) -> tuple[dict[str, list[str]], dict[str, int]]:
++    """Build adjacency list and in-degree map from step definitions.
++
++    Returns (adjacency, in_degree) where adjacency[parent] = [children that depend on parent].
++    """
++    adjacency: dict[str, list[str]] = {name: [] for name in steps}
++    in_degree: dict[str, int] = {name: 0 for name in steps}
++
++    for name, step in steps.items():
++        for dep in step.depends_on:
++            adjacency[dep].append(name)
++            in_degree[name] += 1
++
++    return adjacency, in_degree
++
++
++def topological_sort(steps: dict[str, StepDefinition]) -> list[str]:
++    """Return steps in topological order using Kahn's algorithm.
++
++    Raises CycleError with the participating step names if a cycle exists.
++    """
++    adjacency, in_degree = build_graph(steps)
++
++    queue: deque[str] = deque()
++    for name, deg in in_degree.items():
++        if deg == 0:
++            queue.append(name)
++
++    order: list[str] = []
++    while queue:
++        current = queue.popleft()
++        order.append(current)
++        for child in adjacency[current]:
++            in_degree[child] -= 1
++            if in_degree[child] == 0:
++                queue.append(child)
++
++    if len(order) != len(steps):
++        # Find which steps are in the cycle(s)
++        cycle_members = sorted(name for name, deg in in_degree.items() if deg > 0)
++        raise CycleError(cycle_members)
++
++    return order
++
++
++def get_downstream(step_name: str, steps: dict[str, StepDefinition]) -> set[str]:
++    """Return all steps that transitively depend on `step_name`."""
++    adjacency, _ = build_graph(steps)
++    visited: set[str] = set()
++    queue: deque[str] = deque([step_name])
++
++    while queue:
++        current = queue.popleft()
++        for child in adjacency[current]:
++            if child not in visited:
++                visited.add(child)
++                queue.append(child)
++
++    return visited
++
++
++def get_ready_steps(
++    steps: dict[str, StepDefinition],
++    completed: set[str],
++    running: set[str],
++    cancelled: set[str],
++    skipped: set[str],
++    failed: set[str] | None = None,
++) -> list[str]:
++    """Return step names whose dependencies are all satisfied and at least one succeeded/skipped.
++
++    A step is ready when:
++    - It's not already completed, running, cancelled, skipped, or failed
++    - All its depends_on entries are resolved (completed, skipped, or failed)
++    - At least one depends_on entry succeeded (completed) or was skipped
++    """
++    if failed is None:
++        failed = set()
++    ready: list[str] = []
++    resolved = completed | cancelled | skipped | failed
++
++    for name, step in steps.items():
++        if name in completed or name in running or name in cancelled or name in skipped or name in failed:
++            continue
++
++        if not step.depends_on:
++            ready.append(name)
++            continue
++
++        all_resolved = all(dep in resolved for dep in step.depends_on)
++        if not all_resolved:
++            continue
++
++        # At least one dep must have succeeded or been skipped (not all failed/cancelled)
++        has_live = any(dep in completed or dep in skipped for dep in step.depends_on)
++        if has_live:
++            ready.append(name)
++
++    return ready
++
++
++def get_steps_to_cancel(
++    steps: dict[str, StepDefinition],
++    completed: set[str],
++    running: set[str],
++    cancelled: set[str],
++    skipped: set[str],
++    failed: set[str],
++) -> set[str]:
++    """Return steps that should be cancelled because all deps are resolved and none succeeded/skipped.
++
++    Iterates until stable to handle cascading cancellations (e.g., A fails, B cancelled, C cancelled).
++    """
++    all_cancelled = set(cancelled)
++    new_cancels: set[str] = set()
++
++    while True:
++        resolved = completed | all_cancelled | skipped | failed
++        found: set[str] = set()
++
++        for name, step in steps.items():
++            if name in completed or name in running or name in all_cancelled or name in skipped or name in failed:
++                continue
++
++            if not step.depends_on:
++                continue
++
++            all_resolved = all(dep in resolved for dep in step.depends_on)
++            if not all_resolved:
++                continue
++
++            has_live = any(dep in completed or dep in skipped for dep in step.depends_on)
++            if not has_live:
++                found.add(name)
++
++        if not found:
++            break
++
++        new_cancels |= found
++        all_cancelled |= found
++
++    return new_cancels
++
++
++def resolve_cancellations(
++    failed_step: str,
++    steps: dict[str, StepDefinition],
++    completed: set[str],
++    skipped: set[str],
++    running: set[str] | None = None,
++) -> set[str]:
++    """Determine which steps should be cancelled due to a step failure.
++
++    A downstream step is cancelled if ALL paths from roots to it pass through
++    the failed step (i.e., it has no alternative satisfied or potentially-live
++    dependency path). Running deps are treated as potentially live.
++    """
++    if running is None:
++        running = set()
++
++    downstream = get_downstream(failed_step, steps)
++    to_cancel: set[str] = set()
++
++    for candidate in downstream:
++        step = steps[candidate]
++        # If every dependency is either the failed step, already cancelled,
++        # or itself downstream of the failed step, cancel this step.
++        # Running deps are potentially live — don't cancel yet.
++        has_live_dep = False
++        for dep in step.depends_on:
++            if dep == failed_step or dep in to_cancel:
++                continue
++            if dep in completed or dep in skipped or dep in running:
++                has_live_dep = True
++                break
++
++        if not has_live_dep:
++            to_cancel.add(candidate)
++
++    return to_cancel
++
++
++def resolve_skips(
++    skipped_step: str,
++    steps: dict[str, StepDefinition],
++    completed: set[str],
++    already_skipped: set[str],
++) -> set[str]:
++    """Determine which downstream steps should be skipped.
++
++    A downstream step is skipped only if ALL its dependencies are skipped
++    (no live/completed dependency exists).
++    """
++    downstream = get_downstream(skipped_step, steps)
++    new_skips: set[str] = set()
++    all_skipped = already_skipped | {skipped_step}
++
++    # Iterate in topological order to propagate correctly
++    topo = topological_sort(steps)
++    for name in topo:
++        if name not in downstream:
++            continue
++
++        step = steps[name]
++        all_deps_skipped = all(
++            dep in all_skipped or dep in new_skips for dep in step.depends_on
++        )
++
++        if all_deps_skipped:
++            new_skips.add(name)
++            all_skipped.add(name)
++
++    return new_skips
+diff --git a/src/flowctl/executor.py b/src/flowctl/executor.py
+new file mode 100644
+index 0000000..c200058
+--- /dev/null
++++ b/src/flowctl/executor.py
+@@ -0,0 +1,394 @@
++"""Concurrent workflow executor with retry, timeout, conditions, and SIGINT handling."""
++
++from __future__ import annotations
++
++import os
++import signal
++import subprocess
++import sys
++import threading
++import time
++from datetime import datetime, timezone
++
++from flowctl.dag import (
++    get_ready_steps,
++    get_steps_to_cancel,
++    resolve_skips,
++    topological_sort,
++)
++from flowctl.models import (
++    AttemptResult,
++    ExecutionReport,
++    StepDefinition,
++    StepResult,
++    StepStatus,
++    WorkflowDefinition,
++    WorkflowStatus,
++)
++
++
++class ExecutionState:
++    """Thread-safe container for shared execution state."""
++
++    def __init__(self, workflow: WorkflowDefinition) -> None:
++        self._lock = threading.Lock()
++        self.workflow = workflow
++        self.results: dict[str, StepResult] = {
++            name: StepResult(name=name) for name in workflow.steps
++        }
++        self.completed: set[str] = set()
++        self.failed: set[str] = set()
++        self.running: set[str] = set()
++        self.cancelled: set[str] = set()
++        self.skipped: set[str] = set()
++        self.interrupted = False
++        self._running_processes: dict[str, subprocess.Popen] = {}
++
++    @property
++    def lock(self) -> threading.Lock:
++        return self._lock
++
++    def mark_running(self, name: str) -> None:
++        with self._lock:
++            self.results[name].status = StepStatus.RUNNING
++            self.running.add(name)
++
++    def mark_completed(self, name: str, status: StepStatus) -> None:
++        with self._lock:
++            self.results[name].status = status
++            self.running.discard(name)
++            if status == StepStatus.SUCCEEDED:
++                self.completed.add(name)
++            elif status in (StepStatus.FAILED, StepStatus.TIMED_OUT):
++                self.failed.add(name)
++
++    def mark_cancelled(self, names: set[str]) -> None:
++        with self._lock:
++            for name in names:
++                self.results[name].status = StepStatus.CANCELLED
++                self.cancelled.add(name)
++
++    def mark_skipped(self, names: set[str]) -> None:
++        with self._lock:
++            for name in names:
++                self.results[name].status = StepStatus.SKIPPED
++                self.skipped.add(name)
++
++    def add_attempt(self, name: str, attempt: AttemptResult) -> None:
++        with self._lock:
++            self.results[name].attempts.append(attempt)
++
++    def register_process(self, name: str, proc: subprocess.Popen) -> None:
++        with self._lock:
++            self._running_processes[name] = proc
++
++    def unregister_process(self, name: str) -> None:
++        with self._lock:
++            self._running_processes.pop(name, None)
++
++    def kill_all_running(self) -> None:
++        with self._lock:
++            for name, proc in list(self._running_processes.items()):
++                try:
++                    proc.terminate()
++                except OSError:
++                    pass
++            self.interrupted = True
++
++    def get_ready(self) -> list[str]:
++        with self._lock:
++            return get_ready_steps(
++                self.workflow.steps,
++                self.completed,
++                self.running,
++                self.cancelled,
++                self.skipped,
++                self.failed,
++            )
++
++    def is_done(self) -> bool:
++        with self._lock:
++            total = len(self.workflow.steps)
++            done = len(self.completed) + len(self.failed) + len(self.cancelled) + len(self.skipped)
++            return done >= total
++
++
++def _run_step_attempt(
++    step: StepDefinition,
++    attempt_num: int,
++    state: ExecutionState,
++) -> AttemptResult:
++    """Execute a single attempt of a step command as a subprocess."""
++    env = {**os.environ, **step.env}
++    start = time.monotonic()
++
++    try:
++        proc = subprocess.Popen(
++            step.command,
++            shell=True,
++            stdout=subprocess.PIPE,
++            stderr=subprocess.PIPE,
++            env=env,
++            # Use process group so we can kill the group on timeout
++            preexec_fn=os.setsid if sys.platform != "win32" else None,
++        )
++        state.register_process(step.name, proc)
++
++        try:
++            stdout_bytes, stderr_bytes = proc.communicate(timeout=step.timeout_seconds)
++            duration = time.monotonic() - start
++            state.unregister_process(step.name)
++
++            return AttemptResult(
++                attempt_number=attempt_num,
++                duration_seconds=duration,
++                exit_code=proc.returncode,
++                stdout=stdout_bytes.decode("utf-8", errors="replace"),
++                stderr=stderr_bytes.decode("utf-8", errors="replace"),
++                timed_out=False,
++            )
++        except subprocess.TimeoutExpired:
++            duration = time.monotonic() - start
++            # Kill the whole process group
++            try:
++                if sys.platform != "win32":
++                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
++                else:
++                    proc.kill()
++            except OSError:
++                pass
++
++            stdout_bytes, stderr_bytes = proc.communicate()
++            state.unregister_process(step.name)
++
++            return AttemptResult(
++                attempt_number=attempt_num,
++                duration_seconds=duration,
++                exit_code=None,
++                stdout=stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else "",
++                stderr=stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else "",
++                timed_out=True,
++            )
++    except OSError as exc:
++        duration = time.monotonic() - start
++        state.unregister_process(step.name)
++        return AttemptResult(
++            attempt_number=attempt_num,
++            duration_seconds=duration,
++            exit_code=-1,
++            stdout="",
++            stderr=str(exc),
++            timed_out=False,
++        )
++
++
++def _run_step(step: StepDefinition, state: ExecutionState, log) -> None:
++    """Run a step with retries, then update shared state."""
++    log(f"[START]  {step.name}")
++    state.mark_running(step.name)
++
++    final_status = StepStatus.FAILED
++
++    for attempt_num in range(1, step.retry.max_attempts + 1):
++        if state.interrupted:
++            state.mark_completed(step.name, StepStatus.CANCELLED)
++            log(f"[CANCEL] {step.name} (interrupted)")
++            return
++
++        if attempt_num > 1:
++            log(f"[RETRY]  {step.name} (attempt {attempt_num}/{step.retry.max_attempts})")
++            time.sleep(step.retry.backoff_seconds)
++
++        result = _run_step_attempt(step, attempt_num, state)
++        state.add_attempt(step.name, result)
++
++        if result.timed_out:
++            log(f"[TIMEOUT] {step.name} (attempt {attempt_num})")
++            final_status = StepStatus.TIMED_OUT
++            continue
++
++        if result.exit_code == 0:
++            state.mark_completed(step.name, StepStatus.SUCCEEDED)
++            log(f"[DONE]   {step.name} (exit 0)")
++            return
++        else:
++            log(f"[FAIL]   {step.name} (exit {result.exit_code}, attempt {attempt_num})")
++            final_status = StepStatus.FAILED
++
++    # All attempts exhausted
++    state.mark_completed(step.name, final_status)
++
++    if final_status == StepStatus.TIMED_OUT:
++        log(f"[TIMED_OUT] {step.name} (all attempts exhausted)")
++    else:
++        log(f"[FAILED] {step.name} (all attempts exhausted)")
++
++
++def execute_workflow(
++    workflow: WorkflowDefinition,
++    dry_run: bool = False,
++) -> ExecutionReport:
++    """Execute all steps in the workflow respecting dependencies, concurrency, retries."""
++    # Validate DAG first (topological_sort will raise CycleError if cycles exist)
++    topological_sort(workflow.steps)
++
++    state = ExecutionState(workflow)
++    start_time = datetime.now(timezone.utc)
++    log_lock = threading.Lock()
++
++    def log(msg: str) -> None:
++        with log_lock:
++            print(msg, file=sys.stderr, flush=True)
++
++    if dry_run:
++        topo = topological_sort(workflow.steps)
++        log("Dry run — execution order:")
++        for name in topo:
++            step = workflow.steps[name]
++            deps = f" (after: {', '.join(step.depends_on)})" if step.depends_on else ""
++            log(f"  {name}: {step.command}{deps}")
++            state.results[name].status = StepStatus.SUCCEEDED
++            state.completed.add(name)
++
++        end_time = datetime.now(timezone.utc)
++        return ExecutionReport(
++            workflow_name=workflow.name,
++            start_time=start_time.isoformat(),
++            end_time=end_time.isoformat(),
++            status=WorkflowStatus.SUCCEEDED,
++            steps=state.results,
++        )
++
++    # Install SIGINT handler
++    original_handler = signal.getsignal(signal.SIGINT)
++
++    def _sigint_handler(signum, frame):
++        log("\n[INTERRUPT] Caught SIGINT — shutting down running steps...")
++        state.kill_all_running()
++
++    signal.signal(signal.SIGINT, _sigint_handler)
++
++    try:
++        _execute_loop(workflow, state, log)
++    finally:
++        signal.signal(signal.SIGINT, original_handler)
++
++    end_time = datetime.now(timezone.utc)
++    status = _determine_overall_status(state)
++
++    return ExecutionReport(
++        workflow_name=workflow.name,
++        start_time=start_time.isoformat(),
++        end_time=end_time.isoformat(),
++        status=status,
++        steps=state.results,
++    )
++
++
++def _execute_loop(
++    workflow: WorkflowDefinition,
++    state: ExecutionState,
++    log,
++) -> None:
++    """Main execution loop: schedule ready steps, wait for completions."""
++    threads: dict[str, threading.Thread] = {}
++
++    while not state.is_done():
++        if state.interrupted:
++            # Mark all remaining pending steps as cancelled
++            with state.lock:
++                for name in workflow.steps:
++                    if state.results[name].status == StepStatus.PENDING:
++                        state.results[name].status = StepStatus.CANCELLED
++                        state.cancelled.add(name)
++            break
++
++        ready = state.get_ready()
++
++        # Check for steps that should be cancelled (all deps resolved, none live)
++        with state.lock:
++            to_cancel = get_steps_to_cancel(
++                state.workflow.steps,
++                state.completed,
++                state.running,
++                state.cancelled,
++                state.skipped,
++                state.failed,
++            )
++        if to_cancel:
++            state.mark_cancelled(to_cancel)
++            for c in sorted(to_cancel):
++                log(f"[CANCEL] {c} (all upstream dependencies failed)")
++
++        for step_name in ready:
++            step = workflow.steps[step_name]
++
++            # Evaluate condition
++            if step.condition is not None:
++                with state.lock:
++                    cond_met = step.condition.evaluate(state.results)
++
++                if not cond_met:
++                    log(f"[SKIP]   {step_name} (condition not met)")
++                    state.mark_skipped({step_name})
++
++                    # Propagate skips downstream
++                    with state.lock:
++                        new_skips = resolve_skips(
++                            step_name, workflow.steps, state.completed, state.skipped
++                        )
++                        new_skips -= state.completed | state.running | state.cancelled
++                    if new_skips:
++                        state.mark_skipped(new_skips)
++                        for s in sorted(new_skips):
++                            log(f"[SKIP]   {s} (all dependencies skipped)")
++                    continue
++
++            t = threading.Thread(target=_run_step, args=(step, state, log), daemon=True)
++            threads[step_name] = t
++            t.start()
++
++        # Wait a bit for something to change
++        # Join any completed threads
++        for name in list(threads):
++            t = threads[name]
++            t.join(timeout=0.05)
++            if not t.is_alive():
++                del threads[name]
++
++        if not ready and threads:
++            # Nothing new to schedule, wait for any running thread
++            for t in list(threads.values()):
++                t.join(timeout=0.1)
++                break
++
++        if not ready and not threads and not state.is_done():
++            # Deadlock guard — all remaining steps have unsatisfied deps
++            time.sleep(0.05)
++            if not state.get_ready() and not threads:
++                break
++
++    # Wait for all threads to finish
++    for t in threads.values():
++        t.join(timeout=5.0)
++
++
++def _determine_overall_status(state: ExecutionState) -> WorkflowStatus:
++    has_failed = False
++    has_succeeded = False
++
++    for result in state.results.values():
++        if result.status in (StepStatus.FAILED, StepStatus.TIMED_OUT, StepStatus.CANCELLED):
++            has_failed = True
++        elif result.status == StepStatus.SUCCEEDED:
++            has_succeeded = True
++
++    if state.interrupted:
++        return WorkflowStatus.FAILED
++
++    if has_failed and has_succeeded:
++        return WorkflowStatus.PARTIAL
++    elif has_failed:
++        return WorkflowStatus.FAILED
++    else:
++        return WorkflowStatus.SUCCEEDED
+diff --git a/src/flowctl/models.py b/src/flowctl/models.py
+new file mode 100644
+index 0000000..08f6a91
+--- /dev/null
++++ b/src/flowctl/models.py
+@@ -0,0 +1,160 @@
++"""Data models for flowctl workflows, steps, and execution reports."""
++
++from __future__ import annotations
++
++import enum
++from dataclasses import dataclass, field
++from typing import Any
++
++
++class StepStatus(enum.Enum):
++    PENDING = "pending"
++    RUNNING = "running"
++    SUCCEEDED = "succeeded"
++    FAILED = "failed"
++    TIMED_OUT = "timed_out"
++    CANCELLED = "cancelled"
++    SKIPPED = "skipped"
++
++
++class WorkflowStatus(enum.Enum):
++    SUCCEEDED = "succeeded"
++    FAILED = "failed"
++    PARTIAL = "partial"
++
++
++@dataclass
++class RetryConfig:
++    max_attempts: int = 1
++    backoff_seconds: float = 0.0
++
++
++@dataclass
++class Condition:
++    """Condition that gates a step based on an upstream dependency's status or output.
++
++    Supported forms:
++      - step: <name>, status: succeeded|failed|skipped
++      - step: <name>, output_contains: <substring>
++    """
++
++    step: str
++    status: str | None = None
++    output_contains: str | None = None
++
++    def evaluate(self, step_results: dict[str, StepResult]) -> bool:
++        result = step_results.get(self.step)
++        if result is None:
++            return False
++
++        if self.status is not None:
++            return result.status.value == self.status
++
++        if self.output_contains is not None:
++            last_attempt = result.attempts[-1] if result.attempts else None
++            if last_attempt is None:
++                return False
++            return self.output_contains in last_attempt.stdout
++
++        # No condition criteria -> always true
++        return True
++
++
++@dataclass
++class StepDefinition:
++    name: str
++    command: str
++    depends_on: list[str] = field(default_factory=list)
++    retry: RetryConfig = field(default_factory=RetryConfig)
++    timeout_seconds: float | None = None
++    condition: Condition | None = None
++    env: dict[str, str] = field(default_factory=dict)
++
++
++@dataclass
++class WorkflowDefinition:
++    name: str
++    description: str
++    steps: dict[str, StepDefinition] = field(default_factory=dict)
++
++
++@dataclass
++class AttemptResult:
++    attempt_number: int
++    duration_seconds: float
++    exit_code: int | None
++    stdout: str
++    stderr: str
++    timed_out: bool = False
++
++
++@dataclass
++class StepResult:
++    name: str
++    status: StepStatus = StepStatus.PENDING
++    attempts: list[AttemptResult] = field(default_factory=list)
++
++    @property
++    def final_exit_code(self) -> int | None:
++        if self.attempts:
++            return self.attempts[-1].exit_code
++        return None
++
++    @property
++    def total_duration(self) -> float:
++        return sum(a.duration_seconds for a in self.attempts)
++
++
++@dataclass
++class ExecutionReport:
++    workflow_name: str
++    start_time: str
++    end_time: str
++    status: WorkflowStatus
++    steps: dict[str, StepResult] = field(default_factory=dict)
++
++    @property
++    def summary(self) -> dict[str, Any]:
++        counts: dict[str, int] = {
++            "total": len(self.steps),
++            "succeeded": 0,
++            "failed": 0,
++            "timed_out": 0,
++            "cancelled": 0,
++            "skipped": 0,
++        }
++        for result in self.steps.values():
++            key = result.status.value
++            if key in counts:
++                counts[key] += 1
++        return counts
++
++    def to_dict(self) -> dict[str, Any]:
++        steps_dict: dict[str, Any] = {}
++        for name, result in self.steps.items():
++            steps_dict[name] = {
++                "status": result.status.value,
++                "attempts": len(result.attempts),
++                "final_exit_code": result.final_exit_code,
++                "total_duration_seconds": round(result.total_duration, 3),
++                "attempt_details": [
++                    {
++                        "attempt": a.attempt_number,
++                        "duration_seconds": round(a.duration_seconds, 3),
++                        "exit_code": a.exit_code,
++                        "stdout": a.stdout,
++                        "stderr": a.stderr,
++                        "timed_out": a.timed_out,
++                    }
++                    for a in result.attempts
++                ],
++            }
++
++        return {
++            "workflow_name": self.workflow_name,
++            "start_time": self.start_time,
++            "end_time": self.end_time,
++            "status": self.status.value,
++            "steps": steps_dict,
++            "summary": self.summary,
++        }
+diff --git a/src/flowctl/parser.py b/src/flowctl/parser.py
+new file mode 100644
+index 0000000..cf47e77
+--- /dev/null
++++ b/src/flowctl/parser.py
+@@ -0,0 +1,213 @@
++"""YAML workflow parser with schema validation."""
++
++from __future__ import annotations
++
++import re
++import yaml
++from pathlib import Path
++
++from flowctl.models import (
++    Condition,
++    RetryConfig,
++    StepDefinition,
++    WorkflowDefinition,
++)
++
++_STEP_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
++
++_VALID_CONDITION_STATUSES = {"succeeded", "failed", "skipped"}
++
++
++class ValidationError(Exception):
++    def __init__(self, errors: list[str]) -> None:
++        self.errors = errors
++        super().__init__(f"Validation failed with {len(errors)} error(s)")
++
++
++def parse_workflow_file(path: Path) -> WorkflowDefinition:
++    """Load a YAML workflow file and return a validated WorkflowDefinition."""
++    try:
++        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
++    except yaml.YAMLError as exc:
++        raise ValidationError([f"Invalid YAML in {path}: {exc}"])
++
++    if not isinstance(raw, dict):
++        raise ValidationError([f"{path}: Expected a YAML mapping at top level"])
++
++    return _parse_workflow(raw, str(path))
++
++
++def _parse_workflow(raw: dict, source: str) -> WorkflowDefinition:
++    errors: list[str] = []
++
++    # --- workflow-level fields ---
++    name = raw.get("name")
++    if not name or not isinstance(name, str):
++        errors.append(f"{source}: 'name' is required and must be a string")
++        name = "<unknown>"
++
++    description = raw.get("description", "")
++    if not isinstance(description, str):
++        errors.append(f"{source}: 'description' must be a string")
++        description = ""
++
++    raw_steps = raw.get("steps")
++    if not isinstance(raw_steps, dict) or len(raw_steps) == 0:
++        errors.append(f"{source}: 'steps' is required and must be a non-empty mapping")
++        if errors:
++            raise ValidationError(errors)
++
++    # --- parse individual steps ---
++    steps: dict[str, StepDefinition] = {}
++    step_names: set[str] = set(raw_steps.keys())
++
++    for step_name, step_raw in raw_steps.items():
++        step_errors = _parse_step(step_name, step_raw, step_names, source)
++        if isinstance(step_errors, list):
++            errors.extend(step_errors)
++        else:
++            steps[step_name] = step_errors
++
++    if errors:
++        raise ValidationError(errors)
++
++    return WorkflowDefinition(name=name, description=description, steps=steps)
++
++
++def _parse_step(
++    name: str,
++    raw: dict | None,
++    all_step_names: set[str],
++    source: str,
++) -> StepDefinition | list[str]:
++    """Parse a single step. Returns StepDefinition on success or list of error strings."""
++    errors: list[str] = []
++    prefix = f"{source}: step '{name}'"
++
++    if not _STEP_NAME_RE.match(name):
++        errors.append(
++            f"{prefix}: Step name must contain only alphanumeric characters, "
++            "hyphens, and underscores"
++        )
++
++    if not isinstance(raw, dict):
++        errors.append(f"{prefix}: Step must be a mapping")
++        return errors
++
++    # command
++    command = raw.get("command")
++    if not command or not isinstance(command, str):
++        errors.append(f"{prefix}: 'command' is required and must be a string")
++        command = ""
++
++    # depends_on
++    depends_on: list[str] = []
++    raw_deps = raw.get("depends_on")
++    if raw_deps is not None:
++        if isinstance(raw_deps, str):
++            raw_deps = [raw_deps]
++        if not isinstance(raw_deps, list):
++            errors.append(f"{prefix}: 'depends_on' must be a list of step names")
++        else:
++            for dep in raw_deps:
++                if not isinstance(dep, str):
++                    errors.append(f"{prefix}: dependency must be a string, got {type(dep).__name__}")
++                elif dep not in all_step_names:
++                    errors.append(f"{prefix}: depends on unknown step '{dep}'")
++                elif dep == name:
++                    errors.append(f"{prefix}: step cannot depend on itself")
++                else:
++                    depends_on.append(dep)
++
++    # retry
++    retry = RetryConfig()
++    raw_retry = raw.get("retry")
++    if raw_retry is not None:
++        if not isinstance(raw_retry, dict):
++            errors.append(f"{prefix}: 'retry' must be a mapping")
++        else:
++            ma = raw_retry.get("max_attempts", 1)
++            if not isinstance(ma, int) or ma < 1:
++                errors.append(f"{prefix}: retry.max_attempts must be a positive integer")
++            else:
++                retry.max_attempts = ma
++
++            bs = raw_retry.get("backoff_seconds", 0)
++            if not isinstance(bs, (int, float)) or bs < 0:
++                errors.append(f"{prefix}: retry.backoff_seconds must be a non-negative number")
++            else:
++                retry.backoff_seconds = float(bs)
++
++    # timeout_seconds
++    timeout: float | None = None
++    raw_timeout = raw.get("timeout_seconds")
++    if raw_timeout is not None:
++        if not isinstance(raw_timeout, (int, float)) or raw_timeout < 0:
++            errors.append(f"{prefix}: 'timeout_seconds' must be a non-negative number")
++        else:
++            timeout = float(raw_timeout)
++
++    # condition
++    condition: Condition | None = None
++    raw_cond = raw.get("condition")
++    if raw_cond is not None:
++        if not isinstance(raw_cond, dict):
++            errors.append(f"{prefix}: 'condition' must be a mapping")
++        else:
++            cond_step = raw_cond.get("step")
++            if not cond_step or not isinstance(cond_step, str):
++                errors.append(f"{prefix}: condition.step is required")
++            elif cond_step not in all_step_names:
++                errors.append(f"{prefix}: condition references unknown step '{cond_step}'")
++            elif cond_step not in depends_on:
++                errors.append(
++                    f"{prefix}: condition references step '{cond_step}' which is not in depends_on"
++                )
++
++            cond_status = raw_cond.get("status")
++            cond_output = raw_cond.get("output_contains")
++
++            if cond_status is not None and cond_output is not None:
++                errors.append(f"{prefix}: condition cannot specify both 'status' and 'output_contains'")
++            elif cond_status is None and cond_output is None:
++                errors.append(f"{prefix}: condition must specify 'status' or 'output_contains'")
++
++            if cond_status is not None:
++                if cond_status not in _VALID_CONDITION_STATUSES:
++                    errors.append(
++                        f"{prefix}: condition.status must be one of "
++                        f"{sorted(_VALID_CONDITION_STATUSES)}"
++                    )
++
++            if cond_output is not None and not isinstance(cond_output, str):
++                errors.append(f"{prefix}: condition.output_contains must be a string")
++
++            if not errors or cond_step:
++                condition = Condition(
++                    step=cond_step if isinstance(cond_step, str) else "",
++                    status=cond_status,
++                    output_contains=cond_output if isinstance(cond_output, str) else None,
++                )
++
++    # env
++    env: dict[str, str] = {}
++    raw_env = raw.get("env")
++    if raw_env is not None:
++        if not isinstance(raw_env, dict):
++            errors.append(f"{prefix}: 'env' must be a mapping")
++        else:
++            for k, v in raw_env.items():
++                env[str(k)] = str(v)
++
++    if errors:
++        return errors
++
++    return StepDefinition(
++        name=name,
++        command=command,
++        depends_on=depends_on,
++        retry=retry,
++        timeout_seconds=timeout,
++        condition=condition,
++        env=env,
++    )
+diff --git a/src/flowctl/reporter.py b/src/flowctl/reporter.py
+new file mode 100644
+index 0000000..2c124e6
+--- /dev/null
++++ b/src/flowctl/reporter.py
+@@ -0,0 +1,84 @@
++"""Execution report serialization and human-readable formatting."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++from flowctl.models import ExecutionReport
++
++
++def write_report(report: ExecutionReport, path: Path) -> None:
++    """Write execution report as JSON to the given path."""
++    path.write_text(
++        json.dumps(report.to_dict(), indent=2, ensure_ascii=False) + "\n",
++        encoding="utf-8",
++    )
++
++
++def load_report(path: Path) -> dict:
++    """Load a JSON execution report from disk."""
++    return json.loads(path.read_text(encoding="utf-8"))
++
++
++def format_report(data: dict) -> str:
++    """Format a JSON report dict into a human-readable table string."""
++    lines: list[str] = []
++
++    lines.append(f"Workflow: {data.get('workflow_name', '?')}")
++    lines.append(f"Status:   {data.get('status', '?')}")
++    lines.append(f"Started:  {data.get('start_time', '?')}")
++    lines.append(f"Ended:    {data.get('end_time', '?')}")
++    lines.append("")
++
++    # Table header
++    name_w = 20
++    status_w = 12
++    attempts_w = 8
++    duration_w = 12
++    exit_w = 6
++
++    steps = data.get("steps", {})
++    if steps:
++        # Calculate column widths dynamically
++        name_w = max(name_w, max(len(n) for n in steps) + 2)
++
++    header = (
++        f"{'Step':<{name_w}} "
++        f"{'Status':<{status_w}} "
++        f"{'Attempts':>{attempts_w}} "
++        f"{'Duration':>{duration_w}} "
++        f"{'Exit':>{exit_w}}"
++    )
++    lines.append(header)
++    lines.append("-" * len(header))
++
++    for step_name, step_data in steps.items():
++        status = step_data.get("status", "?")
++        attempts = step_data.get("attempts", 0)
++        duration = step_data.get("total_duration_seconds", 0)
++        exit_code = step_data.get("final_exit_code")
++        exit_str = str(exit_code) if exit_code is not None else "-"
++
++        lines.append(
++            f"{step_name:<{name_w}} "
++            f"{status:<{status_w}} "
++            f"{attempts:>{attempts_w}} "
++            f"{duration:>{duration_w}.3f}s "
++            f"{exit_str:>{exit_w}}"
++        )
++
++    lines.append("")
++
++    # Summary
++    summary = data.get("summary", {})
++    if summary:
++        lines.append("Summary:")
++        lines.append(f"  Total: {summary.get('total', 0)}")
++        lines.append(f"  Succeeded: {summary.get('succeeded', 0)}")
++        lines.append(f"  Failed: {summary.get('failed', 0)}")
++        lines.append(f"  Timed Out: {summary.get('timed_out', 0)}")
++        lines.append(f"  Cancelled: {summary.get('cancelled', 0)}")
++        lines.append(f"  Skipped: {summary.get('skipped', 0)}")
++
++    return "\n".join(lines)
+diff --git a/tests/test_dag.py b/tests/test_dag.py
+new file mode 100644
+index 0000000..816d55b
+--- /dev/null
++++ b/tests/test_dag.py
+@@ -0,0 +1,296 @@
++"""Tests for flowctl.dag — cycle detection, topological sort, subgraph resolution."""
++
++import pytest
++
++from flowctl.dag import (
++    CycleError,
++    build_graph,
++    get_downstream,
++    get_ready_steps,
++    get_steps_to_cancel,
++    resolve_cancellations,
++    resolve_skips,
++    topological_sort,
++)
++from flowctl.models import RetryConfig, StepDefinition
++
++
++def _step(name: str, deps: list[str] | None = None) -> StepDefinition:
++    return StepDefinition(name=name, command=f"echo {name}", depends_on=deps or [])
++
++
++class TestTopologicalSort:
++    def test_linear_chain(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["b"]),
++        }
++        order = topological_sort(steps)
++        assert order.index("a") < order.index("b") < order.index("c")
++
++    def test_diamond(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["a"]),
++            "d": _step("d", ["b", "c"]),
++        }
++        order = topological_sort(steps)
++        assert order.index("a") < order.index("b")
++        assert order.index("a") < order.index("c")
++        assert order.index("b") < order.index("d")
++        assert order.index("c") < order.index("d")
++
++    def test_independent_steps(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b"),
++            "c": _step("c"),
++        }
++        order = topological_sort(steps)
++        assert set(order) == {"a", "b", "c"}
++
++    def test_simple_cycle(self):
++        steps = {
++            "a": _step("a", ["b"]),
++            "b": _step("b", ["a"]),
++        }
++        with pytest.raises(CycleError) as exc_info:
++            topological_sort(steps)
++        assert set(exc_info.value.cycle_members) == {"a", "b"}
++
++    def test_long_chain_cycle(self):
++        steps = {
++            "a": _step("a", ["c"]),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["b"]),
++        }
++        with pytest.raises(CycleError) as exc_info:
++            topological_sort(steps)
++        assert set(exc_info.value.cycle_members) == {"a", "b", "c"}
++
++    def test_multiple_disjoint_cycles(self):
++        steps = {
++            "a": _step("a", ["b"]),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["d"]),
++            "d": _step("d", ["c"]),
++        }
++        with pytest.raises(CycleError) as exc_info:
++            topological_sort(steps)
++        assert set(exc_info.value.cycle_members) == {"a", "b", "c", "d"}
++
++    def test_self_reference_cycle(self):
++        steps = {
++            "a": _step("a", ["a"]),
++        }
++        with pytest.raises(CycleError) as exc_info:
++            topological_sort(steps)
++        assert "a" in exc_info.value.cycle_members
++
++    def test_partial_cycle(self):
++        """A→B→C→B cycle, D depends on A (D is not in the cycle)."""
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a", "c"]),
++            "c": _step("c", ["b"]),
++            "d": _step("d", ["a"]),
++        }
++        with pytest.raises(CycleError) as exc_info:
++            topological_sort(steps)
++        assert "b" in exc_info.value.cycle_members
++        assert "c" in exc_info.value.cycle_members
++        # d and a are not part of the cycle
++        assert "a" not in exc_info.value.cycle_members
++
++
++class TestGetDownstream:
++    def test_no_downstream(self):
++        steps = {"a": _step("a")}
++        assert get_downstream("a", steps) == set()
++
++    def test_linear(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["b"]),
++        }
++        assert get_downstream("a", steps) == {"b", "c"}
++        assert get_downstream("b", steps) == {"c"}
++
++    def test_diamond(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["a"]),
++            "d": _step("d", ["b", "c"]),
++        }
++        assert get_downstream("a", steps) == {"b", "c", "d"}
++        assert get_downstream("b", steps) == {"d"}
++
++
++class TestGetReadySteps:
++    def test_roots_ready(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b"),
++        }
++        ready = get_ready_steps(steps, set(), set(), set(), set())
++        assert set(ready) == {"a", "b"}
++
++    def test_dep_satisfied(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++        }
++        ready = get_ready_steps(steps, {"a"}, set(), set(), set())
++        assert "b" in ready
++
++    def test_dep_not_satisfied(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++        }
++        ready = get_ready_steps(steps, set(), {"a"}, set(), set())
++        assert "b" not in ready
++
++    def test_cancelled_dep_blocks(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++        }
++        # Cancelled dep with no completed dep means step is not ready
++        ready = get_ready_steps(steps, set(), set(), {"a"}, set(), set())
++        assert "b" not in ready
++
++    def test_skipped_dep_satisfies(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++        }
++        ready = get_ready_steps(steps, set(), set(), set(), {"a"})
++        assert "b" in ready
++
++    def test_failed_dep_with_live_sibling(self):
++        """If one dep failed but another completed, step is ready."""
++        steps = {
++            "a": _step("a"),
++            "c": _step("c"),
++            "b": _step("b", ["a", "c"]),
++        }
++        ready = get_ready_steps(steps, {"c"}, set(), set(), set(), {"a"})
++        assert "b" in ready
++
++    def test_all_deps_failed_not_ready(self):
++        """If all deps failed, step is not ready (should be cancelled instead)."""
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++        }
++        ready = get_ready_steps(steps, set(), set(), set(), set(), {"a"})
++        assert "b" not in ready
++
++
++class TestGetStepsToCancel:
++    def test_all_deps_failed(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++        }
++        cancel = get_steps_to_cancel(steps, set(), set(), set(), set(), {"a"})
++        assert "b" in cancel
++
++    def test_mixed_deps_not_cancelled(self):
++        steps = {
++            "a": _step("a"),
++            "c": _step("c"),
++            "b": _step("b", ["a", "c"]),
++        }
++        cancel = get_steps_to_cancel(steps, {"c"}, set(), set(), set(), {"a"})
++        assert "b" not in cancel
++
++    def test_running_dep_prevents_cancel(self):
++        steps = {
++            "a": _step("a"),
++            "c": _step("c"),
++            "b": _step("b", ["a", "c"]),
++        }
++        # a failed, c still running — b should not be cancelled yet
++        cancel = get_steps_to_cancel(steps, set(), {"c"}, set(), set(), {"a"})
++        assert "b" not in cancel
++
++
++class TestResolveCancellations:
++    def test_linear_cancel(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["b"]),
++        }
++        cancelled = resolve_cancellations("a", steps, set(), set())
++        assert cancelled == {"b", "c"}
++
++    def test_diamond_not_cancelled(self):
++        """If B fails but C succeeded, D should NOT be cancelled (D has live dep C)."""
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["a"]),
++            "d": _step("d", ["b", "c"]),
++        }
++        cancelled = resolve_cancellations("b", steps, {"a", "c"}, set())
++        assert cancelled == set()  # d still has live dep c
++
++    def test_diamond_running_prevents_cancel(self):
++        """If B fails but C is still running, D should NOT be cancelled yet."""
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["a"]),
++            "d": _step("d", ["b", "c"]),
++        }
++        cancelled = resolve_cancellations("b", steps, {"a"}, set(), running={"c"})
++        assert "d" not in cancelled
++
++    def test_diamond_all_failed(self):
++        """If B fails and C is neither completed nor running, D is cancelled."""
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["a"]),
++            "d": _step("d", ["b", "c"]),
++        }
++        cancelled = resolve_cancellations("b", steps, {"a"}, set())
++        assert "d" in cancelled
++
++
++class TestResolveSkips:
++    def test_linear_skip(self):
++        steps = {
++            "a": _step("a"),
++            "b": _step("b", ["a"]),
++            "c": _step("c", ["b"]),
++        }
++        new_skips = resolve_skips("a", steps, set(), set())
++        assert new_skips == {"b", "c"}
++
++    def test_multi_dep_not_skipped(self):
++        """If A is skipped but C completed, B should NOT be skipped."""
++        steps = {
++            "a": _step("a"),
++            "c": _step("c"),
++            "b": _step("b", ["a", "c"]),
++        }
++        new_skips = resolve_skips("a", steps, {"c"}, set())
++        assert new_skips == set()
++
++    def test_multi_dep_all_skipped(self):
++        """If both A and C are skipped, B should be skipped."""
++        steps = {
++            "a": _step("a"),
++            "c": _step("c"),
++            "b": _step("b", ["a", "c"]),
++        }
++        new_skips = resolve_skips("a", steps, set(), {"c"})
++        assert "b" in new_skips
+diff --git a/tests/test_executor.py b/tests/test_executor.py
+new file mode 100644
+index 0000000..02819ac
+--- /dev/null
++++ b/tests/test_executor.py
+@@ -0,0 +1,306 @@
++"""Tests for flowctl.executor — step execution, retries, timeouts, conditions."""
++
++import textwrap
++import time
++
++import pytest
++import yaml
++
++from flowctl.executor import execute_workflow
++from flowctl.models import StepStatus, WorkflowStatus
++from flowctl.parser import parse_workflow_file
++
++
++def _write_workflow(tmp_path, content: str):
++    p = tmp_path / "workflow.yaml"
++    p.write_text(textwrap.dedent(content), encoding="utf-8")
++    return parse_workflow_file(p)
++
++
++class TestBasicExecution:
++    def test_single_step_success(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              hello:
++                command: echo hello
++        """)
++        report = execute_workflow(wf)
++        assert report.status == WorkflowStatus.SUCCEEDED
++        assert report.steps["hello"].status == StepStatus.SUCCEEDED
++        assert report.steps["hello"].attempts[0].stdout.strip() == "hello"
++
++    def test_single_step_failure(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              fail:
++                command: exit 1
++        """)
++        report = execute_workflow(wf)
++        assert report.status == WorkflowStatus.FAILED
++        assert report.steps["fail"].status == StepStatus.FAILED
++        assert report.steps["fail"].final_exit_code == 1
++
++    def test_dependency_ordering(self, tmp_path):
++        """Step B depends on A — B must run after A."""
++        out = tmp_path / "order.txt"
++        wf = _write_workflow(tmp_path, f"""\
++            name: test
++            steps:
++              a:
++                command: echo a >> {out}
++              b:
++                command: echo b >> {out}
++                depends_on:
++                  - a
++        """)
++        report = execute_workflow(wf)
++        assert report.status == WorkflowStatus.SUCCEEDED
++        lines = out.read_text().strip().split("\n")
++        assert lines == ["a", "b"]
++
++    def test_concurrent_independent_steps(self, tmp_path):
++        """Two independent steps should run concurrently."""
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: "python3 -c \\"import time; time.sleep(0.2); print('a')\\""
++              b:
++                command: "python3 -c \\"import time; time.sleep(0.2); print('b')\\""
++        """)
++        start = time.monotonic()
++        report = execute_workflow(wf)
++        elapsed = time.monotonic() - start
++
++        assert report.status == WorkflowStatus.SUCCEEDED
++        # If run concurrently, should take ~0.2s, not ~0.4s
++        assert elapsed < 0.6  # generous margin
++
++
++class TestRetry:
++    def test_retry_succeeds_on_second_attempt(self, tmp_path):
++        # Use a file to track attempts — first fails, second succeeds
++        marker = tmp_path / "attempt"
++        wf = _write_workflow(tmp_path, f"""\
++            name: test
++            steps:
++              flaky:
++                command: "if [ -f {marker} ]; then echo ok; else touch {marker} && exit 1; fi"
++                retry:
++                  max_attempts: 3
++                  backoff_seconds: 0
++        """)
++        report = execute_workflow(wf)
++        assert report.status == WorkflowStatus.SUCCEEDED
++        assert report.steps["flaky"].status == StepStatus.SUCCEEDED
++        assert len(report.steps["flaky"].attempts) == 2
++
++    def test_retry_exhausted(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              always_fail:
++                command: exit 1
++                retry:
++                  max_attempts: 3
++                  backoff_seconds: 0
++        """)
++        report = execute_workflow(wf)
++        assert report.status == WorkflowStatus.FAILED
++        assert report.steps["always_fail"].status == StepStatus.FAILED
++        assert len(report.steps["always_fail"].attempts) == 3
++
++
++class TestTimeout:
++    def test_timeout_kills_step(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              slow:
++                command: "python3 -c \\"import time; time.sleep(10)\\""
++                timeout_seconds: 0.3
++        """)
++        start = time.monotonic()
++        report = execute_workflow(wf)
++        elapsed = time.monotonic() - start
++
++        assert report.steps["slow"].status == StepStatus.TIMED_OUT
++        assert report.steps["slow"].attempts[0].timed_out is True
++        assert elapsed < 3.0  # should not wait 10s
++
++    def test_timeout_with_retry(self, tmp_path):
++        """Each retry attempt gets its own fresh timeout."""
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              slow:
++                command: "python3 -c \\"import time; time.sleep(10)\\""
++                timeout_seconds: 0.2
++                retry:
++                  max_attempts: 2
++                  backoff_seconds: 0
++        """)
++        report = execute_workflow(wf)
++        assert report.steps["slow"].status == StepStatus.TIMED_OUT
++        assert len(report.steps["slow"].attempts) == 2
++        for attempt in report.steps["slow"].attempts:
++            assert attempt.timed_out is True
++
++
++class TestCancellation:
++    def test_downstream_cancelled_on_failure(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: exit 1
++              b:
++                command: echo b
++                depends_on:
++                  - a
++              c:
++                command: echo c
++                depends_on:
++                  - b
++        """)
++        report = execute_workflow(wf)
++        assert report.steps["a"].status == StepStatus.FAILED
++        assert report.steps["b"].status == StepStatus.CANCELLED
++        assert report.steps["c"].status == StepStatus.CANCELLED
++
++    def test_partial_cancel_diamond(self, tmp_path):
++        """In a diamond, if one branch fails but the other succeeds,
++        the merge step should still run (it has a live dependency)."""
++        wf = _write_workflow(tmp_path, f"""\
++            name: test
++            steps:
++              root:
++                command: echo root
++              left:
++                command: exit 1
++                depends_on:
++                  - root
++              right:
++                command: echo right
++                depends_on:
++                  - root
++              merge:
++                command: echo merge
++                depends_on:
++                  - left
++                  - right
++        """)
++        report = execute_workflow(wf)
++        assert report.steps["root"].status == StepStatus.SUCCEEDED
++        assert report.steps["left"].status == StepStatus.FAILED
++        assert report.steps["right"].status == StepStatus.SUCCEEDED
++        # merge should NOT be cancelled — right is a live dependency
++        assert report.steps["merge"].status != StepStatus.CANCELLED
++
++
++class TestConditions:
++    def test_condition_met(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo hello
++              b:
++                command: echo world
++                depends_on:
++                  - a
++                condition:
++                  step: a
++                  status: succeeded
++        """)
++        report = execute_workflow(wf)
++        assert report.steps["b"].status == StepStatus.SUCCEEDED
++
++    def test_condition_not_met_skips(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo hello
++              b:
++                command: echo world
++                depends_on:
++                  - a
++                condition:
++                  step: a
++                  status: failed
++        """)
++        report = execute_workflow(wf)
++        assert report.steps["a"].status == StepStatus.SUCCEEDED
++        assert report.steps["b"].status == StepStatus.SKIPPED
++
++    def test_skip_propagation(self, tmp_path):
++        """When B is skipped, C (which depends only on B) should also be skipped."""
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo hello
++              b:
++                command: echo world
++                depends_on:
++                  - a
++                condition:
++                  step: a
++                  status: failed
++              c:
++                command: echo end
++                depends_on:
++                  - b
++        """)
++        report = execute_workflow(wf)
++        assert report.steps["b"].status == StepStatus.SKIPPED
++        assert report.steps["c"].status == StepStatus.SKIPPED
++
++    def test_output_contains_condition(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo "DEPLOY_READY"
++              b:
++                command: echo deploying
++                depends_on:
++                  - a
++                condition:
++                  step: a
++                  output_contains: DEPLOY_READY
++        """)
++        report = execute_workflow(wf)
++        assert report.steps["b"].status == StepStatus.SUCCEEDED
++
++
++class TestDryRun:
++    def test_dry_run_no_execution(self, tmp_path):
++        marker = tmp_path / "executed"
++        wf = _write_workflow(tmp_path, f"""\
++            name: test
++            steps:
++              a:
++                command: touch {marker}
++        """)
++        report = execute_workflow(wf, dry_run=True)
++        assert report.status == WorkflowStatus.SUCCEEDED
++        assert not marker.exists()
++
++
++class TestEnvVars:
++    def test_env_injected(self, tmp_path):
++        wf = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: "python3 -c \\"import os; print(os.environ['MY_VAR'])\\""
++                env:
++                  MY_VAR: hello_flowctl
++        """)
++        report = execute_workflow(wf)
++        assert report.steps["a"].status == StepStatus.SUCCEEDED
++        assert "hello_flowctl" in report.steps["a"].attempts[0].stdout
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+new file mode 100644
+index 0000000..1a05b49
+--- /dev/null
++++ b/tests/test_integration.py
+@@ -0,0 +1,260 @@
++"""Integration tests — full CLI workflow end-to-end."""
++
++import json
++import os
++import textwrap
++
++import pytest
++
++from flowctl.cli import main
++
++
++@pytest.fixture
++def project_dir(tmp_path, monkeypatch):
++    monkeypatch.chdir(tmp_path)
++    return tmp_path
++
++
++class TestCLICommands:
++    def test_version(self, capsys):
++        rc = main(["version"])
++        assert rc == 0
++        assert "flowctl" in capsys.readouterr().out
++
++    def test_no_command_shows_help(self, capsys):
++        rc = main([])
++        assert rc == 1
++
++    def test_validate_valid(self, project_dir):
++        wf = project_dir / "wf.yaml"
++        wf.write_text(textwrap.dedent("""\
++            name: test
++            steps:
++              a:
++                command: echo hello
++        """), encoding="utf-8")
++        rc = main(["validate", str(wf)])
++        assert rc == 0
++
++    def test_validate_cycle(self, project_dir, capsys):
++        wf = project_dir / "wf.yaml"
++        wf.write_text(textwrap.dedent("""\
++            name: test
++            steps:
++              a:
++                command: echo a
++                depends_on:
++                  - b
++              b:
++                command: echo b
++                depends_on:
++                  - a
++        """), encoding="utf-8")
++        rc = main(["validate", str(wf)])
++        assert rc == 1
++        assert "Cycle" in capsys.readouterr().err
++
++    def test_validate_missing_file(self, project_dir, capsys):
++        rc = main(["validate", "nonexistent.yaml"])
++        assert rc == 1
++        assert "not found" in capsys.readouterr().err
++
++    def test_run_simple(self, project_dir):
++        wf = project_dir / "wf.yaml"
++        wf.write_text(textwrap.dedent("""\
++            name: test
++            steps:
++              greet:
++                command: echo hello
++        """), encoding="utf-8")
++        report_path = project_dir / "report.json"
++        rc = main(["run", str(wf), f"--report={report_path}"])
++        assert rc == 0
++        assert report_path.exists()
++
++        data = json.loads(report_path.read_text())
++        assert data["status"] == "succeeded"
++        assert data["steps"]["greet"]["status"] == "succeeded"
++
++    def test_run_failure_exit_code(self, project_dir):
++        wf = project_dir / "wf.yaml"
++        wf.write_text(textwrap.dedent("""\
++            name: test
++            steps:
++              fail:
++                command: exit 1
++        """), encoding="utf-8")
++        report_path = project_dir / "report.json"
++        rc = main(["run", str(wf), f"--report={report_path}"])
++        assert rc == 2
++
++    def test_run_dry_run(self, project_dir):
++        marker = project_dir / "marker"
++        wf = project_dir / "wf.yaml"
++        wf.write_text(textwrap.dedent(f"""\
++            name: test
++            steps:
++              touch:
++                command: touch {marker}
++        """), encoding="utf-8")
++        report_path = project_dir / "report.json"
++        rc = main(["run", str(wf), f"--report={report_path}", "--dry-run"])
++        assert rc == 0
++        assert not marker.exists()
++
++    def test_report_command(self, project_dir, capsys):
++        # Create a report file first
++        report_path = project_dir / "report.json"
++        report_path.write_text(json.dumps({
++            "workflow_name": "demo",
++            "status": "succeeded",
++            "start_time": "T0",
++            "end_time": "T1",
++            "steps": {
++                "a": {
++                    "status": "succeeded",
++                    "attempts": 1,
++                    "final_exit_code": 0,
++                    "total_duration_seconds": 0.5,
++                    "attempt_details": [],
++                },
++            },
++            "summary": {
++                "total": 1,
++                "succeeded": 1,
++                "failed": 0,
++                "timed_out": 0,
++                "cancelled": 0,
++                "skipped": 0,
++            },
++        }), encoding="utf-8")
++
++        rc = main(["report", str(report_path)])
++        assert rc == 0
++        out = capsys.readouterr().out
++        assert "demo" in out
++        assert "succeeded" in out
++
++
++class TestFullWorkflow:
++    def test_multistep_lifecycle(self, project_dir):
++        """Full lifecycle: multi-step with deps, run, verify report."""
++        wf = project_dir / "wf.yaml"
++        out_file = project_dir / "output.txt"
++        wf.write_text(textwrap.dedent(f"""\
++            name: build-and-test
++            description: CI pipeline
++            steps:
++              setup:
++                command: echo setup >> {out_file}
++              build:
++                command: echo build >> {out_file}
++                depends_on:
++                  - setup
++              test-unit:
++                command: echo unit >> {out_file}
++                depends_on:
++                  - build
++              test-integration:
++                command: echo integration >> {out_file}
++                depends_on:
++                  - build
++              deploy:
++                command: echo deploy >> {out_file}
++                depends_on:
++                  - test-unit
++                  - test-integration
++        """), encoding="utf-8")
++
++        report_path = project_dir / "report.json"
++        rc = main(["run", str(wf), f"--report={report_path}"])
++        assert rc == 0
++
++        data = json.loads(report_path.read_text())
++        assert data["status"] == "succeeded"
++        assert data["summary"]["total"] == 5
++        assert data["summary"]["succeeded"] == 5
++
++        # Verify ordering: setup before build, build before tests, tests before deploy
++        lines = out_file.read_text().strip().split("\n")
++        assert lines.index("setup") < lines.index("build")
++        assert lines.index("build") < lines.index("unit")
++        assert lines.index("build") < lines.index("integration")
++
++    def test_failure_cancels_downstream(self, project_dir):
++        wf = project_dir / "wf.yaml"
++        wf.write_text(textwrap.dedent("""\
++            name: test
++            steps:
++              build:
++                command: exit 1
++              test:
++                command: echo test
++                depends_on:
++                  - build
++              deploy:
++                command: echo deploy
++                depends_on:
++                  - test
++        """), encoding="utf-8")
++
++        report_path = project_dir / "report.json"
++        rc = main(["run", str(wf), f"--report={report_path}"])
++        assert rc == 2
++
++        data = json.loads(report_path.read_text())
++        assert data["steps"]["build"]["status"] == "failed"
++        assert data["steps"]["test"]["status"] == "cancelled"
++        assert data["steps"]["deploy"]["status"] == "cancelled"
++        assert data["summary"]["failed"] == 1
++        assert data["summary"]["cancelled"] == 2
++
++    def test_conditional_skip_workflow(self, project_dir):
++        wf = project_dir / "wf.yaml"
++        wf.write_text(textwrap.dedent("""\
++            name: test
++            steps:
++              check:
++                command: echo ok
++              deploy:
++                command: echo deploying
++                depends_on:
++                  - check
++                condition:
++                  step: check
++                  status: failed
++              notify:
++                command: echo notified
++                depends_on:
++                  - deploy
++        """), encoding="utf-8")
++
++        report_path = project_dir / "report.json"
++        rc = main(["run", str(wf), f"--report={report_path}"])
++        assert rc == 0
++
++        data = json.loads(report_path.read_text())
++        assert data["steps"]["check"]["status"] == "succeeded"
++        assert data["steps"]["deploy"]["status"] == "skipped"
++        assert data["steps"]["notify"]["status"] == "skipped"
++
++    def test_retry_and_timeout_combined(self, project_dir):
++        wf = project_dir / "wf.yaml"
++        wf.write_text(textwrap.dedent("""\
++            name: test
++            steps:
++              slow:
++                command: "python3 -c \\"import time; time.sleep(10)\\""
++                timeout_seconds: 0.2
++                retry:
++                  max_attempts: 2
++                  backoff_seconds: 0
++        """), encoding="utf-8")
++
++        report_path = project_dir / "report.json"
++        rc = main(["run", str(wf), f"--report={report_path}"])
++        assert rc == 2
++
++        data = json.loads(report_path.read_text())
++        assert data["steps"]["slow"]["status"] == "timed_out"
++        assert data["steps"]["slow"]["attempts"] == 2
+diff --git a/tests/test_models.py b/tests/test_models.py
+new file mode 100644
+index 0000000..34dda32
+--- /dev/null
++++ b/tests/test_models.py
+@@ -0,0 +1,137 @@
++"""Tests for flowctl.models — data model behavior."""
++
++from flowctl.models import (
++    AttemptResult,
++    Condition,
++    ExecutionReport,
++    StepResult,
++    StepStatus,
++    WorkflowStatus,
++)
++
++
++class TestConditionEvaluate:
++    def test_status_match(self):
++        results = {
++            "a": StepResult(name="a", status=StepStatus.SUCCEEDED),
++        }
++        cond = Condition(step="a", status="succeeded")
++        assert cond.evaluate(results) is True
++
++    def test_status_mismatch(self):
++        results = {
++            "a": StepResult(name="a", status=StepStatus.FAILED),
++        }
++        cond = Condition(step="a", status="succeeded")
++        assert cond.evaluate(results) is False
++
++    def test_output_contains_match(self):
++        results = {
++            "a": StepResult(
++                name="a",
++                status=StepStatus.SUCCEEDED,
++                attempts=[
++                    AttemptResult(
++                        attempt_number=1,
++                        duration_seconds=0.1,
++                        exit_code=0,
++                        stdout="DEPLOY_READY flag set",
++                        stderr="",
++                    )
++                ],
++            ),
++        }
++        cond = Condition(step="a", output_contains="DEPLOY_READY")
++        assert cond.evaluate(results) is True
++
++    def test_output_contains_no_match(self):
++        results = {
++            "a": StepResult(
++                name="a",
++                status=StepStatus.SUCCEEDED,
++                attempts=[
++                    AttemptResult(
++                        attempt_number=1,
++                        duration_seconds=0.1,
++                        exit_code=0,
++                        stdout="nothing here",
++                        stderr="",
++                    )
++                ],
++            ),
++        }
++        cond = Condition(step="a", output_contains="DEPLOY_READY")
++        assert cond.evaluate(results) is False
++
++    def test_missing_step(self):
++        cond = Condition(step="nonexistent", status="succeeded")
++        assert cond.evaluate({}) is False
++
++    def test_no_attempts(self):
++        results = {
++            "a": StepResult(name="a", status=StepStatus.SUCCEEDED),
++        }
++        cond = Condition(step="a", output_contains="hello")
++        assert cond.evaluate(results) is False
++
++
++class TestStepResult:
++    def test_final_exit_code(self):
++        r = StepResult(
++            name="x",
++            attempts=[
++                AttemptResult(1, 0.1, 1, "", ""),
++                AttemptResult(2, 0.1, 0, "", ""),
++            ],
++        )
++        assert r.final_exit_code == 0
++
++    def test_final_exit_code_no_attempts(self):
++        r = StepResult(name="x")
++        assert r.final_exit_code is None
++
++    def test_total_duration(self):
++        r = StepResult(
++            name="x",
++            attempts=[
++                AttemptResult(1, 1.5, 0, "", ""),
++                AttemptResult(2, 2.5, 0, "", ""),
++            ],
++        )
++        assert r.total_duration == 4.0
++
++
++class TestExecutionReport:
++    def test_summary_counts(self):
++        report = ExecutionReport(
++            workflow_name="test",
++            start_time="T0",
++            end_time="T1",
++            status=WorkflowStatus.PARTIAL,
++            steps={
++                "a": StepResult(name="a", status=StepStatus.SUCCEEDED),
++                "b": StepResult(name="b", status=StepStatus.FAILED),
++                "c": StepResult(name="c", status=StepStatus.SKIPPED),
++                "d": StepResult(name="d", status=StepStatus.CANCELLED),
++            },
++        )
++        s = report.summary
++        assert s["total"] == 4
++        assert s["succeeded"] == 1
++        assert s["failed"] == 1
++        assert s["skipped"] == 1
++        assert s["cancelled"] == 1
++
++    def test_to_dict_structure(self):
++        report = ExecutionReport(
++            workflow_name="test",
++            start_time="T0",
++            end_time="T1",
++            status=WorkflowStatus.SUCCEEDED,
++            steps={"a": StepResult(name="a", status=StepStatus.SUCCEEDED)},
++        )
++        d = report.to_dict()
++        assert d["workflow_name"] == "test"
++        assert "steps" in d
++        assert "summary" in d
++        assert d["steps"]["a"]["status"] == "succeeded"
+diff --git a/tests/test_parser.py b/tests/test_parser.py
+new file mode 100644
+index 0000000..809133c
+--- /dev/null
++++ b/tests/test_parser.py
+@@ -0,0 +1,245 @@
++"""Tests for flowctl.parser — YAML loading and schema validation."""
++
++import textwrap
++
++import pytest
++import yaml
++
++from flowctl.parser import ValidationError, parse_workflow_file
++
++
++def _write_workflow(tmp_path, content: str):
++    p = tmp_path / "workflow.yaml"
++    p.write_text(textwrap.dedent(content), encoding="utf-8")
++    return p
++
++
++class TestParseWorkflowFile:
++    def test_minimal_valid(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              greet:
++                command: echo hello
++        """)
++        wf = parse_workflow_file(p)
++        assert wf.name == "test"
++        assert "greet" in wf.steps
++        assert wf.steps["greet"].command == "echo hello"
++
++    def test_full_step_features(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: full
++            description: A full workflow
++            steps:
++              build:
++                command: make build
++                retry:
++                  max_attempts: 3
++                  backoff_seconds: 1.5
++                timeout_seconds: 30
++                env:
++                  CC: gcc
++              test:
++                command: make test
++                depends_on:
++                  - build
++                condition:
++                  step: build
++                  status: succeeded
++        """)
++        wf = parse_workflow_file(p)
++        assert wf.description == "A full workflow"
++        build = wf.steps["build"]
++        assert build.retry.max_attempts == 3
++        assert build.retry.backoff_seconds == 1.5
++        assert build.timeout_seconds == 30.0
++        assert build.env == {"CC": "gcc"}
++
++        test = wf.steps["test"]
++        assert test.depends_on == ["build"]
++        assert test.condition is not None
++        assert test.condition.step == "build"
++        assert test.condition.status == "succeeded"
++
++    def test_missing_name(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            steps:
++              a:
++                command: echo a
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("'name' is required" in e for e in exc_info.value.errors)
++
++    def test_missing_steps(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: empty
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("'steps' is required" in e for e in exc_info.value.errors)
++
++    def test_missing_command(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                depends_on: []
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("'command' is required" in e for e in exc_info.value.errors)
++
++    def test_unknown_dependency(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo a
++                depends_on:
++                  - nonexistent
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("unknown step 'nonexistent'" in e for e in exc_info.value.errors)
++
++    def test_self_dependency(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo a
++                depends_on:
++                  - a
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("cannot depend on itself" in e for e in exc_info.value.errors)
++
++    def test_invalid_step_name(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              "bad name!":
++                command: echo hello
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("alphanumeric" in e for e in exc_info.value.errors)
++
++    def test_negative_timeout(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo a
++                timeout_seconds: -5
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("non-negative" in e for e in exc_info.value.errors)
++
++    def test_negative_retry_backoff(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo a
++                retry:
++                  max_attempts: 2
++                  backoff_seconds: -1
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("non-negative" in e for e in exc_info.value.errors)
++
++    def test_invalid_yaml(self, tmp_path):
++        p = tmp_path / "bad.yaml"
++        p.write_text("{{{{not yaml", encoding="utf-8")
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("Invalid YAML" in e for e in exc_info.value.errors)
++
++    def test_condition_unknown_step(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo a
++              b:
++                command: echo b
++                depends_on:
++                  - a
++                condition:
++                  step: nonexistent
++                  status: succeeded
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("unknown step 'nonexistent'" in e for e in exc_info.value.errors)
++
++    def test_condition_not_in_depends(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo a
++              b:
++                command: echo b
++                condition:
++                  step: a
++                  status: succeeded
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("not in depends_on" in e for e in exc_info.value.errors)
++
++    def test_condition_both_status_and_output(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo a
++              b:
++                command: echo b
++                depends_on:
++                  - a
++                condition:
++                  step: a
++                  status: succeeded
++                  output_contains: hello
++        """)
++        with pytest.raises(ValidationError) as exc_info:
++            parse_workflow_file(p)
++        assert any("cannot specify both" in e for e in exc_info.value.errors)
++
++    def test_depends_on_string_shorthand(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo a
++              b:
++                command: echo b
++                depends_on: a
++        """)
++        wf = parse_workflow_file(p)
++        assert wf.steps["b"].depends_on == ["a"]
++
++    def test_output_contains_condition(self, tmp_path):
++        p = _write_workflow(tmp_path, """\
++            name: test
++            steps:
++              a:
++                command: echo hello
++              b:
++                command: echo world
++                depends_on:
++                  - a
++                condition:
++                  step: a
++                  output_contains: hello
++        """)
++        wf = parse_workflow_file(p)
++        assert wf.steps["b"].condition.output_contains == "hello"
+diff --git a/tests/test_reporter.py b/tests/test_reporter.py
+new file mode 100644
+index 0000000..ec9bb59
+--- /dev/null
++++ b/tests/test_reporter.py
+@@ -0,0 +1,105 @@
++"""Tests for flowctl.reporter — JSON report writing and formatting."""
++
++import json
++
++from flowctl.models import (
++    AttemptResult,
++    ExecutionReport,
++    StepResult,
++    StepStatus,
++    WorkflowStatus,
++)
++from flowctl.reporter import format_report, load_report, write_report
++
++
++def _make_report() -> ExecutionReport:
++    steps = {
++        "build": StepResult(
++            name="build",
++            status=StepStatus.SUCCEEDED,
++            attempts=[
++                AttemptResult(
++                    attempt_number=1,
++                    duration_seconds=1.234,
++                    exit_code=0,
++                    stdout="compiled",
++                    stderr="",
++                )
++            ],
++        ),
++        "test": StepResult(
++            name="test",
++            status=StepStatus.FAILED,
++            attempts=[
++                AttemptResult(
++                    attempt_number=1,
++                    duration_seconds=0.5,
++                    exit_code=1,
++                    stdout="FAIL",
++                    stderr="assertion error",
++                )
++            ],
++        ),
++    }
++    return ExecutionReport(
++        workflow_name="ci",
++        start_time="2026-04-19T10:00:00+00:00",
++        end_time="2026-04-19T10:00:02+00:00",
++        status=WorkflowStatus.PARTIAL,
++        steps=steps,
++    )
++
++
++class TestWriteReport:
++    def test_roundtrip(self, tmp_path):
++        report = _make_report()
++        path = tmp_path / "report.json"
++        write_report(report, path)
++
++        data = load_report(path)
++        assert data["workflow_name"] == "ci"
++        assert data["status"] == "partial"
++        assert data["steps"]["build"]["status"] == "succeeded"
++        assert data["steps"]["test"]["status"] == "failed"
++        assert data["summary"]["total"] == 2
++        assert data["summary"]["succeeded"] == 1
++        assert data["summary"]["failed"] == 1
++
++    def test_json_structure(self, tmp_path):
++        report = _make_report()
++        path = tmp_path / "report.json"
++        write_report(report, path)
++
++        raw = json.loads(path.read_text())
++        build_details = raw["steps"]["build"]["attempt_details"]
++        assert len(build_details) == 1
++        assert build_details[0]["stdout"] == "compiled"
++        assert build_details[0]["exit_code"] == 0
++
++
++class TestFormatReport:
++    def test_contains_key_info(self):
++        report = _make_report()
++        data = report.to_dict()
++        text = format_report(data)
++
++        assert "ci" in text
++        assert "partial" in text
++        assert "build" in text
++        assert "test" in text
++        assert "succeeded" in text
++        assert "failed" in text
++        assert "Summary:" in text
++
++    def test_empty_steps(self):
++        data = {
++            "workflow_name": "empty",
++            "status": "succeeded",
++            "start_time": "T0",
++            "end_time": "T1",
++            "steps": {},
++            "summary": {"total": 0, "succeeded": 0, "failed": 0, "timed_out": 0, "cancelled": 0, "skipped": 0},
++        }
++        text = format_report(data)
++        assert "empty" in text
++        assert "Total: 0" in text

@@ -1,0 +1,2051 @@
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
+index 7943fb5..fc4463a 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
++++ b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
+@@ -1,16 +1,24 @@
+ package com.piggymetrics.account.client;
+ 
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.BudgetEvaluationRequest;
++import com.piggymetrics.account.domain.BudgetStatus;
+ import org.springframework.cloud.openfeign.FeignClient;
+ import org.springframework.http.MediaType;
+ import org.springframework.web.bind.annotation.PathVariable;
++import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RequestMethod;
+ 
++import java.util.List;
++
+ @FeignClient(name = "statistics-service", fallback = StatisticsServiceClientFallback.class)
+ public interface StatisticsServiceClient {
+ 
+ 	@RequestMapping(method = RequestMethod.PUT, value = "/statistics/{accountName}", consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
+ 	void updateStatistics(@PathVariable("accountName") String accountName, Account account);
+ 
++	@RequestMapping(method = RequestMethod.PUT, value = "/statistics/{accountName}/evaluate-budgets", consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
++	List<BudgetStatus> evaluateBudgets(@PathVariable("accountName") String accountName, @RequestBody BudgetEvaluationRequest request);
++
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
+index 21c9167..f27edd6 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
++++ b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
+@@ -1,10 +1,15 @@
+ package com.piggymetrics.account.client;
+ 
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.BudgetEvaluationRequest;
++import com.piggymetrics.account.domain.BudgetStatus;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Component;
+ 
++import java.util.Collections;
++import java.util.List;
++
+ /**
+  * @author cdov
+  */
+@@ -15,4 +20,10 @@ public class StatisticsServiceClientFallback implements StatisticsServiceClient
+     public void updateStatistics(String accountName, Account account) {
+         LOGGER.error("Error during update statistics for account: {}", accountName);
+     }
++
++    @Override
++    public List<BudgetStatus> evaluateBudgets(String accountName, BudgetEvaluationRequest request) {
++        LOGGER.error("Error during budget evaluation for account: {}", accountName);
++        return Collections.emptyList();
++    }
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/controller/AccountController.java b/account-service/src/main/java/com/piggymetrics/account/controller/AccountController.java
+index 2361a91..9ec02a9 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/controller/AccountController.java
++++ b/account-service/src/main/java/com/piggymetrics/account/controller/AccountController.java
+@@ -1,6 +1,8 @@
+ package com.piggymetrics.account.controller;
+ 
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetStatus;
+ import com.piggymetrics.account.domain.User;
+ import com.piggymetrics.account.service.AccountService;
+ import org.springframework.beans.factory.annotation.Autowired;
+@@ -9,6 +11,7 @@ import org.springframework.web.bind.annotation.*;
+ 
+ import javax.validation.Valid;
+ import java.security.Principal;
++import java.util.List;
+ 
+ @RestController
+ public class AccountController {
+@@ -36,4 +39,30 @@ public class AccountController {
+ 	public Account createNewAccount(@Valid @RequestBody User user) {
+ 		return accountService.create(user);
+ 	}
++
++	@RequestMapping(path = "/current/budgets", method = RequestMethod.POST)
++	public Budget createBudget(Principal principal, @Valid @RequestBody Budget budget) {
++		return accountService.createBudget(principal.getName(), budget);
++	}
++
++	@RequestMapping(path = "/current/budgets", method = RequestMethod.GET)
++	public List<Budget> getBudgets(Principal principal) {
++		return accountService.getBudgets(principal.getName());
++	}
++
++	@RequestMapping(path = "/current/budgets/{budgetId}", method = RequestMethod.PUT)
++	public Budget updateBudget(Principal principal, @PathVariable String budgetId, @Valid @RequestBody Budget budget) {
++		return accountService.updateBudget(principal.getName(), budgetId, budget);
++	}
++
++	@RequestMapping(path = "/current/budgets/{budgetId}", method = RequestMethod.DELETE)
++	public void deleteBudget(Principal principal, @PathVariable String budgetId) {
++		accountService.deleteBudget(principal.getName(), budgetId);
++	}
++
++	@PreAuthorize("#oauth2.hasScope('server')")
++	@RequestMapping(path = "/{accountName}/budget-evaluation", method = RequestMethod.GET)
++	public List<BudgetStatus> evaluateBudgets(@PathVariable String accountName) {
++		return accountService.evaluateBudgets(accountName);
++	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/Account.java b/account-service/src/main/java/com/piggymetrics/account/domain/Account.java
+index 59d98ac..36785c4 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/Account.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/Account.java
+@@ -7,6 +7,7 @@ import org.springframework.data.mongodb.core.mapping.Document;
+ 
+ import javax.validation.Valid;
+ import javax.validation.constraints.NotNull;
++import java.util.ArrayList;
+ import java.util.Date;
+ import java.util.List;
+ 
+@@ -32,6 +33,9 @@ public class Account {
+ 	@Length(min = 0, max = 20_000)
+ 	private String note;
+ 
++	@Valid
++	private List<Budget> budgets = new ArrayList<>();
++
+ 	public String getName() {
+ 		return name;
+ 	}
+@@ -79,4 +83,12 @@ public class Account {
+ 	public void setNote(String note) {
+ 		this.note = note;
+ 	}
++
++	public List<Budget> getBudgets() {
++		return budgets;
++	}
++
++	public void setBudgets(List<Budget> budgets) {
++		this.budgets = budgets;
++	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java b/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
+new file mode 100644
+index 0000000..c842ae6
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/Budget.java
+@@ -0,0 +1,109 @@
++package com.piggymetrics.account.domain;
++
++import org.hibernate.validator.constraints.Length;
++
++import javax.validation.constraints.Max;
++import javax.validation.constraints.Min;
++import javax.validation.constraints.NotNull;
++import java.math.BigDecimal;
++import java.util.Date;
++
++public class Budget {
++
++	private String budgetId;
++
++	@NotNull
++	@Length(min = 1, max = 20)
++	private String category;
++
++	@NotNull
++	private BigDecimal limit;
++
++	@NotNull
++	private TimePeriod period;
++
++	@NotNull
++	private Currency currency;
++
++	@Min(1)
++	@Max(100)
++	private int thresholdPercent = 80;
++
++	private boolean active = true;
++
++	private Date createdDate;
++
++	private Date lastTriggeredDate;
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public TimePeriod getPeriod() {
++		return period;
++	}
++
++	public void setPeriod(TimePeriod period) {
++		this.period = period;
++	}
++
++	public Currency getCurrency() {
++		return currency;
++	}
++
++	public void setCurrency(Currency currency) {
++		this.currency = currency;
++	}
++
++	public int getThresholdPercent() {
++		return thresholdPercent;
++	}
++
++	public void setThresholdPercent(int thresholdPercent) {
++		this.thresholdPercent = thresholdPercent;
++	}
++
++	public boolean isActive() {
++		return active;
++	}
++
++	public void setActive(boolean active) {
++		this.active = active;
++	}
++
++	public Date getCreatedDate() {
++		return createdDate;
++	}
++
++	public void setCreatedDate(Date createdDate) {
++		this.createdDate = createdDate;
++	}
++
++	public Date getLastTriggeredDate() {
++		return lastTriggeredDate;
++	}
++
++	public void setLastTriggeredDate(Date lastTriggeredDate) {
++		this.lastTriggeredDate = lastTriggeredDate;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluationRequest.java b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluationRequest.java
+new file mode 100644
+index 0000000..52ff2fc
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetEvaluationRequest.java
+@@ -0,0 +1,34 @@
++package com.piggymetrics.account.domain;
++
++import java.util.List;
++
++public class BudgetEvaluationRequest {
++
++	private List<Budget> budgets;
++
++	private Account account;
++
++	public BudgetEvaluationRequest() {
++	}
++
++	public BudgetEvaluationRequest(List<Budget> budgets, Account account) {
++		this.budgets = budgets;
++		this.account = account;
++	}
++
++	public List<Budget> getBudgets() {
++		return budgets;
++	}
++
++	public void setBudgets(List<Budget> budgets) {
++		this.budgets = budgets;
++	}
++
++	public Account getAccount() {
++		return account;
++	}
++
++	public void setAccount(Account account) {
++		this.account = account;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/BudgetStatus.java b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetStatus.java
+new file mode 100644
+index 0000000..2997a92
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/BudgetStatus.java
+@@ -0,0 +1,70 @@
++package com.piggymetrics.account.domain;
++
++import java.math.BigDecimal;
++
++public class BudgetStatus {
++
++	private String budgetId;
++
++	private String category;
++
++	private BigDecimal limit;
++
++	private BigDecimal spent;
++
++	private BigDecimal percentUsed;
++
++	private String status;
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public BigDecimal getSpent() {
++		return spent;
++	}
++
++	public void setSpent(BigDecimal spent) {
++		this.spent = spent;
++	}
++
++	public BigDecimal getPercentUsed() {
++		return percentUsed;
++	}
++
++	public void setPercentUsed(BigDecimal percentUsed) {
++		this.percentUsed = percentUsed;
++	}
++
++	public String getStatus() {
++		return status;
++	}
++
++	public void setStatus(String status) {
++		this.status = status;
++	}
++
++	public boolean isAlertWorthy() {
++		return "WARNING".equals(status) || "EXCEEDED".equals(status);
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/AccountService.java b/account-service/src/main/java/com/piggymetrics/account/service/AccountService.java
+index 187a508..8a6cf57 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/AccountService.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/AccountService.java
+@@ -1,8 +1,12 @@
+ package com.piggymetrics.account.service;
+ 
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetStatus;
+ import com.piggymetrics.account.domain.User;
+ 
++import java.util.List;
++
+ public interface AccountService {
+ 
+ 	/**
+@@ -31,4 +35,30 @@ public interface AccountService {
+ 	 * @param update
+ 	 */
+ 	void saveChanges(String name, Account update);
++
++	/**
++	 * Creates a new budget for the given account
++	 */
++	Budget createBudget(String accountName, Budget budget);
++
++	/**
++	 * Returns all active budgets for the given account
++	 */
++	List<Budget> getBudgets(String accountName);
++
++	/**
++	 * Updates an existing budget
++	 */
++	Budget updateBudget(String accountName, String budgetId, Budget budget);
++
++	/**
++	 * Soft-deletes a budget by setting active = false
++	 */
++	void deleteBudget(String accountName, String budgetId);
++
++	/**
++	 * Evaluates all active budgets for the given account against
++	 * current spending via the Statistics Service
++	 */
++	List<BudgetStatus> evaluateBudgets(String accountName);
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
+index 8594bf5..5841ab7 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
+@@ -3,6 +3,9 @@ package com.piggymetrics.account.service;
+ import com.piggymetrics.account.client.AuthServiceClient;
+ import com.piggymetrics.account.client.StatisticsServiceClient;
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Budget;
++import com.piggymetrics.account.domain.BudgetEvaluationRequest;
++import com.piggymetrics.account.domain.BudgetStatus;
+ import com.piggymetrics.account.domain.Currency;
+ import com.piggymetrics.account.domain.Saving;
+ import com.piggymetrics.account.domain.User;
+@@ -14,7 +17,11 @@ import org.springframework.stereotype.Service;
+ import org.springframework.util.Assert;
+ 
+ import java.math.BigDecimal;
++import java.util.ArrayList;
+ import java.util.Date;
++import java.util.List;
++import java.util.UUID;
++import java.util.stream.Collectors;
+ 
+ @Service
+ public class AccountServiceImpl implements AccountService {
+@@ -61,6 +68,7 @@ public class AccountServiceImpl implements AccountService {
+ 		account.setName(user.getUsername());
+ 		account.setLastSeen(new Date());
+ 		account.setSaving(saving);
++		account.setBudgets(new ArrayList<>());
+ 
+ 		repository.save(account);
+ 
+@@ -89,4 +97,149 @@ public class AccountServiceImpl implements AccountService {
+ 
+ 		statisticsClient.updateStatistics(name, account);
+ 	}
++
++	/**
++	 * {@inheritDoc}
++	 */
++	@Override
++	public Budget createBudget(String accountName, Budget budget) {
++
++		Account account = repository.findByName(accountName);
++		Assert.notNull(account, "can't find account with name " + accountName);
++
++		validateBudgetFields(budget);
++		checkForDuplicateBudget(account, budget.getCategory(), budget.getPeriod(), null);
++
++		budget.setBudgetId(UUID.randomUUID().toString());
++		budget.setCreatedDate(new Date());
++		budget.setActive(true);
++		budget.setLastTriggeredDate(null);
++
++		if (account.getBudgets() == null) {
++			account.setBudgets(new ArrayList<>());
++		}
++		account.getBudgets().add(budget);
++		repository.save(account);
++
++		log.info("new budget '{}' created for account {}", budget.getCategory(), accountName);
++
++		return budget;
++	}
++
++	/**
++	 * {@inheritDoc}
++	 */
++	@Override
++	public List<Budget> getBudgets(String accountName) {
++
++		Account account = repository.findByName(accountName);
++		Assert.notNull(account, "can't find account with name " + accountName);
++
++		if (account.getBudgets() == null) {
++			return new ArrayList<>();
++		}
++
++		return account.getBudgets().stream()
++				.filter(Budget::isActive)
++				.collect(Collectors.toList());
++	}
++
++	/**
++	 * {@inheritDoc}
++	 */
++	@Override
++	public Budget updateBudget(String accountName, String budgetId, Budget update) {
++
++		Account account = repository.findByName(accountName);
++		Assert.notNull(account, "can't find account with name " + accountName);
++
++		Budget existing = findBudgetById(account, budgetId);
++		validateBudgetFields(update);
++		checkForDuplicateBudget(account, update.getCategory(), update.getPeriod(), budgetId);
++
++		existing.setCategory(update.getCategory());
++		existing.setLimit(update.getLimit());
++		existing.setPeriod(update.getPeriod());
++		existing.setCurrency(update.getCurrency());
++		existing.setThresholdPercent(update.getThresholdPercent());
++
++		repository.save(account);
++
++		log.info("budget '{}' updated for account {}", budgetId, accountName);
++
++		return existing;
++	}
++
++	/**
++	 * {@inheritDoc}
++	 */
++	@Override
++	public void deleteBudget(String accountName, String budgetId) {
++
++		Account account = repository.findByName(accountName);
++		Assert.notNull(account, "can't find account with name " + accountName);
++
++		Budget existing = findBudgetById(account, budgetId);
++		existing.setActive(false);
++		repository.save(account);
++
++		log.info("budget '{}' soft-deleted for account {}", budgetId, accountName);
++	}
++
++	private Budget findBudgetById(Account account, String budgetId) {
++		if (account.getBudgets() == null) {
++			throw new IllegalArgumentException("budget not found: " + budgetId);
++		}
++		return account.getBudgets().stream()
++				.filter(b -> b.isActive() && budgetId.equals(b.getBudgetId()))
++				.findFirst()
++				.orElseThrow(() -> new IllegalArgumentException("budget not found: " + budgetId));
++	}
++
++	private void validateBudgetFields(Budget budget) {
++		Assert.notNull(budget.getCategory(), "budget category is required");
++		Assert.hasLength(budget.getCategory(), "budget category must not be empty");
++		Assert.notNull(budget.getLimit(), "budget limit is required");
++		Assert.isTrue(budget.getLimit().compareTo(BigDecimal.ZERO) > 0, "budget limit must be positive");
++		Assert.notNull(budget.getPeriod(), "budget period is required");
++		Assert.notNull(budget.getCurrency(), "budget currency is required");
++		Assert.isTrue(budget.getThresholdPercent() >= 1 && budget.getThresholdPercent() <= 100,
++				"thresholdPercent must be between 1 and 100");
++	}
++
++	private void checkForDuplicateBudget(Account account, String category, com.piggymetrics.account.domain.TimePeriod period, String excludeBudgetId) {
++		if (account.getBudgets() == null) {
++			return;
++		}
++		boolean duplicate = account.getBudgets().stream()
++				.filter(Budget::isActive)
++				.filter(b -> excludeBudgetId == null || !excludeBudgetId.equals(b.getBudgetId()))
++				.anyMatch(b -> b.getCategory().equalsIgnoreCase(category) && b.getPeriod() == period);
++		Assert.isTrue(!duplicate, "an active budget already exists for category '" + category + "' and period " + period);
++	}
++
++	/**
++	 * {@inheritDoc}
++	 */
++	@Override
++	public List<BudgetStatus> evaluateBudgets(String accountName) {
++
++		Account account = repository.findByName(accountName);
++		Assert.notNull(account, "can't find account with name " + accountName);
++
++		List<Budget> activeBudgets = account.getBudgets() == null
++				? new ArrayList<>()
++				: account.getBudgets().stream().filter(Budget::isActive).collect(Collectors.toList());
++
++		if (activeBudgets.isEmpty()) {
++			return new ArrayList<>();
++		}
++
++		BudgetEvaluationRequest request = new BudgetEvaluationRequest(activeBudgets, account);
++		List<BudgetStatus> statuses = statisticsClient.evaluateBudgets(accountName, request);
++
++		log.info("evaluated {} budgets for account {}", activeBudgets.size(), accountName);
++
++		return statuses;
++	}
+ }
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
+index 675d54c..0adbe57 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
+@@ -10,10 +10,12 @@ import org.mockito.InjectMocks;
+ import org.mockito.Mock;
+ 
+ import java.math.BigDecimal;
++import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.Collections;
++import java.util.List;
+ 
+-import static org.junit.Assert.assertEquals;
+-import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.*;
+ import static org.mockito.Mockito.*;
+ import static org.mockito.MockitoAnnotations.initMocks;
+ 
+@@ -146,4 +148,233 @@ public class AccountServiceTest {
+ 		when(accountService.findByName("test")).thenReturn(null);
+ 		accountService.saveChanges("test", update);
+ 	}
++
++	@Test
++	public void shouldCreateBudget() {
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>());
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		Budget budget = new Budget();
++		budget.setCategory("Grocery");
++		budget.setLimit(new BigDecimal("500"));
++		budget.setPeriod(TimePeriod.MONTH);
++		budget.setCurrency(Currency.USD);
++		budget.setThresholdPercent(80);
++
++		Budget result = accountService.createBudget("test", budget);
++
++		assertNotNull(result.getBudgetId());
++		assertEquals("Grocery", result.getCategory());
++		assertNotNull(result.getCreatedDate());
++		assertTrue(result.isActive());
++		assertEquals(1, account.getBudgets().size());
++		verify(repository, times(1)).save(account);
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void shouldFailToCreateDuplicateBudget() {
++
++		Budget existing = new Budget();
++		existing.setBudgetId("b1");
++		existing.setCategory("Grocery");
++		existing.setPeriod(TimePeriod.MONTH);
++		existing.setCurrency(Currency.USD);
++		existing.setLimit(new BigDecimal("500"));
++		existing.setThresholdPercent(80);
++		existing.setActive(true);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>(Collections.singletonList(existing)));
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		Budget duplicate = new Budget();
++		duplicate.setCategory("Grocery");
++		duplicate.setLimit(new BigDecimal("600"));
++		duplicate.setPeriod(TimePeriod.MONTH);
++		duplicate.setCurrency(Currency.USD);
++		duplicate.setThresholdPercent(80);
++
++		accountService.createBudget("test", duplicate);
++	}
++
++	@Test
++	public void shouldGetActiveBudgetsOnly() {
++
++		Budget active = new Budget();
++		active.setBudgetId("b1");
++		active.setCategory("Grocery");
++		active.setActive(true);
++
++		Budget inactive = new Budget();
++		inactive.setBudgetId("b2");
++		inactive.setCategory("Travel");
++		inactive.setActive(false);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(Arrays.asList(active, inactive));
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		List<Budget> budgets = accountService.getBudgets("test");
++
++		assertEquals(1, budgets.size());
++		assertEquals("b1", budgets.get(0).getBudgetId());
++	}
++
++	@Test
++	public void shouldUpdateBudget() {
++
++		Budget existing = new Budget();
++		existing.setBudgetId("b1");
++		existing.setCategory("Grocery");
++		existing.setPeriod(TimePeriod.MONTH);
++		existing.setCurrency(Currency.USD);
++		existing.setLimit(new BigDecimal("500"));
++		existing.setThresholdPercent(80);
++		existing.setActive(true);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>(Collections.singletonList(existing)));
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		Budget update = new Budget();
++		update.setCategory("Grocery");
++		update.setLimit(new BigDecimal("700"));
++		update.setPeriod(TimePeriod.MONTH);
++		update.setCurrency(Currency.USD);
++		update.setThresholdPercent(90);
++
++		Budget result = accountService.updateBudget("test", "b1", update);
++
++		assertEquals(new BigDecimal("700"), result.getLimit());
++		assertEquals(90, result.getThresholdPercent());
++		verify(repository, times(1)).save(account);
++	}
++
++	@Test
++	public void shouldSoftDeleteBudget() {
++
++		Budget existing = new Budget();
++		existing.setBudgetId("b1");
++		existing.setCategory("Grocery");
++		existing.setActive(true);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>(Collections.singletonList(existing)));
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		accountService.deleteBudget("test", "b1");
++
++		assertFalse(existing.isActive());
++		verify(repository, times(1)).save(account);
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void shouldFailToDeleteNonexistentBudget() {
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>());
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		accountService.deleteBudget("test", "nonexistent");
++	}
++
++	@Test
++	public void shouldEvaluateBudgetsViaStatisticsService() {
++
++		Budget budget = new Budget();
++		budget.setBudgetId("b1");
++		budget.setCategory("Grocery");
++		budget.setPeriod(TimePeriod.MONTH);
++		budget.setCurrency(Currency.USD);
++		budget.setLimit(new BigDecimal("500"));
++		budget.setThresholdPercent(80);
++		budget.setActive(true);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>(Collections.singletonList(budget)));
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		BudgetStatus expectedStatus = new BudgetStatus();
++		expectedStatus.setBudgetId("b1");
++		expectedStatus.setCategory("Grocery");
++		expectedStatus.setStatus("UNDER_BUDGET");
++
++		when(statisticsClient.evaluateBudgets(eq("test"), any(BudgetEvaluationRequest.class)))
++				.thenReturn(Collections.singletonList(expectedStatus));
++
++		List<BudgetStatus> result = accountService.evaluateBudgets("test");
++
++		assertEquals(1, result.size());
++		assertEquals("UNDER_BUDGET", result.get(0).getStatus());
++		verify(statisticsClient, times(1)).evaluateBudgets(eq("test"), any(BudgetEvaluationRequest.class));
++	}
++
++	@Test
++	public void shouldReturnEmptyListWhenNoBudgetsToEvaluate() {
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>());
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		List<BudgetStatus> result = accountService.evaluateBudgets("test");
++
++		assertTrue(result.isEmpty());
++		verify(statisticsClient, never()).evaluateBudgets(anyString(), any(BudgetEvaluationRequest.class));
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void shouldFailToCreateBudgetWithNullCategory() {
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>());
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		Budget budget = new Budget();
++		budget.setCategory(null);
++		budget.setLimit(new BigDecimal("500"));
++		budget.setPeriod(TimePeriod.MONTH);
++		budget.setCurrency(Currency.USD);
++		budget.setThresholdPercent(80);
++
++		accountService.createBudget("test", budget);
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void shouldFailToCreateBudgetWithNegativeLimit() {
++
++		Account account = new Account();
++		account.setName("test");
++		account.setBudgets(new ArrayList<>());
++
++		when(repository.findByName("test")).thenReturn(account);
++
++		Budget budget = new Budget();
++		budget.setCategory("Grocery");
++		budget.setLimit(new BigDecimal("-100"));
++		budget.setPeriod(TimePeriod.MONTH);
++		budget.setCurrency(Currency.USD);
++		budget.setThresholdPercent(80);
++
++		accountService.createBudget("test", budget);
++	}
+ }
+diff --git a/config/src/main/resources/shared/notification-service.yml b/config/src/main/resources/shared/notification-service.yml
+index 4ab5302..117d18f 100644
+--- a/config/src/main/resources/shared/notification-service.yml
++++ b/config/src/main/resources/shared/notification-service.yml
+@@ -25,6 +25,13 @@ backup:
+     subject: PiggyMetrics account backup
+     attachment: backup.json
+ 
++budget:
++  alert:
++    cron: 0 0 */6 * * *
++    email:
++      text: "Hi {0}, some of your budgets need attention:\r\n\r\n{1}\r\nLog in to PiggyMetrics to review your spending.\r\n\r\nCheers,\r\nPiggyMetrics team"
++      subject: PiggyMetrics budget alert
++
+ spring:
+   data:
+     mongodb:
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClient.java b/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClient.java
+index dd26ace..3a352a0 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClient.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/client/AccountServiceClient.java
+@@ -1,15 +1,21 @@
+ package com.piggymetrics.notification.client;
+ 
++import com.piggymetrics.notification.domain.BudgetAlertStatus;
+ import org.springframework.cloud.openfeign.FeignClient;
+ import org.springframework.http.MediaType;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RequestMethod;
+ 
++import java.util.List;
++
+ @FeignClient(name = "account-service")
+ public interface AccountServiceClient {
+ 
+ 	@RequestMapping(method = RequestMethod.GET, value = "/accounts/{accountName}", consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
+ 	String getAccount(@PathVariable("accountName") String accountName);
+ 
++	@RequestMapping(method = RequestMethod.GET, value = "/accounts/{accountName}/budget-evaluation", consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
++	List<BudgetAlertStatus> evaluateBudgets(@PathVariable("accountName") String accountName);
++
+ }
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetAlertStatus.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetAlertStatus.java
+new file mode 100644
+index 0000000..eb536aa
+--- /dev/null
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/BudgetAlertStatus.java
+@@ -0,0 +1,70 @@
++package com.piggymetrics.notification.domain;
++
++import java.math.BigDecimal;
++
++public class BudgetAlertStatus {
++
++	private String budgetId;
++
++	private String category;
++
++	private BigDecimal limit;
++
++	private BigDecimal spent;
++
++	private BigDecimal percentUsed;
++
++	private String status;
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public BigDecimal getSpent() {
++		return spent;
++	}
++
++	public void setSpent(BigDecimal spent) {
++		this.spent = spent;
++	}
++
++	public BigDecimal getPercentUsed() {
++		return percentUsed;
++	}
++
++	public void setPercentUsed(BigDecimal percentUsed) {
++		this.percentUsed = percentUsed;
++	}
++
++	public String getStatus() {
++		return status;
++	}
++
++	public void setStatus(String status) {
++		this.status = status;
++	}
++
++	public boolean isAlertWorthy() {
++		return "WARNING".equals(status) || "EXCEEDED".equals(status);
++	}
++}
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/domain/NotificationType.java b/notification-service/src/main/java/com/piggymetrics/notification/domain/NotificationType.java
+index 5c74351..35eadc9 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/domain/NotificationType.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/domain/NotificationType.java
+@@ -3,7 +3,8 @@ package com.piggymetrics.notification.domain;
+ public enum NotificationType {
+ 
+ 	BACKUP("backup.email.subject", "backup.email.text", "backup.email.attachment"),
+-	REMIND("remind.email.subject", "remind.email.text", null);
++	REMIND("remind.email.subject", "remind.email.text", null),
++	BUDGET_ALERT("budget.alert.email.subject", "budget.alert.email.text", null);
+ 
+ 	private String subject;
+ 	private String text;
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/repository/RecipientRepository.java b/notification-service/src/main/java/com/piggymetrics/notification/repository/RecipientRepository.java
+index e24fd97..12d7e4c 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/repository/RecipientRepository.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/repository/RecipientRepository.java
+@@ -20,4 +20,8 @@ public interface RecipientRepository extends CrudRepository<Recipient, String> {
+ 			"new Date(new Date().setDate(new Date().getDate() - this.scheduledNotifications.REMIND.frequency ))' }] }")
+ 	List<Recipient> findReadyForRemind();
+ 
++	@Query("{ $and: [ {'scheduledNotifications.BUDGET_ALERT.active': true }, { $where: 'this.scheduledNotifications.BUDGET_ALERT.lastNotified < " +
++			"new Date(new Date().setDate(new Date().getDate() - this.scheduledNotifications.BUDGET_ALERT.frequency ))' }] }")
++	List<Recipient> findReadyForBudgetAlert();
++
+ }
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/service/NotificationService.java b/notification-service/src/main/java/com/piggymetrics/notification/service/NotificationService.java
+index a836d45..b25780c 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/service/NotificationService.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/service/NotificationService.java
+@@ -5,4 +5,6 @@ public interface NotificationService {
+ 	void sendBackupNotifications();
+ 
+ 	void sendRemindNotifications();
++
++	void sendBudgetAlertNotifications();
+ }
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/service/NotificationServiceImpl.java b/notification-service/src/main/java/com/piggymetrics/notification/service/NotificationServiceImpl.java
+index baeab19..c96bbbd 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/service/NotificationServiceImpl.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/service/NotificationServiceImpl.java
+@@ -1,6 +1,7 @@
+ package com.piggymetrics.notification.service;
+ 
+ import com.piggymetrics.notification.client.AccountServiceClient;
++import com.piggymetrics.notification.domain.BudgetAlertStatus;
+ import com.piggymetrics.notification.domain.NotificationType;
+ import com.piggymetrics.notification.domain.Recipient;
+ import org.slf4j.Logger;
+@@ -11,6 +12,7 @@ import org.springframework.stereotype.Service;
+ 
+ import java.util.List;
+ import java.util.concurrent.CompletableFuture;
++import java.util.stream.Collectors;
+ 
+ @Service
+ public class NotificationServiceImpl implements NotificationService {
+@@ -64,4 +66,44 @@ public class NotificationServiceImpl implements NotificationService {
+ 			}
+ 		}));
+ 	}
++
++	@Override
++	@Scheduled(cron = "${budget.alert.cron}")
++	public void sendBudgetAlertNotifications() {
++
++		final NotificationType type = NotificationType.BUDGET_ALERT;
++
++		List<Recipient> recipients = recipientService.findReadyToNotify(type);
++		log.info("found {} recipients for budget alert notification", recipients.size());
++
++		recipients.forEach(recipient -> CompletableFuture.runAsync(() -> {
++			try {
++				List<BudgetAlertStatus> statuses = client.evaluateBudgets(recipient.getAccountName());
++				List<BudgetAlertStatus> alerts = statuses.stream()
++						.filter(BudgetAlertStatus::isAlertWorthy)
++						.collect(Collectors.toList());
++
++				if (!alerts.isEmpty()) {
++					String alertSummary = buildAlertSummary(alerts);
++					emailService.send(type, recipient, alertSummary);
++					recipientService.markNotified(type, recipient);
++				}
++			} catch (Throwable t) {
++				log.error("an error during budget alert notification for {}", recipient, t);
++			}
++		}));
++	}
++
++	private String buildAlertSummary(List<BudgetAlertStatus> alerts) {
++		StringBuilder sb = new StringBuilder();
++		for (BudgetAlertStatus alert : alerts) {
++			sb.append(String.format("- %s: spent %s of %s (%s%%) [%s]%n",
++					alert.getCategory(),
++					alert.getSpent(),
++					alert.getLimit(),
++					alert.getPercentUsed(),
++					alert.getStatus()));
++		}
++		return sb.toString();
++	}
+ }
+diff --git a/notification-service/src/main/java/com/piggymetrics/notification/service/RecipientServiceImpl.java b/notification-service/src/main/java/com/piggymetrics/notification/service/RecipientServiceImpl.java
+index 456ac85..1f15857 100644
+--- a/notification-service/src/main/java/com/piggymetrics/notification/service/RecipientServiceImpl.java
++++ b/notification-service/src/main/java/com/piggymetrics/notification/service/RecipientServiceImpl.java
+@@ -57,6 +57,8 @@ public class RecipientServiceImpl implements RecipientService {
+ 				return repository.findReadyForBackup();
+ 			case REMIND:
+ 				return repository.findReadyForRemind();
++			case BUDGET_ALERT:
++				return repository.findReadyForBudgetAlert();
+ 			default:
+ 				throw new IllegalArgumentException();
+ 		}
+diff --git a/notification-service/src/test/java/com/piggymetrics/notification/service/NotificationServiceImplTest.java b/notification-service/src/test/java/com/piggymetrics/notification/service/NotificationServiceImplTest.java
+index 0727679..591f5c9 100644
+--- a/notification-service/src/test/java/com/piggymetrics/notification/service/NotificationServiceImplTest.java
++++ b/notification-service/src/test/java/com/piggymetrics/notification/service/NotificationServiceImplTest.java
+@@ -2,6 +2,7 @@ package com.piggymetrics.notification.service;
+ 
+ import com.google.common.collect.ImmutableList;
+ import com.piggymetrics.notification.client.AccountServiceClient;
++import com.piggymetrics.notification.domain.BudgetAlertStatus;
+ import com.piggymetrics.notification.domain.NotificationType;
+ import com.piggymetrics.notification.domain.Recipient;
+ import org.junit.Before;
+@@ -11,6 +12,8 @@ import org.mockito.Mock;
+ 
+ import javax.mail.MessagingException;
+ import java.io.IOException;
++import java.math.BigDecimal;
++import java.util.Collections;
+ 
+ import static org.mockito.Mockito.*;
+ import static org.mockito.MockitoAnnotations.initMocks;
+@@ -83,4 +86,104 @@ public class NotificationServiceImplTest {
+ 
+ 		verify(recipientService, never()).markNotified(NotificationType.REMIND, withError);
+ 	}
++
++	@Test
++	public void shouldSendBudgetAlertWhenWarningOrExceeded() throws IOException, MessagingException, InterruptedException {
++
++		Recipient recipient = new Recipient();
++		recipient.setAccountName("test-user");
++
++		BudgetAlertStatus warning = new BudgetAlertStatus();
++		warning.setBudgetId("b1");
++		warning.setCategory("Grocery");
++		warning.setLimit(new BigDecimal("500"));
++		warning.setSpent(new BigDecimal("450"));
++		warning.setPercentUsed(new BigDecimal("90.00"));
++		warning.setStatus("WARNING");
++
++		BudgetAlertStatus underBudget = new BudgetAlertStatus();
++		underBudget.setBudgetId("b2");
++		underBudget.setCategory("Transport");
++		underBudget.setStatus("UNDER_BUDGET");
++
++		when(recipientService.findReadyToNotify(NotificationType.BUDGET_ALERT)).thenReturn(ImmutableList.of(recipient));
++		when(client.evaluateBudgets("test-user")).thenReturn(ImmutableList.of(warning, underBudget));
++
++		notificationService.sendBudgetAlertNotifications();
++
++		// TODO test concurrent code in a right way
++
++		verify(emailService, timeout(100)).send(eq(NotificationType.BUDGET_ALERT), eq(recipient), anyString());
++		verify(recipientService, timeout(100)).markNotified(NotificationType.BUDGET_ALERT, recipient);
++	}
++
++	@Test
++	public void shouldNotSendBudgetAlertWhenAllBudgetsUnderLimit() throws InterruptedException {
++
++		Recipient recipient = new Recipient();
++		recipient.setAccountName("test-user");
++
++		BudgetAlertStatus underBudget = new BudgetAlertStatus();
++		underBudget.setBudgetId("b1");
++		underBudget.setCategory("Grocery");
++		underBudget.setStatus("UNDER_BUDGET");
++
++		when(recipientService.findReadyToNotify(NotificationType.BUDGET_ALERT)).thenReturn(ImmutableList.of(recipient));
++		when(client.evaluateBudgets("test-user")).thenReturn(ImmutableList.of(underBudget));
++
++		notificationService.sendBudgetAlertNotifications();
++
++		// Give async time to execute
++		Thread.sleep(100);
++
++		verify(recipientService, never()).markNotified(eq(NotificationType.BUDGET_ALERT), any(Recipient.class));
++	}
++
++	@Test
++	public void shouldContinueBudgetAlertProcessingWhenErrorOccursForOneRecipient() throws IOException, MessagingException, InterruptedException {
++
++		Recipient withError = new Recipient();
++		withError.setAccountName("with-error");
++
++		Recipient withNoError = new Recipient();
++		withNoError.setAccountName("with-no-error");
++
++		BudgetAlertStatus exceeded = new BudgetAlertStatus();
++		exceeded.setBudgetId("b1");
++		exceeded.setCategory("Grocery");
++		exceeded.setLimit(new BigDecimal("500"));
++		exceeded.setSpent(new BigDecimal("600"));
++		exceeded.setPercentUsed(new BigDecimal("120.00"));
++		exceeded.setStatus("EXCEEDED");
++
++		when(client.evaluateBudgets("with-error")).thenThrow(new RuntimeException());
++		when(client.evaluateBudgets("with-no-error")).thenReturn(ImmutableList.of(exceeded));
++		when(recipientService.findReadyToNotify(NotificationType.BUDGET_ALERT)).thenReturn(ImmutableList.of(withNoError, withError));
++
++		notificationService.sendBudgetAlertNotifications();
++
++		// TODO test concurrent code in a right way
++
++		verify(emailService, timeout(100)).send(eq(NotificationType.BUDGET_ALERT), eq(withNoError), anyString());
++		verify(recipientService, timeout(100)).markNotified(NotificationType.BUDGET_ALERT, withNoError);
++
++		verify(recipientService, never()).markNotified(NotificationType.BUDGET_ALERT, withError);
++	}
++
++	@Test
++	public void shouldNotSendBudgetAlertWhenNoBudgetsExist() throws InterruptedException {
++
++		Recipient recipient = new Recipient();
++		recipient.setAccountName("test-user");
++
++		when(recipientService.findReadyToNotify(NotificationType.BUDGET_ALERT)).thenReturn(ImmutableList.of(recipient));
++		when(client.evaluateBudgets("test-user")).thenReturn(Collections.emptyList());
++
++		notificationService.sendBudgetAlertNotifications();
++
++		// Give async time to execute
++		Thread.sleep(100);
++
++		verify(recipientService, never()).markNotified(eq(NotificationType.BUDGET_ALERT), any(Recipient.class));
++	}
+ }
+\ No newline at end of file
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/controller/StatisticsController.java b/statistics-service/src/main/java/com/piggymetrics/statistics/controller/StatisticsController.java
+index 788737b..a47ccf5 100644
+--- a/statistics-service/src/main/java/com/piggymetrics/statistics/controller/StatisticsController.java
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/controller/StatisticsController.java
+@@ -1,7 +1,10 @@
+ package com.piggymetrics.statistics.controller;
+ 
+ import com.piggymetrics.statistics.domain.Account;
++import com.piggymetrics.statistics.domain.BudgetEvaluationRequest;
++import com.piggymetrics.statistics.domain.BudgetStatus;
+ import com.piggymetrics.statistics.domain.timeseries.DataPoint;
++import com.piggymetrics.statistics.service.BudgetEvaluationService;
+ import com.piggymetrics.statistics.service.StatisticsService;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.security.access.prepost.PreAuthorize;
+@@ -17,6 +20,9 @@ public class StatisticsController {
+ 	@Autowired
+ 	private StatisticsService statisticsService;
+ 
++	@Autowired
++	private BudgetEvaluationService budgetEvaluationService;
++
+ 	@RequestMapping(value = "/current", method = RequestMethod.GET)
+ 	public List<DataPoint> getCurrentAccountStatistics(Principal principal) {
+ 		return statisticsService.findByAccountName(principal.getName());
+@@ -33,4 +39,11 @@ public class StatisticsController {
+ 	public void saveAccountStatistics(@PathVariable String accountName, @Valid @RequestBody Account account) {
+ 		statisticsService.save(accountName, account);
+ 	}
++
++	@PreAuthorize("#oauth2.hasScope('server')")
++	@RequestMapping(value = "/{accountName}/evaluate-budgets", method = RequestMethod.PUT)
++	public List<BudgetStatus> evaluateBudgets(@PathVariable String accountName,
++			@Valid @RequestBody BudgetEvaluationRequest request) {
++		return budgetEvaluationService.evaluate(request.getBudgets(), request.getAccount());
++	}
+ }
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluationRequest.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluationRequest.java
+new file mode 100644
+index 0000000..7a28048
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetEvaluationRequest.java
+@@ -0,0 +1,32 @@
++package com.piggymetrics.statistics.domain;
++
++import javax.validation.Valid;
++import javax.validation.constraints.NotNull;
++import java.util.List;
++
++public class BudgetEvaluationRequest {
++
++	@Valid
++	@NotNull
++	private List<BudgetItem> budgets;
++
++	@Valid
++	@NotNull
++	private Account account;
++
++	public List<BudgetItem> getBudgets() {
++		return budgets;
++	}
++
++	public void setBudgets(List<BudgetItem> budgets) {
++		this.budgets = budgets;
++	}
++
++	public Account getAccount() {
++		return account;
++	}
++
++	public void setAccount(Account account) {
++		this.account = account;
++	}
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetItem.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetItem.java
+new file mode 100644
+index 0000000..c02238f
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetItem.java
+@@ -0,0 +1,66 @@
++package com.piggymetrics.statistics.domain;
++
++import java.math.BigDecimal;
++
++public class BudgetItem {
++
++	private String budgetId;
++
++	private String category;
++
++	private BigDecimal limit;
++
++	private TimePeriod period;
++
++	private Currency currency;
++
++	private int thresholdPercent;
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public TimePeriod getPeriod() {
++		return period;
++	}
++
++	public void setPeriod(TimePeriod period) {
++		this.period = period;
++	}
++
++	public Currency getCurrency() {
++		return currency;
++	}
++
++	public void setCurrency(Currency currency) {
++		this.currency = currency;
++	}
++
++	public int getThresholdPercent() {
++		return thresholdPercent;
++	}
++
++	public void setThresholdPercent(int thresholdPercent) {
++		this.thresholdPercent = thresholdPercent;
++	}
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetStatus.java b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetStatus.java
+new file mode 100644
+index 0000000..13988a6
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/domain/BudgetStatus.java
+@@ -0,0 +1,70 @@
++package com.piggymetrics.statistics.domain;
++
++import java.math.BigDecimal;
++
++public class BudgetStatus {
++
++	private String budgetId;
++
++	private String category;
++
++	private BigDecimal limit;
++
++	private BigDecimal spent;
++
++	private BigDecimal percentUsed;
++
++	private BudgetStatusType status;
++
++	public enum BudgetStatusType {
++		UNDER_BUDGET, WARNING, EXCEEDED
++	}
++
++	public String getBudgetId() {
++		return budgetId;
++	}
++
++	public void setBudgetId(String budgetId) {
++		this.budgetId = budgetId;
++	}
++
++	public String getCategory() {
++		return category;
++	}
++
++	public void setCategory(String category) {
++		this.category = category;
++	}
++
++	public BigDecimal getLimit() {
++		return limit;
++	}
++
++	public void setLimit(BigDecimal limit) {
++		this.limit = limit;
++	}
++
++	public BigDecimal getSpent() {
++		return spent;
++	}
++
++	public void setSpent(BigDecimal spent) {
++		this.spent = spent;
++	}
++
++	public BigDecimal getPercentUsed() {
++		return percentUsed;
++	}
++
++	public void setPercentUsed(BigDecimal percentUsed) {
++		this.percentUsed = percentUsed;
++	}
++
++	public BudgetStatusType getStatus() {
++		return status;
++	}
++
++	public void setStatus(BudgetStatusType status) {
++		this.status = status;
++	}
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationService.java b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationService.java
+new file mode 100644
+index 0000000..b7cc433
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationService.java
+@@ -0,0 +1,21 @@
++package com.piggymetrics.statistics.service;
++
++import com.piggymetrics.statistics.domain.Account;
++import com.piggymetrics.statistics.domain.BudgetItem;
++import com.piggymetrics.statistics.domain.BudgetStatus;
++
++import java.util.List;
++
++public interface BudgetEvaluationService {
++
++	/**
++	 * Evaluates a list of budgets against the given account data.
++	 * Normalizes expenses to each budget's currency and period,
++	 * then computes spent amounts and status for each budget.
++	 *
++	 * @param budgets the budgets to evaluate
++	 * @param account the account data containing incomes and expenses
++	 * @return list of evaluation results
++	 */
++	List<BudgetStatus> evaluate(List<BudgetItem> budgets, Account account);
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
+new file mode 100644
+index 0000000..5766412
+--- /dev/null
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImpl.java
+@@ -0,0 +1,140 @@
++package com.piggymetrics.statistics.service;
++
++import com.piggymetrics.statistics.domain.*;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.util.Assert;
++
++import java.math.BigDecimal;
++import java.math.RoundingMode;
++import java.util.List;
++import java.util.Map;
++import java.util.stream.Collectors;
++
++@Service
++public class BudgetEvaluationServiceImpl implements BudgetEvaluationService {
++
++	private static final String TOTAL_CATEGORY = "_TOTAL";
++	private static final int SCALE = 4;
++
++	private final Logger log = LoggerFactory.getLogger(getClass());
++
++	@Autowired
++	private ExchangeRatesService ratesService;
++
++	@Override
++	public List<BudgetStatus> evaluate(List<BudgetItem> budgets, Account account) {
++		Assert.notNull(budgets, "budgets must not be null");
++		Assert.notNull(account, "account must not be null");
++
++		Map<Currency, BigDecimal> rates = ratesService.getCurrentRates();
++
++		return budgets.stream()
++				.map(budget -> evaluateSingleBudget(budget, account, rates))
++				.collect(Collectors.toList());
++	}
++
++	private BudgetStatus evaluateSingleBudget(BudgetItem budget, Account account, Map<Currency, BigDecimal> rates) {
++		BigDecimal spent = computeSpentAmount(budget, account.getExpenses(), rates);
++		BigDecimal percentUsed = computePercentUsed(spent, budget.getLimit());
++		BudgetStatus.BudgetStatusType statusType = classifyStatus(percentUsed, budget.getThresholdPercent());
++
++		BudgetStatus status = new BudgetStatus();
++		status.setBudgetId(budget.getBudgetId());
++		status.setCategory(budget.getCategory());
++		status.setLimit(budget.getLimit());
++		status.setSpent(spent);
++		status.setPercentUsed(percentUsed);
++		status.setStatus(statusType);
++
++		log.debug("budget '{}' evaluated: spent={}, limit={}, percent={}%, status={}",
++				budget.getCategory(), spent, budget.getLimit(), percentUsed, statusType);
++
++		return status;
++	}
++
++	private BigDecimal computeSpentAmount(BudgetItem budget, List<Item> expenses, Map<Currency, BigDecimal> rates) {
++		if (expenses == null || expenses.isEmpty()) {
++			return BigDecimal.ZERO;
++		}
++
++		List<Item> relevantExpenses = filterExpenses(budget.getCategory(), expenses);
++
++		return relevantExpenses.stream()
++				.map(expense -> normalizeExpense(expense, budget.getCurrency(), budget.getPeriod(), rates))
++				.reduce(BigDecimal.ZERO, BigDecimal::add);
++	}
++
++	private List<Item> filterExpenses(String category, List<Item> expenses) {
++		if (TOTAL_CATEGORY.equals(category)) {
++			return expenses;
++		}
++		return expenses.stream()
++				.filter(e -> e.getTitle() != null && e.getTitle().equalsIgnoreCase(category))
++				.collect(Collectors.toList());
++	}
++
++	/**
++	 * Normalizes an expense to the budget's target currency and target period.
++	 *
++	 * Step 1: Convert the expense amount from its native currency to the budget's currency.
++	 * Step 2: Convert the expense from its native period to the budget's period.
++	 *
++	 * The existing TimePeriod.getBaseRatio() normalizes to DAY (e.g., MONTH=30.4368, YEAR=365.2425).
++	 * To convert from expensePeriod to budgetPeriod:
++	 *   normalizedAmount = amount * (budgetPeriod.baseRatio / expensePeriod.baseRatio)
++	 *
++	 * Example: $1200/YEAR expense against a MONTH budget:
++	 *   1200 * (30.4368 / 365.2425) = ~$100/month
++	 */
++	private BigDecimal normalizeExpense(Item expense, Currency targetCurrency, TimePeriod targetPeriod, Map<Currency, BigDecimal> rates) {
++		BigDecimal convertedAmount = convertCurrency(expense.getAmount(), expense.getCurrency(), targetCurrency, rates);
++		return convertPeriod(convertedAmount, expense.getPeriod(), targetPeriod);
++	}
++
++	private BigDecimal convertCurrency(BigDecimal amount, Currency from, Currency to, Map<Currency, BigDecimal> rates) {
++		if (from == to) {
++			return amount;
++		}
++		BigDecimal fromRate = rates.get(from);
++		BigDecimal toRate = rates.get(to);
++		Assert.notNull(fromRate, "exchange rate not found for " + from);
++		Assert.notNull(toRate, "exchange rate not found for " + to);
++
++		// rates are relative to USD base: to convert from A to B => amount * (rateB / rateA)
++		BigDecimal ratio = toRate.divide(fromRate, SCALE, RoundingMode.HALF_UP);
++		return amount.multiply(ratio).setScale(SCALE, RoundingMode.HALF_UP);
++	}
++
++	private BigDecimal convertPeriod(BigDecimal amount, TimePeriod fromPeriod, TimePeriod toPeriod) {
++		if (fromPeriod == toPeriod) {
++			return amount;
++		}
++		// amount is "per fromPeriod". To convert to toPeriod:
++		// result = amount * (toPeriod.baseRatio / fromPeriod.baseRatio)
++		return amount
++				.multiply(toPeriod.getBaseRatio())
++				.divide(fromPeriod.getBaseRatio(), SCALE, RoundingMode.HALF_UP);
++	}
++
++	private BigDecimal computePercentUsed(BigDecimal spent, BigDecimal limit) {
++		if (limit.compareTo(BigDecimal.ZERO) == 0) {
++			return spent.compareTo(BigDecimal.ZERO) > 0 ? new BigDecimal("100.00") : BigDecimal.ZERO;
++		}
++		return spent
++				.multiply(new BigDecimal("100"))
++				.divide(limit, 2, RoundingMode.HALF_UP);
++	}
++
++	private BudgetStatus.BudgetStatusType classifyStatus(BigDecimal percentUsed, int thresholdPercent) {
++		if (percentUsed.compareTo(new BigDecimal("100")) >= 0) {
++			return BudgetStatus.BudgetStatusType.EXCEEDED;
++		}
++		if (percentUsed.compareTo(new BigDecimal(thresholdPercent)) >= 0) {
++			return BudgetStatus.BudgetStatusType.WARNING;
++		}
++		return BudgetStatus.BudgetStatusType.UNDER_BUDGET;
++	}
++}
+diff --git a/statistics-service/src/test/java/com/piggymetrics/statistics/controller/StatisticsControllerTest.java b/statistics-service/src/test/java/com/piggymetrics/statistics/controller/StatisticsControllerTest.java
+index 6040a21..f60fd82 100644
+--- a/statistics-service/src/test/java/com/piggymetrics/statistics/controller/StatisticsControllerTest.java
++++ b/statistics-service/src/test/java/com/piggymetrics/statistics/controller/StatisticsControllerTest.java
+@@ -3,12 +3,16 @@ package com.piggymetrics.statistics.controller;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.google.common.collect.ImmutableList;
+ import com.piggymetrics.statistics.domain.Account;
++import com.piggymetrics.statistics.domain.BudgetEvaluationRequest;
++import com.piggymetrics.statistics.domain.BudgetItem;
++import com.piggymetrics.statistics.domain.BudgetStatus;
+ import com.piggymetrics.statistics.domain.Currency;
+ import com.piggymetrics.statistics.domain.Item;
+ import com.piggymetrics.statistics.domain.Saving;
+ import com.piggymetrics.statistics.domain.TimePeriod;
+ import com.piggymetrics.statistics.domain.timeseries.DataPoint;
+ import com.piggymetrics.statistics.domain.timeseries.DataPointId;
++import com.piggymetrics.statistics.service.BudgetEvaluationService;
+ import com.piggymetrics.statistics.service.StatisticsService;
+ import com.sun.security.auth.UserPrincipal;
+ import org.junit.Before;
+@@ -24,6 +28,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+ 
+ import java.math.BigDecimal;
+ import java.util.Date;
++import java.util.List;
+ 
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyString;
+@@ -48,6 +53,9 @@ public class StatisticsControllerTest {
+ 	@Mock
+ 	private StatisticsService statisticsService;
+ 
++	@Mock
++	private BudgetEvaluationService budgetEvaluationService;
++
+ 	private MockMvc mockMvc;
+ 
+ 	@Before
+@@ -118,4 +126,56 @@ public class StatisticsControllerTest {
+ 
+ 		verify(statisticsService, times(1)).save(anyString(), any(Account.class));
+ 	}
++
++	@Test
++	public void shouldEvaluateBudgets() throws Exception {
++
++		Saving saving = new Saving();
++		saving.setAmount(new BigDecimal(1500));
++		saving.setCurrency(Currency.USD);
++		saving.setInterest(new BigDecimal("3.32"));
++		saving.setDeposit(true);
++		saving.setCapitalization(false);
++
++		Item grocery = new Item();
++		grocery.setTitle("Grocery");
++		grocery.setAmount(new BigDecimal(10));
++		grocery.setCurrency(Currency.USD);
++		grocery.setPeriod(TimePeriod.DAY);
++
++		Account account = new Account();
++		account.setSaving(saving);
++		account.setExpenses(ImmutableList.of(grocery));
++
++		BudgetItem budgetItem = new BudgetItem();
++		budgetItem.setBudgetId("b1");
++		budgetItem.setCategory("Grocery");
++		budgetItem.setLimit(new BigDecimal("500"));
++		budgetItem.setPeriod(TimePeriod.MONTH);
++		budgetItem.setCurrency(Currency.USD);
++		budgetItem.setThresholdPercent(80);
++
++		BudgetEvaluationRequest request = new BudgetEvaluationRequest();
++		request.setBudgets(ImmutableList.of(budgetItem));
++		request.setAccount(account);
++
++		BudgetStatus budgetStatus = new BudgetStatus();
++		budgetStatus.setBudgetId("b1");
++		budgetStatus.setCategory("Grocery");
++		budgetStatus.setStatus(BudgetStatus.BudgetStatusType.WARNING);
++		budgetStatus.setSpent(new BigDecimal("304.37"));
++		budgetStatus.setPercentUsed(new BigDecimal("60.87"));
++
++		when(budgetEvaluationService.evaluate(any(), any(Account.class)))
++				.thenReturn(ImmutableList.of(budgetStatus));
++
++		String json = mapper.writeValueAsString(request);
++
++		mockMvc.perform(put("/test/evaluate-budgets").contentType(MediaType.APPLICATION_JSON).content(json))
++				.andExpect(jsonPath("$[0].budgetId").value("b1"))
++				.andExpect(jsonPath("$[0].category").value("Grocery"))
++				.andExpect(status().isOk());
++
++		verify(budgetEvaluationService, times(1)).evaluate(any(), any(Account.class));
++	}
+ }
+\ No newline at end of file
+diff --git a/statistics-service/src/test/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImplTest.java b/statistics-service/src/test/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImplTest.java
+new file mode 100644
+index 0000000..9e26d3f
+--- /dev/null
++++ b/statistics-service/src/test/java/com/piggymetrics/statistics/service/BudgetEvaluationServiceImplTest.java
+@@ -0,0 +1,326 @@
++package com.piggymetrics.statistics.service;
++
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableMap;
++import com.piggymetrics.statistics.domain.*;
++import org.junit.Before;
++import org.junit.Test;
++import org.mockito.InjectMocks;
++import org.mockito.Mock;
++
++import java.math.BigDecimal;
++import java.math.RoundingMode;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.when;
++import static org.mockito.MockitoAnnotations.initMocks;
++
++public class BudgetEvaluationServiceImplTest {
++
++	@InjectMocks
++	private BudgetEvaluationServiceImpl budgetEvaluationService;
++
++	@Mock
++	private ExchangeRatesService ratesService;
++
++	private Map<Currency, BigDecimal> defaultRates;
++
++	@Before
++	public void setup() {
++		initMocks(this);
++		defaultRates = ImmutableMap.of(
++				Currency.USD, BigDecimal.ONE,
++				Currency.EUR, new BigDecimal("0.8"),
++				Currency.RUB, new BigDecimal("80")
++		);
++		when(ratesService.getCurrentRates()).thenReturn(defaultRates);
++	}
++
++	@Test
++	public void shouldEvaluateSingleBudgetUnderLimit() {
++
++		Item grocery = new Item();
++		grocery.setTitle("Grocery");
++		grocery.setAmount(new BigDecimal("300"));
++		grocery.setCurrency(Currency.USD);
++		grocery.setPeriod(TimePeriod.MONTH);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(grocery));
++
++		BudgetItem budget = createBudgetItem("b1", "Grocery", new BigDecimal("500"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		BudgetStatus status = result.get(0);
++		assertEquals("b1", status.getBudgetId());
++		assertEquals("Grocery", status.getCategory());
++		assertEquals(BudgetStatus.BudgetStatusType.UNDER_BUDGET, status.getStatus());
++		assertTrue(new BigDecimal("300").compareTo(status.getSpent().setScale(0, RoundingMode.HALF_UP)) == 0);
++		assertTrue(new BigDecimal("60.00").compareTo(status.getPercentUsed()) == 0);
++	}
++
++	@Test
++	public void shouldEvaluateBudgetAsWarningWhenAboveThreshold() {
++
++		Item grocery = new Item();
++		grocery.setTitle("Grocery");
++		grocery.setAmount(new BigDecimal("450"));
++		grocery.setCurrency(Currency.USD);
++		grocery.setPeriod(TimePeriod.MONTH);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(grocery));
++
++		BudgetItem budget = createBudgetItem("b1", "Grocery", new BigDecimal("500"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		assertEquals(BudgetStatus.BudgetStatusType.WARNING, result.get(0).getStatus());
++		assertTrue(new BigDecimal("90.00").compareTo(result.get(0).getPercentUsed()) == 0);
++	}
++
++	@Test
++	public void shouldEvaluateBudgetAsExceededWhenOverLimit() {
++
++		Item grocery = new Item();
++		grocery.setTitle("Grocery");
++		grocery.setAmount(new BigDecimal("600"));
++		grocery.setCurrency(Currency.USD);
++		grocery.setPeriod(TimePeriod.MONTH);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(grocery));
++
++		BudgetItem budget = createBudgetItem("b1", "Grocery", new BigDecimal("500"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		assertEquals(BudgetStatus.BudgetStatusType.EXCEEDED, result.get(0).getStatus());
++		assertTrue(new BigDecimal("120.00").compareTo(result.get(0).getPercentUsed()) == 0);
++	}
++
++	@Test
++	public void shouldConvertCurrencyWhenBudgetAndExpenseDiffer() {
++
++		// Expense: 80 EUR/MONTH. Budget: 120 USD/MONTH.
++		// Convert 80 EUR to USD: 80 * (1 / 0.8) = 100 USD
++		// 100 / 120 = 83.33% -> WARNING (threshold 80)
++		Item expense = new Item();
++		expense.setTitle("Travel");
++		expense.setAmount(new BigDecimal("80"));
++		expense.setCurrency(Currency.EUR);
++		expense.setPeriod(TimePeriod.MONTH);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(expense));
++
++		BudgetItem budget = createBudgetItem("b1", "Travel", new BigDecimal("120"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		assertEquals(BudgetStatus.BudgetStatusType.WARNING, result.get(0).getStatus());
++	}
++
++	@Test
++	public void shouldConvertPeriodWhenBudgetAndExpenseDiffer() {
++
++		// Expense: 1200 USD/YEAR. Budget: 200 USD/MONTH.
++		// Convert period: 1200 * (30.4368 / 365.2425) = ~99.8627 USD/MONTH
++		// 99.86 / 200 = ~49.93% -> UNDER_BUDGET
++		Item expense = new Item();
++		expense.setTitle("Subscription");
++		expense.setAmount(new BigDecimal("1200"));
++		expense.setCurrency(Currency.USD);
++		expense.setPeriod(TimePeriod.YEAR);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(expense));
++
++		BudgetItem budget = createBudgetItem("b1", "Subscription", new BigDecimal("200"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		assertEquals(BudgetStatus.BudgetStatusType.UNDER_BUDGET, result.get(0).getStatus());
++		assertTrue(result.get(0).getPercentUsed().compareTo(new BigDecimal("50")) < 0);
++	}
++
++	@Test
++	public void shouldUseTotalCategoryToSumAllExpenses() {
++
++		Item grocery = new Item();
++		grocery.setTitle("Grocery");
++		grocery.setAmount(new BigDecimal("200"));
++		grocery.setCurrency(Currency.USD);
++		grocery.setPeriod(TimePeriod.MONTH);
++
++		Item transport = new Item();
++		transport.setTitle("Transport");
++		transport.setAmount(new BigDecimal("100"));
++		transport.setCurrency(Currency.USD);
++		transport.setPeriod(TimePeriod.MONTH);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(grocery, transport));
++
++		BudgetItem budget = createBudgetItem("b1", "_TOTAL", new BigDecimal("500"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		// 300/500 = 60%
++		assertTrue(new BigDecimal("60.00").compareTo(result.get(0).getPercentUsed()) == 0);
++		assertEquals(BudgetStatus.BudgetStatusType.UNDER_BUDGET, result.get(0).getStatus());
++	}
++
++	@Test
++	public void shouldReturnZeroSpentWhenNoExpenses() {
++
++		Account account = new Account();
++		account.setExpenses(Collections.emptyList());
++
++		BudgetItem budget = createBudgetItem("b1", "Grocery", new BigDecimal("500"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		assertTrue(BigDecimal.ZERO.compareTo(result.get(0).getSpent()) == 0);
++		assertEquals(BudgetStatus.BudgetStatusType.UNDER_BUDGET, result.get(0).getStatus());
++	}
++
++	@Test
++	public void shouldReturnZeroSpentWhenExpensesListIsNull() {
++
++		Account account = new Account();
++		account.setExpenses(null);
++
++		BudgetItem budget = createBudgetItem("b1", "Grocery", new BigDecimal("500"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		assertTrue(BigDecimal.ZERO.compareTo(result.get(0).getSpent()) == 0);
++	}
++
++	@Test
++	public void shouldEvaluateMultipleBudgets() {
++
++		Item grocery = new Item();
++		grocery.setTitle("Grocery");
++		grocery.setAmount(new BigDecimal("400"));
++		grocery.setCurrency(Currency.USD);
++		grocery.setPeriod(TimePeriod.MONTH);
++
++		Item transport = new Item();
++		transport.setTitle("Transport");
++		transport.setAmount(new BigDecimal("50"));
++		transport.setCurrency(Currency.USD);
++		transport.setPeriod(TimePeriod.MONTH);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(grocery, transport));
++
++		BudgetItem budgetGrocery = createBudgetItem("b1", "Grocery", new BigDecimal("500"),
++				TimePeriod.MONTH, Currency.USD, 80);
++		BudgetItem budgetTransport = createBudgetItem("b2", "Transport", new BigDecimal("100"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(
++				ImmutableList.of(budgetGrocery, budgetTransport), account);
++
++		assertEquals(2, result.size());
++
++		BudgetStatus groceryStatus = result.stream()
++				.filter(s -> "Grocery".equals(s.getCategory()))
++				.findFirst().get();
++		BudgetStatus transportStatus = result.stream()
++				.filter(s -> "Transport".equals(s.getCategory()))
++				.findFirst().get();
++
++		assertEquals(BudgetStatus.BudgetStatusType.WARNING, groceryStatus.getStatus()); // 400/500 = 80%
++		assertEquals(BudgetStatus.BudgetStatusType.UNDER_BUDGET, transportStatus.getStatus()); // 50/100 = 50%
++	}
++
++	@Test
++	public void shouldFilterExpensesByCaseSensitivity() {
++
++		Item expense = new Item();
++		expense.setTitle("grocery");
++		expense.setAmount(new BigDecimal("100"));
++		expense.setCurrency(Currency.USD);
++		expense.setPeriod(TimePeriod.MONTH);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(expense));
++
++		BudgetItem budget = createBudgetItem("b1", "Grocery", new BigDecimal("500"),
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		// Should match case-insensitively
++		assertTrue(new BigDecimal("100").compareTo(result.get(0).getSpent().setScale(0, RoundingMode.HALF_UP)) == 0);
++	}
++
++	@Test
++	public void shouldHandleZeroLimitBudgetWithSpending() {
++
++		Item expense = new Item();
++		expense.setTitle("Grocery");
++		expense.setAmount(new BigDecimal("100"));
++		expense.setCurrency(Currency.USD);
++		expense.setPeriod(TimePeriod.MONTH);
++
++		Account account = new Account();
++		account.setExpenses(ImmutableList.of(expense));
++
++		BudgetItem budget = createBudgetItem("b1", "Grocery", BigDecimal.ZERO,
++				TimePeriod.MONTH, Currency.USD, 80);
++
++		List<BudgetStatus> result = budgetEvaluationService.evaluate(ImmutableList.of(budget), account);
++
++		assertEquals(1, result.size());
++		// Zero limit with spending -> 100% -> EXCEEDED
++		assertTrue(new BigDecimal("100.00").compareTo(result.get(0).getPercentUsed()) == 0);
++		assertEquals(BudgetStatus.BudgetStatusType.EXCEEDED, result.get(0).getStatus());
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void shouldFailWhenBudgetsIsNull() {
++		budgetEvaluationService.evaluate(null, new Account());
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void shouldFailWhenAccountIsNull() {
++		budgetEvaluationService.evaluate(ImmutableList.of(), null);
++	}
++
++	private BudgetItem createBudgetItem(String id, String category, BigDecimal limit,
++										TimePeriod period, Currency currency, int thresholdPercent) {
++		BudgetItem item = new BudgetItem();
++		item.setBudgetId(id);
++		item.setCategory(category);
++		item.setLimit(limit);
++		item.setPeriod(period);
++		item.setCurrency(currency);
++		item.setThresholdPercent(thresholdPercent);
++		return item;
++	}
++}
