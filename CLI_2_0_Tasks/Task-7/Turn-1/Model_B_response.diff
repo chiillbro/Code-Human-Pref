@@ -1,0 +1,1484 @@
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..45b5fe1
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,16 @@
++[build-system]
++requires = ["setuptools>=68.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "logpipe"
++version = "0.1.0"
++description = "CLI log analysis tool — normalize, filter, analyze, report."
++requires-python = ">=3.10"
++dependencies = ["PyYAML>=6.0"]
++
++[project.scripts]
++logpipe = "logpipe.cli:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
+diff --git a/src/logpipe/__init__.py b/src/logpipe/__init__.py
+new file mode 100644
+index 0000000..057a515
+--- /dev/null
++++ b/src/logpipe/__init__.py
+@@ -0,0 +1,3 @@
++"""logpipe — CLI log analysis tool."""
++
++__version__ = "0.1.0"
+diff --git a/src/logpipe/__main__.py b/src/logpipe/__main__.py
+new file mode 100644
+index 0000000..a781eb8
+--- /dev/null
++++ b/src/logpipe/__main__.py
+@@ -0,0 +1,5 @@
++"""Allow running with `python -m logpipe`."""
++
++from logpipe.cli import main
++
++main()
+diff --git a/src/logpipe/analysis.py b/src/logpipe/analysis.py
+new file mode 100644
+index 0000000..759f4a9
+--- /dev/null
++++ b/src/logpipe/analysis.py
+@@ -0,0 +1,131 @@
++"""Windowed metrics, severity breakdown, and anomaly detection."""
++
++from __future__ import annotations
++
++import math
++import re
++from collections import Counter, defaultdict
++from datetime import datetime, timedelta
++from typing import Any
++
++from logpipe.config import AnalysisSettings
++from logpipe.models import LogEvent
++
++
++def _window_key(ts: datetime, window_seconds: int) -> str:
++    """Round a timestamp down to the start of its window."""
++    epoch = ts.timestamp()
++    bucket = int(epoch // window_seconds) * window_seconds
++    return datetime.fromtimestamp(bucket).isoformat()
++
++
++# Collapse numbers / hex / uuids so similar messages cluster together.
++_COLLAPSE = [
++    (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I), "<UUID>"),
++    (re.compile(r"0x[0-9a-fA-F]+"), "<HEX>"),
++    (re.compile(r"\b\d+\b"), "<N>"),
++]
++
++
++def _signature(message: str) -> str:
++    sig = message
++    for pat, repl in _COLLAPSE:
++        sig = pat.sub(repl, sig)
++    return sig
++
++
++class AnalysisResult:
++    """Container for all computed metrics."""
++
++    __slots__ = (
++        "total_events",
++        "level_counts",
++        "windows",
++        "anomalies",
++        "top_patterns",
++        "time_range",
++    )
++
++    def __init__(self) -> None:
++        self.total_events: int = 0
++        self.level_counts: Counter[str] = Counter()
++        self.windows: dict[str, dict[str, Any]] = {}
++        self.anomalies: list[dict[str, Any]] = []
++        self.top_patterns: list[tuple[str, int]] = []
++        self.time_range: tuple[str | None, str | None] = (None, None)
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "total_events": self.total_events,
++            "level_counts": dict(self.level_counts),
++            "time_range": {"start": self.time_range[0], "end": self.time_range[1]},
++            "windows": self.windows,
++            "anomalies": self.anomalies,
++            "top_patterns": [{"pattern": p, "count": c} for p, c in self.top_patterns],
++        }
++
++
++def analyze(events: list[LogEvent], settings: AnalysisSettings) -> AnalysisResult:
++    """Run full analysis on a batch of events."""
++    result = AnalysisResult()
++    result.total_events = len(events)
++
++    if not events:
++        return result
++
++    # Level breakdown
++    for ev in events:
++        if ev.level:
++            result.level_counts[ev.level] += 1
++
++    # Time range
++    timestamps = [ev.timestamp for ev in events if ev.timestamp]
++    if timestamps:
++        mn, mx = min(timestamps), max(timestamps)
++        result.time_range = (mn.isoformat(), mx.isoformat())
++
++    # Windowed counts
++    window_counts: dict[str, int] = defaultdict(int)
++    window_levels: dict[str, Counter[str]] = defaultdict(Counter)
++    for ev in events:
++        if ev.timestamp is None:
++            continue
++        wk = _window_key(ev.timestamp, settings.window_seconds)
++        window_counts[wk] += 1
++        if ev.level:
++            window_levels[wk][ev.level] += 1
++
++    for wk in sorted(window_counts):
++        result.windows[wk] = {
++            "count": window_counts[wk],
++            "levels": dict(window_levels[wk]),
++        }
++
++    # Anomaly detection (z-score on window counts)
++    if len(window_counts) >= 3:
++        counts = list(window_counts.values())
++        mean = sum(counts) / len(counts)
++        variance = sum((c - mean) ** 2 for c in counts) / len(counts)
++        stddev = math.sqrt(variance) if variance > 0 else 0.0
++
++        if stddev > 0:
++            for wk in sorted(window_counts):
++                c = window_counts[wk]
++                z = (c - mean) / stddev
++                if abs(z) >= settings.anomaly_threshold:
++                    result.anomalies.append({
++                        "window": wk,
++                        "count": c,
++                        "z_score": round(z, 2),
++                        "type": "spike" if z > 0 else "drop",
++                        "mean": round(mean, 2),
++                        "stddev": round(stddev, 2),
++                    })
++
++    # Top message patterns
++    sig_counter: Counter[str] = Counter()
++    for ev in events:
++        sig_counter[_signature(ev.message)] += 1
++    result.top_patterns = sig_counter.most_common(10)
++
++    return result
+diff --git a/src/logpipe/cli.py b/src/logpipe/cli.py
+new file mode 100644
+index 0000000..8572d7c
+--- /dev/null
++++ b/src/logpipe/cli.py
+@@ -0,0 +1,97 @@
++"""Command-line interface — ``logpipe analyze`` and ``logpipe tail``."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++
++from logpipe import __version__
++from logpipe.analysis import analyze
++from logpipe.config import load_config
++from logpipe.pipeline import PipelineStats, run_pipeline
++from logpipe.report import build_report, build_summary, report_to_json
++from logpipe.tail import tail_follow
++
++
++def _build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="logpipe",
++        description="CLI log analysis tool — normalize, filter, analyze, report.",
++    )
++    parser.add_argument("--version", action="version", version=f"logpipe {__version__}")
++
++    sub = parser.add_subparsers(dest="command")
++
++    # --- analyze ---
++    an = sub.add_parser("analyze", help="Batch-analyze log files and produce a report.")
++    an.add_argument("files", nargs="+", help="Log files to analyze.")
++    an.add_argument("-c", "--config", default=None, help="YAML config file.")
++    an.add_argument(
++        "-o", "--output", default=None,
++        help="Write JSON report to this file (default: stdout).",
++    )
++
++    # --- tail ---
++    ta = sub.add_parser("tail", help="Follow log files in real time.")
++    ta.add_argument("files", nargs="+", help="Log files to tail.")
++    ta.add_argument("-c", "--config", default=None, help="YAML config file.")
++    ta.add_argument(
++        "--interval", type=float, default=30.0,
++        help="Seconds between periodic analysis summaries (default: 30).",
++    )
++
++    return parser
++
++
++def main(argv: list[str] | None = None) -> None:
++    parser = _build_parser()
++    args = parser.parse_args(argv)
++
++    if args.command is None:
++        parser.print_help()
++        sys.exit(1)
++
++    if args.command == "analyze":
++        _cmd_analyze(args)
++    elif args.command == "tail":
++        _cmd_tail(args)
++
++
++# ── analyze ──────────────────────────────────────────────────────────
++
++def _cmd_analyze(args: argparse.Namespace) -> None:
++    config = load_config(args.config)
++
++    # Drain the generator to collect events and stats.
++    gen = run_pipeline(args.files, config)
++    events = []
++    stats: PipelineStats | None = None
++    try:
++        while True:
++            events.append(next(gen))
++    except StopIteration as stop:
++        stats = stop.value
++
++    if stats is None:
++        stats = PipelineStats()
++
++    result = analyze(events, config.analysis)
++    report = build_report(result, stats)
++
++    json_str = report_to_json(report)
++    if args.output:
++        with open(args.output, "w") as f:
++            f.write(json_str + "\n")
++        print(f"logpipe: report written to {args.output}", file=sys.stderr)
++    else:
++        print(json_str)
++
++    # Always print the human-readable summary to stderr.
++    print("\n" + build_summary(report), file=sys.stderr)
++
++
++# ── tail ─────────────────────────────────────────────────────────────
++
++def _cmd_tail(args: argparse.Namespace) -> None:
++    config = load_config(args.config)
++    tail_follow(args.files, config, interval=args.interval)
+diff --git a/src/logpipe/config.py b/src/logpipe/config.py
+new file mode 100644
+index 0000000..c85465a
+--- /dev/null
++++ b/src/logpipe/config.py
+@@ -0,0 +1,66 @@
++"""Load and validate YAML configuration for filters, transforms, and analysis."""
++
++from __future__ import annotations
++
++import dataclasses
++from pathlib import Path
++from typing import Any
++
++import yaml
++
++
++@dataclasses.dataclass(slots=True)
++class FilterSpec:
++    type: str
++    params: dict[str, Any]
++
++
++@dataclasses.dataclass(slots=True)
++class TransformSpec:
++    type: str
++    params: dict[str, Any]
++
++
++@dataclasses.dataclass(slots=True)
++class AnalysisSettings:
++    window_seconds: int = 60
++    anomaly_threshold: float = 2.0
++
++
++@dataclasses.dataclass(slots=True)
++class Config:
++    filters: list[FilterSpec] = dataclasses.field(default_factory=list)
++    transforms: list[TransformSpec] = dataclasses.field(default_factory=list)
++    analysis: AnalysisSettings = dataclasses.field(default_factory=AnalysisSettings)
++
++
++def load_config(path: str | Path | None) -> Config:
++    """Load config from a YAML file, or return defaults when *path* is None."""
++    if path is None:
++        return Config()
++
++    with open(path) as f:
++        raw = yaml.safe_load(f)
++
++    if not isinstance(raw, dict):
++        return Config()
++
++    filters: list[FilterSpec] = []
++    for entry in raw.get("filters") or []:
++        ftype = entry.pop("type", None)
++        if ftype:
++            filters.append(FilterSpec(type=ftype, params=entry))
++
++    transforms: list[TransformSpec] = []
++    for entry in raw.get("transforms") or []:
++        ttype = entry.pop("type", None)
++        if ttype:
++            transforms.append(TransformSpec(type=ttype, params=entry))
++
++    analysis_raw = raw.get("analysis") or {}
++    analysis = AnalysisSettings(
++        window_seconds=int(analysis_raw.get("window_seconds", 60)),
++        anomaly_threshold=float(analysis_raw.get("anomaly_threshold", 2.0)),
++    )
++
++    return Config(filters=filters, transforms=transforms, analysis=analysis)
+diff --git a/src/logpipe/filters.py b/src/logpipe/filters.py
+new file mode 100644
+index 0000000..d251872
+--- /dev/null
++++ b/src/logpipe/filters.py
+@@ -0,0 +1,77 @@
++"""Configurable event filters."""
++
++from __future__ import annotations
++
++import re
++from datetime import datetime
++from typing import Any, Callable
++
++from logpipe.config import FilterSpec
++from logpipe.models import LEVEL_ORDER, LogEvent
++
++
++def build_filters(specs: list[FilterSpec]) -> list[Callable[[LogEvent], bool]]:
++    """Return a list of predicate functions from filter specs.
++
++    Each predicate returns True if the event should be **kept**.
++    """
++    out: list[Callable[[LogEvent], bool]] = []
++    for spec in specs:
++        builder = _REGISTRY.get(spec.type)
++        if builder is None:
++            raise ValueError(f"Unknown filter type: {spec.type!r}")
++        out.append(builder(spec.params))
++    return out
++
++
++# -- individual builders ---------------------------------------------------
++
++
++def _level_filter(params: dict[str, Any]) -> Callable[[LogEvent], bool]:
++    min_level = params.get("min_level", "WARNING").upper()
++    threshold = LEVEL_ORDER.get(min_level, 0)
++
++    def _keep(event: LogEvent) -> bool:
++        if event.level is None:
++            return True  # keep events with unknown level
++        return LEVEL_ORDER.get(event.level, 0) >= threshold
++
++    return _keep
++
++
++def _regex_filter(params: dict[str, Any]) -> Callable[[LogEvent], bool]:
++    pattern = re.compile(params["pattern"], re.IGNORECASE)
++    field = params.get("field", "message")
++
++    def _keep(event: LogEvent) -> bool:
++        if field == "message":
++            text = event.message
++        else:
++            text = str(event.fields.get(field, ""))
++        return pattern.search(text) is not None
++
++    return _keep
++
++
++def _timerange_filter(params: dict[str, Any]) -> Callable[[LogEvent], bool]:
++    start = datetime.fromisoformat(params["start"]) if "start" in params else None
++    end = datetime.fromisoformat(params["end"]) if "end" in params else None
++
++    def _keep(event: LogEvent) -> bool:
++        if event.timestamp is None:
++            return True
++        ts = event.timestamp
++        if start and ts < start:
++            return False
++        if end and ts > end:
++            return False
++        return True
++
++    return _keep
++
++
++_REGISTRY: dict[str, Callable[[dict[str, Any]], Callable[[LogEvent], bool]]] = {
++    "level": _level_filter,
++    "regex": _regex_filter,
++    "timerange": _timerange_filter,
++}
+diff --git a/src/logpipe/formats/__init__.py b/src/logpipe/formats/__init__.py
+new file mode 100644
+index 0000000..905e431
+--- /dev/null
++++ b/src/logpipe/formats/__init__.py
+@@ -0,0 +1,34 @@
++"""Log format parsers and auto-detection."""
++
++from __future__ import annotations
++
++import sys
++from typing import TYPE_CHECKING
++
++from logpipe.formats.jsonl import JSONLParser
++from logpipe.formats.kv import KVParser
++from logpipe.formats.syslog import SyslogParser
++from logpipe.formats.base import Parser
++
++if TYPE_CHECKING:
++    pass
++
++PARSERS: list[Parser] = [JSONLParser(), SyslogParser(), KVParser()]
++
++
++def detect_parser(sample_lines: list[str]) -> Parser:
++    """Pick the best parser for *sample_lines* by confidence score.
++
++    Falls back to the KV parser (which can treat plain lines as message-only).
++    """
++    if not sample_lines:
++        return KVParser()
++
++    best: Parser = PARSERS[-1]
++    best_score = 0.0
++    for parser in PARSERS:
++        score = parser.probe(sample_lines)
++        if score > best_score:
++            best_score = score
++            best = parser
++    return best
+diff --git a/src/logpipe/formats/base.py b/src/logpipe/formats/base.py
+new file mode 100644
+index 0000000..ed4baf2
+--- /dev/null
++++ b/src/logpipe/formats/base.py
+@@ -0,0 +1,21 @@
++"""Abstract base for log format parsers."""
++
++from __future__ import annotations
++
++import abc
++
++from logpipe.models import LogEvent
++
++
++class Parser(abc.ABC):
++    """Interface every format parser must implement."""
++
++    name: str = "base"
++
++    @abc.abstractmethod
++    def probe(self, sample_lines: list[str]) -> float:
++        """Return 0.0–1.0 confidence that *sample_lines* match this format."""
++
++    @abc.abstractmethod
++    def parse_line(self, line: str, *, source: str, line_number: int) -> LogEvent | None:
++        """Parse a single raw line into a LogEvent, or None on failure."""
+diff --git a/src/logpipe/formats/jsonl.py b/src/logpipe/formats/jsonl.py
+new file mode 100644
+index 0000000..a9527d8
+--- /dev/null
++++ b/src/logpipe/formats/jsonl.py
+@@ -0,0 +1,93 @@
++"""JSON-lines log parser."""
++
++from __future__ import annotations
++
++import json
++from datetime import datetime, timezone
++from typing import Any
++
++from logpipe.formats.base import Parser
++from logpipe.models import LogEvent, normalize_level
++
++
++_TS_KEYS = ("timestamp", "time", "ts", "@timestamp", "datetime", "date")
++_LEVEL_KEYS = ("level", "severity", "loglevel", "log_level", "lvl")
++_MSG_KEYS = ("message", "msg", "text", "log", "body")
++
++
++def _first_match(data: dict[str, Any], candidates: tuple[str, ...]) -> Any | None:
++    for key in candidates:
++        if key in data:
++            return data[key]
++    return None
++
++
++def _parse_ts(raw: Any) -> datetime | None:
++    if raw is None:
++        return None
++    if isinstance(raw, (int, float)):
++        try:
++            return datetime.fromtimestamp(raw, tz=timezone.utc)
++        except (OSError, ValueError):
++            return None
++    s = str(raw)
++    for fmt in (
++        "%Y-%m-%dT%H:%M:%S.%fZ",
++        "%Y-%m-%dT%H:%M:%SZ",
++        "%Y-%m-%dT%H:%M:%S.%f%z",
++        "%Y-%m-%dT%H:%M:%S%z",
++        "%Y-%m-%d %H:%M:%S.%f",
++        "%Y-%m-%d %H:%M:%S",
++    ):
++        try:
++            return datetime.strptime(s, fmt)
++        except ValueError:
++            continue
++    return None
++
++
++class JSONLParser(Parser):
++    name = "jsonl"
++
++    def probe(self, sample_lines: list[str]) -> float:
++        hits = 0
++        for line in sample_lines:
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                obj = json.loads(line)
++                if isinstance(obj, dict):
++                    hits += 1
++            except (json.JSONDecodeError, ValueError):
++                pass
++        return hits / max(len(sample_lines), 1)
++
++    def parse_line(self, line: str, *, source: str, line_number: int) -> LogEvent | None:
++        line = line.strip()
++        if not line:
++            return None
++        try:
++            data = json.loads(line)
++        except (json.JSONDecodeError, ValueError):
++            return None
++        if not isinstance(data, dict):
++            return None
++
++        ts = _parse_ts(_first_match(data, _TS_KEYS))
++        level = normalize_level(str(_first_match(data, _LEVEL_KEYS) or ""))
++        message = str(_first_match(data, _MSG_KEYS) or "")
++
++        # Everything else goes into fields
++        skip = set(_TS_KEYS) | set(_LEVEL_KEYS) | set(_MSG_KEYS)
++        fields = {k: v for k, v in data.items() if k not in skip}
++
++        return LogEvent(
++            timestamp=ts,
++            level=level,
++            message=message,
++            source=source,
++            line_number=line_number,
++            raw=line,
++            fields=fields,
++        )
+diff --git a/src/logpipe/formats/kv.py b/src/logpipe/formats/kv.py
+new file mode 100644
+index 0000000..deca76d
+--- /dev/null
++++ b/src/logpipe/formats/kv.py
+@@ -0,0 +1,140 @@
++"""Key-value / plain-text log parser.
++
++Handles lines like:
++    ts=2024-01-15T10:30:00Z level=ERROR msg="disk full" host=web-01
++
++Also acts as the fallback parser: if a line has no kv pairs it is stored
++as a plain message with optional timestamp/level extracted by regex.
++"""
++
++from __future__ import annotations
++
++import re
++from datetime import datetime
++
++from logpipe.formats.base import Parser
++from logpipe.models import LogEvent, normalize_level
++
++
++# key=value or key="quoted value"
++_KV_PAIR = re.compile(r"""(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))""")
++
++_TS_KEYS = {"ts", "timestamp", "time", "datetime", "date"}
++_LEVEL_KEYS = {"level", "severity", "loglevel", "lvl"}
++_MSG_KEYS = {"msg", "message", "text"}
++
++# Fallback regex for unstructured lines
++_PLAIN_TS = re.compile(
++    r"(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)"
++)
++_PLAIN_LEVEL = re.compile(
++    r"\b(?P<lvl>DEBUG|INFO|NOTICE|WARN(?:ING)?|ERROR|ERR|CRIT(?:ICAL)?|FATAL|EMERG(?:ENCY)?|ALERT|PANIC)\b",
++    re.IGNORECASE,
++)
++
++_TS_FMTS = (
++    "%Y-%m-%dT%H:%M:%S.%fZ",
++    "%Y-%m-%dT%H:%M:%SZ",
++    "%Y-%m-%dT%H:%M:%S.%f%z",
++    "%Y-%m-%dT%H:%M:%S%z",
++    "%Y-%m-%d %H:%M:%S.%f",
++    "%Y-%m-%d %H:%M:%S",
++)
++
++
++def _try_parse_ts(raw: str) -> datetime | None:
++    for fmt in _TS_FMTS:
++        try:
++            return datetime.strptime(raw, fmt)
++        except ValueError:
++            continue
++    return None
++
++
++class KVParser(Parser):
++    name = "kv"
++
++    def probe(self, sample_lines: list[str]) -> float:
++        hits = 0
++        for line in sample_lines:
++            line = line.strip()
++            if not line:
++                continue
++            pairs = _KV_PAIR.findall(line)
++            if len(pairs) >= 2:
++                hits += 1
++        return hits / max(len(sample_lines), 1) * 0.9  # slight discount vs jsonl/syslog
++
++    def parse_line(self, line: str, *, source: str, line_number: int) -> LogEvent | None:
++        line_s = line.strip()
++        if not line_s:
++            return None
++
++        pairs = _KV_PAIR.findall(line_s)
++        if len(pairs) >= 2:
++            return self._from_kv(pairs, line_s, source, line_number)
++
++        # Fallback: plain text
++        return self._from_plain(line_s, source, line_number)
++
++    # ------------------------------------------------------------------
++
++    def _from_kv(
++        self,
++        pairs: list[tuple[str, str, str]],
++        raw: str,
++        source: str,
++        line_number: int,
++    ) -> LogEvent:
++        data: dict[str, str] = {}
++        for key, quoted_val, bare_val in pairs:
++            data[key.lower()] = quoted_val if quoted_val else bare_val
++
++        ts_raw = None
++        for k in _TS_KEYS:
++            if k in data:
++                ts_raw = data.pop(k)
++                break
++        level_raw = None
++        for k in _LEVEL_KEYS:
++            if k in data:
++                level_raw = data.pop(k)
++                break
++        msg = ""
++        for k in _MSG_KEYS:
++            if k in data:
++                msg = data.pop(k)
++                break
++
++        return LogEvent(
++            timestamp=_try_parse_ts(ts_raw) if ts_raw else None,
++            level=normalize_level(level_raw),
++            message=msg,
++            source=source,
++            line_number=line_number,
++            raw=raw,
++            fields=data,
++        )
++
++    def _from_plain(
++        self, raw: str, source: str, line_number: int
++    ) -> LogEvent:
++        ts: datetime | None = None
++        m = _PLAIN_TS.search(raw)
++        if m:
++            ts = _try_parse_ts(m.group("ts"))
++
++        level: str | None = None
++        m = _PLAIN_LEVEL.search(raw)
++        if m:
++            level = normalize_level(m.group("lvl"))
++
++        return LogEvent(
++            timestamp=ts,
++            level=level,
++            message=raw,
++            source=source,
++            line_number=line_number,
++            raw=raw,
++            fields={},
++        )
+diff --git a/src/logpipe/formats/syslog.py b/src/logpipe/formats/syslog.py
+new file mode 100644
+index 0000000..299ee8f
+--- /dev/null
++++ b/src/logpipe/formats/syslog.py
+@@ -0,0 +1,161 @@
++"""Syslog (RFC 3164 / RFC 5424) log parser."""
++
++from __future__ import annotations
++
++import re
++from datetime import datetime
++from typing import Any
++
++from logpipe.formats.base import Parser
++from logpipe.models import LogEvent, normalize_level
++
++
++# RFC 3164: "Mar 15 10:23:45 hostname process[pid]: message"
++_RFC3164 = re.compile(
++    r"^(?:<(?P<pri>\d{1,3})>)?"
++    r"(?P<month>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+"
++    r"(?P<time>\d{2}:\d{2}:\d{2})\s+"
++    r"(?P<hostname>\S+)\s+"
++    r"(?P<tag>\S+?)(?:\[(?P<pid>\d+)\])?:\s*"
++    r"(?P<message>.*)",
++    re.DOTALL,
++)
++
++# RFC 5424: "<pri>version timestamp hostname app-name procid msgid structured-data msg"
++_RFC5424 = re.compile(
++    r"^<(?P<pri>\d{1,3})>"
++    r"(?P<version>\d+)\s+"
++    r"(?P<timestamp>\S+)\s+"
++    r"(?P<hostname>\S+)\s+"
++    r"(?P<appname>\S+)\s+"
++    r"(?P<procid>\S+)\s+"
++    r"(?P<msgid>\S+)\s+"
++    r"(?P<sd>(?:\[.*?\])+|-)\s*"
++    r"(?P<message>.*)",
++    re.DOTALL,
++)
++
++_MONTHS = {
++    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
++    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
++}
++
++# Syslog severity (from PRI) → our level names.
++_SYSLOG_SEVERITY = [
++    "CRITICAL",  # 0 emergency
++    "CRITICAL",  # 1 alert
++    "CRITICAL",  # 2 critical
++    "ERROR",     # 3 error
++    "WARNING",   # 4 warning
++    "INFO",      # 5 notice
++    "INFO",      # 6 informational
++    "DEBUG",     # 7 debug
++]
++
++
++def _level_from_pri(pri: str | None) -> str | None:
++    if pri is None:
++        return None
++    try:
++        severity = int(pri) & 0x07
++        return _SYSLOG_SEVERITY[severity]
++    except (ValueError, IndexError):
++        return None
++
++
++def _parse_rfc3164_ts(month: str, day: str, time_str: str) -> datetime | None:
++    mon = _MONTHS.get(month)
++    if mon is None:
++        return None
++    try:
++        now = datetime.now()
++        return datetime(
++            year=now.year, month=mon, day=int(day),
++            hour=int(time_str[:2]),
++            minute=int(time_str[3:5]),
++            second=int(time_str[6:8]),
++        )
++    except (ValueError, IndexError):
++        return None
++
++
++def _parse_rfc5424_ts(raw: str) -> datetime | None:
++    if raw == "-":
++        return None
++    for fmt in (
++        "%Y-%m-%dT%H:%M:%S.%fZ",
++        "%Y-%m-%dT%H:%M:%SZ",
++        "%Y-%m-%dT%H:%M:%S.%f%z",
++        "%Y-%m-%dT%H:%M:%S%z",
++    ):
++        try:
++            return datetime.strptime(raw, fmt)
++        except ValueError:
++            continue
++    return None
++
++
++class SyslogParser(Parser):
++    name = "syslog"
++
++    def probe(self, sample_lines: list[str]) -> float:
++        hits = 0
++        for line in sample_lines:
++            line = line.strip()
++            if not line:
++                continue
++            if _RFC5424.match(line) or _RFC3164.match(line):
++                hits += 1
++        return hits / max(len(sample_lines), 1)
++
++    def parse_line(self, line: str, *, source: str, line_number: int) -> LogEvent | None:
++        line_s = line.strip()
++        if not line_s:
++            return None
++
++        m = _RFC5424.match(line_s)
++        if m:
++            return self._from_5424(m, line_s, source, line_number)
++
++        m = _RFC3164.match(line_s)
++        if m:
++            return self._from_3164(m, line_s, source, line_number)
++
++        return None
++
++    # ------------------------------------------------------------------
++
++    def _from_5424(
++        self, m: re.Match[str], raw: str, source: str, line_number: int
++    ) -> LogEvent:
++        fields: dict[str, Any] = {}
++        for key in ("hostname", "appname", "procid", "msgid"):
++            val = m.group(key)
++            if val and val != "-":
++                fields[key] = val
++        return LogEvent(
++            timestamp=_parse_rfc5424_ts(m.group("timestamp")),
++            level=_level_from_pri(m.group("pri")),
++            message=m.group("message"),
++            source=source,
++            line_number=line_number,
++            raw=raw,
++            fields=fields,
++        )
++
++    def _from_3164(
++        self, m: re.Match[str], raw: str, source: str, line_number: int
++    ) -> LogEvent:
++        fields: dict[str, Any] = {"hostname": m.group("hostname"), "tag": m.group("tag")}
++        pid = m.group("pid")
++        if pid:
++            fields["pid"] = pid
++        return LogEvent(
++            timestamp=_parse_rfc3164_ts(m.group("month"), m.group("day"), m.group("time")),
++            level=_level_from_pri(m.group("pri")),
++            message=m.group("message"),
++            source=source,
++            line_number=line_number,
++            raw=raw,
++            fields=fields,
++        )
+diff --git a/src/logpipe/models.py b/src/logpipe/models.py
+new file mode 100644
+index 0000000..965347c
+--- /dev/null
++++ b/src/logpipe/models.py
+@@ -0,0 +1,57 @@
++"""Normalized log event representation."""
++
++from __future__ import annotations
++
++import dataclasses
++from datetime import datetime
++from typing import Any
++
++
++LEVEL_ORDER = {"DEBUG": 0, "INFO": 1, "WARNING": 2, "ERROR": 3, "CRITICAL": 4}
++
++LEVEL_ALIASES: dict[str, str] = {
++    "TRACE": "DEBUG",
++    "WARN": "WARNING",
++    "FATAL": "CRITICAL",
++    "PANIC": "CRITICAL",
++    "EMERGENCY": "CRITICAL",
++    "EMERG": "CRITICAL",
++    "ALERT": "CRITICAL",
++    "CRIT": "CRITICAL",
++    "ERR": "ERROR",
++    "NOTICE": "INFO",
++    "INFORMATIONAL": "INFO",
++}
++
++
++def normalize_level(raw: str | None) -> str | None:
++    """Map arbitrary severity strings to DEBUG/INFO/WARNING/ERROR/CRITICAL."""
++    if raw is None:
++        return None
++    upper = raw.strip().upper()
++    if upper in LEVEL_ORDER:
++        return upper
++    return LEVEL_ALIASES.get(upper)
++
++
++@dataclasses.dataclass(slots=True)
++class LogEvent:
++    """A single normalized log event."""
++
++    timestamp: datetime | None
++    level: str | None
++    message: str
++    source: str
++    line_number: int
++    raw: str
++    fields: dict[str, Any] = dataclasses.field(default_factory=dict)
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
++            "level": self.level,
++            "message": self.message,
++            "source": self.source,
++            "line_number": self.line_number,
++            "fields": self.fields,
++        }
+diff --git a/src/logpipe/pipeline.py b/src/logpipe/pipeline.py
+new file mode 100644
+index 0000000..905c771
+--- /dev/null
++++ b/src/logpipe/pipeline.py
+@@ -0,0 +1,110 @@
++"""Core pipeline: read files -> parse -> filter -> transform -> yield events."""
++
++from __future__ import annotations
++
++import sys
++from collections.abc import Generator, Iterable
++from pathlib import Path
++from typing import Callable
++
++from logpipe.config import Config
++from logpipe.filters import build_filters
++from logpipe.formats import detect_parser
++from logpipe.formats.base import Parser
++from logpipe.models import LogEvent
++from logpipe.transforms import build_transforms
++
++SAMPLE_SIZE = 20
++
++
++class PipelineStats:
++    """Counters accumulated while running the pipeline."""
++
++    __slots__ = ("files_processed", "files_skipped", "lines_processed", "lines_skipped")
++
++    def __init__(self) -> None:
++        self.files_processed: int = 0
++        self.files_skipped: int = 0
++        self.lines_processed: int = 0
++        self.lines_skipped: int = 0
++
++
++def _open_and_detect(path: Path, stats: PipelineStats) -> tuple[list[str], Parser] | None:
++    """Read sample lines and choose a parser.  Returns None on failure."""
++    try:
++        with open(path, errors="replace") as f:
++            sample = [f.readline() for _ in range(SAMPLE_SIZE)]
++        sample = [l for l in sample if l]
++    except OSError as exc:
++        print(f"logpipe: warning: cannot read {path}: {exc}", file=sys.stderr)
++        stats.files_skipped += 1
++        return None
++    parser = detect_parser(sample)
++    return sample, parser
++
++
++def run_pipeline(
++    files: Iterable[str | Path],
++    config: Config,
++) -> Generator[LogEvent, None, PipelineStats]:
++    """Yield filtered/transformed LogEvents from *files*.
++
++    After the generator is exhausted, its return value (accessible via
++    ``StopIteration.value``) is a ``PipelineStats`` instance.
++    """
++    predicates = build_filters(config.filters)
++    mutators = build_transforms(config.transforms)
++    stats = PipelineStats()
++
++    for file_path in files:
++        path = Path(file_path)
++        result = _open_and_detect(path, stats)
++        if result is None:
++            continue
++        _, parser = result
++        stats.files_processed += 1
++        yield from _process_file(path, parser, predicates, mutators, stats)
++
++    return stats
++
++
++def _process_file(
++    path: Path,
++    parser: Parser,
++    predicates: list[Callable[[LogEvent], bool]],
++    mutators: list[Callable[[LogEvent], None]],
++    stats: PipelineStats,
++) -> Generator[LogEvent, None, None]:
++    try:
++        fh = open(path, errors="replace")
++    except OSError as exc:
++        print(f"logpipe: warning: cannot read {path}: {exc}", file=sys.stderr)
++        stats.files_skipped += 1
++        return
++
++    with fh:
++        for lineno, raw_line in enumerate(fh, start=1):
++            stats.lines_processed += 1
++            try:
++                event = parser.parse_line(raw_line, source=str(path), line_number=lineno)
++            except Exception as exc:
++                print(
++                    f"logpipe: warning: {path}:{lineno}: parse error: {exc}",
++                    file=sys.stderr,
++                )
++                stats.lines_skipped += 1
++                continue
++
++            if event is None:
++                stats.lines_skipped += 1
++                continue
++
++            # Filters
++            if not all(pred(event) for pred in predicates):
++                continue
++
++            # Transforms
++            for mutator in mutators:
++                mutator(event)
++
++            yield event
+diff --git a/src/logpipe/report.py b/src/logpipe/report.py
+new file mode 100644
+index 0000000..63c70d0
+--- /dev/null
++++ b/src/logpipe/report.py
+@@ -0,0 +1,93 @@
++"""Build the JSON report and a human-readable natural-language summary."""
++
++from __future__ import annotations
++
++import json
++from typing import Any
++
++from logpipe.analysis import AnalysisResult
++from logpipe.pipeline import PipelineStats
++
++
++def build_report(
++    result: AnalysisResult,
++    stats: PipelineStats,
++) -> dict[str, Any]:
++    """Return the full JSON-serialisable report dict."""
++    return {
++        "pipeline": {
++            "files_processed": stats.files_processed,
++            "files_skipped": stats.files_skipped,
++            "lines_processed": stats.lines_processed,
++            "lines_skipped": stats.lines_skipped,
++        },
++        "analysis": result.to_dict(),
++    }
++
++
++def report_to_json(report: dict[str, Any]) -> str:
++    return json.dumps(report, indent=2)
++
++
++def build_summary(report: dict[str, Any]) -> str:
++    """Produce a natural-language summary from the report dict."""
++    lines: list[str] = []
++    pipe = report["pipeline"]
++    analysis = report["analysis"]
++
++    lines.append("=== logpipe analysis summary ===\n")
++
++    # Pipeline stats
++    lines.append(
++        f"Processed {pipe['files_processed']} file(s) "
++        f"({pipe['lines_processed']} lines). "
++        f"Skipped {pipe['files_skipped']} unreadable file(s) and "
++        f"{pipe['lines_skipped']} malformed line(s)."
++    )
++
++    total = analysis["total_events"]
++    lines.append(f"\nTotal matching events: {total}")
++
++    # Time range
++    tr = analysis["time_range"]
++    if tr["start"]:
++        lines.append(f"Time range: {tr['start']}  to  {tr['end']}")
++
++    # Severity breakdown
++    lc = analysis["level_counts"]
++    if lc:
++        parts = ", ".join(f"{lvl}: {cnt}" for lvl, cnt in sorted(lc.items()))
++        lines.append(f"Severity breakdown: {parts}")
++
++    # Anomalies
++    anomalies = analysis["anomalies"]
++    if anomalies:
++        lines.append(f"\n!! {len(anomalies)} anomalous window(s) detected:")
++        for a in anomalies:
++            direction = "SPIKE" if a["type"] == "spike" else "DROP"
++            lines.append(
++                f"  - {a['window']}: {direction} — {a['count']} events "
++                f"(z-score {a['z_score']:+.2f}, mean {a['mean']:.1f}, "
++                f"stddev {a['stddev']:.1f})"
++            )
++    else:
++        lines.append("\nNo anomalous windows detected.")
++
++    # Top patterns
++    patterns = analysis["top_patterns"]
++    if patterns:
++        lines.append("\nTop recurring message patterns:")
++        for i, entry in enumerate(patterns[:5], start=1):
++            lines.append(f"  {i}. ({entry['count']}x) {entry['pattern'][:120]}")
++
++    # Windows overview
++    windows = analysis["windows"]
++    if windows:
++        counts = [w["count"] for w in windows.values()]
++        lines.append(
++            f"\nWindowed metrics: {len(windows)} window(s), "
++            f"min {min(counts)} / max {max(counts)} / "
++            f"avg {sum(counts)/len(counts):.1f} events per window."
++        )
++
++    return "\n".join(lines)
+diff --git a/src/logpipe/tail.py b/src/logpipe/tail.py
+new file mode 100644
+index 0000000..be692bc
+--- /dev/null
++++ b/src/logpipe/tail.py
+@@ -0,0 +1,150 @@
++"""Real-time file following with the same analysis pipeline."""
++
++from __future__ import annotations
++
++import os
++import sys
++import time
++from collections.abc import Callable
++from pathlib import Path
++
++from logpipe.analysis import AnalysisResult, analyze
++from logpipe.config import Config
++from logpipe.filters import build_filters
++from logpipe.formats import detect_parser
++from logpipe.formats.base import Parser
++from logpipe.models import LogEvent
++from logpipe.report import build_report, build_summary
++from logpipe.pipeline import PipelineStats
++from logpipe.transforms import build_transforms
++
++SAMPLE_SIZE = 20
++
++
++class _TailedFile:
++    """Track one file being tailed."""
++
++    __slots__ = ("path", "fh", "parser", "lineno")
++
++    def __init__(self, path: Path, fh, parser: Parser, lineno: int) -> None:  # noqa: ANN001
++        self.path = path
++        self.fh = fh
++        self.parser = parser
++        self.lineno = lineno
++
++
++def _open_tail(path: Path, stats: PipelineStats) -> _TailedFile | None:
++    try:
++        fh = open(path, errors="replace")
++    except OSError as exc:
++        print(f"logpipe: warning: cannot open {path}: {exc}", file=sys.stderr)
++        stats.files_skipped += 1
++        return None
++
++    # Read sample for format detection, then seek to end.
++    sample: list[str] = []
++    for _ in range(SAMPLE_SIZE):
++        ln = fh.readline()
++        if not ln:
++            break
++        sample.append(ln)
++    parser = detect_parser(sample)
++
++    # Count existing lines so we start line numbers correctly.
++    fh.seek(0, os.SEEK_END)
++    total_lines = sum(1 for _ in open(path, errors="replace"))
++    stats.files_processed += 1
++    return _TailedFile(path=path, fh=fh, parser=parser, lineno=total_lines)
++
++
++def tail_follow(
++    files: list[str | Path],
++    config: Config,
++    interval: float = 30.0,
++) -> None:
++    """Follow *files* for new lines, applying the analysis pipeline.
++
++    Prints matching events in real-time.  Every *interval* seconds prints
++    a summary of events seen in that window.  Runs until interrupted.
++    """
++    predicates = build_filters(config.filters)
++    mutators = build_transforms(config.transforms)
++    stats = PipelineStats()
++
++    tailed: list[_TailedFile] = []
++    for fp in files:
++        tf = _open_tail(Path(fp), stats)
++        if tf:
++            tailed.append(tf)
++
++    if not tailed:
++        print("logpipe: no files to tail.", file=sys.stderr)
++        return
++
++    window_events: list[LogEvent] = []
++    last_summary = time.monotonic()
++
++    print(f"logpipe: tailing {len(tailed)} file(s), Ctrl+C to stop.\n", file=sys.stderr)
++    try:
++        while True:
++            got_new = False
++            for tf in tailed:
++                while True:
++                    line = tf.fh.readline()
++                    if not line:
++                        break
++                    got_new = True
++                    tf.lineno += 1
++                    stats.lines_processed += 1
++                    try:
++                        event = tf.parser.parse_line(
++                            line, source=str(tf.path), line_number=tf.lineno
++                        )
++                    except Exception as exc:
++                        print(
++                            f"logpipe: warning: {tf.path}:{tf.lineno}: {exc}",
++                            file=sys.stderr,
++                        )
++                        stats.lines_skipped += 1
++                        continue
++
++                    if event is None:
++                        stats.lines_skipped += 1
++                        continue
++
++                    if not all(p(event) for p in predicates):
++                        continue
++                    for m in mutators:
++                        m(event)
++
++                    window_events.append(event)
++                    _print_event(event)
++
++            # Periodic summary
++            now = time.monotonic()
++            if now - last_summary >= interval and window_events:
++                result = analyze(window_events, config.analysis)
++                report = build_report(result, stats)
++                print("\n" + build_summary(report) + "\n", file=sys.stderr)
++                window_events.clear()
++                last_summary = now
++
++            if not got_new:
++                time.sleep(0.25)
++    except KeyboardInterrupt:
++        # Final summary
++        if window_events:
++            result = analyze(window_events, config.analysis)
++            report = build_report(result, stats)
++            print("\n" + build_summary(report), file=sys.stderr)
++        print("\nlogpipe: stopped.", file=sys.stderr)
++    finally:
++        for tf in tailed:
++            tf.fh.close()
++
++
++def _print_event(event: LogEvent) -> None:
++    ts = event.timestamp.isoformat() if event.timestamp else "----"
++    lvl = (event.level or "---").ljust(8)
++    src = Path(event.source).name
++    print(f"[{ts}] {lvl} {src}: {event.message}")
+diff --git a/src/logpipe/transforms.py b/src/logpipe/transforms.py
+new file mode 100644
+index 0000000..06dbabf
+--- /dev/null
++++ b/src/logpipe/transforms.py
+@@ -0,0 +1,53 @@
++"""Configurable event transforms (mutate events in-place)."""
++
++from __future__ import annotations
++
++import re
++from typing import Any, Callable
++
++from logpipe.config import TransformSpec
++from logpipe.models import LogEvent
++
++
++def build_transforms(specs: list[TransformSpec]) -> list[Callable[[LogEvent], None]]:
++    """Return a list of mutator functions from transform specs."""
++    out: list[Callable[[LogEvent], None]] = []
++    for spec in specs:
++        builder = _REGISTRY.get(spec.type)
++        if builder is None:
++            raise ValueError(f"Unknown transform type: {spec.type!r}")
++        out.append(builder(spec.params))
++    return out
++
++
++# -- individual builders ---------------------------------------------------
++
++
++def _extract_transform(params: dict[str, Any]) -> Callable[[LogEvent], None]:
++    pattern = re.compile(params["pattern"])
++    field = params.get("field", "message")
++
++    def _apply(event: LogEvent) -> None:
++        text = event.message if field == "message" else str(event.fields.get(field, ""))
++        m = pattern.search(text)
++        if m:
++            event.fields.update(m.groupdict())
++
++    return _apply
++
++
++def _rename_transform(params: dict[str, Any]) -> Callable[[LogEvent], None]:
++    src = params["from"]
++    dst = params["to"]
++
++    def _apply(event: LogEvent) -> None:
++        if src in event.fields:
++            event.fields[dst] = event.fields.pop(src)
++
++    return _apply
++
++
++_REGISTRY: dict[str, Callable[[dict[str, Any]], Callable[[LogEvent], None]]] = {
++    "extract": _extract_transform,
++    "rename": _rename_transform,
++}
+diff --git a/tests/fixtures/app.jsonl b/tests/fixtures/app.jsonl
+new file mode 100644
+index 0000000..2ef00ed
+--- /dev/null
++++ b/tests/fixtures/app.jsonl
+@@ -0,0 +1,20 @@
++{"timestamp":"2024-06-15T10:00:01Z","level":"INFO","message":"Server started on port 8080","service":"web"}
++{"timestamp":"2024-06-15T10:00:05Z","level":"DEBUG","message":"Loading config from /etc/app.yaml","service":"web"}
++{"timestamp":"2024-06-15T10:00:10Z","level":"INFO","message":"Connected to database host=db-01","service":"web"}
++{"timestamp":"2024-06-15T10:00:15Z","level":"WARNING","message":"Slow query detected: 1200ms for user=alice","service":"db"}
++{"timestamp":"2024-06-15T10:00:20Z","level":"ERROR","message":"Connection refused to cache host=redis-01","service":"cache"}
++{"timestamp":"2024-06-15T10:00:25Z","level":"INFO","message":"Request processed in 45ms user=bob path=/api/v1/users","service":"web"}
++{"timestamp":"2024-06-15T10:00:30Z","level":"INFO","message":"Request processed in 52ms user=carol path=/api/v1/orders","service":"web"}
++{"timestamp":"2024-06-15T10:00:35Z","level":"ERROR","message":"Timeout connecting to payment gateway after 30000ms","service":"payments"}
++{"timestamp":"2024-06-15T10:00:40Z","level":"WARNING","message":"Memory usage at 85% on host=web-02","service":"monitor"}
++{"timestamp":"2024-06-15T10:00:45Z","level":"INFO","message":"Healthcheck passed","service":"web"}
++THIS IS A MALFORMED LINE WITHOUT JSON
++{"timestamp":"2024-06-15T10:01:00Z","level":"CRITICAL","message":"Out of memory on host=web-02, killing process","service":"monitor"}
++{"timestamp":"2024-06-15T10:01:05Z","level":"ERROR","message":"Connection refused to cache host=redis-01","service":"cache"}
++{"timestamp":"2024-06-15T10:01:10Z","level":"INFO","message":"Request processed in 38ms user=dave path=/api/v1/health","service":"web"}
++{"timestamp":"2024-06-15T10:01:50Z","level":"ERROR","message":"Disk full on /var/log partition","service":"monitor"}
++{"timestamp":"2024-06-15T10:01:50Z","level":"ERROR","message":"Disk full on /var/log partition","service":"monitor"}
++{"timestamp":"2024-06-15T10:01:50Z","level":"ERROR","message":"Disk full on /var/log partition","service":"monitor"}
++{"timestamp":"2024-06-15T10:01:50Z","level":"ERROR","message":"Disk full on /var/log partition","service":"monitor"}
++{"timestamp":"2024-06-15T10:01:50Z","level":"ERROR","message":"Disk full on /var/log partition","service":"monitor"}
++{"timestamp":"2024-06-15T10:01:55Z","level":"INFO","message":"Auto-cleanup freed 2GB on /var/log","service":"monitor"}
+diff --git a/tests/fixtures/config.yaml b/tests/fixtures/config.yaml
+new file mode 100644
+index 0000000..fa521cf
+--- /dev/null
++++ b/tests/fixtures/config.yaml
+@@ -0,0 +1,12 @@
++filters:
++  - type: level
++    min_level: INFO
++
++transforms:
++  - type: extract
++    pattern: 'user=(?P<user>\w+)'
++    field: message
++
++analysis:
++  window_seconds: 60
++  anomaly_threshold: 2.0
+diff --git a/tests/fixtures/custom.log b/tests/fixtures/custom.log
+new file mode 100644
+index 0000000..97037ed
+--- /dev/null
++++ b/tests/fixtures/custom.log
+@@ -0,0 +1,8 @@
++ts=2024-06-15T10:00:00Z level=INFO msg="Worker pool initialized" workers=8 host=worker-01
++ts=2024-06-15T10:00:10Z level=DEBUG msg="Processing task 101" queue=default host=worker-01
++ts=2024-06-15T10:00:20Z level=INFO msg="Task 101 completed in 250ms" queue=default host=worker-01
++ts=2024-06-15T10:00:30Z level=WARNING msg="Queue depth exceeding threshold" queue=default depth=500 host=worker-01
++ts=2024-06-15T10:00:40Z level=ERROR msg="Task 102 failed: connection reset" queue=priority host=worker-02
++ts=2024-06-15T10:00:50Z level=INFO msg="Retrying task 102 attempt 2" queue=priority host=worker-02
++ts=2024-06-15T10:01:00Z level=INFO msg="Task 102 completed on retry" queue=priority host=worker-02
++ts=2024-06-15T10:01:10Z level=ERROR msg="Disk I/O error on /data/scratch" host=worker-03
+diff --git a/tests/fixtures/system.log b/tests/fixtures/system.log
+new file mode 100644
+index 0000000..00a8046
+--- /dev/null
++++ b/tests/fixtures/system.log
+@@ -0,0 +1,11 @@
++Apr 15 09:00:01 web-01 sshd[12345]: Accepted publickey for deploy from 10.0.0.5
++Apr 15 09:00:05 web-01 nginx[6789]: GET /index.html 200 1024
++Apr 15 09:00:10 web-01 kernel: [  120.456] EXT4-fs warning: mounting unchecked fs
++Apr 15 09:00:15 db-01 postgres[4321]: LOG: checkpoint starting: time
++Apr 15 09:00:20 db-01 postgres[4321]: ERROR: duplicate key violates unique constraint "users_pkey"
++Apr 15 09:00:25 web-01 nginx[6789]: GET /api/health 200 12
++Apr 15 09:00:30 web-01 nginx[6789]: POST /api/login 401 45
++<134>1 2024-06-15T10:02:00.000Z web-01 myapp 1234 - - Starting batch job 42
++<131>1 2024-06-15T10:02:05.000Z web-01 myapp 1234 - - ERROR in batch job 42: timeout
++GARBAGE LINE THAT IS NOT SYSLOG AT ALL: !!!@@@
++Apr 15 09:01:00 web-01 cron[9999]: (root) CMD (/usr/bin/cleanup.sh)

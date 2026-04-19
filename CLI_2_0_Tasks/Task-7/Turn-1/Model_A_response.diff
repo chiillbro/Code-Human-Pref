@@ -1,0 +1,1769 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..5e7bdef
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,61 @@
++# logpipe
++
++A CLI log-analysis tool. Point it at one or more log files in different
++formats — JSON-lines, syslog, Apache/nginx CLF, or your own regex-described
++format — and it normalizes everything into a common event model, runs
++configurable filters/transforms, computes windowed metrics, flags anomalous
++spikes/drops, and produces both a JSON report and a readable summary.
++
++Stdlib + PyYAML only.
++
++## Install
++
++```bash
++pip install -e .
++```
++
++## Commands
++
++```bash
++# Batch analysis — text summary to stdout, JSON report to file
++logpipe analyze app.jsonl /var/log/syslog access.log -c logpipe.yaml -o report.json
++
++# Same but print JSON to stdout
++logpipe analyze app.jsonl -f json
++
++# Real-time monitoring with rolling analysis (Ctrl-C for final summary)
++logpipe tail /var/log/syslog app.jsonl -c logpipe.yaml --refresh 10
++
++# Just show what format each file is detected as
++logpipe detect *.log
++```
++
++## Config file
++
++All sections optional. See `examples/logpipe.yaml`.
++
++```yaml
++parsers:
++  custom:
++    - name: myapp
++      pattern: '^(?P<timestamp>\S+) \[(?P<level>\w+)\] (?P<message>.*)$'
++      time_format: '%Y-%m-%dT%H:%M:%S'
++
++filters:
++  - { type: level,   min: WARNING }
++  - { type: exclude, field: message, pattern: 'healthcheck' }
++
++transforms:
++  - { type: set, field: env, value: prod }
++
++analysis:
++  window_seconds: 60
++  anomaly_z: 2.5
++  top_messages: 10
++```
++
++## Resilience
++
++* Unreadable files are warned about and skipped — they never abort the run.
++* Malformed lines are counted, warned, and skipped.
++* Unknown filter/transform/parser types in config are warned and ignored.
+diff --git a/examples/logpipe.yaml b/examples/logpipe.yaml
+new file mode 100644
+index 0000000..c751109
+--- /dev/null
++++ b/examples/logpipe.yaml
+@@ -0,0 +1,24 @@
++# Example logpipe configuration. Every section is optional.
++
++parsers:
++  custom:
++    - name: bracketed
++      pattern: '^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}) \[(?P<level>\w+)\] (?P<message>.*)$'
++      time_format: '%Y-%m-%dT%H:%M:%S'
++
++filters:
++  - type: exclude
++    field: message
++    pattern: 'healthcheck|ELB-HealthChecker'
++  # - type: level
++  #   min: WARNING
++
++transforms:
++  - type: set
++    field: env
++    value: prod
++
++analysis:
++  window_seconds: 60
++  anomaly_z: 2.0
++  top_messages: 10
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..b800970
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,21 @@
++[build-system]
++requires = ["setuptools>=68", "wheel"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "logpipe"
++version = "0.1.0"
++description = "CLI log analysis tool: normalize, filter, analyze and report on heterogeneous log files"
++readme = "README.md"
++requires-python = ">=3.9"
++license = { text = "MIT" }
++authors = [{ name = "Vijay" }]
++dependencies = [
++    "PyYAML>=6.0",
++]
++
++[project.scripts]
++logpipe = "logpipe.cli:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
+diff --git a/src/logpipe/__init__.py b/src/logpipe/__init__.py
+new file mode 100644
+index 0000000..005ed11
+--- /dev/null
++++ b/src/logpipe/__init__.py
+@@ -0,0 +1,6 @@
++"""logpipe — normalize, filter, analyze and report on heterogeneous log files."""
++
++from .event import LogEvent
++
++__all__ = ["LogEvent"]
++__version__ = "0.1.0"
+diff --git a/src/logpipe/__main__.py b/src/logpipe/__main__.py
+new file mode 100644
+index 0000000..bfdcd0c
+--- /dev/null
++++ b/src/logpipe/__main__.py
+@@ -0,0 +1,4 @@
++from .cli import main
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/logpipe/analysis.py b/src/logpipe/analysis.py
+new file mode 100644
+index 0000000..b7ce79a
+--- /dev/null
++++ b/src/logpipe/analysis.py
+@@ -0,0 +1,189 @@
++"""Windowed metrics and anomaly flagging.
++
++The analyzer consumes :class:`LogEvent` objects and accumulates:
++
++* global counts (total, per level, per source, per host);
++* time-bucketed counts at ``window_seconds`` resolution, both overall and per
++  level — this gives event-rate series;
++* a "top messages" table built on a normalised message signature so that
++  ``error: timeout after 53ms`` and ``error: timeout after 7ms`` collapse;
++* anomalous windows: buckets whose total count is more than ``anomaly_z``
++  standard deviations from the mean (spikes *and* drops).
++
++Everything is stdlib; ``statistics`` handles mean/stdev.
++"""
++from __future__ import annotations
++
++import re
++import statistics
++from collections import Counter, defaultdict
++from dataclasses import dataclass, field
++from datetime import datetime, timedelta
++from typing import Any, Dict, Iterable, List, Optional, Tuple
++
++from .config import AnalysisConfig
++from .event import LogEvent
++
++_NUM = re.compile(r"\d+")
++_HEX = re.compile(r"\b[0-9a-fA-F]{8,}\b")
++_UUID = re.compile(r"\b[0-9a-fA-F-]{32,36}\b")
++
++
++def _signature(msg: str) -> str:
++    """Collapse volatile bits of a message so similar lines group together."""
++    s = _UUID.sub("<id>", msg)
++    s = _HEX.sub("<hex>", s)
++    s = _NUM.sub("<n>", s)
++    return s.strip()[:200]
++
++
++def _floor(ts: datetime, seconds: int) -> datetime:
++    epoch = ts.replace(tzinfo=None).timestamp() if ts.tzinfo else ts.timestamp()
++    base = int(epoch // seconds) * seconds
++    return datetime.fromtimestamp(base)
++
++
++@dataclass
++class Anomaly:
++    window_start: datetime
++    count: int
++    z_score: float
++    kind: str  # "spike" or "drop"
++
++    def to_dict(self) -> Dict[str, Any]:
++        return {
++            "window_start": self.window_start.isoformat(),
++            "count": self.count,
++            "z_score": round(self.z_score, 2),
++            "kind": self.kind,
++        }
++
++
++@dataclass
++class AnalysisResult:
++    total: int = 0
++    by_level: Counter = field(default_factory=Counter)
++    by_source: Counter = field(default_factory=Counter)
++    by_host: Counter = field(default_factory=Counter)
++    first_ts: Optional[datetime] = None
++    last_ts: Optional[datetime] = None
++    windows: Dict[datetime, int] = field(default_factory=dict)
++    windows_by_level: Dict[datetime, Counter] = field(default_factory=lambda: defaultdict(Counter))
++    top_messages: List[Tuple[str, int]] = field(default_factory=list)
++    anomalies: List[Anomaly] = field(default_factory=list)
++    window_seconds: int = 60
++
++    def to_dict(self) -> Dict[str, Any]:
++        ordered = sorted(self.windows.items(), key=lambda kv: kv[0])
++        return {
++            "total_events": self.total,
++            "time_range": {
++                "first": self.first_ts.isoformat() if self.first_ts else None,
++                "last": self.last_ts.isoformat() if self.last_ts else None,
++            },
++            "by_level": dict(self.by_level),
++            "by_source": dict(self.by_source),
++            "by_host": dict(self.by_host),
++            "window_seconds": self.window_seconds,
++            "rate_per_window": [
++                {
++                    "start": w.isoformat(),
++                    "count": c,
++                    "by_level": dict(self.windows_by_level.get(w, {})),
++                }
++                for w, c in ordered
++            ],
++            "top_messages": [{"signature": s, "count": c} for s, c in self.top_messages],
++            "anomalies": [a.to_dict() for a in self.anomalies],
++        }
++
++
++class Analyzer:
++    def __init__(self, cfg: AnalysisConfig) -> None:
++        self.cfg = cfg
++        self._by_level: Counter = Counter()
++        self._by_source: Counter = Counter()
++        self._by_host: Counter = Counter()
++        self._windows: Dict[datetime, int] = defaultdict(int)
++        self._windows_by_level: Dict[datetime, Counter] = defaultdict(Counter)
++        self._messages: Counter = Counter()
++        self._total = 0
++        self._first: Optional[datetime] = None
++        self._last: Optional[datetime] = None
++
++    # -- feed -------------------------------------------------------------
++
++    def feed(self, ev: LogEvent) -> None:
++        self._total += 1
++        self._by_level[ev.level or "UNKNOWN"] += 1
++        self._by_source[ev.source] += 1
++        if ev.host:
++            self._by_host[ev.host] += 1
++        self._messages[_signature(ev.message)] += 1
++        if ev.timestamp is not None:
++            ts = ev.timestamp.replace(tzinfo=None) if ev.timestamp.tzinfo else ev.timestamp
++            if self._first is None or ts < self._first:
++                self._first = ts
++            if self._last is None or ts > self._last:
++                self._last = ts
++            bucket = _floor(ev.timestamp, self.cfg.window_seconds)
++            self._windows[bucket] += 1
++            self._windows_by_level[bucket][ev.level or "UNKNOWN"] += 1
++
++    def feed_all(self, events: Iterable[LogEvent]) -> None:
++        for ev in events:
++            self.feed(ev)
++
++    # -- finish -----------------------------------------------------------
++
++    def result(self) -> AnalysisResult:
++        windows = self._fill_gaps(dict(self._windows))
++        anomalies = self._detect_anomalies(windows)
++        return AnalysisResult(
++            total=self._total,
++            by_level=Counter(self._by_level),
++            by_source=Counter(self._by_source),
++            by_host=Counter(self._by_host),
++            first_ts=self._first,
++            last_ts=self._last,
++            windows=windows,
++            windows_by_level=dict(self._windows_by_level),
++            top_messages=self._messages.most_common(self.cfg.top_messages),
++            anomalies=anomalies,
++            window_seconds=self.cfg.window_seconds,
++        )
++
++    def _fill_gaps(self, windows: Dict[datetime, int]) -> Dict[datetime, int]:
++        """Insert zero-count buckets between first and last so drops are visible."""
++        if len(windows) < 2:
++            return windows
++        keys = sorted(windows)
++        step = timedelta(seconds=self.cfg.window_seconds)
++        span = (keys[-1] - keys[0]) // step
++        if span > 10_000:
++            # Refuse to materialise an absurd number of empty buckets (e.g. one
++            # stray 1970 timestamp). Keep only what we observed.
++            return windows
++        cur = keys[0]
++        while cur <= keys[-1]:
++            windows.setdefault(cur, 0)
++            cur += step
++        return windows
++
++    def _detect_anomalies(self, windows: Dict[datetime, int]) -> List[Anomaly]:
++        if len(windows) < 3:
++            return []
++        ordered = sorted(windows.items(), key=lambda kv: kv[0])
++        counts = [c for _, c in ordered]
++        mean = statistics.fmean(counts)
++        stdev = statistics.pstdev(counts)
++        if stdev == 0:
++            return []
++        out: List[Anomaly] = []
++        for start, c in ordered:
++            z = (c - mean) / stdev
++            if z >= self.cfg.anomaly_z:
++                out.append(Anomaly(start, c, z, "spike"))
++            elif z <= -self.cfg.anomaly_z:
++                out.append(Anomaly(start, c, z, "drop"))
++        return out
+diff --git a/src/logpipe/cli.py b/src/logpipe/cli.py
+new file mode 100644
+index 0000000..3abbe57
+--- /dev/null
++++ b/src/logpipe/cli.py
+@@ -0,0 +1,106 @@
++"""Command-line entry point.  ``logpipe analyze`` / ``logpipe tail`` / ``logpipe detect``."""
++from __future__ import annotations
++
++import argparse
++import sys
++from typing import Sequence
++
++from .analysis import Analyzer
++from .config import Config
++from .parsers import build_registry, detect_parser
++from .pipeline import Pipeline
++from .report import build_report, to_json, to_text
++from .tail import run_tail
++
++
++def _cmd_analyze(args: argparse.Namespace) -> int:
++    cfg = Config.load(args.config)
++    if args.window:
++        cfg.analysis.window_seconds = args.window
++    pipe = Pipeline(cfg)
++    events, stats = pipe.read_paths(args.paths)
++    analyzer = Analyzer(cfg.analysis)
++    analyzer.feed_all(events)
++    result = analyzer.result()
++    report = build_report(result, stats)
++
++    if args.output:
++        with open(args.output, "w", encoding="utf-8") as fh:
++            fh.write(to_json(report))
++        print(f"logpipe: wrote JSON report to {args.output}", file=sys.stderr)
++
++    if args.format in ("json", "both"):
++        print(to_json(report))
++    if args.format in ("text", "both"):
++        if args.format == "both":
++            print("\n" + "=" * 60 + "\n")
++        print(to_text(report))
++
++    # non-zero exit if every input failed to open
++    return 0 if stats.files_ok or not args.paths else 1
++
++
++def _cmd_tail(args: argparse.Namespace) -> int:
++    cfg = Config.load(args.config)
++    if args.window:
++        cfg.analysis.window_seconds = args.window
++    return run_tail(
++        args.paths,
++        cfg,
++        interval=args.interval,
++        refresh=args.refresh,
++        from_start=args.from_start,
++    )
++
++
++def _cmd_detect(args: argparse.Namespace) -> int:
++    cfg = Config.load(args.config)
++    registry = build_registry(cfg.custom_parsers)
++    for p in args.paths:
++        parser, conf = detect_parser(p, registry)
++        print(f"{p}: {parser.name} (confidence {conf:.0%})")
++    return 0
++
++
++def build_parser() -> argparse.ArgumentParser:
++    ap = argparse.ArgumentParser(
++        prog="logpipe",
++        description="Normalize, filter, analyze and report on heterogeneous log files.",
++    )
++    sub = ap.add_subparsers(dest="cmd", required=True)
++
++    a = sub.add_parser("analyze", help="batch-analyze one or more log files")
++    a.add_argument("paths", nargs="+", help="log file(s) to analyze")
++    a.add_argument("-c", "--config", help="YAML config file")
++    a.add_argument("-o", "--output", help="write JSON report to this path")
++    a.add_argument("-w", "--window", type=int, help="override analysis window (seconds)")
++    a.add_argument(
++        "-f", "--format", choices=("text", "json", "both"), default="text",
++        help="what to print to stdout (default: text)",
++    )
++    a.set_defaults(func=_cmd_analyze)
++
++    t = sub.add_parser("tail", help="follow files in real time through the pipeline")
++    t.add_argument("paths", nargs="+", help="log file(s) to follow")
++    t.add_argument("-c", "--config", help="YAML config file")
++    t.add_argument("-w", "--window", type=int, help="override analysis window (seconds)")
++    t.add_argument("--interval", type=float, default=0.5, help="poll interval seconds")
++    t.add_argument("--refresh", type=float, default=5.0, help="summary refresh seconds")
++    t.add_argument("--from-start", action="store_true", help="read existing content first")
++    t.set_defaults(func=_cmd_tail)
++
++    d = sub.add_parser("detect", help="show which parser would be picked for each file")
++    d.add_argument("paths", nargs="+")
++    d.add_argument("-c", "--config", help="YAML config file")
++    d.set_defaults(func=_cmd_detect)
++
++    return ap
++
++
++def main(argv: Sequence[str] | None = None) -> int:
++    args = build_parser().parse_args(argv)
++    return args.func(args)
++
++
++if __name__ == "__main__":  # pragma: no cover
++    raise SystemExit(main())
+diff --git a/src/logpipe/config.py b/src/logpipe/config.py
+new file mode 100644
+index 0000000..292b9d3
+--- /dev/null
++++ b/src/logpipe/config.py
+@@ -0,0 +1,82 @@
++"""Configuration loading.
++
++The config file is YAML and every section is optional::
++
++    parsers:
++      custom:
++        - name: myapp
++          pattern: '^(?P<timestamp>\\S+) \\[(?P<level>\\w+)\\] (?P<message>.*)$'
++          time_format: '%Y-%m-%dT%H:%M:%S'
++
++    filters:
++      - type: level
++        min: WARNING
++      - type: match
++        field: message
++        pattern: 'timeout|refused'
++      - type: exclude
++        field: message
++        pattern: 'healthcheck'
++      - type: time_range
++        after: '2026-01-01T00:00:00'
++
++    transforms:
++      - type: set
++        field: env
++        value: prod
++      - type: drop
++        field: password
++      - type: rename
++        field: msg
++        to: message
++
++    analysis:
++      window_seconds: 60
++      anomaly_z: 2.5
++      top_messages: 10
++"""
++from __future__ import annotations
++
++import sys
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional
++
++import yaml
++
++
++@dataclass
++class AnalysisConfig:
++    window_seconds: int = 60
++    anomaly_z: float = 2.5
++    top_messages: int = 10
++
++
++@dataclass
++class Config:
++    filters: List[Dict[str, Any]] = field(default_factory=list)
++    transforms: List[Dict[str, Any]] = field(default_factory=list)
++    custom_parsers: List[Dict[str, Any]] = field(default_factory=list)
++    analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
++
++    @classmethod
++    def load(cls, path: Optional[str]) -> "Config":
++        if not path:
++            return cls()
++        try:
++            with open(path, "r", encoding="utf-8") as fh:
++                data = yaml.safe_load(fh) or {}
++        except (OSError, yaml.YAMLError) as exc:
++            print(f"logpipe: warning: could not load config {path!r}: {exc}", file=sys.stderr)
++            return cls()
++
++        an = data.get("analysis") or {}
++        return cls(
++            filters=list(data.get("filters") or []),
++            transforms=list(data.get("transforms") or []),
++            custom_parsers=list((data.get("parsers") or {}).get("custom") or []),
++            analysis=AnalysisConfig(
++                window_seconds=int(an.get("window_seconds", 60)),
++                anomaly_z=float(an.get("anomaly_z", 2.5)),
++                top_messages=int(an.get("top_messages", 10)),
++            ),
++        )
+diff --git a/src/logpipe/event.py b/src/logpipe/event.py
+new file mode 100644
+index 0000000..e1d6210
+--- /dev/null
++++ b/src/logpipe/event.py
+@@ -0,0 +1,80 @@
++"""Normalized log event model shared by every parser, filter and analyzer."""
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from datetime import datetime
++from typing import Any, Dict, Optional
++
++
++# Canonical ordering for severity comparison / filtering.
++LEVEL_ORDER = {
++    "TRACE": 5,
++    "DEBUG": 10,
++    "INFO": 20,
++    "NOTICE": 25,
++    "WARNING": 30,
++    "ERROR": 40,
++    "CRITICAL": 50,
++    "ALERT": 60,
++    "EMERGENCY": 70,
++}
++
++_LEVEL_ALIASES = {
++    "WARN": "WARNING",
++    "ERR": "ERROR",
++    "FATAL": "CRITICAL",
++    "CRIT": "CRITICAL",
++    "EMERG": "EMERGENCY",
++    "PANIC": "EMERGENCY",
++}
++
++
++def normalize_level(value: Any) -> Optional[str]:
++    """Map an arbitrary level token to one of the canonical names, or None."""
++    if value is None:
++        return None
++    s = str(value).strip().upper()
++    if not s:
++        return None
++    s = _LEVEL_ALIASES.get(s, s)
++    return s if s in LEVEL_ORDER else None
++
++
++@dataclass
++class LogEvent:
++    """A single log line after format-specific parsing.
++
++    Every parser produces these so the rest of the pipeline (filters,
++    transforms, analysis, reporting) is format-agnostic.
++    """
++
++    timestamp: Optional[datetime]
++    level: Optional[str]
++    message: str
++    source: str
++    raw: str
++    host: Optional[str] = None
++    extra: Dict[str, Any] = field(default_factory=dict)
++
++    def get(self, name: str, default: Any = None) -> Any:
++        """Field access that falls back to ``extra`` — used by filters/transforms."""
++        if name in ("timestamp", "level", "message", "source", "raw", "host"):
++            return getattr(self, name)
++        return self.extra.get(name, default)
++
++    def set(self, name: str, value: Any) -> None:
++        if name in ("timestamp", "level", "message", "source", "raw", "host"):
++            setattr(self, name, value)
++        else:
++            self.extra[name] = value
++
++    def to_dict(self) -> Dict[str, Any]:
++        d: Dict[str, Any] = {
++            "timestamp": self.timestamp.isoformat() if self.timestamp else None,
++            "level": self.level,
++            "message": self.message,
++            "source": self.source,
++            "host": self.host,
++        }
++        d.update(self.extra)
++        return d
+diff --git a/src/logpipe/filters.py b/src/logpipe/filters.py
+new file mode 100644
+index 0000000..cfb6dce
+--- /dev/null
++++ b/src/logpipe/filters.py
+@@ -0,0 +1,190 @@
++"""Config-driven filters and transforms.
++
++Both are built from the lists of dicts in the config file. A *filter* is a
++predicate ``LogEvent -> bool``; a *transform* is ``LogEvent -> LogEvent``.
++Unknown ``type`` values are warned about and ignored so a typo in the config
++cannot bring the pipeline down.
++"""
++from __future__ import annotations
++
++import re
++import sys
++from datetime import datetime
++from typing import Any, Callable, Dict, List, Optional
++
++from .event import LEVEL_ORDER, LogEvent, normalize_level
++
++Predicate = Callable[[LogEvent], bool]
++Transform = Callable[[LogEvent], LogEvent]
++
++
++# ---- filters --------------------------------------------------------------
++
++def _f_level(spec: Dict[str, Any]) -> Predicate:
++    floor = LEVEL_ORDER.get(normalize_level(spec.get("min")) or "", 0)
++
++    def pred(ev: LogEvent) -> bool:
++        if ev.level is None:
++            return floor == 0  # only keep unlevelled events when no floor set
++        return LEVEL_ORDER.get(ev.level, 0) >= floor
++
++    return pred
++
++
++def _f_match(spec: Dict[str, Any], *, negate: bool = False) -> Predicate:
++    field = spec.get("field", "message")
++    rx = re.compile(spec["pattern"])
++
++    def pred(ev: LogEvent) -> bool:
++        val = ev.get(field)
++        hit = val is not None and rx.search(str(val)) is not None
++        return (not hit) if negate else hit
++
++    return pred
++
++
++def _f_equals(spec: Dict[str, Any]) -> Predicate:
++    field = spec["field"]
++    want = spec["value"]
++
++    def pred(ev: LogEvent) -> bool:
++        return ev.get(field) == want
++
++    return pred
++
++
++def _parse_dt(s: Optional[str]) -> Optional[datetime]:
++    if not s:
++        return None
++    try:
++        return datetime.fromisoformat(s.replace("Z", "+00:00"))
++    except ValueError:
++        return None
++
++
++def _f_time_range(spec: Dict[str, Any]) -> Predicate:
++    after = _parse_dt(spec.get("after"))
++    before = _parse_dt(spec.get("before"))
++
++    def _comparable(a: datetime, b: datetime) -> tuple[datetime, datetime]:
++        # Mixing naive and aware datetimes raises; strip tzinfo when they differ.
++        if (a.tzinfo is None) != (b.tzinfo is None):
++            return a.replace(tzinfo=None), b.replace(tzinfo=None)
++        return a, b
++
++    def pred(ev: LogEvent) -> bool:
++        if ev.timestamp is None:
++            return True
++        if after is not None:
++            x, y = _comparable(ev.timestamp, after)
++            if x < y:
++                return False
++        if before is not None:
++            x, y = _comparable(ev.timestamp, before)
++            if x > y:
++                return False
++        return True
++
++    return pred
++
++
++_FILTER_BUILDERS: Dict[str, Callable[[Dict[str, Any]], Predicate]] = {
++    "level": _f_level,
++    "match": _f_match,
++    "exclude": lambda s: _f_match(s, negate=True),
++    "equals": _f_equals,
++    "time_range": _f_time_range,
++}
++
++
++def build_filters(specs: List[Dict[str, Any]]) -> List[Predicate]:
++    out: List[Predicate] = []
++    for spec in specs:
++        t = spec.get("type")
++        builder = _FILTER_BUILDERS.get(t)
++        if builder is None:
++            print(f"logpipe: warning: unknown filter type {t!r}, skipping", file=sys.stderr)
++            continue
++        try:
++            out.append(builder(spec))
++        except (KeyError, re.error, TypeError) as exc:
++            print(f"logpipe: warning: bad filter {spec!r}: {exc}", file=sys.stderr)
++    return out
++
++
++# ---- transforms -----------------------------------------------------------
++
++def _t_set(spec: Dict[str, Any]) -> Transform:
++    field, value = spec["field"], spec["value"]
++
++    def tr(ev: LogEvent) -> LogEvent:
++        ev.set(field, value)
++        return ev
++
++    return tr
++
++
++def _t_drop(spec: Dict[str, Any]) -> Transform:
++    field = spec["field"]
++
++    def tr(ev: LogEvent) -> LogEvent:
++        ev.extra.pop(field, None)
++        return ev
++
++    return tr
++
++
++def _t_rename(spec: Dict[str, Any]) -> Transform:
++    src, dst = spec["field"], spec["to"]
++
++    def tr(ev: LogEvent) -> LogEvent:
++        if src in ev.extra:
++            ev.set(dst, ev.extra.pop(src))
++        return ev
++
++    return tr
++
++
++def _t_normalize_level(spec: Dict[str, Any]) -> Transform:
++    field = spec.get("field", "level")
++
++    def tr(ev: LogEvent) -> LogEvent:
++        ev.level = normalize_level(ev.get(field)) or ev.level
++        return ev
++
++    return tr
++
++
++_TRANSFORM_BUILDERS: Dict[str, Callable[[Dict[str, Any]], Transform]] = {
++    "set": _t_set,
++    "drop": _t_drop,
++    "rename": _t_rename,
++    "normalize_level": _t_normalize_level,
++}
++
++
++def build_transforms(specs: List[Dict[str, Any]]) -> List[Transform]:
++    out: List[Transform] = []
++    for spec in specs:
++        t = spec.get("type")
++        builder = _TRANSFORM_BUILDERS.get(t)
++        if builder is None:
++            print(f"logpipe: warning: unknown transform type {t!r}, skipping", file=sys.stderr)
++            continue
++        try:
++            out.append(builder(spec))
++        except (KeyError, TypeError) as exc:
++            print(f"logpipe: warning: bad transform {spec!r}: {exc}", file=sys.stderr)
++    return out
++
++
++def apply_pipeline(
++    ev: LogEvent, filters: List[Predicate], transforms: List[Transform]
++) -> Optional[LogEvent]:
++    """Run one event through filters then transforms; ``None`` if filtered out."""
++    for f in filters:
++        if not f(ev):
++            return None
++    for t in transforms:
++        ev = t(ev)
++    return ev
+diff --git a/src/logpipe/parsers/__init__.py b/src/logpipe/parsers/__init__.py
+new file mode 100644
+index 0000000..b6dffd3
+--- /dev/null
++++ b/src/logpipe/parsers/__init__.py
+@@ -0,0 +1,16 @@
++from .base import Parser
++from .jsonl import JSONLinesParser
++from .syslog import SyslogParser
++from .clf import CLFParser
++from .regex import RegexParser
++from .detect import detect_parser, build_registry
++
++__all__ = [
++    "Parser",
++    "JSONLinesParser",
++    "SyslogParser",
++    "CLFParser",
++    "RegexParser",
++    "detect_parser",
++    "build_registry",
++]
+diff --git a/src/logpipe/parsers/base.py b/src/logpipe/parsers/base.py
+new file mode 100644
+index 0000000..5399eda
+--- /dev/null
++++ b/src/logpipe/parsers/base.py
+@@ -0,0 +1,32 @@
++"""Parser base class.
++
++A parser takes one raw line and returns a :class:`LogEvent` if it can make
++sense of it, or ``None`` if it cannot. Parsers must never raise on malformed
++input — the pipeline relies on ``None`` to count and skip bad lines without
++crashing.
++"""
++from __future__ import annotations
++
++from abc import ABC, abstractmethod
++from typing import Optional
++
++from ..event import LogEvent
++
++
++class Parser(ABC):
++    #: short identifier shown in reports / detection output
++    name: str = "base"
++
++    @abstractmethod
++    def parse(self, line: str, source: str) -> Optional[LogEvent]:  # pragma: no cover
++        ...
++
++    def score(self, sample_lines: list[str]) -> float:
++        """Fraction of sample lines this parser successfully handles.
++
++        Used by auto-detection to pick the best parser for a file.
++        """
++        if not sample_lines:
++            return 0.0
++        ok = sum(1 for ln in sample_lines if self.parse(ln, "<detect>") is not None)
++        return ok / len(sample_lines)
+diff --git a/src/logpipe/parsers/clf.py b/src/logpipe/parsers/clf.py
+new file mode 100644
+index 0000000..dcd1f43
+--- /dev/null
++++ b/src/logpipe/parsers/clf.py
+@@ -0,0 +1,66 @@
++"""Apache / nginx Common Log Format (and the Combined variant).
++
++``host ident authuser [date] "request" status bytes [ "referer" "ua" ]``
++
++HTTP access logs do not carry a syslog-style severity, so we synthesize one
++from the status code (5xx -> ERROR, 4xx -> WARNING, else INFO) so they can be
++mixed with other sources in severity breakdowns.
++"""
++from __future__ import annotations
++
++import re
++from datetime import datetime
++from typing import Optional
++
++from ..event import LogEvent
++from .base import Parser
++
++_PAT = re.compile(
++    r'^(?P<host>\S+)\s+\S+\s+\S+\s+'
++    r'\[(?P<ts>[^\]]+)\]\s+'
++    r'"(?P<request>[^"]*)"\s+'
++    r'(?P<status>\d{3})\s+'
++    r'(?P<bytes>\d+|-)'
++    r'(?:\s+"(?P<referer>[^"]*)"\s+"(?P<ua>[^"]*)")?'
++    r"\s*$"
++)
++
++
++def _level_for_status(status: int) -> str:
++    if status >= 500:
++        return "ERROR"
++    if status >= 400:
++        return "WARNING"
++    return "INFO"
++
++
++class CLFParser(Parser):
++    name = "clf"
++
++    def parse(self, line: str, source: str) -> Optional[LogEvent]:
++        m = _PAT.match(line.rstrip("\n"))
++        if not m:
++            return None
++        try:
++            ts = datetime.strptime(m["ts"], "%d/%b/%Y:%H:%M:%S %z")
++        except ValueError:
++            ts = None
++        status = int(m["status"])
++        size = m["bytes"]
++        extra = {
++            "status": status,
++            "bytes": int(size) if size != "-" else 0,
++            "request": m["request"],
++        }
++        if m.group("referer") is not None:
++            extra["referer"] = m["referer"]
++            extra["user_agent"] = m["ua"]
++        return LogEvent(
++            timestamp=ts,
++            level=_level_for_status(status),
++            message=m["request"] or line.rstrip("\n"),
++            source=source,
++            raw=line.rstrip("\n"),
++            host=m["host"],
++            extra=extra,
++        )
+diff --git a/src/logpipe/parsers/detect.py b/src/logpipe/parsers/detect.py
+new file mode 100644
+index 0000000..e7e7d4e
+--- /dev/null
++++ b/src/logpipe/parsers/detect.py
+@@ -0,0 +1,74 @@
++"""Format auto-detection.
++
++We sample the first few non-blank lines of a file, ask every registered parser
++to score itself against the sample, and pick the highest scorer above a
++confidence floor. If nothing clears the floor we fall back to the JSON-lines
++parser (which degrades gracefully to "whole line as message" for non-JSON).
++"""
++from __future__ import annotations
++
++import sys
++from typing import List, Optional, Sequence
++
++from .base import Parser
++from .jsonl import JSONLinesParser
++from .syslog import SyslogParser
++from .clf import CLFParser
++from .regex import RegexParser
++
++
++def build_registry(custom: Optional[Sequence[dict]] = None) -> List[Parser]:
++    """Built-in parsers plus any custom regex parsers from config."""
++    reg: List[Parser] = [JSONLinesParser(), SyslogParser(), CLFParser()]
++    for spec in custom or []:
++        try:
++            reg.append(
++                RegexParser(
++                    name=spec["name"],
++                    pattern=spec["pattern"],
++                    time_format=spec.get("time_format"),
++                )
++            )
++        except (KeyError, Exception) as exc:  # noqa: BLE001 — config errors must not crash
++            print(f"logpipe: warning: skipping custom parser {spec!r}: {exc}", file=sys.stderr)
++    return reg
++
++
++def _sample(path: str, n: int = 25) -> List[str]:
++    lines: List[str] = []
++    with open(path, "r", encoding="utf-8", errors="replace") as fh:
++        for raw in fh:
++            if raw.strip():
++                lines.append(raw)
++            if len(lines) >= n:
++                break
++    return lines
++
++
++def detect_parser(
++    path: str,
++    registry: Sequence[Parser],
++    *,
++    min_confidence: float = 0.5,
++) -> tuple[Parser, float]:
++    """Return ``(parser, confidence)`` for *path*.
++
++    Never raises on I/O errors — callers handle the unreadable-file case
++    separately, but if sampling itself fails we return the fallback at 0.0.
++    """
++    try:
++        sample = _sample(path)
++    except OSError:
++        return registry[0], 0.0
++
++    best: Parser = registry[0]
++    best_score = -1.0
++    for p in registry:
++        s = p.score(sample)
++        if s > best_score:
++            best, best_score = p, s
++    if best_score < min_confidence:
++        # Nobody is confident — keep the best guess but report the low score so
++        # the caller can warn the user.
++        return best, best_score
++    return best, best_score
+diff --git a/src/logpipe/parsers/jsonl.py b/src/logpipe/parsers/jsonl.py
+new file mode 100644
+index 0000000..8fc5779
+--- /dev/null
++++ b/src/logpipe/parsers/jsonl.py
+@@ -0,0 +1,86 @@
++"""JSON-lines parser.
++
++Handles structured logs where each line is a JSON object. Field names vary a
++lot in the wild so we probe a list of common aliases for timestamp / level /
++message and dump everything else into ``extra``.
++"""
++from __future__ import annotations
++
++import json
++from datetime import datetime, timezone
++from typing import Any, Optional
++
++from ..event import LogEvent, normalize_level
++from .base import Parser
++
++_TS_KEYS = ("timestamp", "time", "ts", "@timestamp", "asctime", "date")
++_LEVEL_KEYS = ("level", "severity", "lvl", "levelname", "loglevel")
++_MSG_KEYS = ("message", "msg", "text", "event", "log")
++_HOST_KEYS = ("host", "hostname", "node")
++
++
++def _parse_ts(value: Any) -> Optional[datetime]:
++    if value is None:
++        return None
++    if isinstance(value, (int, float)):
++        # Heuristic: > 1e12 means milliseconds since epoch.
++        try:
++            if value > 1e12:
++                value = value / 1000.0
++            return datetime.fromtimestamp(value, tz=timezone.utc)
++        except (OverflowError, OSError, ValueError):
++            return None
++    s = str(value).strip()
++    if not s:
++        return None
++    # ISO-8601 (allow trailing Z)
++    try:
++        return datetime.fromisoformat(s.replace("Z", "+00:00"))
++    except ValueError:
++        pass
++    for fmt in ("%Y-%m-%d %H:%M:%S,%f", "%Y-%m-%d %H:%M:%S", "%d/%b/%Y:%H:%M:%S %z"):
++        try:
++            return datetime.strptime(s, fmt)
++        except ValueError:
++            continue
++    return None
++
++
++def _first(d: dict, keys: tuple[str, ...]) -> tuple[Optional[str], Any]:
++    for k in keys:
++        if k in d:
++            return k, d[k]
++    return None, None
++
++
++class JSONLinesParser(Parser):
++    name = "jsonl"
++
++    def parse(self, line: str, source: str) -> Optional[LogEvent]:
++        s = line.strip()
++        if not s or s[0] not in "{[":
++            return None
++        try:
++            obj = json.loads(s)
++        except (json.JSONDecodeError, ValueError):
++            return None
++        if not isinstance(obj, dict):
++            return None
++
++        ts_key, ts_raw = _first(obj, _TS_KEYS)
++        lvl_key, lvl_raw = _first(obj, _LEVEL_KEYS)
++        msg_key, msg_raw = _first(obj, _MSG_KEYS)
++        host_key, host_raw = _first(obj, _HOST_KEYS)
++
++        used = {ts_key, lvl_key, msg_key, host_key}
++        extra = {k: v for k, v in obj.items() if k not in used}
++
++        return LogEvent(
++            timestamp=_parse_ts(ts_raw),
++            level=normalize_level(lvl_raw),
++            message=str(msg_raw) if msg_raw is not None else s,
++            source=source,
++            raw=line.rstrip("\n"),
++            host=str(host_raw) if host_raw is not None else None,
++            extra=extra,
++        )
+diff --git a/src/logpipe/parsers/regex.py b/src/logpipe/parsers/regex.py
+new file mode 100644
+index 0000000..b816477
+--- /dev/null
++++ b/src/logpipe/parsers/regex.py
+@@ -0,0 +1,52 @@
++"""User-defined regex parser.
++
++Lets the config file describe a custom format with a regex containing named
++groups. Recognised group names: ``timestamp``, ``level``, ``message``, ``host``;
++any other group is stored in ``extra``.
++"""
++from __future__ import annotations
++
++import re
++from datetime import datetime
++from typing import Optional
++
++from ..event import LogEvent, normalize_level
++from .base import Parser
++
++
++class RegexParser(Parser):
++    def __init__(self, name: str, pattern: str, time_format: Optional[str] = None) -> None:
++        self.name = name
++        self._re = re.compile(pattern)
++        self._time_format = time_format
++
++    def parse(self, line: str, source: str) -> Optional[LogEvent]:
++        m = self._re.match(line.rstrip("\n"))
++        if not m:
++            return None
++        gd = m.groupdict()
++        ts = None
++        ts_raw = gd.pop("timestamp", None)
++        if ts_raw and self._time_format:
++            try:
++                ts = datetime.strptime(ts_raw, self._time_format)
++            except ValueError:
++                ts = None
++        elif ts_raw:
++            try:
++                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
++            except ValueError:
++                ts = None
++        level = normalize_level(gd.pop("level", None))
++        message = gd.pop("message", None) or line.rstrip("\n")
++        host = gd.pop("host", None)
++        extra = {k: v for k, v in gd.items() if v is not None}
++        return LogEvent(
++            timestamp=ts,
++            level=level,
++            message=message,
++            source=source,
++            raw=line.rstrip("\n"),
++            host=host,
++            extra=extra,
++        )
+diff --git a/src/logpipe/parsers/syslog.py b/src/logpipe/parsers/syslog.py
+new file mode 100644
+index 0000000..320daf6
+--- /dev/null
++++ b/src/logpipe/parsers/syslog.py
+@@ -0,0 +1,72 @@
++"""RFC-3164 (BSD syslog) parser.
++
++Covers the classic ``<PRI>MMM dd HH:MM:SS host proc[pid]: message`` shape and
++the very common variant without the ``<PRI>`` prefix (what you usually see in
++``/var/log/syslog``). The year is not encoded in RFC-3164 so we default to the
++current year.
++"""
++from __future__ import annotations
++
++import re
++from datetime import datetime
++from typing import Optional
++
++from ..event import LogEvent, normalize_level
++from .base import Parser
++
++# severity portion of the PRI value (RFC 5424 table 2)
++_SYSLOG_SEVERITY = {
++    0: "EMERGENCY",
++    1: "ALERT",
++    2: "CRITICAL",
++    3: "ERROR",
++    4: "WARNING",
++    5: "NOTICE",
++    6: "INFO",
++    7: "DEBUG",
++}
++
++_PAT = re.compile(
++    r"^(?:<(?P<pri>\d{1,3})>)?"
++    r"(?P<ts>[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+"
++    r"(?P<host>[^\s]+)\s+"
++    r"(?P<proc>[^\s\[:]+)(?:\[(?P<pid>\d+)\])?:\s?"
++    r"(?P<msg>.*)$"
++)
++
++
++class SyslogParser(Parser):
++    name = "syslog"
++
++    def __init__(self, default_year: Optional[int] = None) -> None:
++        self._year = default_year or datetime.now().year
++
++    def parse(self, line: str, source: str) -> Optional[LogEvent]:
++        m = _PAT.match(line.rstrip("\n"))
++        if not m:
++            return None
++        try:
++            ts = datetime.strptime(f"{self._year} {m['ts']}", "%Y %b %d %H:%M:%S")
++        except ValueError:
++            ts = None
++
++        level = None
++        pri = m.group("pri")
++        if pri is not None:
++            level = _SYSLOG_SEVERITY.get(int(pri) & 7)
++
++        extra = {"process": m["proc"]}
++        if m.group("pid"):
++            extra["pid"] = int(m["pid"])
++        if pri is not None:
++            extra["facility"] = int(pri) >> 3
++
++        return LogEvent(
++            timestamp=ts,
++            level=normalize_level(level),
++            message=m["msg"],
++            source=source,
++            raw=line.rstrip("\n"),
++            host=m["host"],
++            extra=extra,
++        )
+diff --git a/src/logpipe/pipeline.py b/src/logpipe/pipeline.py
+new file mode 100644
+index 0000000..233a56b
+--- /dev/null
++++ b/src/logpipe/pipeline.py
+@@ -0,0 +1,103 @@
++"""Ingestion pipeline: files -> parsed, filtered, transformed events.
++
++This module owns the resilience guarantees:
++
++* unreadable files are reported and skipped, never fatal;
++* lines a parser cannot handle are counted and skipped;
++* the generator keeps yielding regardless of per-line failures.
++"""
++from __future__ import annotations
++
++import sys
++from dataclasses import dataclass, field
++from typing import Dict, Iterable, Iterator, List, Sequence
++
++from .config import Config
++from .event import LogEvent
++from .filters import Predicate, Transform, apply_pipeline, build_filters, build_transforms
++from .parsers import Parser, build_registry, detect_parser
++
++
++@dataclass
++class IngestStats:
++    files_ok: List[str] = field(default_factory=list)
++    files_failed: Dict[str, str] = field(default_factory=dict)  # path -> reason
++    parsers_used: Dict[str, str] = field(default_factory=dict)  # path -> parser name
++    lines_read: int = 0
++    lines_malformed: int = 0
++    events_emitted: int = 0
++    events_filtered: int = 0
++
++
++class Pipeline:
++    def __init__(self, config: Config) -> None:
++        self.config = config
++        self.registry: List[Parser] = build_registry(config.custom_parsers)
++        self.filters: List[Predicate] = build_filters(config.filters)
++        self.transforms: List[Transform] = build_transforms(config.transforms)
++
++    # -- batch ------------------------------------------------------------
++
++    def read_paths(self, paths: Sequence[str]) -> tuple[Iterator[LogEvent], IngestStats]:
++        stats = IngestStats()
++
++        def gen() -> Iterator[LogEvent]:
++            for path in paths:
++                yield from self._read_one(path, stats)
++
++        return gen(), stats
++
++    def _read_one(self, path: str, stats: IngestStats) -> Iterator[LogEvent]:
++        try:
++            fh = open(path, "r", encoding="utf-8", errors="replace")
++        except OSError as exc:
++            stats.files_failed[path] = str(exc)
++            print(f"logpipe: warning: cannot open {path!r}: {exc}", file=sys.stderr)
++            return
++        try:
++            parser, conf = detect_parser(path, self.registry)
++        except Exception as exc:  # noqa: BLE001 — detection must never be fatal
++            fh.close()
++            stats.files_failed[path] = f"detect: {exc}"
++            print(f"logpipe: warning: cannot inspect {path!r}: {exc}", file=sys.stderr)
++            return
++        stats.parsers_used[path] = parser.name
++        if conf < 0.5:
++            print(
++                f"logpipe: warning: low confidence ({conf:.0%}) detecting format of "
++                f"{path!r}; using {parser.name}",
++                file=sys.stderr,
++            )
++        stats.files_ok.append(path)
++        with fh:
++            yield from self._consume(fh, parser, path, stats)
++
++    def _consume(
++        self,
++        lines: Iterable[str],
++        parser: Parser,
++        source: str,
++        stats: IngestStats,
++    ) -> Iterator[LogEvent]:
++        for raw in lines:
++            if not raw.strip():
++                continue
++            stats.lines_read += 1
++            ev = parser.parse(raw, source)
++            if ev is None:
++                stats.lines_malformed += 1
++                continue
++            out = apply_pipeline(ev, self.filters, self.transforms)
++            if out is None:
++                stats.events_filtered += 1
++                continue
++            stats.events_emitted += 1
++            yield out
++
++    # -- streaming (used by tail) ----------------------------------------
++
++    def process_line(self, raw: str, parser: Parser, source: str) -> LogEvent | None:
++        ev = parser.parse(raw, source)
++        if ev is None:
++            return None
++        return apply_pipeline(ev, self.filters, self.transforms)
+diff --git a/src/logpipe/report.py b/src/logpipe/report.py
+new file mode 100644
+index 0000000..d754724
+--- /dev/null
++++ b/src/logpipe/report.py
+@@ -0,0 +1,103 @@
++"""Render an :class:`AnalysisResult` + ingest stats as JSON and as prose."""
++from __future__ import annotations
++
++import json
++from typing import Any, Dict
++
++from .analysis import AnalysisResult
++from .pipeline import IngestStats
++
++
++def build_report(result: AnalysisResult, stats: IngestStats) -> Dict[str, Any]:
++    return {
++        "ingest": {
++            "files_ok": stats.files_ok,
++            "files_failed": stats.files_failed,
++            "parsers_used": stats.parsers_used,
++            "lines_read": stats.lines_read,
++            "lines_malformed": stats.lines_malformed,
++            "events_emitted": stats.events_emitted,
++            "events_filtered": stats.events_filtered,
++        },
++        "analysis": result.to_dict(),
++    }
++
++
++def to_json(report: Dict[str, Any]) -> str:
++    return json.dumps(report, indent=2, default=str)
++
++
++def _fmt_span(first: str | None, last: str | None) -> str:
++    if not first or not last:
++        return "an unknown time range (no timestamps found)"
++    return f"{first} to {last}"
++
++
++def to_text(report: Dict[str, Any]) -> str:
++    ing = report["ingest"]
++    an = report["analysis"]
++    lines: list[str] = []
++
++    n_files = len(ing["files_ok"])
++    lines.append(
++        f"Analyzed {an['total_events']} events from {n_files} file(s) "
++        f"spanning {_fmt_span(an['time_range']['first'], an['time_range']['last'])}."
++    )
++    if ing["files_failed"]:
++        for p, why in ing["files_failed"].items():
++            lines.append(f"  ! Skipped {p}: {why}")
++    if ing["lines_malformed"]:
++        lines.append(
++            f"  ! {ing['lines_malformed']} malformed line(s) were skipped "
++            f"({ing['lines_read']} read total)."
++        )
++    if ing["events_filtered"]:
++        lines.append(f"  - {ing['events_filtered']} event(s) removed by filters.")
++
++    lines.append("")
++    lines.append(f"Parsers chosen per file:")
++    for p, name in ing["parsers_used"].items():
++        lines.append(f"  {p}: {name}")
++
++    lines.append("")
++    lines.append("Severity breakdown:")
++    by_level = sorted(an["by_level"].items(), key=lambda kv: -kv[1])
++    for lvl, c in by_level:
++        lines.append(f"  {lvl:<10} {c}")
++
++    if an["by_host"]:
++        lines.append("")
++        lines.append("Top hosts:")
++        for h, c in sorted(an["by_host"].items(), key=lambda kv: -kv[1])[:5]:
++            lines.append(f"  {h:<20} {c}")
++
++    rates = an["rate_per_window"]
++    if rates:
++        counts = [w["count"] for w in rates]
++        avg = sum(counts) / len(counts)
++        peak = max(rates, key=lambda w: w["count"])
++        lines.append("")
++        lines.append(
++            f"Event rate: avg {avg:.1f} / {an['window_seconds']}s window across "
++            f"{len(rates)} windows; peak {peak['count']} at {peak['start']}."
++        )
++
++    if an["anomalies"]:
++        lines.append("")
++        lines.append(f"Flagged {len(an['anomalies'])} anomalous window(s):")
++        for a in an["anomalies"]:
++            lines.append(
++                f"  {a['kind'].upper():<5} at {a['window_start']}: "
++                f"{a['count']} events (z={a['z_score']})"
++            )
++    else:
++        lines.append("")
++        lines.append("No anomalous windows detected.")
++
++    if an["top_messages"]:
++        lines.append("")
++        lines.append("Most frequent message patterns:")
++        for m in an["top_messages"][:10]:
++            lines.append(f"  {m['count']:>6}  {m['signature']}")
++
++    return "\n".join(lines)
+diff --git a/src/logpipe/tail.py b/src/logpipe/tail.py
+new file mode 100644
+index 0000000..9b2c4ee
+--- /dev/null
++++ b/src/logpipe/tail.py
+@@ -0,0 +1,134 @@
++"""``logpipe tail`` — follow files in real time through the same pipeline.
++
++Pure-stdlib polling tail (no inotify): each tracked file remembers its last
++read offset and inode. On every tick we read any new bytes, push complete lines
++through the parser/filter/transform chain, print matching events, and feed a
++rolling :class:`Analyzer` whose summary is re-rendered every ``--refresh``
++seconds.
++
++Rotation is detected by inode change or file shrink, in which case we reopen
++from the start.
++"""
++from __future__ import annotations
++
++import os
++import sys
++import time
++from typing import List, Optional, Sequence
++
++from .analysis import Analyzer
++from .config import Config
++from .parsers import Parser, detect_parser
++from .pipeline import Pipeline
++
++
++class _Tracked:
++    def __init__(self, path: str, parser: Parser, from_start: bool) -> None:
++        self.path = path
++        self.parser = parser
++        self.buf = ""
++        self.fh = None
++        self.inode: Optional[int] = None
++        self._open(seek_end=not from_start)
++
++    def _open(self, *, seek_end: bool) -> None:
++        try:
++            self.fh = open(self.path, "r", encoding="utf-8", errors="replace")
++            st = os.fstat(self.fh.fileno())
++            self.inode = st.st_ino
++            if seek_end:
++                self.fh.seek(0, os.SEEK_END)
++        except OSError as exc:
++            print(f"logpipe: warning: cannot open {self.path!r}: {exc}", file=sys.stderr)
++            self.fh = None
++            self.inode = None
++
++    def _maybe_reopen(self) -> None:
++        try:
++            st = os.stat(self.path)
++        except OSError:
++            return
++        if self.fh is None or st.st_ino != self.inode or st.st_size < self.fh.tell():
++            if self.fh:
++                self.fh.close()
++            self.buf = ""
++            self._open(seek_end=False)
++
++    def poll(self) -> List[str]:
++        self._maybe_reopen()
++        if self.fh is None:
++            return []
++        chunk = self.fh.read()
++        if not chunk:
++            return []
++        self.buf += chunk
++        lines: List[str] = []
++        while "\n" in self.buf:
++            line, self.buf = self.buf.split("\n", 1)
++            if line.strip():
++                lines.append(line)
++        return lines
++
++
++def _format_event(ev) -> str:
++    ts = ev.timestamp.isoformat(sep=" ", timespec="seconds") if ev.timestamp else "-"
++    lvl = ev.level or "-"
++    return f"[{ts}] {lvl:<8} {ev.source}: {ev.message}"
++
++
++def run_tail(
++    paths: Sequence[str],
++    config: Config,
++    *,
++    interval: float = 0.5,
++    refresh: float = 5.0,
++    from_start: bool = False,
++) -> int:
++    pipe = Pipeline(config)
++    analyzer = Analyzer(config.analysis)
++
++    tracked: List[_Tracked] = []
++    for p in paths:
++        parser, conf = detect_parser(p, pipe.registry)
++        print(f"logpipe: following {p} (format: {parser.name}, confidence {conf:.0%})",
++              file=sys.stderr)
++        tracked.append(_Tracked(p, parser, from_start))
++
++    last_refresh = time.monotonic()
++    try:
++        while True:
++            activity = False
++            for t in tracked:
++                for line in t.poll():
++                    activity = True
++                    ev = pipe.process_line(line, t.parser, t.path)
++                    if ev is None:
++                        continue
++                    analyzer.feed(ev)
++                    print(_format_event(ev))
++            now = time.monotonic()
++            if now - last_refresh >= refresh:
++                _print_rolling_summary(analyzer)
++                last_refresh = now
++            if not activity:
++                time.sleep(interval)
++    except KeyboardInterrupt:
++        print("\nlogpipe: interrupted — final summary:", file=sys.stderr)
++        _print_rolling_summary(analyzer)
++        return 0
++
++
++def _print_rolling_summary(analyzer: Analyzer) -> None:
++    res = analyzer.result()
++    levels = ", ".join(f"{k}={v}" for k, v in sorted(res.by_level.items(), key=lambda kv: -kv[1]))
++    anom = f", {len(res.anomalies)} anomalous window(s)" if res.anomalies else ""
++    print(
++        f"--- summary: {res.total} events | {levels or 'no levels'} | "
++        f"{len(res.windows)} x {res.window_seconds}s windows{anom} ---",
++        file=sys.stderr,
++    )
++    for a in res.anomalies[-3:]:
++        print(
++            f"    {a.kind.upper()} at {a.window_start.isoformat()} count={a.count} z={a.z_score:.2f}",
++            file=sys.stderr,
++        )
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_smoke.py b/tests/test_smoke.py
+new file mode 100644
+index 0000000..9f11f62
+--- /dev/null
++++ b/tests/test_smoke.py
+@@ -0,0 +1,139 @@
++"""End-to-end smoke tests covering detection, resilience, analysis, reporting."""
++from __future__ import annotations
++
++import json
++import os
++import textwrap
++import unittest
++from tempfile import TemporaryDirectory
++
++from logpipe.analysis import Analyzer
++from logpipe.config import Config, AnalysisConfig
++from logpipe.parsers import JSONLinesParser, SyslogParser, CLFParser, build_registry, detect_parser
++from logpipe.pipeline import Pipeline
++from logpipe.report import build_report, to_json, to_text
++
++
++JSONL = "\n".join(
++    json.dumps({"ts": f"2026-04-19T10:{m:02d}:00Z", "level": lvl, "msg": msg})
++    for m, lvl, msg in [
++        (0, "info", "boot ok"),
++        (0, "warn", "disk 80%"),
++        (1, "error", "timeout after 53ms"),
++        (1, "error", "timeout after 7ms"),
++        (5, "info", "boot ok"),
++    ]
++) + "\nNOT JSON AT ALL\n"
++
++SYSLOG = textwrap.dedent(
++    """\
++    Apr 19 10:00:01 web1 nginx[123]: GET /health 200
++    Apr 19 10:00:30 web1 kernel: oom-killer invoked
++    <11>Apr 19 10:01:02 web1 app[77]: db connection refused
++    """
++)
++
++CLF = textwrap.dedent(
++    """\
++    127.0.0.1 - - [19/Apr/2026:10:00:00 +0000] "GET / HTTP/1.1" 200 512
++    127.0.0.1 - - [19/Apr/2026:10:00:10 +0000] "GET /missing HTTP/1.1" 404 0
++    10.0.0.5 - - [19/Apr/2026:10:00:20 +0000] "POST /api HTTP/1.1" 500 128 "-" "curl/8"
++    """
++)
++
++
++class ParserTests(unittest.TestCase):
++    def test_jsonl(self) -> None:
++        p = JSONLinesParser()
++        ev = p.parse('{"ts": "2026-04-19T10:00:00Z", "level": "warn", "msg": "hi"}', "x")
++        assert ev is not None
++        self.assertEqual(ev.level, "WARNING")
++        self.assertEqual(ev.message, "hi")
++        self.assertIsNone(p.parse("not json", "x"))
++
++    def test_syslog(self) -> None:
++        p = SyslogParser(default_year=2026)
++        ev = p.parse("<11>Apr 19 10:01:02 web1 app[77]: boom", "x")
++        assert ev is not None
++        self.assertEqual(ev.level, "ERROR")  # 11 & 7 == 3 -> ERROR
++        self.assertEqual(ev.host, "web1")
++        self.assertEqual(ev.extra["pid"], 77)
++
++    def test_clf(self) -> None:
++        p = CLFParser()
++        ev = p.parse(CLF.splitlines()[2], "x")
++        assert ev is not None
++        self.assertEqual(ev.level, "ERROR")
++        self.assertEqual(ev.extra["status"], 500)
++        self.assertEqual(ev.extra["user_agent"], "curl/8")
++
++
++class DetectTests(unittest.TestCase):
++    def test_detect_each_format(self) -> None:
++        reg = build_registry()
++        with TemporaryDirectory() as d:
++            for name, content, expect in [
++                ("a.jsonl", JSONL, "jsonl"),
++                ("b.syslog", SYSLOG, "syslog"),
++                ("c.clf", CLF, "clf"),
++            ]:
++                path = os.path.join(d, name)
++                with open(path, "w") as fh:
++                    fh.write(content)
++                parser, conf = detect_parser(path, reg)
++                self.assertEqual(parser.name, expect, f"{name}: got {parser.name}")
++                self.assertGreaterEqual(conf, 0.5)
++
++
++class PipelineTests(unittest.TestCase):
++    def test_resilience_and_report(self) -> None:
++        cfg = Config(
++            filters=[{"type": "exclude", "field": "message", "pattern": "health"}],
++            analysis=AnalysisConfig(window_seconds=60, anomaly_z=1.0),
++        )
++        pipe = Pipeline(cfg)
++        with TemporaryDirectory() as d:
++            paths = []
++            for name, content in [("a.jsonl", JSONL), ("b.syslog", SYSLOG), ("c.clf", CLF)]:
++                p = os.path.join(d, name)
++                with open(p, "w") as fh:
++                    fh.write(content)
++                paths.append(p)
++            paths.append(os.path.join(d, "does-not-exist.log"))  # must not crash
++
++            events, stats = pipe.read_paths(paths)
++            an = Analyzer(cfg.analysis)
++            an.feed_all(events)
++            res = an.result()
++
++        self.assertEqual(len(stats.files_ok), 3)
++        self.assertEqual(len(stats.files_failed), 1)
++        self.assertGreaterEqual(stats.lines_malformed, 1)  # the "NOT JSON" line
++        self.assertGreater(stats.events_filtered, 0)       # healthcheck excluded
++        self.assertGreater(res.total, 0)
++        self.assertIn("ERROR", res.by_level)
++        self.assertGreater(len(res.windows), 1)
++
++        report = build_report(res, stats)
++        js = to_json(report)
++        self.assertIn('"total_events"', js)
++        text = to_text(report)
++        self.assertIn("Analyzed", text)
++        self.assertIn("Severity breakdown", text)
++
++    def test_anomaly_spike(self) -> None:
++        an = Analyzer(AnalysisConfig(window_seconds=60, anomaly_z=1.5))
++        from datetime import datetime
++        from logpipe.event import LogEvent
++        # 5 quiet windows of 1 event, one window of 20
++        for minute in range(5):
++            an.feed(LogEvent(datetime(2026, 4, 19, 10, minute, 0), "INFO", "x", "s", "x"))
++        for _ in range(20):
++            an.feed(LogEvent(datetime(2026, 4, 19, 10, 5, 0), "ERROR", "boom", "s", "boom"))
++        res = an.result()
++        kinds = {a.kind for a in res.anomalies}
++        self.assertIn("spike", kinds)
++
++
++if __name__ == "__main__":
++    unittest.main()
