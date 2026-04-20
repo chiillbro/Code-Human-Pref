@@ -1,0 +1,364 @@
+diff --git a/src/logpipe/analysis.py b/src/logpipe/analysis.py
+index a7df8e1..b268d79 100644
+--- a/src/logpipe/analysis.py
++++ b/src/logpipe/analysis.py
+@@ -52,14 +52,18 @@ def _floor(ts: datetime, seconds: int) -> datetime:
+ class Anomaly:
+     window_start: datetime
+     count: int
+-    baseline: float  # median of the trailing K windows
+-    kind: str        # "spike" or "drop"
++    baseline: float      # median of the trailing K windows
++    lower_bound: float   # median - sensitivity * IQR
++    upper_bound: float   # median + sensitivity * IQR
++    kind: str            # "spike" or "drop"
+ 
+     def to_dict(self) -> Dict[str, Any]:
+         return {
+             "window_start": self.window_start.isoformat(),
+             "count": self.count,
+             "baseline": round(self.baseline, 2),
++            "lower_bound": round(self.lower_bound, 2),
++            "upper_bound": round(self.upper_bound, 2),
+             "kind": self.kind,
+         }
+ 
+@@ -191,9 +195,9 @@ class Analyzer:
+             upper = median + sens * iqr
+             lower = median - sens * iqr
+             if count > upper:
+-                out.append(Anomaly(start, count, float(median), "spike"))
++                out.append(Anomaly(start, count, float(median), float(lower), float(upper), "spike"))
+             elif count < lower:
+-                out.append(Anomaly(start, count, float(median), "drop"))
++                out.append(Anomaly(start, count, float(median), float(lower), float(upper), "drop"))
+         return out
+ 
+ 
+diff --git a/src/logpipe/cli.py b/src/logpipe/cli.py
+index 414b2fd..29b49ce 100644
+--- a/src/logpipe/cli.py
++++ b/src/logpipe/cli.py
+@@ -62,6 +62,92 @@ def _cmd_detect(args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++_STARTER_CONFIG = """\
++# logpipe configuration
++# Uncomment and edit the sections you need.
++
++# ─── Custom parsers ──────────────────────────────────────────────────
++# Define regex-based parsers for formats logpipe doesn't handle natively.
++# Named groups "timestamp", "level", "message", "host" map to core fields;
++# everything else lands in the event's extra dict.
++#
++# parsers:
++#   custom:
++#     - name: myapp
++#       pattern: '^(?P<timestamp>\\S+) \\[(?P<level>\\w+)\\] (?P<message>.*)$'
++#       time_format: '%Y-%m-%dT%H:%M:%S'
++
++# ─── Filters ─────────────────────────────────────────────────────────
++# Events that don't match every filter are dropped from the pipeline.
++#
++# filters:
++#   # Keep only events at WARNING or above (DEBUG and INFO are dropped).
++#   - type: level
++#     min: WARNING
++#
++#   # Keep events whose field matches a regex (default field: message).
++#   - type: match
++#     field: message
++#     pattern: 'timeout|error|refused'
++#
++#   # Drop events whose field matches a regex.
++#   - type: exclude
++#     field: message
++#     pattern: 'healthcheck|ELB-HealthChecker'
++#
++#   # Keep events where a field equals an exact value.
++#   - type: equals
++#     field: status
++#     value: 500
++#
++#   # Keep events within a time range (ISO-8601, either bound optional).
++#   - type: time_range
++#     after:  '2026-01-01T00:00:00'
++#     before: '2026-12-31T23:59:59'
++
++# ─── Transforms ──────────────────────────────────────────────────────
++# Applied in order after filters. Mutate events in-place.
++#
++# transforms:
++#   # Set a field to a fixed value (creates it if absent).
++#   - type: set
++#     field: env
++#     value: prod
++#
++#   # Remove a field from the event's extra dict.
++#   - type: drop
++#     field: password
++#
++#   # Rename a field.
++#   - type: rename
++#     field: msg
++#     to: message
++#
++#   # Re-normalize the level from another field (handy for custom parsers).
++#   - type: normalize_level
++#     field: severity
++
++# ─── Analysis ────────────────────────────────────────────────────────
++# analysis:
++#   # Width (in seconds) of each time bucket for rate calculation.
++#   window_seconds: 60
++#
++#   # Rolling anomaly detection: number of trailing windows used as baseline.
++#   baseline_windows: 20
++#
++#   # Bounds = median ± sensitivity × IQR.  Lower = more flags.
++#   anomaly_sensitivity: 1.5
++#
++#   # How many top message patterns to include in the report.
++#   top_messages: 10
++"""
++
++
++def _cmd_config_init(args: argparse.Namespace) -> int:
++    print(_STARTER_CONFIG, end="")
++    return 0
++
++
+ def build_parser() -> argparse.ArgumentParser:
+     ap = argparse.ArgumentParser(
+         prog="logpipe",
+@@ -94,6 +180,11 @@ def build_parser() -> argparse.ArgumentParser:
+     d.add_argument("-c", "--config", help="YAML config file")
+     d.set_defaults(func=_cmd_detect)
+ 
++    c = sub.add_parser("config", help="configuration helpers")
++    csub = c.add_subparsers(dest="config_cmd", required=True)
++    ci = csub.add_parser("init", help="print a documented starter config to stdout")
++    ci.set_defaults(func=_cmd_config_init)
++
+     return ap
+ 
+ 
+diff --git a/src/logpipe/parsers/syslog.py b/src/logpipe/parsers/syslog.py
+index 320daf6..17311ee 100644
+--- a/src/logpipe/parsers/syslog.py
++++ b/src/logpipe/parsers/syslog.py
+@@ -2,13 +2,17 @@
+ 
+ Covers the classic ``<PRI>MMM dd HH:MM:SS host proc[pid]: message`` shape and
+ the very common variant without the ``<PRI>`` prefix (what you usually see in
+-``/var/log/syslog``). The year is not encoded in RFC-3164 so we default to the
+-current year.
++``/var/log/syslog``).
++
++RFC-3164 omits the year. We use a reference date (default: today) and infer the
++year: if the parsed month is *after* the reference month we assume the entry is
++from the previous year. This handles the common case of analyzing December
++entries in January/February/etc.
+ """
+ from __future__ import annotations
+ 
+ import re
+-from datetime import datetime
++from datetime import date, datetime
+ from typing import Optional
+ 
+ from ..event import LogEvent, normalize_level
+@@ -38,15 +42,38 @@ _PAT = re.compile(
+ class SyslogParser(Parser):
+     name = "syslog"
+ 
+-    def __init__(self, default_year: Optional[int] = None) -> None:
+-        self._year = default_year or datetime.now().year
++    def __init__(
++        self,
++        default_year: Optional[int] = None,
++        reference_date: Optional[date] = None,
++    ) -> None:
++        if reference_date is not None:
++            self._year = reference_date.year
++            self._ref_month = reference_date.month
++        elif default_year is not None:
++            # Explicit year without a reference date: set ref_month=12 so the
++            # rollback logic never fires (preserves backward compatibility).
++            self._year = default_year
++            self._ref_month = 12
++        else:
++            today = date.today()
++            self._year = today.year
++            self._ref_month = today.month
++
++    def _infer_year(self, month: int) -> int:
++        if month > self._ref_month:
++            return self._year - 1
++        return self._year
+ 
+     def parse(self, line: str, source: str) -> Optional[LogEvent]:
+         m = _PAT.match(line.rstrip("\n"))
+         if not m:
+             return None
+         try:
+-            ts = datetime.strptime(f"{self._year} {m['ts']}", "%Y %b %d %H:%M:%S")
++            # Parse without year first so we can read the month.
++            preliminary = datetime.strptime(m["ts"], "%b %d %H:%M:%S")
++            year = self._infer_year(preliminary.month)
++            ts = preliminary.replace(year=year)
+         except ValueError:
+             ts = None
+ 
+diff --git a/src/logpipe/report.py b/src/logpipe/report.py
+index 148996a..36fd7b8 100644
+--- a/src/logpipe/report.py
++++ b/src/logpipe/report.py
+@@ -88,7 +88,8 @@ def to_text(report: Dict[str, Any]) -> str:
+         for a in an["anomalies"]:
+             lines.append(
+                 f"  {a['kind'].upper():<5} at {a['window_start']}: "
+-                f"{a['count']} events (baseline {a['baseline']})"
++                f"{a['count']} events (baseline {a['baseline']}, "
++                f"bounds [{a['lower_bound']}, {a['upper_bound']}])"
+             )
+     else:
+         lines.append("")
+diff --git a/src/logpipe/tail.py b/src/logpipe/tail.py
+index e0dd00f..23476f6 100644
+--- a/src/logpipe/tail.py
++++ b/src/logpipe/tail.py
+@@ -130,6 +130,7 @@ def _print_rolling_summary(analyzer: Analyzer) -> None:
+     for a in res.anomalies[-3:]:
+         print(
+             f"    {a.kind.upper()} at {a.window_start.isoformat()} "
+-            f"count={a.count} baseline={a.baseline:g}",
++            f"count={a.count} baseline={a.baseline:g} "
++            f"bounds=[{a.lower_bound:g}, {a.upper_bound:g}]",
+             file=sys.stderr,
+         )
+diff --git a/tests/test_analysis.py b/tests/test_analysis.py
+index c137056..cbb5f47 100644
+--- a/tests/test_analysis.py
++++ b/tests/test_analysis.py
+@@ -61,9 +61,9 @@ class AnomalyTests(unittest.TestCase):
+         _feed_series(an, [3, 4, 100, 2, 5], self.BASE)  # only 5 windows == K
+         self.assertEqual(an.result().anomalies, [])
+ 
+-    def test_spike_flagged(self) -> None:
+-        an = self._analyzer(k=5)
+-        # baseline ~10, then a 100 spike
++    def test_spike_flagged_with_bounds(self) -> None:
++        an = self._analyzer(k=5, sens=1.5)
++        # baseline [9,10,10,11,12] median=10 IQR=Q3-Q1
+         _feed_series(an, [10, 11, 9, 10, 12, 100], self.BASE)
+         res = an.result()
+         self.assertEqual(len(res.anomalies), 1)
+@@ -72,6 +72,13 @@ class AnomalyTests(unittest.TestCase):
+         self.assertEqual(a.count, 100)
+         self.assertEqual(a.window_start, datetime(2026, 4, 19, 10, 5, 0))
+         self.assertAlmostEqual(a.baseline, 10.0, places=3)
++        # bounds must be present and count must exceed upper
++        self.assertGreater(a.count, a.upper_bound)
++        self.assertLess(a.lower_bound, a.upper_bound)
++        # bounds should also show up in to_dict / JSON
++        d = a.to_dict()
++        self.assertIn("lower_bound", d)
++        self.assertIn("upper_bound", d)
+ 
+     def test_drop_flagged(self) -> None:
+         an = self._analyzer(k=5)
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+index cb00b92..04eec98 100644
+--- a/tests/test_integration.py
++++ b/tests/test_integration.py
+@@ -69,6 +69,9 @@ class AnalyzeCLITests(unittest.TestCase):
+         self.assertEqual(len(spikes), 1)
+         self.assertEqual(spikes[0]["count"], 80)
+         self.assertIn("baseline", spikes[0])
++        self.assertIn("lower_bound", spikes[0])
++        self.assertIn("upper_bound", spikes[0])
++        self.assertGreater(spikes[0]["count"], spikes[0]["upper_bound"])
+ 
+     def test_missing_config_exits_nonzero(self) -> None:
+         with TemporaryDirectory() as d:
+@@ -78,5 +81,30 @@ class AnalyzeCLITests(unittest.TestCase):
+         self.assertEqual(rc, 2)
+ 
+ 
++class ConfigInitTests(unittest.TestCase):
++    def test_config_init_prints_documented_yaml(self) -> None:
++        import io
++        from contextlib import redirect_stdout
++
++        buf = io.StringIO()
++        with redirect_stdout(buf):
++            rc = main(["config", "init"])
++        self.assertEqual(rc, 0)
++        output = buf.getvalue()
++        # Should mention every filter type
++        for keyword in ["level", "match", "exclude", "equals", "time_range",
++                        "set", "drop", "rename", "normalize_level",
++                        "window_seconds", "baseline_windows", "anomaly_sensitivity",
++                        "top_messages", "custom"]:
++            self.assertIn(keyword, output, f"missing {keyword!r}")
++        # Should be valid-ish YAML (all lines are comments or blank)
++        for line in output.splitlines():
++            stripped = line.strip()
++            self.assertTrue(
++                stripped == "" or stripped.startswith("#"),
++                f"non-comment line in starter config: {line!r}",
++            )
++
++
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_parsers.py b/tests/test_parsers.py
+index e5a0617..1064acb 100644
+--- a/tests/test_parsers.py
++++ b/tests/test_parsers.py
+@@ -2,7 +2,7 @@
+ from __future__ import annotations
+ 
+ import unittest
+-from datetime import datetime, timezone
++from datetime import date, datetime, timezone
+ 
+ from logpipe.parsers import CLFParser, JSONLinesParser, RegexParser, SyslogParser
+ 
+@@ -87,6 +87,34 @@ class SyslogTests(unittest.TestCase):
+     def test_malformed_rejected(self) -> None:
+         self.assertIsNone(self.p.parse("not a syslog line at all", "src"))
+ 
++    def test_year_rollback_december_in_april(self) -> None:
++        # Analyzing December entries with a reference date in April should
++        # produce timestamps in the previous year.
++        p = SyslogParser(reference_date=date(2026, 4, 20))
++        ev = p.parse("Dec 31 23:59:59 web1 app[1]: nye", "src")
++        assert ev is not None
++        self.assertEqual(ev.timestamp, datetime(2025, 12, 31, 23, 59, 59))
++
++    def test_no_rollback_same_month(self) -> None:
++        p = SyslogParser(reference_date=date(2026, 4, 20))
++        ev = p.parse("Apr  1 00:00:00 web1 app[1]: start", "src")
++        assert ev is not None
++        self.assertEqual(ev.timestamp.year, 2026)
++
++    def test_no_rollback_earlier_month(self) -> None:
++        p = SyslogParser(reference_date=date(2026, 4, 20))
++        ev = p.parse("Jan  5 10:00:00 web1 app[1]: x", "src")
++        assert ev is not None
++        self.assertEqual(ev.timestamp.year, 2026)
++
++    def test_default_year_compat_no_rollback(self) -> None:
++        # Passing explicit default_year (old API) sets ref_month=12 so
++        # no rollback ever fires — preserves backward compatibility.
++        p = SyslogParser(default_year=2026)
++        ev = p.parse("Dec 31 23:59:59 web1 app[1]: nye", "src")
++        assert ev is not None
++        self.assertEqual(ev.timestamp.year, 2026)
++
+ 
+ class CLFTests(unittest.TestCase):
+     def setUp(self) -> None:
