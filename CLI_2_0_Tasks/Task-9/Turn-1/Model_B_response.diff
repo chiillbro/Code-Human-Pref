@@ -1,0 +1,1484 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..6501744
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,125 @@
++# tablesmith
++
++A lightweight, scriptable pipeline engine for transforming tabular data.  
++Pure Python standard library — no external dependencies.
++
++## Install
++
++```bash
++pip install -e .
++```
++
++## Quick start
++
++```bash
++# Filter and select columns
++tablesmith data.csv --filter 'age > 30' --select name,age
++
++# Sort and limit
++tablesmith data.json --sort salary:desc --head 10
++
++# Group and aggregate
++tablesmith sales.csv --group-by region --agg 'revenue:sum,revenue:mean'
++
++# Join two files
++tablesmith orders.csv --join customers.csv --join-on customer_id=id --join-how left
++
++# Convert formats
++tablesmith data.csv -o data.json
++tablesmith data.json -o data.jsonl
++
++# Pipe from stdin
++cat data.csv | tablesmith --filter 'status == "active"' -f json
++```
++
++## Supported formats
++
++CSV, TSV, JSON (array of objects), and JSONL — auto-detected from file extension.  
++Override with `-F` (input) or `-f` (output).
++
++## Inline operations
++
++Operations are applied in this order: filter → rename → join → select → group → sort → head/tail → describe → count.
++
++| Flag | Description | Example |
++|------|-------------|---------|
++| `--filter EXPR` | Filter rows (repeatable) | `--filter 'age > 30'` |
++| `--select COLS` | Pick columns | `--select name,email` |
++| `--rename MAP` | Rename columns | `--rename old:new,x:y` |
++| `--sort SPEC` | Sort rows | `--sort age:desc,name` |
++| `--group-by COLS` | Group rows | `--group-by dept` |
++| `--agg SPEC` | Aggregations | `--agg salary:mean,id:count` |
++| `--join FILE` | Join with file | `--join other.csv` |
++| `--join-on SPEC` | Join key | `--join-on id` or `--join-on a=b` |
++| `--join-how TYPE` | Join type | `--join-how left` |
++| `--head N` | First N rows | `--head 5` |
++| `--tail N` | Last N rows | `--tail 5` |
++| `--count` | Count rows | |
++| `--describe` | Column stats | |
++
++## Filter expressions
++
++```
++age > 30
++name == "Alice"
++status != "inactive"
++salary >= 50000 and department == "Engineering"
++name contains "smith"
++name startswith "A"
++city endswith "ton"
++age is null
++age is not null
++status in ("active", "pending")
++(age > 25) or (role == "admin")
++not active
++`column with spaces` > 10
++```
++
++## Pipeline files
++
++For complex multi-step transforms, define a pipeline in JSON:
++
++```json
++{
++  "steps": [
++    {"op": "filter", "expr": "age > 18"},
++    {"op": "rename", "columns": "name:full_name"},
++    {"op": "select", "columns": "full_name,age,dept"},
++    {"op": "group", "by": "dept", "agg": "age:mean,age:count"},
++    {"op": "sort", "by": "age_mean:desc"}
++  ]
++}
++```
++
++Run it:
++
++```bash
++tablesmith data.csv --pipeline transform.json -o result.csv
++```
++
++### Pipeline operations
++
++| op | Required fields | Optional |
++|----|----------------|----------|
++| `filter` | `expr` | |
++| `select` | `columns` | |
++| `rename` | `columns` | |
++| `sort` | `by` | |
++| `group` | `by`, `agg` | |
++| `join` | `file`, `on` | `how` |
++| `head` | | `n` (default 10) |
++| `tail` | | `n` (default 10) |
++| `count` | | |
++| `describe` | | |
++
++## Type inference
++
++Types are inferred automatically from data values:
++- Integers: `"42"` → `42`
++- Floats: `"3.14"` → `3.14`
++- Booleans: `"true"` / `"false"`
++- Null: empty string, `"null"`, `"none"`, `"na"`, `"n/a"`, `"nan"`, `"-"`
++
++## Aggregation functions
++
++`sum`, `mean`/`avg`, `min`, `max`, `count`, `first`, `last`
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..913eb53
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,13 @@
++[build-system]
++requires = ["setuptools>=64"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "tablesmith"
++version = "0.1.0"
++description = "A lightweight pipeline engine for transforming tabular data"
++requires-python = ">=3.8"
++license = {text = "MIT"}
++
++[project.scripts]
++tablesmith = "tablesmith.cli:main"
+diff --git a/tablesmith/__init__.py b/tablesmith/__init__.py
+new file mode 100644
+index 0000000..e719996
+--- /dev/null
++++ b/tablesmith/__init__.py
+@@ -0,0 +1,3 @@
++"""tablesmith - A lightweight pipeline engine for transforming tabular data."""
++
++__version__ = "0.1.0"
+diff --git a/tablesmith/__main__.py b/tablesmith/__main__.py
+new file mode 100644
+index 0000000..1ce515e
+--- /dev/null
++++ b/tablesmith/__main__.py
+@@ -0,0 +1,5 @@
++"""Support running as python -m tablesmith."""
++
++from .cli import main
++
++main()
+diff --git a/tablesmith/cli.py b/tablesmith/cli.py
+new file mode 100644
+index 0000000..e574c7a
+--- /dev/null
++++ b/tablesmith/cli.py
+@@ -0,0 +1,163 @@
++"""Command-line interface for tablesmith."""
++
++import argparse
++import sys
++
++from .errors import handle_error, TablesmithError
++from .io import read_input, write_output
++from .ops import (
++    filter_rows, select_columns, rename_columns, sort_rows,
++    group_by, join, head, tail, count, describe,
++)
++from .pipeline import load_pipeline, run_pipeline
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(
++        prog="tablesmith",
++        description="A lightweight pipeline engine for transforming tabular data.",
++        epilog=(
++            "examples:\n"
++            "  tablesmith data.csv --filter 'age > 30' --select name,age\n"
++            "  tablesmith data.json --sort salary:desc --head 10 -o top.csv\n"
++            "  tablesmith data.csv --group-by dept --agg salary:mean,salary:max\n"
++            "  tablesmith data.csv --join teams.csv --join-on team_id=id\n"
++            "  tablesmith --pipeline transform.json data.csv -o result.json\n"
++            "  cat data.csv | tablesmith --filter 'status == \"active\"'\n"
++        ),
++        formatter_class=argparse.RawDescriptionHelpFormatter,
++    )
++
++    parser.add_argument("input", nargs="?", default=None, help="input file (default: stdin)")
++
++    io_grp = parser.add_argument_group("input/output")
++    io_grp.add_argument("-o", "--output", default=None, help="output file (default: stdout)")
++    io_grp.add_argument(
++        "-f", "--format", default=None, dest="output_format",
++        choices=["csv", "json", "jsonl", "tsv"],
++        help="output format (auto-detected from extension)",
++    )
++    io_grp.add_argument(
++        "-F", "--input-format", default=None,
++        choices=["csv", "json", "jsonl", "tsv"],
++        help="input format (auto-detected from extension)",
++    )
++
++    ops_grp = parser.add_argument_group("operations (applied in order)")
++    ops_grp.add_argument(
++        "--filter", action="append", default=[], metavar="EXPR",
++        help="filter rows (e.g. 'age > 30'). repeatable",
++    )
++    ops_grp.add_argument("--select", default=None, metavar="COLS", help="select columns (comma-separated)")
++    ops_grp.add_argument("--rename", default=None, metavar="MAP", help="rename columns (old:new,...)")
++    ops_grp.add_argument("--sort", default=None, metavar="SPEC", help="sort by columns (col:asc,...)")
++    ops_grp.add_argument("--group-by", default=None, metavar="COLS", help="group by columns")
++    ops_grp.add_argument("--agg", default=None, metavar="SPEC", help="aggregations (col:func,...)")
++    ops_grp.add_argument("--join", default=None, metavar="FILE", help="join with another file")
++    ops_grp.add_argument("--join-on", default=None, metavar="SPEC", help="join key (col or left=right)")
++    ops_grp.add_argument(
++        "--join-how", default="inner",
++        choices=["inner", "left", "right", "outer"],
++        help="join type (default: inner)",
++    )
++
++    util_grp = parser.add_argument_group("utility")
++    util_grp.add_argument("--head", type=int, default=None, metavar="N", help="first N rows")
++    util_grp.add_argument("--tail", type=int, default=None, metavar="N", help="last N rows")
++    util_grp.add_argument("--count", action="store_true", help="count rows")
++    util_grp.add_argument("--describe", action="store_true", help="show column types and stats")
++
++    pipe_grp = parser.add_argument_group("pipeline")
++    pipe_grp.add_argument("--pipeline", default=None, metavar="FILE", help="run from a JSON pipeline file")
++
++    return parser
++
++
++def _validate_args(args):
++    if args.group_by and not args.agg:
++        raise TablesmithError(
++            "--group-by requires --agg",
++            hint="e.g. --agg 'salary:sum,salary:count'",
++        )
++    if args.agg and not args.group_by:
++        raise TablesmithError(
++            "--agg requires --group-by",
++            hint="e.g. --group-by 'department'",
++        )
++    if args.join and not args.join_on:
++        raise TablesmithError(
++            "--join requires --join-on",
++            hint="e.g. --join-on 'id' or --join-on 'dept_id=id'",
++        )
++    if args.join_on and not args.join:
++        raise TablesmithError("--join-on requires --join")
++
++    has_inline = (
++        args.filter or args.select or args.rename or args.sort
++        or args.group_by or args.join
++        or args.head is not None or args.tail is not None
++        or args.count or args.describe
++    )
++    if args.pipeline and has_inline:
++        raise TablesmithError(
++            "cannot combine --pipeline with inline operations",
++            hint="use either --pipeline or inline flags, not both",
++        )
++
++
++def _apply_inline_ops(rows, args):
++    """Apply inline operations in a fixed, predictable order."""
++    for expr in args.filter:
++        rows = filter_rows(rows, expr)
++
++    if args.rename:
++        rows = rename_columns(rows, args.rename)
++
++    if args.join:
++        right_rows = read_input(args.join)
++        rows = join(rows, right_rows, args.join_on, args.join_how)
++
++    if args.select:
++        rows = select_columns(rows, args.select)
++
++    if args.group_by:
++        rows = group_by(rows, args.group_by, args.agg)
++
++    if args.sort:
++        rows = sort_rows(rows, args.sort)
++
++    if args.head is not None:
++        rows = head(rows, args.head)
++
++    if args.tail is not None:
++        rows = tail(rows, args.tail)
++
++    if args.describe:
++        rows = describe(rows)
++
++    if args.count:
++        rows = count(rows)
++
++    return rows
++
++
++@handle_error
++def main(argv=None):
++    parser = build_parser()
++    args = parser.parse_args(argv)
++
++    if args.input is None and sys.stdin.isatty() and not args.pipeline:
++        parser.print_help(sys.stderr)
++        sys.exit(1)
++
++    _validate_args(args)
++
++    rows = read_input(args.input, fmt=args.input_format)
++
++    if args.pipeline:
++        steps = load_pipeline(args.pipeline)
++        rows = run_pipeline(rows, steps)
++    else:
++        rows = _apply_inline_ops(rows, args)
++
++    write_output(rows, args.output, fmt=args.output_format)
+diff --git a/tablesmith/errors.py b/tablesmith/errors.py
+new file mode 100644
+index 0000000..46f80cb
+--- /dev/null
++++ b/tablesmith/errors.py
+@@ -0,0 +1,60 @@
++"""User-friendly error handling for tablesmith."""
++
++import sys
++
++
++class TablesmithError(Exception):
++    """Base error for all tablesmith errors."""
++
++    def __init__(self, message, hint=None):
++        self.hint = hint
++        super().__init__(message)
++
++    def format(self):
++        msg = f"error: {self}"
++        if self.hint:
++            msg += f"\n  hint: {self.hint}"
++        return msg
++
++
++class ColumnNotFoundError(TablesmithError):
++    """A referenced column does not exist in the data."""
++
++    def __init__(self, column, available):
++        self.column = column
++        self.available = available
++        avail_str = ", ".join(sorted(available)) if available else "(none)"
++        super().__init__(
++            f"column '{column}' not found",
++            hint=f"available columns: {avail_str}",
++        )
++
++
++class ParseError(TablesmithError):
++    """Error parsing a filter expression or pipeline file."""
++    pass
++
++
++class IOError_(TablesmithError):
++    """Error reading or writing data."""
++    pass
++
++
++class OperationError(TablesmithError):
++    """Error during a data operation."""
++    pass
++
++
++def handle_error(func):
++    """Decorator that catches TablesmithError and prints a friendly message."""
++    def wrapper(*args, **kwargs):
++        try:
++            return func(*args, **kwargs)
++        except TablesmithError as e:
++            print(f"tablesmith: {e.format()}", file=sys.stderr)
++            sys.exit(1)
++        except BrokenPipeError:
++            sys.exit(0)
++        except KeyboardInterrupt:
++            sys.exit(130)
++    return wrapper
+diff --git a/tablesmith/expr.py b/tablesmith/expr.py
+new file mode 100644
+index 0000000..ff8d0dc
+--- /dev/null
++++ b/tablesmith/expr.py
+@@ -0,0 +1,416 @@
++"""Expression parser for filter operations.
++
++Supports:
++  Comparisons:  age > 30, name == "Alice"
++  Logical:      expr and expr, expr or expr, not expr
++  Parentheses:  (age > 30) and (name == "Alice")
++  String ops:   name contains "ali", name startswith "A", name endswith "z"
++  Null checks:  age is null, age is not null
++  In lists:     status in ("active", "pending")
++  Quoted cols:  `column name` > 10
++"""
++
++from .errors import ParseError
++
++
++class _T:
++    IDENT = "IDENT"
++    STRING = "STRING"
++    NUMBER = "NUMBER"
++    OP = "OP"
++    AND = "AND"
++    OR = "OR"
++    NOT = "NOT"
++    IS = "IS"
++    NULL = "NULL"
++    IN = "IN"
++    CONTAINS = "CONTAINS"
++    STARTSWITH = "STARTSWITH"
++    ENDSWITH = "ENDSWITH"
++    LPAREN = "LPAREN"
++    RPAREN = "RPAREN"
++    COMMA = "COMMA"
++    EOF = "EOF"
++
++
++_KEYWORDS = {
++    "and": _T.AND,
++    "or": _T.OR,
++    "not": _T.NOT,
++    "is": _T.IS,
++    "null": _T.NULL,
++    "none": _T.NULL,
++    "in": _T.IN,
++    "contains": _T.CONTAINS,
++    "startswith": _T.STARTSWITH,
++    "endswith": _T.ENDSWITH,
++}
++
++_TWO_CHAR_OPS = {"==", "!=", ">=", "<="}
++
++
++class Token:
++    __slots__ = ("type", "value", "pos")
++
++    def __init__(self, type, value, pos):
++        self.type = type
++        self.value = value
++        self.pos = pos
++
++
++def tokenize(expr):
++    """Tokenize a filter expression string."""
++    tokens = []
++    i = 0
++    n = len(expr)
++
++    while i < n:
++        if expr[i].isspace():
++            i += 1
++            continue
++
++        # Backtick-quoted identifiers (for column names with spaces)
++        if expr[i] == "`":
++            start = i
++            i += 1
++            while i < n and expr[i] != "`":
++                i += 1
++            if i >= n:
++                raise ParseError(
++                    f"unterminated backtick identifier at position {start}",
++                    hint="close it with another backtick: `column name`",
++                )
++            tokens.append(Token(_T.IDENT, expr[start + 1:i], start))
++            i += 1
++            continue
++
++        # String literals
++        if expr[i] in ('"', "'"):
++            quote = expr[i]
++            start = i
++            i += 1
++            parts = []
++            while i < n and expr[i] != quote:
++                if expr[i] == "\\" and i + 1 < n:
++                    i += 1
++                parts.append(expr[i])
++                i += 1
++            if i >= n:
++                raise ParseError(
++                    f"unterminated string starting at position {start}",
++                    hint="make sure quotes are balanced",
++                )
++            i += 1
++            tokens.append(Token(_T.STRING, "".join(parts), start))
++            continue
++
++        # Numbers
++        if expr[i].isdigit() or (
++            expr[i] == "-" and i + 1 < n and expr[i + 1].isdigit()
++        ):
++            start = i
++            if expr[i] == "-":
++                i += 1
++            while i < n and expr[i].isdigit():
++                i += 1
++            if i < n and expr[i] == ".":
++                i += 1
++                while i < n and expr[i].isdigit():
++                    i += 1
++                tokens.append(Token(_T.NUMBER, float(expr[start:i]), start))
++            else:
++                tokens.append(Token(_T.NUMBER, int(expr[start:i]), start))
++            continue
++
++        # Two-char operators
++        if i + 1 < n and expr[i:i + 2] in _TWO_CHAR_OPS:
++            tokens.append(Token(_T.OP, expr[i:i + 2], i))
++            i += 2
++            continue
++
++        # Single-char operators
++        if expr[i] in (">", "<"):
++            tokens.append(Token(_T.OP, expr[i], i))
++            i += 1
++            continue
++
++        # Bare = treated as ==
++        if expr[i] == "=":
++            tokens.append(Token(_T.OP, "==", i))
++            i += 1
++            continue
++
++        # Parentheses and comma
++        if expr[i] == "(":
++            tokens.append(Token(_T.LPAREN, "(", i))
++            i += 1
++            continue
++        if expr[i] == ")":
++            tokens.append(Token(_T.RPAREN, ")", i))
++            i += 1
++            continue
++        if expr[i] == ",":
++            tokens.append(Token(_T.COMMA, ",", i))
++            i += 1
++            continue
++
++        # Identifiers and keywords
++        if expr[i].isalpha() or expr[i] == "_":
++            start = i
++            while i < n and (expr[i].isalnum() or expr[i] in ("_", ".")):
++                i += 1
++            word = expr[start:i]
++            lower = word.lower()
++            if lower in _KEYWORDS:
++                tokens.append(Token(_KEYWORDS[lower], lower, start))
++            elif lower == "true":
++                tokens.append(Token(_T.NUMBER, True, start))
++            elif lower == "false":
++                tokens.append(Token(_T.NUMBER, False, start))
++            else:
++                tokens.append(Token(_T.IDENT, word, start))
++            continue
++
++        raise ParseError(
++            f"unexpected character '{expr[i]}' at position {i}",
++            hint=f"in expression: {expr}",
++        )
++
++    tokens.append(Token(_T.EOF, None, n))
++    return tokens
++
++
++class _Parser:
++    """Recursive descent parser for filter expressions."""
++
++    def __init__(self, tokens, source):
++        self.tokens = tokens
++        self.source = source
++        self.pos = 0
++
++    def peek(self):
++        return self.tokens[self.pos]
++
++    def advance(self):
++        tok = self.tokens[self.pos]
++        self.pos += 1
++        return tok
++
++    def expect(self, ttype):
++        tok = self.peek()
++        if tok.type != ttype:
++            raise ParseError(
++                f"expected {ttype} but got {tok.type} ({tok.value!r}) "
++                f"at position {tok.pos}",
++                hint=f"in expression: {self.source}",
++            )
++        return self.advance()
++
++    def parse(self):
++        node = self._or()
++        if self.peek().type != _T.EOF:
++            tok = self.peek()
++            raise ParseError(
++                f"unexpected token {tok.value!r} at position {tok.pos}",
++                hint=f"in expression: {self.source}",
++            )
++        return node
++
++    def _or(self):
++        left = self._and()
++        while self.peek().type == _T.OR:
++            self.advance()
++            left = ("or", left, self._and())
++        return left
++
++    def _and(self):
++        left = self._not()
++        while self.peek().type == _T.AND:
++            self.advance()
++            left = ("and", left, self._not())
++        return left
++
++    def _not(self):
++        if self.peek().type == _T.NOT:
++            self.advance()
++            return ("not", self._not())
++        return self._primary()
++
++    def _primary(self):
++        if self.peek().type == _T.LPAREN:
++            self.advance()
++            node = self._or()
++            self.expect(_T.RPAREN)
++            return node
++        return self._comparison()
++
++    def _comparison(self):
++        left = self._value()
++        tok = self.peek()
++
++        if tok.type == _T.OP:
++            op = self.advance().value
++            return ("cmp", op, left, self._value())
++
++        if tok.type == _T.IS:
++            self.advance()
++            if self.peek().type == _T.NOT:
++                self.advance()
++                self.expect(_T.NULL)
++                return ("is_not_null", left)
++            self.expect(_T.NULL)
++            return ("is_null", left)
++
++        if tok.type == _T.CONTAINS:
++            self.advance()
++            return ("contains", left, self._value())
++
++        if tok.type == _T.STARTSWITH:
++            self.advance()
++            return ("startswith", left, self._value())
++
++        if tok.type == _T.ENDSWITH:
++            self.advance()
++            return ("endswith", left, self._value())
++
++        if tok.type == _T.IN:
++            self.advance()
++            self.expect(_T.LPAREN)
++            values = [self._value()]
++            while self.peek().type == _T.COMMA:
++                self.advance()
++                values.append(self._value())
++            self.expect(_T.RPAREN)
++            return ("in", left, values)
++
++        # Bare value used as truthy check
++        return ("truthy", left)
++
++    def _value(self):
++        tok = self.peek()
++        if tok.type == _T.IDENT:
++            self.advance()
++            return ("col", tok.value)
++        if tok.type == _T.STRING:
++            self.advance()
++            return ("lit", tok.value)
++        if tok.type == _T.NUMBER:
++            self.advance()
++            return ("lit", tok.value)
++        if tok.type == _T.NULL:
++            self.advance()
++            return ("lit", None)
++        raise ParseError(
++            f"expected a value but got {tok.type} ({tok.value!r}) "
++            f"at position {tok.pos}",
++            hint=f"in expression: {self.source}",
++        )
++
++
++def parse_expression(expr_str):
++    """Parse a filter expression string into an AST."""
++    tokens = tokenize(expr_str)
++    return _Parser(tokens, expr_str).parse()
++
++
++def _resolve(node, row):
++    """Resolve an AST value node against a row."""
++    if node[0] == "col":
++        col_name = node[1]
++        if col_name in row:
++            return row[col_name]
++        # Case-insensitive fallback
++        for k in row:
++            if k.lower() == col_name.lower():
++                return row[k]
++        return None
++    if node[0] == "lit":
++        return node[1]
++    raise ParseError(f"unexpected node in value position: {node}")
++
++
++def _safe_compare(a, b, op):
++    """Compare two values, handling type mismatches and nulls."""
++    if a is None or b is None:
++        if op == "==":
++            return a is None and b is None
++        if op == "!=":
++            return not (a is None and b is None)
++        return False
++
++    # Coerce for cross-type numeric comparison
++    try:
++        if isinstance(a, str) and isinstance(b, (int, float)):
++            a = float(a)
++        elif isinstance(b, str) and isinstance(a, (int, float)):
++            b = float(b)
++    except (ValueError, TypeError):
++        pass
++
++    try:
++        if op == "==":
++            return a == b
++        if op == "!=":
++            return a != b
++        if op == ">":
++            return a > b
++        if op == "<":
++            return a < b
++        if op == ">=":
++            return a >= b
++        if op == "<=":
++            return a <= b
++    except TypeError:
++        return False
++    return False
++
++
++def evaluate(ast, row):
++    """Evaluate a parsed expression against a row dict."""
++    op = ast[0]
++
++    if op == "cmp":
++        _, cmp_op, left, right = ast
++        return _safe_compare(_resolve(left, row), _resolve(right, row), cmp_op)
++
++    if op == "and":
++        return evaluate(ast[1], row) and evaluate(ast[2], row)
++
++    if op == "or":
++        return evaluate(ast[1], row) or evaluate(ast[2], row)
++
++    if op == "not":
++        return not evaluate(ast[1], row)
++
++    if op == "is_null":
++        return _resolve(ast[1], row) is None
++
++    if op == "is_not_null":
++        return _resolve(ast[1], row) is not None
++
++    if op == "contains":
++        a, b = _resolve(ast[1], row), _resolve(ast[2], row)
++        if a is None or b is None:
++            return False
++        return str(b).lower() in str(a).lower()
++
++    if op == "startswith":
++        a, b = _resolve(ast[1], row), _resolve(ast[2], row)
++        if a is None or b is None:
++            return False
++        return str(a).lower().startswith(str(b).lower())
++
++    if op == "endswith":
++        a, b = _resolve(ast[1], row), _resolve(ast[2], row)
++        if a is None or b is None:
++            return False
++        return str(a).lower().endswith(str(b).lower())
++
++    if op == "in":
++        a = _resolve(ast[1], row)
++        return a in [_resolve(v, row) for v in ast[2]]
++
++    if op == "truthy":
++        return bool(_resolve(ast[1], row))
++
++    raise ParseError(f"unknown expression node: {op}")
+diff --git a/tablesmith/io.py b/tablesmith/io.py
+new file mode 100644
+index 0000000..fadf48b
+--- /dev/null
++++ b/tablesmith/io.py
+@@ -0,0 +1,166 @@
++"""Input/output handling for CSV, JSON, and JSONL formats."""
++
++import csv
++import json
++import sys
++
++from .errors import IOError_
++from .types import infer_types
++
++
++def detect_format(path, default="csv"):
++    """Detect format from file extension."""
++    if path is None:
++        return default
++    lower = path.lower()
++    if lower.endswith(".json"):
++        return "json"
++    if lower.endswith(".jsonl") or lower.endswith(".ndjson"):
++        return "jsonl"
++    if lower.endswith(".tsv"):
++        return "tsv"
++    return "csv"
++
++
++def read_csv(stream, delimiter=","):
++    """Read CSV from a text stream."""
++    reader = csv.DictReader(stream, delimiter=delimiter)
++    rows = []
++    for i, row in enumerate(reader, 1):
++        try:
++            rows.append(dict(row))
++        except Exception as e:
++            raise IOError_(f"error reading CSV row {i}: {e}")
++    return rows
++
++
++def read_json(stream):
++    """Read JSON (array of objects) from a text stream."""
++    try:
++        data = json.load(stream)
++    except json.JSONDecodeError as e:
++        raise IOError_(f"invalid JSON: {e}")
++
++    if isinstance(data, list):
++        for i, item in enumerate(data):
++            if not isinstance(item, dict):
++                raise IOError_(
++                    f"JSON array element {i} is not an object",
++                    hint="expected an array of objects like [{...}, {...}]",
++                )
++        return data
++    if isinstance(data, dict):
++        return [data]
++    raise IOError_(
++        "expected a JSON array of objects or a single object",
++        hint="input should look like [{...}, {...}] or {...}",
++    )
++
++
++def read_jsonl(stream):
++    """Read JSONL (one JSON object per line) from a text stream."""
++    rows = []
++    for i, line in enumerate(stream, 1):
++        line = line.strip()
++        if not line:
++            continue
++        try:
++            obj = json.loads(line)
++        except json.JSONDecodeError as e:
++            raise IOError_(f"invalid JSON on line {i}: {e}")
++        if not isinstance(obj, dict):
++            raise IOError_(f"line {i} is not a JSON object")
++        rows.append(obj)
++    return rows
++
++
++def read_input(source=None, fmt=None):
++    """Read tabular data from a file or stdin."""
++    if fmt is None:
++        fmt = detect_format(source)
++
++    try:
++        if source is None or source == "-":
++            stream = sys.stdin
++        else:
++            stream = open(source, "r", newline="" if fmt in ("csv", "tsv") else None)
++    except FileNotFoundError:
++        raise IOError_(f"file not found: {source}")
++    except PermissionError:
++        raise IOError_(f"permission denied: {source}")
++
++    try:
++        if fmt == "csv":
++            rows = read_csv(stream)
++        elif fmt == "tsv":
++            rows = read_csv(stream, delimiter="\t")
++        elif fmt == "json":
++            rows = read_json(stream)
++        elif fmt == "jsonl":
++            rows = read_jsonl(stream)
++        else:
++            raise IOError_(
++                f"unknown format: {fmt}",
++                hint="supported formats: csv, json, jsonl, tsv",
++            )
++    finally:
++        if stream is not sys.stdin:
++            stream.close()
++
++    return infer_types(rows)
++
++
++def write_csv(rows, stream, delimiter=","):
++    """Write rows as CSV to a text stream."""
++    if not rows:
++        return
++    fieldnames = list(rows[0].keys())
++    writer = csv.DictWriter(stream, fieldnames=fieldnames, delimiter=delimiter)
++    writer.writeheader()
++    for row in rows:
++        writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
++
++
++def write_json(rows, stream):
++    """Write rows as JSON array to a text stream."""
++    json.dump(rows, stream, indent=2, default=str)
++    stream.write("\n")
++
++
++def write_jsonl(rows, stream):
++    """Write rows as JSONL to a text stream."""
++    for row in rows:
++        json.dump(row, stream, default=str)
++        stream.write("\n")
++
++
++def write_output(rows, dest=None, fmt=None):
++    """Write tabular data to a file or stdout."""
++    if fmt is None:
++        fmt = detect_format(dest)
++
++    try:
++        if dest is None or dest == "-":
++            stream = sys.stdout
++        else:
++            stream = open(dest, "w", newline="" if fmt in ("csv", "tsv") else None)
++    except PermissionError:
++        raise IOError_(f"permission denied: {dest}")
++
++    try:
++        if fmt == "csv":
++            write_csv(rows, stream)
++        elif fmt == "tsv":
++            write_csv(rows, stream, delimiter="\t")
++        elif fmt == "json":
++            write_json(rows, stream)
++        elif fmt == "jsonl":
++            write_jsonl(rows, stream)
++        else:
++            raise IOError_(
++                f"unknown output format: {fmt}",
++                hint="supported formats: csv, json, jsonl, tsv",
++            )
++    finally:
++        if stream is not sys.stdout:
++            stream.close()
+diff --git a/tablesmith/ops.py b/tablesmith/ops.py
+new file mode 100644
+index 0000000..fbbadb4
+--- /dev/null
++++ b/tablesmith/ops.py
+@@ -0,0 +1,287 @@
++"""Data transformation operations."""
++
++from .errors import ColumnNotFoundError, OperationError, ParseError
++from .expr import parse_expression, evaluate
++
++
++def _get_columns(rows):
++    if not rows:
++        return set()
++    return set(rows[0].keys())
++
++
++def _validate_columns(rows, columns, operation):
++    if not rows:
++        return
++    available = _get_columns(rows)
++    for col in columns:
++        if col not in available:
++            raise ColumnNotFoundError(col, available)
++
++
++def filter_rows(rows, expr_str):
++    """Filter rows matching an expression."""
++    if not rows:
++        return rows
++    ast = parse_expression(expr_str)
++    return [row for row in rows if evaluate(ast, row)]
++
++
++def select_columns(rows, columns_str):
++    """Select specific columns (comma-separated)."""
++    if not rows:
++        return rows
++    columns = [c.strip() for c in columns_str.split(",")]
++    _validate_columns(rows, columns, "select")
++    return [{col: row.get(col) for col in columns} for row in rows]
++
++
++def rename_columns(rows, rename_str):
++    """Rename columns. Format: old:new,old2:new2"""
++    if not rows:
++        return rows
++
++    mapping = {}
++    for pair in rename_str.split(","):
++        pair = pair.strip()
++        if ":" not in pair:
++            raise OperationError(
++                f"invalid rename spec '{pair}'",
++                hint="expected format: old_name:new_name",
++            )
++        old, new = pair.split(":", 1)
++        mapping[old.strip()] = new.strip()
++
++    _validate_columns(rows, mapping.keys(), "rename")
++
++    result = []
++    for row in rows:
++        new_row = {}
++        for key, val in row.items():
++            new_row[mapping.get(key, key)] = val
++        result.append(new_row)
++    return result
++
++
++def sort_rows(rows, sort_str):
++    """Sort rows. Format: col:asc,col2:desc (default asc)."""
++    if not rows:
++        return rows
++
++    sort_keys = []
++    for spec in sort_str.split(","):
++        spec = spec.strip()
++        if ":" in spec:
++            col, direction = spec.rsplit(":", 1)
++            col = col.strip()
++            direction = direction.strip().lower()
++            if direction not in ("asc", "desc"):
++                raise OperationError(
++                    f"invalid sort direction '{direction}'",
++                    hint="use 'asc' or 'desc'",
++                )
++            reverse = direction == "desc"
++        else:
++            col = spec
++            reverse = False
++        sort_keys.append((col, reverse))
++
++    _validate_columns(rows, [k[0] for k in sort_keys], "sort")
++
++    # Stable sort: apply from last key to first
++    result = list(rows)
++    for col, reverse in reversed(sort_keys):
++        def make_key(c):
++            def sort_key(row):
++                v = row.get(c)
++                # Nulls always sort last
++                if v is None:
++                    return (1, "")
++                return (0, v)
++            return sort_key
++        result.sort(key=make_key(col), reverse=reverse)
++    return result
++
++
++def _parse_agg_spec(agg_str):
++    aggs = []
++    for spec in agg_str.split(","):
++        spec = spec.strip()
++        if ":" not in spec:
++            raise OperationError(
++                f"invalid aggregation spec '{spec}'",
++                hint="expected format: column:function (e.g. salary:sum)",
++            )
++        col, func = spec.split(":", 1)
++        func = func.strip().lower()
++        valid = ("sum", "mean", "avg", "min", "max", "count", "first", "last")
++        if func not in valid:
++            raise OperationError(
++                f"unknown aggregation function '{func}'",
++                hint=f"supported: {', '.join(valid)}",
++            )
++        aggs.append((col.strip(), func))
++    return aggs
++
++
++def _aggregate(values, func):
++    non_null = [v for v in values if v is not None]
++    if func == "count":
++        return len(non_null)
++    if func == "first":
++        return values[0] if values else None
++    if func == "last":
++        return values[-1] if values else None
++    if not non_null:
++        return None
++    if func == "sum":
++        return sum(non_null)
++    if func in ("mean", "avg"):
++        return sum(non_null) / len(non_null)
++    if func == "min":
++        return min(non_null)
++    if func == "max":
++        return max(non_null)
++
++
++def group_by(rows, group_str, agg_str):
++    """Group rows by columns and aggregate."""
++    if not rows:
++        return rows
++
++    group_cols = [c.strip() for c in group_str.split(",")]
++    aggs = _parse_agg_spec(agg_str)
++
++    _validate_columns(rows, group_cols, "group-by")
++    _validate_columns(rows, [a[0] for a in aggs], "aggregate")
++
++    groups = {}
++    for row in rows:
++        key = tuple(row.get(col) for col in group_cols)
++        groups.setdefault(key, []).append(row)
++
++    result = []
++    for key, group_rows in groups.items():
++        new_row = dict(zip(group_cols, key))
++        for col, func in aggs:
++            values = [r.get(col) for r in group_rows]
++            new_row[f"{col}_{func}"] = _aggregate(values, func)
++        result.append(new_row)
++    return result
++
++
++def join(left_rows, right_rows, on_str, how="inner"):
++    """Join left rows with right rows.
++
++    on_str: "col" for same-name key or "left_col=right_col".
++    how: inner, left, right, outer.
++    """
++    if "=" in on_str:
++        left_col, right_col = [s.strip() for s in on_str.split("=", 1)]
++    else:
++        left_col = right_col = on_str.strip()
++
++    if left_rows:
++        _validate_columns(left_rows, [left_col], "join (left)")
++    if right_rows:
++        _validate_columns(right_rows, [right_col], "join (right)")
++
++    # Index the right side
++    right_index = {}
++    for row in right_rows:
++        key = row.get(right_col)
++        right_index.setdefault(key, []).append(row)
++
++    result = []
++    right_matched = set()
++
++    for left_row in left_rows:
++        key = left_row.get(left_col)
++        matches = right_index.get(key, [])
++
++        if matches:
++            for right_row in matches:
++                merged = dict(left_row)
++                for k, v in right_row.items():
++                    if k == right_col and left_col == right_col:
++                        continue  # don't duplicate the join key
++                    if k in merged:
++                        merged[f"right_{k}"] = v
++                    else:
++                        merged[k] = v
++                result.append(merged)
++                right_matched.add(id(right_row))
++        elif how in ("left", "outer"):
++            merged = dict(left_row)
++            if right_rows:
++                for k in right_rows[0]:
++                    if k not in merged:
++                        merged[k] = None
++            result.append(merged)
++
++    if how in ("right", "outer"):
++        for right_row in right_rows:
++            if id(right_row) not in right_matched:
++                merged = {}
++                if left_rows:
++                    for k in left_rows[0]:
++                        merged[k] = None
++                merged.update(right_row)
++                result.append(merged)
++
++    return result
++
++
++def head(rows, n):
++    """First n rows."""
++    return rows[:n]
++
++
++def tail(rows, n):
++    """Last n rows."""
++    return rows[-n:] if n else rows
++
++
++def count(rows):
++    """Single row with the count."""
++    return [{"count": len(rows)}]
++
++
++def _column_type_name(values):
++    if not values:
++        return "empty"
++    types = set(type(v).__name__ for v in values)
++    if types == {"int"}:
++        return "integer"
++    if types <= {"int", "float"}:
++        return "number"
++    if types == {"bool"}:
++        return "boolean"
++    if types == {"str"}:
++        return "string"
++    return "mixed"
++
++
++def describe(rows):
++    """Summary statistics for each column."""
++    if not rows:
++        return [{"info": "no data"}]
++
++    result = []
++    for col in rows[0].keys():
++        values = [r.get(col) for r in rows]
++        non_null = [v for v in values if v is not None]
++        info = {
++            "column": col,
++            "type": _column_type_name(non_null),
++            "non_null": len(non_null),
++            "null": len(values) - len(non_null),
++            "unique": len(set(str(v) for v in non_null)),
++        }
++        numeric = [v for v in non_null if isinstance(v, (int, float))]
++        if numeric:
++            info["min"] = min(numeric)
++            info["max"] = max(numeric)
++            info["mean"] = round(sum(numeric) / len(numeric), 2)
++        result.append(info)
++    return result
+diff --git a/tablesmith/pipeline.py b/tablesmith/pipeline.py
+new file mode 100644
+index 0000000..82c5207
+--- /dev/null
++++ b/tablesmith/pipeline.py
+@@ -0,0 +1,135 @@
++"""Pipeline definition file loading and execution."""
++
++import json
++
++from .errors import IOError_, OperationError, ParseError
++from . import ops
++from .io import read_input
++
++
++def load_pipeline(path):
++    """Load a pipeline from a JSON definition file.
++
++    Format:
++    {
++      "steps": [
++        {"op": "filter", "expr": "age > 30"},
++        {"op": "select", "columns": "name,age"},
++        {"op": "sort", "by": "age:desc"},
++        {"op": "rename", "columns": "old:new"},
++        {"op": "group", "by": "dept", "agg": "salary:mean"},
++        {"op": "join", "file": "other.csv", "on": "id", "how": "left"},
++        {"op": "head", "n": 10},
++        {"op": "tail", "n": 5},
++        {"op": "count"},
++        {"op": "describe"}
++      ]
++    }
++    """
++    try:
++        with open(path, "r") as f:
++            data = json.load(f)
++    except FileNotFoundError:
++        raise IOError_(f"pipeline file not found: {path}")
++    except json.JSONDecodeError as e:
++        raise ParseError(
++            f"invalid JSON in pipeline file: {e}",
++            hint="pipeline files must be valid JSON",
++        )
++
++    if not isinstance(data, dict) or "steps" not in data:
++        raise ParseError(
++            "pipeline file must contain a 'steps' array",
++            hint='expected: {"steps": [{"op": "...", ...}, ...]}',
++        )
++
++    steps = data["steps"]
++    if not isinstance(steps, list):
++        raise ParseError("'steps' must be an array")
++
++    for i, step in enumerate(steps):
++        if not isinstance(step, dict):
++            raise ParseError(f"step {i + 1} must be an object")
++        if "op" not in step:
++            raise ParseError(
++                f"step {i + 1} is missing the 'op' field",
++                hint="each step needs an 'op' like 'filter', 'select', 'sort', etc.",
++            )
++
++    return steps
++
++
++def run_pipeline(rows, steps):
++    """Execute a list of pipeline steps."""
++    for i, step in enumerate(steps, 1):
++        op = step["op"]
++        try:
++            rows = _execute_step(rows, step)
++        except (ParseError, IOError_, OperationError):
++            raise
++        except Exception as e:
++            raise OperationError(f"step {i} ({op}) failed: {e}")
++    return rows
++
++
++def _require(step, field, op):
++    if field not in step:
++        raise ParseError(
++            f"'{op}' step requires a '{field}' field",
++            hint=f'example: {{"op": "{op}", "{field}": "..."}}',
++        )
++    return step[field]
++
++
++_VALID_OPS = (
++    "filter", "select", "rename", "sort", "group",
++    "join", "head", "tail", "count", "describe",
++)
++
++
++def _execute_step(rows, step):
++    op = step["op"]
++
++    if op == "filter":
++        return ops.filter_rows(rows, _require(step, "expr", op))
++
++    if op == "select":
++        return ops.select_columns(rows, _require(step, "columns", op))
++
++    if op == "rename":
++        return ops.rename_columns(rows, _require(step, "columns", op))
++
++    if op == "sort":
++        return ops.sort_rows(rows, _require(step, "by", op))
++
++    if op == "group":
++        return ops.group_by(
++            rows,
++            _require(step, "by", op),
++            _require(step, "agg", op),
++        )
++
++    if op == "join":
++        right = read_input(_require(step, "file", op))
++        return ops.join(
++            rows, right,
++            _require(step, "on", op),
++            step.get("how", "inner"),
++        )
++
++    if op == "head":
++        return ops.head(rows, int(step.get("n", 10)))
++
++    if op == "tail":
++        return ops.tail(rows, int(step.get("n", 10)))
++
++    if op == "count":
++        return ops.count(rows)
++
++    if op == "describe":
++        return ops.describe(rows)
++
++    raise OperationError(
++        f"unknown operation '{op}'",
++        hint=f"supported: {', '.join(_VALID_OPS)}",
++    )
+diff --git a/tablesmith/types.py b/tablesmith/types.py
+new file mode 100644
+index 0000000..41dbc44
+--- /dev/null
++++ b/tablesmith/types.py
+@@ -0,0 +1,45 @@
++"""Automatic type inference for tabular data."""
++
++
++_NULL_VALUES = {"", "null", "none", "na", "n/a", "nan", "-"}
++
++
++def infer_value(value):
++    """Infer the type of a single value and return the cast version."""
++    if value is None:
++        return None
++    if not isinstance(value, str):
++        return value  # already typed (e.g. from JSON)
++
++    stripped = value.strip()
++    if stripped.lower() in _NULL_VALUES:
++        return None
++
++    # Try int
++    try:
++        return int(stripped)
++    except ValueError:
++        pass
++
++    # Try float
++    try:
++        return float(stripped)
++    except ValueError:
++        pass
++
++    # Only auto-cast unambiguous booleans
++    lower = stripped.lower()
++    if lower == "true":
++        return True
++    if lower == "false":
++        return False
++
++    return value
++
++
++def infer_types(rows):
++    """Infer and cast types for all values in all rows. Modifies rows in place."""
++    for row in rows:
++        for key in row:
++            row[key] = infer_value(row[key])
++    return rows
