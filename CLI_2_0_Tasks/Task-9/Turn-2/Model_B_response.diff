@@ -1,0 +1,1016 @@
+diff --git a/tablesmith/cli.py b/tablesmith/cli.py
+index fba4560..b339902 100644
+--- a/tablesmith/cli.py
++++ b/tablesmith/cli.py
+@@ -2,17 +2,20 @@
+ from __future__ import annotations
+ 
+ import argparse
++import json
+ import sys
+ import traceback
+-from typing import List, Optional, Tuple
++from typing import Any, Dict, List, Optional, Tuple
+ 
+ from . import __version__
+ from .errors import TablesmithError
+-from .ioformats import FORMATS
+-from .ops import REGISTRY, build_from_cli
++from .ioformats import FORMATS, read_rows
++from .ops import REGISTRY, build_from_cli, _columns_of
+ from .pipeline import Pipeline
+ 
+ 
++# ------------------------------------------------------------------ run ---
++
+ class _StepAction(argparse.Action):
+     """Append (op_name, raw_arg) to a shared ordered list so that
+     `--filter x --sort y --filter z` runs in exactly that order."""
+@@ -27,7 +30,7 @@ class _StepAction(argparse.Action):
+         setattr(namespace, "steps", steps)
+ 
+ 
+-def _build_parser() -> argparse.ArgumentParser:
++def _build_run_parser() -> argparse.ArgumentParser:
+     # canonical op names, de-duplicated
+     canon = sorted({cls.name: cls for cls in REGISTRY.values()}.items())
+ 
+@@ -35,11 +38,18 @@ def _build_parser() -> argparse.ArgumentParser:
+     for name, cls in canon:
+         epilog_lines.append(f"  --{name:<9} {cls.cli_help}")
+     epilog_lines += [
++        "",
++        "pipeline + inline: when -p is used, inline flags are appended AFTER the",
++        "pipeline file's steps, so you can make ad-hoc tweaks to a saved pipeline.",
++        "",
++        "subcommands:",
++        "  tablesmith inspect <file>          show schema: columns, types, nulls, samples",
++        "  tablesmith validate <pipeline.json> check pipeline structure before running",
+         "",
+         "examples:",
+-        "  tablesmith data.csv --filter 'age >= 18' --select 'name,age' --sort '-age'",
++        "  tablesmith data.csv --filter 'age >= 18' --select 'name,age' --sort 'age:desc'",
+         "  cat data.jsonl | tablesmith - -i jsonl --group 'dept:avg(salary),count()' -F json",
+-        "  tablesmith --pipeline transform.json",
++        "  tablesmith -p transform.json --filter 'bonus > 1000'  # tweak saved pipeline",
+     ]
+ 
+     p = argparse.ArgumentParser(
+@@ -102,8 +112,8 @@ def _build_parser() -> argparse.ArgumentParser:
+     return p
+ 
+ 
+-def main(argv: Optional[List[str]] = None) -> int:
+-    parser = _build_parser()
++def _cmd_run(argv: List[str]) -> int:
++    parser = _build_run_parser()
+     args = parser.parse_args(argv)
+ 
+     try:
+@@ -146,7 +156,6 @@ def main(argv: Optional[List[str]] = None) -> int:
+             traceback.print_exc()
+         return 1
+     except BrokenPipeError:
+-        # downstream closed (e.g. `| head`); exit quietly
+         try:
+             sys.stderr.close()
+         except Exception:
+@@ -157,5 +166,194 @@ def main(argv: Optional[List[str]] = None) -> int:
+         return 130
+ 
+ 
++# -------------------------------------------------------------- inspect ---
++
++def _infer_type_label(values: list) -> str:
++    """Given the typed values for a column, return a human label."""
++    types = set()
++    for v in values:
++        if v is None:
++            continue
++        types.add(type(v).__name__)
++    if not types:
++        return "null"
++    if types == {"int"}:
++        return "int"
++    if types <= {"int", "float"}:
++        return "float"
++    if types == {"float"}:
++        return "float"
++    if types == {"bool"}:
++        return "bool"
++    if types == {"str"}:
++        return "str"
++    return "/".join(sorted(types))
++
++
++def _format_sample(v: Any) -> str:
++    if v is None:
++        return "null"
++    if isinstance(v, str):
++        if len(v) > 30:
++            return f'"{v[:27]}..."'
++        return f'"{v}"'
++    return str(v)
++
++
++def _cmd_inspect(argv: List[str]) -> int:
++    p = argparse.ArgumentParser(
++        prog="tablesmith inspect",
++        description="Print inferred schema: column names, types, null counts and sample values.",
++    )
++    p.add_argument("file", help="input file to inspect")
++    p.add_argument("-i", "--input-format", choices=FORMATS, default=None)
++    p.add_argument("--delimiter", default=None)
++    p.add_argument("--no-infer", action="store_true")
++    p.add_argument("-F", "--output-format", choices=("text", "json"), default="text")
++    p.add_argument("--debug", action="store_true")
++    args = p.parse_args(argv)
++
++    try:
++        rows = read_rows(
++            args.file,
++            args.input_format,
++            delimiter=args.delimiter,
++            no_infer=args.no_infer,
++        )
++    except TablesmithError as e:
++        print(f"tablesmith inspect: {e}", file=sys.stderr)
++        return 1
++
++    cols = _columns_of(rows) if rows else []
++
++    schema: List[Dict[str, Any]] = []
++    for col in cols:
++        values = [r.get(col) for r in rows]
++        nulls = sum(1 for v in values if v is None)
++        non_null = [v for v in values if v is not None]
++        samples = non_null[:5]
++        schema.append({
++            "column": col,
++            "type": _infer_type_label(values),
++            "nulls": nulls,
++            "total": len(values),
++            "samples": samples,
++        })
++
++    if args.output_format == "json":
++        json.dump(schema, sys.stdout, indent=2, default=str)
++        sys.stdout.write("\n")
++        return 0
++
++    # text table
++    if not schema:
++        print("(no columns)")
++        return 0
++
++    name_w = max(len(s["column"]) for s in schema)
++    name_w = max(name_w, 6)  # min "Column"
++    type_w = max(len(s["type"]) for s in schema)
++    type_w = max(type_w, 4)
++
++    header = (
++        f"{'Column':<{name_w}}  {'Type':<{type_w}}  "
++        f"{'Nulls':>5}  {'Total':>5}  Sample"
++    )
++    sep = f"{'─' * name_w}  {'─' * type_w}  {'─' * 5}  {'─' * 5}  {'─' * 30}"
++    print(header)
++    print(sep)
++    for s in schema:
++        sample_str = ", ".join(_format_sample(v) for v in s["samples"])
++        print(
++            f"{s['column']:<{name_w}}  {s['type']:<{type_w}}  "
++            f"{s['nulls']:>5}  {s['total']:>5}  {sample_str}"
++        )
++    return 0
++
++
++# ------------------------------------------------------------ validate ---
++
++def _cmd_validate(argv: List[str]) -> int:
++    p = argparse.ArgumentParser(
++        prog="tablesmith validate",
++        description="Validate a pipeline file's structure and column references.",
++    )
++    p.add_argument("pipeline", help="pipeline JSON file to validate")
++    p.add_argument(
++        "--input", default=None,
++        help="input data file (enables column-reference validation across steps)",
++    )
++    p.add_argument("-i", "--input-format", choices=FORMATS, default=None)
++    p.add_argument("--delimiter", default=None)
++    p.add_argument("--no-infer", action="store_true")
++    p.add_argument("--debug", action="store_true")
++    args = p.parse_args(argv)
++
++    # 1. structural validation — parse the pipeline file
++    try:
++        pipe = Pipeline.from_file(args.pipeline)
++    except TablesmithError as e:
++        print(f"tablesmith validate: {e}", file=sys.stderr)
++        return 1
++
++    n = len(pipe.steps)
++    steps_desc = ", ".join(op.name for op in pipe.steps)
++
++    # 2. column-reference validation (if input is available)
++    in_path = args.input
++    if in_path is None and pipe.input_spec:
++        in_path = pipe.input_spec.get("path")
++
++    if in_path and in_path != "-":
++        try:
++            rows = read_rows(
++                in_path,
++                args.input_format or (pipe.input_spec or {}).get("format"),
++                delimiter=args.delimiter,
++                no_infer=args.no_infer,
++            )
++            columns = _columns_of(rows) if rows else []
++            pipe.validate_columns(columns)
++        except TablesmithError as e:
++            print(f"tablesmith validate: {e}", file=sys.stderr)
++            return 1
++        print(
++            f"ok: {args.pipeline} is valid ({n} step{'s' if n != 1 else ''}: "
++            f"{steps_desc}) — columns checked against {in_path}"
++        )
++    else:
++        print(
++            f"ok: {args.pipeline} is valid ({n} step{'s' if n != 1 else ''}: "
++            f"{steps_desc}) — pass --input FILE to also check column references"
++        )
++    return 0
++
++
++# ---------------------------------------------------------- entry point ---
++
++def main(argv: Optional[List[str]] = None) -> int:
++    raw = argv if argv is not None else sys.argv[1:]
++
++    # detect subcommands before argparse touches argv
++    if raw and raw[0] in ("inspect", "validate"):
++        cmd = raw[0]
++        try:
++            if cmd == "inspect":
++                return _cmd_inspect(raw[1:])
++            else:
++                return _cmd_validate(raw[1:])
++        except BrokenPipeError:
++            try:
++                sys.stderr.close()
++            except Exception:
++                pass
++            return 0
++        except KeyboardInterrupt:
++            print("tablesmith: interrupted", file=sys.stderr)
++            return 130
++
++    return _cmd_run(raw)
++
++
+ if __name__ == "__main__":  # pragma: no cover
+     raise SystemExit(main())
+diff --git a/tablesmith/errors.py b/tablesmith/errors.py
+index a7a8bb2..e61d054 100644
+--- a/tablesmith/errors.py
++++ b/tablesmith/errors.py
+@@ -71,11 +71,12 @@ class PipelineFileError(TablesmithError):
+ 
+ def unknown_column(name: str, available: Iterable[str], **ctx) -> ColumnError:
+     cols = list(available)
+-    hint = None
++    hints: list = []
+     close = difflib.get_close_matches(name, cols, n=1)
+     if close:
+-        hint = f"did you mean '{close[0]}'?"
+-    elif cols:
++        hints.append(f"did you mean '{close[0]}'?")
++    if cols:
+         preview = ", ".join(cols[:8]) + (" …" if len(cols) > 8 else "")
+-        hint = f"available columns: {preview}"
++        hints.append(f"available columns: {preview}")
++    hint = "\n".join(hints) if hints else None
+     return ColumnError(f"unknown column '{name}'", hint=hint, **ctx)
+diff --git a/tablesmith/ops.py b/tablesmith/ops.py
+index 98a8aa1..16a3161 100644
+--- a/tablesmith/ops.py
++++ b/tablesmith/ops.py
+@@ -69,6 +69,15 @@ class Op:
+     def describe(self) -> str:
+         return self.name
+ 
++    def validate_columns(self, available: set) -> None:
++        """Check that columns referenced by this op exist in *available*.
++        Raises ColumnError on the first unknown reference."""
++
++    def output_columns(self, available: List[str]) -> List[str]:
++        """Return the column list that downstream steps will see after this op.
++        Default: pass-through (same columns as input)."""
++        return list(available)
++
+ 
+ # ------------------------------------------------------------------ filter
+ @register
+@@ -91,6 +100,12 @@ class Filter(Op):
+     def from_spec(cls, spec):
+         return cls(spec["expr"])
+ 
++    def validate_columns(self, available: set) -> None:
++        refs = self.expr.referenced_columns()
++        for c in refs:
++            if c not in available:
++                raise unknown_column(c, available, step="filter")
++
+     def apply(self, rows: Rows) -> Rows:
+         # validate referenced columns once up front for a nicer error
+         refs = self.expr.referenced_columns()
+@@ -98,7 +113,7 @@ class Filter(Op):
+             have = set(_columns_of(rows))
+             for c in refs:
+                 if c not in have:
+-                    raise unknown_column(c, have)
++                    raise unknown_column(c, have, step="filter")
+         out = []
+         for i, r in enumerate(rows):
+             try:
+@@ -173,6 +188,14 @@ class Select(Op):
+                     mapping.append((c, c))
+         return cls(mapping)
+ 
++    def validate_columns(self, available: set) -> None:
++        for src, _ in self.mapping:
++            if src not in available:
++                raise unknown_column(src, available, step="select")
++
++    def output_columns(self, available: List[str]) -> List[str]:
++        return [dst for _, dst in self.mapping]
++
+     def apply(self, rows: Rows) -> Rows:
+         _require_columns(rows, [s for s, _ in self.mapping])
+         out = []
+@@ -218,6 +241,14 @@ class Rename(Op):
+     def from_spec(cls, spec):
+         return cls(dict(spec["columns"]))
+ 
++    def validate_columns(self, available: set) -> None:
++        for src in self.mapping:
++            if src not in available:
++                raise unknown_column(src, available, step="rename")
++
++    def output_columns(self, available: List[str]) -> List[str]:
++        return [self.mapping.get(c, c) for c in available]
++
+     def apply(self, rows: Rows) -> Rows:
+         _require_columns(rows, list(self.mapping))
+         out = []
+@@ -249,6 +280,15 @@ class Drop(Op):
+     def from_spec(cls, spec):
+         return cls(list(spec["columns"]))
+ 
++    def validate_columns(self, available: set) -> None:
++        for c in self.cols:
++            if c not in available:
++                raise unknown_column(c, available, step="drop")
++
++    def output_columns(self, available: List[str]) -> List[str]:
++        kill = set(self.cols)
++        return [c for c in available if c not in kill]
++
+     def apply(self, rows: Rows) -> Rows:
+         kill = set(self.cols)
+         return [{k: v for k, v in r.items() if k not in kill} for r in rows]
+@@ -299,6 +339,11 @@ class Sort(Op):
+                 keys.append((k, bool(desc)))
+         return cls(keys)
+ 
++    def validate_columns(self, available: set) -> None:
++        for col, _ in self.keys:
++            if col not in available:
++                raise unknown_column(col, available, step="sort")
++
+     def apply(self, rows: Rows) -> Rows:
+         _require_columns(rows, [c for c, _ in self.keys])
+         out = list(rows)
+@@ -440,6 +485,15 @@ class Group(Op):
+             aggs = [("count", None, "count")]
+         return cls(list(by), aggs)
+ 
++    def validate_columns(self, available: set) -> None:
++        needed = list(self.by) + [c for _, c, _ in self.aggs if c]
++        for c in needed:
++            if c not in available:
++                raise unknown_column(c, available, step="group")
++
++    def output_columns(self, available: List[str]) -> List[str]:
++        return list(self.by) + [alias for _, _, alias in self.aggs]
++
+     def apply(self, rows: Rows) -> Rows:
+         needed = list(self.by) + [c for _, c, _ in self.aggs if c]
+         _require_columns(rows, needed)
+@@ -559,6 +613,26 @@ class Join(Op):
+         right = read_rows(path, fmt)
+         return cls(right, lk, rk, how, prefix, source=path)
+ 
++    def validate_columns(self, available: set) -> None:
++        if self.left_key not in available:
++            raise unknown_column(self.left_key, available, step="join")
++        if self.right:
++            rcols = set(_columns_of(self.right))
++            if self.right_key not in rcols:
++                raise unknown_column(self.right_key, rcols, step="join")
++
++    def output_columns(self, available: List[str]) -> List[str]:
++        right_cols = [c for c in _columns_of(self.right) if c != self.right_key]
++        out = list(available)
++        for c in right_cols:
++            if self.prefix:
++                out.append(f"{self.prefix}{c}")
++            elif c in set(available):
++                out.append(f"r_{c}")
++            else:
++                out.append(c)
++        return out
++
+     def apply(self, rows: Rows) -> Rows:
+         _require_columns(rows, [self.left_key])
+         if self.right:
+@@ -638,6 +712,18 @@ class Compute(Op):
+     def from_spec(cls, spec):
+         return cls(spec["column"], spec["expr"])
+ 
++    def validate_columns(self, available: set) -> None:
++        refs = self.expr.referenced_columns()
++        for c in refs:
++            if c not in available:
++                raise unknown_column(c, available, step="compute")
++
++    def output_columns(self, available: List[str]) -> List[str]:
++        out = list(available)
++        if self.col not in set(available):
++            out.append(self.col)
++        return out
++
+     def apply(self, rows: Rows) -> Rows:
+         out = []
+         for i, r in enumerate(rows):
+@@ -706,6 +792,12 @@ class Distinct(Op):
+         c = spec.get("columns")
+         return cls(list(c) if c else None)
+ 
++    def validate_columns(self, available: set) -> None:
++        if self.cols:
++            for c in self.cols:
++                if c not in available:
++                    raise unknown_column(c, available, step="distinct")
++
+     def apply(self, rows: Rows) -> Rows:
+         if self.cols:
+             _require_columns(rows, self.cols)
+diff --git a/tablesmith/pipeline.py b/tablesmith/pipeline.py
+index e7eb374..8734b57 100644
+--- a/tablesmith/pipeline.py
++++ b/tablesmith/pipeline.py
+@@ -74,6 +74,23 @@ class Pipeline:
+             p.add(op)
+         return p
+ 
++    # --------------------------------------------------------- validate --
++    def validate_columns(self, columns: List[str]) -> List[str]:
++        """Trace column names through every step. Raises on the first
++        unknown-column reference. Returns the final column list."""
++        cur = list(columns)
++        for i, op in enumerate(self.steps):
++            try:
++                op.validate_columns(set(cur))
++            except TablesmithError as e:
++                if e.step is None:
++                    e.step = op.name
++                if e.step_index is None:
++                    e.step_index = i
++                raise
++            cur = op.output_columns(cur)
++        return cur
++
+     # -------------------------------------------------------------- run --
+     def run(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+         cur = rows
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_hardening.py b/tests/test_hardening.py
+new file mode 100644
+index 0000000..b2f7de0
+--- /dev/null
++++ b/tests/test_hardening.py
+@@ -0,0 +1,511 @@
++"""Tests for hardening: fail-fast column errors, inspect, validate, pipeline+inline."""
++from __future__ import annotations
++
++import json
++import os
++import tempfile
++import textwrap
++import unittest
++
++from tablesmith.cli import main as cli_main, _cmd_inspect, _cmd_validate
++from tablesmith.errors import ColumnError, TablesmithError
++from tablesmith.ioformats import read_rows
++from tablesmith.ops import Filter, Select, Sort, Group, Compute, _columns_of
++from tablesmith.pipeline import Pipeline
++
++
++# ---------------------------------------------------------------- helpers --
++
++def _write_tmp(content: str, suffix: str = ".csv") -> str:
++    fd, path = tempfile.mkstemp(suffix=suffix)
++    with os.fdopen(fd, "w") as f:
++        f.write(content)
++    return path
++
++
++_PEOPLE_CSV = textwrap.dedent("""\
++    id,name,age,dept,salary
++    1,Alice,34,eng,120000
++    2,Bob,29,eng,95000
++    3,Carol,41,sales,88000
++    4,Dave,23,sales,61000
++    5,Eve,38,eng,142000
++    6,Frank,,ops,70000
++""")
++
++
++class FilterColumnFailFastTest(unittest.TestCase):
++    """Unknown columns in filter expressions must raise ColumnError with
++    the bad name, available columns, and — when close — a suggestion."""
++
++    def setUp(self):
++        self.path = _write_tmp(_PEOPLE_CSV)
++        self.rows = read_rows(self.path)
++
++    def tearDown(self):
++        os.unlink(self.path)
++
++    def test_typo_column_raises_column_error(self):
++        """filter on 'agee' (typo) must raise, not silently skip."""
++        f = Filter("agee > 10")
++        with self.assertRaises(ColumnError) as ctx:
++            f.apply(self.rows)
++        err = ctx.exception
++        self.assertIn("agee", err.message)
++
++    def test_typo_column_shows_suggestion(self):
++        f = Filter("agee > 10")
++        with self.assertRaises(ColumnError) as ctx:
++            f.apply(self.rows)
++        rendered = str(ctx.exception)
++        self.assertIn("did you mean", rendered)
++        self.assertIn("age", rendered)
++
++    def test_typo_column_always_shows_available(self):
++        """Even when there is a did-you-mean, the available columns must
++        also be listed so the user can see what's there."""
++        f = Filter("agee > 10")
++        with self.assertRaises(ColumnError) as ctx:
++            f.apply(self.rows)
++        rendered = str(ctx.exception)
++        self.assertIn("available columns:", rendered)
++
++    def test_totally_wrong_column_shows_available(self):
++        """A column name with no close match still lists what's available."""
++        f = Filter("zzz > 0")
++        with self.assertRaises(ColumnError) as ctx:
++            f.apply(self.rows)
++        rendered = str(ctx.exception)
++        self.assertIn("zzz", rendered)
++        self.assertIn("available columns:", rendered)
++
++    def test_filter_never_silently_returns_empty(self):
++        """Ensure a bad column doesn't just produce an empty result."""
++        f = Filter("nonexistent == 1")
++        with self.assertRaises(ColumnError):
++            f.apply(self.rows)
++
++    def test_compute_bad_column_fails_fast(self):
++        """compute also uses expressions; same fail-fast behaviour."""
++        c = Compute("x", "nonexistent * 2")
++        with self.assertRaises(ColumnError):
++            c.apply(self.rows)
++
++    def test_select_bad_column_fails(self):
++        s = Select.from_cli("name,nonexistent")
++        with self.assertRaises(ColumnError) as ctx:
++            s.apply(self.rows)
++        self.assertIn("nonexistent", str(ctx.exception))
++
++    def test_sort_bad_column_fails(self):
++        s = Sort.from_cli("nonexistent:desc")
++        with self.assertRaises(ColumnError):
++            s.apply(self.rows)
++
++
++class InspectOutputShapeTest(unittest.TestCase):
++    """tablesmith inspect must produce a well-structured schema."""
++
++    def setUp(self):
++        self.path = _write_tmp(_PEOPLE_CSV)
++
++    def tearDown(self):
++        os.unlink(self.path)
++
++    def test_inspect_json_has_all_fields(self):
++        """Each entry in JSON inspect output must have column/type/nulls/total/samples."""
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = _cmd_inspect([self.path, "-F", "json"])
++        finally:
++            sys.stdout = old_stdout
++        self.assertEqual(rc, 0)
++        schema = json.loads(buf.getvalue())
++        self.assertIsInstance(schema, list)
++        self.assertEqual(len(schema), 5)  # id, name, age, dept, salary
++        required_keys = {"column", "type", "nulls", "total", "samples"}
++        for entry in schema:
++            self.assertTrue(
++                required_keys <= set(entry.keys()),
++                f"missing keys in {entry}",
++            )
++
++    def test_inspect_types_inferred(self):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            _cmd_inspect([self.path, "-F", "json"])
++        finally:
++            sys.stdout = old_stdout
++        schema = json.loads(buf.getvalue())
++        by_col = {e["column"]: e for e in schema}
++        self.assertEqual(by_col["id"]["type"], "int")
++        self.assertEqual(by_col["name"]["type"], "str")
++        self.assertEqual(by_col["age"]["type"], "int")
++        self.assertEqual(by_col["salary"]["type"], "int")
++
++    def test_inspect_null_count(self):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            _cmd_inspect([self.path, "-F", "json"])
++        finally:
++            sys.stdout = old_stdout
++        schema = json.loads(buf.getvalue())
++        by_col = {e["column"]: e for e in schema}
++        self.assertEqual(by_col["age"]["nulls"], 1)  # Frank has no age
++        self.assertEqual(by_col["name"]["nulls"], 0)
++
++    def test_inspect_samples_capped(self):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            _cmd_inspect([self.path, "-F", "json"])
++        finally:
++            sys.stdout = old_stdout
++        schema = json.loads(buf.getvalue())
++        for entry in schema:
++            self.assertLessEqual(len(entry["samples"]), 5)
++
++    def test_inspect_text_output_has_header(self):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = _cmd_inspect([self.path])
++        finally:
++            sys.stdout = old_stdout
++        self.assertEqual(rc, 0)
++        lines = buf.getvalue().strip().splitlines()
++        self.assertGreaterEqual(len(lines), 3)  # header + separator + at least 1 row
++        self.assertIn("Column", lines[0])
++        self.assertIn("Type", lines[0])
++        self.assertIn("Nulls", lines[0])
++
++
++class ValidateCatchesMalformedTest(unittest.TestCase):
++    """tablesmith validate must reject bad pipeline configs with clear errors."""
++
++    def test_missing_steps_key(self):
++        path = _write_tmp('{"input": "foo.csv"}', suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stderr = sys.stderr
++            sys.stderr = buf
++            try:
++                rc = _cmd_validate([path])
++            finally:
++                sys.stderr = old_stderr
++            self.assertEqual(rc, 1)
++            self.assertIn("missing 'steps'", buf.getvalue())
++        finally:
++            os.unlink(path)
++
++    def test_unknown_op_name(self):
++        doc = {"steps": [{"op": "fliter", "expr": "x > 1"}]}
++        path = _write_tmp(json.dumps(doc), suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stderr = sys.stderr
++            sys.stderr = buf
++            try:
++                rc = _cmd_validate([path])
++            finally:
++                sys.stderr = old_stderr
++            self.assertEqual(rc, 1)
++            self.assertIn("fliter", buf.getvalue())
++            self.assertIn("unknown operation", buf.getvalue())
++        finally:
++            os.unlink(path)
++
++    def test_missing_required_field(self):
++        doc = {"steps": [{"op": "filter"}]}  # missing 'expr'
++        path = _write_tmp(json.dumps(doc), suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stderr = sys.stderr
++            sys.stderr = buf
++            try:
++                rc = _cmd_validate([path])
++            finally:
++                sys.stderr = old_stderr
++            self.assertEqual(rc, 1)
++            self.assertIn("missing required field", buf.getvalue())
++        finally:
++            os.unlink(path)
++
++    def test_invalid_json(self):
++        path = _write_tmp("{not json at all", suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stderr = sys.stderr
++            sys.stderr = buf
++            try:
++                rc = _cmd_validate([path])
++            finally:
++                sys.stderr = old_stderr
++            self.assertEqual(rc, 1)
++            self.assertIn("invalid JSON", buf.getvalue())
++        finally:
++            os.unlink(path)
++
++    def test_step_not_object(self):
++        doc = {"steps": ["filter age > 30"]}  # step must be a dict
++        path = _write_tmp(json.dumps(doc), suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stderr = sys.stderr
++            sys.stderr = buf
++            try:
++                rc = _cmd_validate([path])
++            finally:
++                sys.stderr = old_stderr
++            self.assertEqual(rc, 1)
++            self.assertIn("must be an object", buf.getvalue())
++        finally:
++            os.unlink(path)
++
++    def test_valid_pipeline_succeeds(self):
++        csv_path = _write_tmp(_PEOPLE_CSV)
++        doc = {
++            "input": csv_path,
++            "steps": [
++                {"op": "filter", "expr": "age > 30"},
++                {"op": "select", "columns": ["name", "age"]},
++            ],
++        }
++        pipe_path = _write_tmp(json.dumps(doc), suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stdout = sys.stdout
++            sys.stdout = buf
++            try:
++                rc = _cmd_validate([pipe_path])
++            finally:
++                sys.stdout = old_stdout
++            self.assertEqual(rc, 0)
++            self.assertIn("ok", buf.getvalue())
++        finally:
++            os.unlink(csv_path)
++            os.unlink(pipe_path)
++
++    def test_validate_catches_bad_column_ref(self):
++        """validate with --input detects a column reference that doesn't exist."""
++        csv_path = _write_tmp(_PEOPLE_CSV)
++        doc = {
++            "steps": [{"op": "filter", "expr": "bogus_col > 10"}],
++        }
++        pipe_path = _write_tmp(json.dumps(doc), suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stderr = sys.stderr
++            sys.stderr = buf
++            try:
++                rc = _cmd_validate([pipe_path, "--input", csv_path])
++            finally:
++                sys.stderr = old_stderr
++            self.assertEqual(rc, 1)
++            self.assertIn("bogus_col", buf.getvalue())
++        finally:
++            os.unlink(csv_path)
++            os.unlink(pipe_path)
++
++    def test_validate_traces_columns_across_steps(self):
++        """After a select that drops a column, a later step referencing it
++        should fail validation."""
++        csv_path = _write_tmp(_PEOPLE_CSV)
++        doc = {
++            "input": csv_path,
++            "steps": [
++                {"op": "select", "columns": ["name", "age"]},
++                {"op": "filter", "expr": "salary > 100000"},
++            ],
++        }
++        pipe_path = _write_tmp(json.dumps(doc), suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stderr = sys.stderr
++            sys.stderr = buf
++            try:
++                rc = _cmd_validate([pipe_path])
++            finally:
++                sys.stderr = old_stderr
++            self.assertEqual(rc, 1)
++            err = buf.getvalue()
++            self.assertIn("salary", err)
++            self.assertIn("unknown column", err)
++        finally:
++            os.unlink(csv_path)
++            os.unlink(pipe_path)
++
++
++class PipelineInlineCombinedTest(unittest.TestCase):
++    """Pipeline file steps + inline flags must run in the combined order:
++    file steps first, inline steps appended after."""
++
++    def setUp(self):
++        self.csv_path = _write_tmp(_PEOPLE_CSV)
++
++    def tearDown(self):
++        os.unlink(self.csv_path)
++        if hasattr(self, "pipe_path"):
++            os.unlink(self.pipe_path)
++
++    def test_inline_appended_after_pipeline(self):
++        """Pipeline selects name+salary; inline sort+limit narrows further."""
++        doc = {
++            "input": self.csv_path,
++            "steps": [
++                {"op": "filter", "expr": "salary > 80000"},
++                {"op": "select", "columns": ["name", "salary"]},
++            ],
++        }
++        self.pipe_path = _write_tmp(json.dumps(doc), suffix=".json")
++
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = cli_main([
++                "-p", self.pipe_path,
++                "--sort", "salary:desc",
++                "--limit", "2",
++                "-F", "json",
++            ])
++        finally:
++            sys.stdout = old_stdout
++
++        self.assertEqual(rc, 0)
++        rows = json.loads(buf.getvalue())
++        self.assertEqual(len(rows), 2)
++        self.assertEqual(rows[0]["name"], "Eve")
++        self.assertEqual(rows[0]["salary"], 142000)
++        self.assertEqual(rows[1]["name"], "Alice")
++
++    def test_execution_order_matters(self):
++        """The inline filter uses a column that only exists AFTER the
++        pipeline's compute step — proves ordering is file-then-inline."""
++        doc = {
++            "input": self.csv_path,
++            "steps": [
++                {"op": "compute", "column": "bonus", "expr": "salary * 0.1"},
++            ],
++        }
++        self.pipe_path = _write_tmp(json.dumps(doc), suffix=".json")
++
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = cli_main([
++                "-p", self.pipe_path,
++                "--filter", "bonus > 10000",
++                "--select", "name,bonus",
++                "-F", "json",
++            ])
++        finally:
++            sys.stdout = old_stdout
++
++        self.assertEqual(rc, 0)
++        rows = json.loads(buf.getvalue())
++        # only Alice (12000) and Eve (14200) have bonus > 10000
++        names = {r["name"] for r in rows}
++        self.assertEqual(names, {"Alice", "Eve"})
++
++    def test_inline_only_still_works(self):
++        """No pipeline file, just inline — must still work as before."""
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = cli_main([
++                self.csv_path,
++                "--filter", "age > 35",
++                "--select", "name",
++                "-F", "json",
++            ])
++        finally:
++            sys.stdout = old_stdout
++
++        self.assertEqual(rc, 0)
++        rows = json.loads(buf.getvalue())
++        names = {r["name"] for r in rows}
++        self.assertEqual(names, {"Carol", "Eve"})
++
++    def test_pipeline_input_overridable(self):
++        """CLI positional input overrides the pipeline file's input."""
++        doc = {
++            "input": "/nonexistent/path.csv",
++            "steps": [{"op": "limit", "n": 1}],
++        }
++        self.pipe_path = _write_tmp(json.dumps(doc), suffix=".json")
++
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = cli_main([
++                self.csv_path,
++                "-p", self.pipe_path,
++                "-F", "json",
++            ])
++        finally:
++            sys.stdout = old_stdout
++
++        self.assertEqual(rc, 0)
++        rows = json.loads(buf.getvalue())
++        self.assertEqual(len(rows), 1)
++
++    def test_explain_shows_combined(self):
++        doc = {
++            "input": self.csv_path,
++            "steps": [{"op": "filter", "expr": "age > 30"}],
++        }
++        self.pipe_path = _write_tmp(json.dumps(doc), suffix=".json")
++
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = cli_main([
++                "-p", self.pipe_path,
++                "--sort", "age:desc",
++                "--explain",
++            ])
++        finally:
++            sys.stdout = old_stdout
++
++        self.assertEqual(rc, 0)
++        desc = buf.getvalue().strip()
++        # pipeline step first, then inline
++        self.assertIn("filter", desc)
++        self.assertIn("sort", desc)
++        parts = desc.split("|")
++        self.assertEqual(len(parts), 2)
++
++
++if __name__ == "__main__":
++    unittest.main()
