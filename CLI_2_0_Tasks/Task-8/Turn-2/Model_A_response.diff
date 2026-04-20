@@ -1,0 +1,423 @@
+diff --git a/.claude/plans/concurrent-wandering-pie.md b/.claude/plans/concurrent-wandering-pie.md
+deleted file mode 100644
+index 8a50084..0000000
+--- a/.claude/plans/concurrent-wandering-pie.md
++++ /dev/null
+@@ -1,183 +0,0 @@
+-# Multi-Currency Wallet System Implementation Plan
+-
+-## Context
+-
+-PiggyMetrics lets each income/expense Item carry its own Currency, and the statistics-service normalizes everything to USD for its datapoints, but the account-service has no concept of a wallet. There is no way for a user to see a total balance across all currencies converted into a preferred display currency. This plan adds a multi-currency wallet system to the account-service: per-currency balances, monthly normalization, currency conversion via the statistics-service, REST endpoints, and daily snapshots.
+-
+----
+-
+-## Part 1: Statistics-Service (expose exchange rates)
+-
+-### 1.1 Add `/rates` endpoint to StatisticsController
+-**Modify:** `statistics-service/src/main/java/.../statistics/controller/StatisticsController.java`
+-- Inject `ExchangeRatesService` (alongside existing `StatisticsService`)
+-- Add `GET /rates` method with `@PreAuthorize("#oauth2.hasScope('server')")` returning `Map<Currency, BigDecimal>` from `exchangeRatesService.getCurrentRates()`
+-
+-### 1.2 Add test for `/rates` endpoint
+-**Modify:** `statistics-service/src/test/java/.../statistics/controller/StatisticsControllerTest.java`
+-- Add `@Mock ExchangeRatesService exchangeRatesService`
+-- Add `shouldGetCurrentRates()` test case
+-
+----
+-
+-## Part 2: Account-Service Domain Model
+-
+-### 2.1 Add month ratios to TimePeriod enum
+-**Modify:** `account-service/src/main/java/.../account/domain/TimePeriod.java`
+-
+-Currently a plain enum. Add a `monthRatio` field so `monthlyAmount = amount * period.getMonthRatio()`:
+-- `YEAR(1.0/12.0)`, `QUARTER(1.0/3.0)`, `MONTH(1.0)`, `DAY(30.4368)`, `HOUR(30.4368*24.0)`
+-
+-### 2.2 Create Wallet domain class
+-**New:** `account-service/src/main/java/.../account/domain/Wallet.java`
+-
+-Fields: `Map<Currency,BigDecimal> balances`, `Map<Currency,BigDecimal> convertedBalances`, `BigDecimal totalBalance`, `BigDecimal totalMonthlyIncome`, `BigDecimal totalMonthlyExpenses`, `BigDecimal netSavingsRatePercent`, `Currency baseCurrency`, `Date lastUpdated`
+-
+-### 2.3 Create WalletSnapshot + WalletSnapshotId
+-**New:** `account-service/src/main/java/.../account/domain/WalletSnapshot.java` - `@Document(collection="wallet_snapshots")` with `@Id WalletSnapshotId id` and `Wallet wallet`
+-
+-**New:** `account-service/src/main/java/.../account/domain/WalletSnapshotId.java` - compound key with `String account` + `Date date` (mirrors DataPointId pattern from statistics-service)
+-
+-### 2.4 Add Wallet field to Account
+-**Modify:** `account-service/src/main/java/.../account/domain/Account.java`
+-- Add `private Wallet wallet` with getter/setter. Existing documents without wallet will deserialize to `null` (no backward compat issue).
+-
+----
+-
+-## Part 3: Account-Service Infrastructure
+-
+-### 3.1 Create ExchangeRatesClient Feign interface
+-**New:** `account-service/src/main/java/.../account/client/ExchangeRatesClient.java`
+-- `@FeignClient(name="statistics-service", contextId="exchangeRatesClient", fallback=ExchangeRatesClientFallback.class)`
+-- `GET /rates` returning `Map<Currency, BigDecimal>`
+-
+-### 3.2 Create ExchangeRatesClientFallback
+-**New:** `account-service/src/main/java/.../account/client/ExchangeRatesClientFallback.java`
+-- Returns hardcoded approximate rates: `USD=1, EUR=0.9, RUB=75.0`
+-- Logs warning (follows StatisticsServiceClientFallback pattern)
+-
+-### 3.3 Create MongoDB converters for WalletSnapshotId
+-**New:** `account-service/src/main/java/.../account/repository/converter/WalletSnapshotIdReaderConverter.java`
+-**New:** `account-service/src/main/java/.../account/repository/converter/WalletSnapshotIdWriterConverter.java`
+-- Follows DataPointId converter pattern from statistics-service
+-
+-### 3.4 Register converters in AccountApplication
+-**Modify:** `account-service/src/main/java/.../account/AccountApplication.java`
+-- Add `CustomConversionsConfig` inner class with `CustomConversions` bean (same pattern as StatisticsApplication)
+-
+-### 3.5 Create WalletSnapshotRepository
+-**New:** `account-service/src/main/java/.../account/repository/WalletSnapshotRepository.java`
+-- `CrudRepository<WalletSnapshot, WalletSnapshotId>`
+-- `findByIdAccount(String account)`
+-- `findByIdAccountAndIdDateBetween(String account, Date from, Date to)`
+-
+----
+-
+-## Part 4: Account-Service Core Logic
+-
+-### 4.1 Create WalletService interface
+-**New:** `account-service/src/main/java/.../account/service/WalletService.java`
+-- `Wallet getWallet(String accountName)`
+-- `Wallet recalculate(String accountName)`
+-- `Wallet changeBaseCurrency(String accountName, Currency currency)`
+-- `List<WalletSnapshot> getHistory(String accountName, Date from, Date to)`
+-
+-### 4.2 Create WalletServiceImpl
+-**New:** `account-service/src/main/java/.../account/service/WalletServiceImpl.java`
+-
+-Core `buildWallet(Account, Currency baseCurrency)` method:
+-1. Fetch rates from `exchangeRatesClient.getRates()`
+-2. Normalize all income items to monthly amounts: `amount * period.getMonthRatio()`
+-3. Normalize all expense items to monthly amounts
+-4. Compute per-currency native balances (income - expense per currency)
+-5. Convert each per-currency balance to base display currency
+-6. Sum total monthly income/expenses in base currency
+-7. Add Saving amount (converted to base currency) to get total balance: `totalBalance = (totalIncome - totalExpenses) + savingInBase`
+-8. Compute savings rate: `(income - expenses) / income * 100`
+-
+-`recalculate()` - loads account, calls buildWallet, saves wallet on account, saves daily snapshot
+-`changeBaseCurrency()` - loads account, calls buildWallet with new currency, saves
+-`saveSnapshot()` - uses compound ID (account + start-of-day) so same-day saves upsert
+-
+-Dependencies: `AccountRepository`, `WalletSnapshotRepository`, `ExchangeRatesClient` (no circular dependency with AccountService)
+-
+-### 4.3 Wire into AccountServiceImpl.saveChanges()
+-**Modify:** `account-service/src/main/java/.../account/service/AccountServiceImpl.java`
+-- Inject `WalletService`
+-- After existing save + statisticsClient call, add `walletService.recalculate(name)` wrapped in try-catch (wallet failure must not break account save)
+-
+----
+-
+-## Part 5: REST Endpoints
+-
+-### 5.1 Create WalletController
+-**New:** `account-service/src/main/java/.../account/controller/WalletController.java`
+-- `GET /current/wallet` - get current wallet
+-- `POST /current/wallet/refresh` - force recalculate
+-- `PUT /current/wallet/currency` - change base currency (body: Currency enum value)
+-- `GET /current/wallet/history?from=X&to=Y` - wallet snapshots by date range
+-
+-All use `Principal` for auth (consistent with AccountController). All fall under existing `.anyRequest().authenticated()` security config.
+-
+----
+-
+-## Part 6: Tests
+-
+-### 6.1 WalletServiceTest
+-**New:** `account-service/src/test/java/.../account/service/WalletServiceTest.java`
+-- Tests: single currency, multi-currency, time period normalization, saving inclusion, savings rate, base currency change, null incomes/expenses, account not found, snapshot creation
+-
+-### 6.2 WalletControllerTest
+-**New:** `account-service/src/test/java/.../account/controller/WalletControllerTest.java`
+-- Tests: GET wallet, POST refresh, PUT currency, GET history
+-
+-### 6.3 ExchangeRatesClientFallbackTest
+-**New:** `account-service/src/test/java/.../account/client/ExchangeRatesClientFallbackTest.java`
+-
+-### 6.4 Update existing AccountServiceTest
+-**Modify:** `account-service/src/test/java/.../account/service/AccountServiceTest.java`
+-- Add `@Mock WalletService walletService` so saveChanges test works with new injection
+-
+-### 6.5 Update existing StatisticsControllerTest
+-**Modify:** `statistics-service/src/test/java/.../statistics/controller/StatisticsControllerTest.java`
+-- Add `@Mock ExchangeRatesService` + test for `/rates`
+-
+----
+-
+-## File Summary
+-
+-**New files (11):**
+-- `account-service/.../client/ExchangeRatesClient.java`
+-- `account-service/.../client/ExchangeRatesClientFallback.java`
+-- `account-service/.../domain/Wallet.java`
+-- `account-service/.../domain/WalletSnapshot.java`
+-- `account-service/.../domain/WalletSnapshotId.java`
+-- `account-service/.../repository/WalletSnapshotRepository.java`
+-- `account-service/.../repository/converter/WalletSnapshotIdReaderConverter.java`
+-- `account-service/.../repository/converter/WalletSnapshotIdWriterConverter.java`
+-- `account-service/.../service/WalletService.java`
+-- `account-service/.../service/WalletServiceImpl.java`
+-- `account-service/.../controller/WalletController.java`
+-
+-**New test files (3):**
+-- `account-service/.../service/WalletServiceTest.java`
+-- `account-service/.../controller/WalletControllerTest.java`
+-- `account-service/.../client/ExchangeRatesClientFallbackTest.java`
+-
+-**Modified files (7):**
+-- `statistics-service/.../controller/StatisticsController.java` (add `/rates` endpoint)
+-- `statistics-service/.../controller/StatisticsControllerTest.java` (add rates test)
+-- `account-service/.../domain/TimePeriod.java` (add month ratios)
+-- `account-service/.../domain/Account.java` (add wallet field)
+-- `account-service/.../service/AccountServiceImpl.java` (trigger wallet recalculation)
+-- `account-service/.../AccountApplication.java` (register MongoDB converters)
+-- `account-service/.../service/AccountServiceTest.java` (add WalletService mock)
+-
+----
+-
+-## Verification
+-
+-1. `mvn test -pl statistics-service` - all existing + new rates endpoint test pass
+-2. `mvn test -pl account-service` - all existing + new wallet tests pass
+-3. `mvn package` for both services - clean build
+-4. Existing GET/PUT endpoints return same structure (wallet is additive `null` field on old accounts)
+diff --git a/account-service/src/main/java/com/piggymetrics/account/controller/WalletController.java b/account-service/src/main/java/com/piggymetrics/account/controller/WalletController.java
+index 52ea084..09b8ca5 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/controller/WalletController.java
++++ b/account-service/src/main/java/com/piggymetrics/account/controller/WalletController.java
+@@ -28,7 +28,7 @@ public class WalletController {
+ 		return walletService.recalculate(principal.getName());
+ 	}
+ 
+-	@RequestMapping(path = "/current/wallet/currency", method = RequestMethod.PUT)
++	@RequestMapping(path = "/current/wallet/base-currency", method = RequestMethod.PUT)
+ 	public Wallet changeBaseCurrency(Principal principal, @RequestBody Currency currency) {
+ 		return walletService.changeBaseCurrency(principal.getName(), currency);
+ 	}
+@@ -36,8 +36,8 @@ public class WalletController {
+ 	@RequestMapping(path = "/current/wallet/history", method = RequestMethod.GET)
+ 	public List<WalletSnapshot> getWalletHistory(
+ 			Principal principal,
+-			@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) Date from,
+-			@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) Date to) {
++			@RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) Date from,
++			@RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) Date to) {
+ 		return walletService.getHistory(principal.getName(), from, to);
+ 	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/WalletServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/WalletServiceImpl.java
+index b842e1a..edfb256 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/WalletServiceImpl.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/WalletServiceImpl.java
+@@ -15,18 +15,32 @@ import java.math.RoundingMode;
+ import java.time.Instant;
+ import java.time.LocalDate;
+ import java.time.ZoneId;
++import java.time.temporal.ChronoUnit;
+ import java.util.Date;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Set;
++import java.util.concurrent.TimeUnit;
+ 
+ @Service
+ public class WalletServiceImpl implements WalletService {
+ 
+ 	private final Logger log = LoggerFactory.getLogger(getClass());
+ 
++	static final int MAX_HISTORY_RANGE_DAYS = 365;
++
++	static final int MAX_HISTORY_RESULTS = 100;
++
++	static final int DEFAULT_HISTORY_RANGE_DAYS = 30;
++
++	private static final long RATES_CACHE_TTL_MS = TimeUnit.MINUTES.toMillis(5);
++
++	private volatile Map<Currency, BigDecimal> cachedRates;
++
++	private volatile long cachedRatesTimestamp;
++
+ 	@Autowired
+ 	private AccountRepository accountRepository;
+ 
+@@ -88,13 +102,31 @@ public class WalletServiceImpl implements WalletService {
+ 	@Override
+ 	public List<WalletSnapshot> getHistory(String accountName, Date from, Date to) {
+ 		Assert.hasLength(accountName);
+-		Assert.notNull(from);
+-		Assert.notNull(to);
+-		return snapshotRepository.findByIdAccountAndIdDateBetween(accountName, from, to);
++
++		Date now = new Date();
++		if (to == null) {
++			to = now;
++		}
++		if (from == null) {
++			from = Date.from(to.toInstant().minus(DEFAULT_HISTORY_RANGE_DAYS, ChronoUnit.DAYS));
++		}
++
++		long rangeDays = TimeUnit.MILLISECONDS.toDays(to.getTime() - from.getTime());
++		if (rangeDays > MAX_HISTORY_RANGE_DAYS) {
++			throw new IllegalArgumentException(
++					"Date range exceeds maximum of " + MAX_HISTORY_RANGE_DAYS + " days");
++		}
++
++		List<WalletSnapshot> snapshots = snapshotRepository.findByIdAccountAndIdDateBetween(accountName, from, to);
++
++		if (snapshots.size() > MAX_HISTORY_RESULTS) {
++			return snapshots.subList(snapshots.size() - MAX_HISTORY_RESULTS, snapshots.size());
++		}
++		return snapshots;
+ 	}
+ 
+ 	Wallet buildWallet(Account account, Currency baseCurrency) {
+-		Map<Currency, BigDecimal> rates = statisticsClient.getRates();
++		Map<Currency, BigDecimal> rates = getCachedRates();
+ 
+ 		Map<Currency, BigDecimal> monthlyIncomeByCurrency = new HashMap<>();
+ 		if (account.getIncomes() != null) {
+@@ -177,6 +209,16 @@ public class WalletServiceImpl implements WalletService {
+ 		return wallet;
+ 	}
+ 
++	private Map<Currency, BigDecimal> getCachedRates() {
++		long now = System.currentTimeMillis();
++		if (cachedRates == null || (now - cachedRatesTimestamp) > RATES_CACHE_TTL_MS) {
++			cachedRates = statisticsClient.getRates();
++			cachedRatesTimestamp = now;
++			log.debug("exchange rates cache refreshed");
++		}
++		return cachedRates;
++	}
++
+ 	private BigDecimal convert(BigDecimal amount, Currency from, Currency to,
+ 							   Map<Currency, BigDecimal> rates) {
+ 		if (from == to) {
+diff --git a/account-service/src/test/java/com/piggymetrics/account/controller/WalletControllerTest.java b/account-service/src/test/java/com/piggymetrics/account/controller/WalletControllerTest.java
+index df02b33..31dc70c 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/controller/WalletControllerTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/controller/WalletControllerTest.java
+@@ -83,7 +83,7 @@ public class WalletControllerTest {
+ 
+ 		when(walletService.changeBaseCurrency("test", Currency.EUR)).thenReturn(wallet);
+ 
+-		mockMvc.perform(put("/current/wallet/currency")
++		mockMvc.perform(put("/current/wallet/base-currency")
+ 				.principal(new UserPrincipal("test"))
+ 				.contentType(MediaType.APPLICATION_JSON)
+ 				.content("\"EUR\""))
+@@ -111,6 +111,23 @@ public class WalletControllerTest {
+ 				.andExpect(status().isOk());
+ 	}
+ 
++	@Test
++	public void shouldGetWalletHistoryWithDefaultDates() throws Exception {
++
++		WalletSnapshot snapshot = new WalletSnapshot();
++		snapshot.setId(new WalletSnapshotId("test", new Date()));
++		snapshot.setWallet(createTestWallet());
++
++		when(walletService.getHistory(org.mockito.ArgumentMatchers.eq("test"),
++				org.mockito.ArgumentMatchers.isNull(),
++				org.mockito.ArgumentMatchers.isNull()))
++				.thenReturn(Arrays.asList(snapshot));
++
++		mockMvc.perform(get("/current/wallet/history")
++				.principal(new UserPrincipal("test")))
++				.andExpect(status().isOk());
++	}
++
+ 	private Wallet createTestWallet() {
+ 		Wallet wallet = new Wallet();
+ 		wallet.setBaseCurrency(Currency.USD);
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/WalletServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/WalletServiceTest.java
+index 96307f8..fe93579 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/service/WalletServiceTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/service/WalletServiceTest.java
+@@ -237,16 +237,75 @@ public class WalletServiceTest {
+ 	@Test
+ 	public void shouldReturnWalletHistory() {
+ 
+-		Date from = new Date(1000000000L);
+-		Date to = new Date(2000000000L);
++		Date to = new Date();
++		Date from = new Date(to.getTime() - java.util.concurrent.TimeUnit.DAYS.toMillis(30));
+ 
+ 		List<WalletSnapshot> snapshots = Arrays.asList(new WalletSnapshot());
+-		when(snapshotRepository.findByIdAccountAndIdDateBetween("test", from, to)).thenReturn(snapshots);
++		when(snapshotRepository.findByIdAccountAndIdDateBetween(
++				eq("test"), any(Date.class), any(Date.class))).thenReturn(snapshots);
+ 
+ 		List<WalletSnapshot> result = walletService.getHistory("test", from, to);
+ 		assertEquals(1, result.size());
+ 	}
+ 
++	@Test
++	public void shouldDefaultHistoryDatesWhenNull() {
++
++		List<WalletSnapshot> snapshots = Arrays.asList(new WalletSnapshot());
++		when(snapshotRepository.findByIdAccountAndIdDateBetween(
++				eq("test"), any(Date.class), any(Date.class))).thenReturn(snapshots);
++
++		List<WalletSnapshot> result = walletService.getHistory("test", null, null);
++		assertEquals(1, result.size());
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void shouldRejectHistoryRangeExceeding365Days() {
++
++		Date to = new Date();
++		Date from = new Date(to.getTime() - java.util.concurrent.TimeUnit.DAYS.toMillis(400));
++
++		walletService.getHistory("test", from, to);
++	}
++
++	@Test
++	public void shouldCapHistoryResultsTo100() {
++
++		Date to = new Date();
++		Date from = new Date(to.getTime() - java.util.concurrent.TimeUnit.DAYS.toMillis(30));
++
++		List<WalletSnapshot> manySnapshots = new java.util.ArrayList<>();
++		for (int i = 0; i < 150; i++) {
++			manySnapshots.add(new WalletSnapshot());
++		}
++		when(snapshotRepository.findByIdAccountAndIdDateBetween(
++				eq("test"), any(Date.class), any(Date.class))).thenReturn(manySnapshots);
++
++		List<WalletSnapshot> result = walletService.getHistory("test", from, to);
++		assertEquals(WalletServiceImpl.MAX_HISTORY_RESULTS, result.size());
++	}
++
++	@Test
++	public void shouldCacheRatesAcrossRecalculations() {
++
++		Saving saving = createSaving(new BigDecimal("0"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(Collections.emptyList());
++		account.setExpenses(Collections.emptyList());
++		account.setSaving(saving);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		walletService.recalculate("test");
++		walletService.recalculate("test");
++		walletService.recalculate("test");
++
++		// Rates should only be fetched once due to 5-minute cache
++		verify(statisticsClient, times(1)).getRates();
++	}
++
+ 	@Test
+ 	public void shouldGetExistingWallet() {
+ 
