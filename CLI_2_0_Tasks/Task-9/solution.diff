@@ -1,0 +1,3735 @@
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..4a38b9c
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,16 @@
++[build-system]
++requires = ["setuptools>=68.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "tablesmith"
++version = "0.1.0"
++description = "A CLI tabular data transformation pipeline engine"
++requires-python = ">=3.11"
++license = {text = "MIT"}
++
++[project.scripts]
++tablesmith = "tablesmith.cli:main"
++
++[tool.setuptools.packages.find]
++where = ["src"]
+diff --git a/src/tablesmith/__init__.py b/src/tablesmith/__init__.py
+new file mode 100644
+index 0000000..f16c991
+--- /dev/null
++++ b/src/tablesmith/__init__.py
+@@ -0,0 +1,3 @@
++"""tablesmith - A CLI tabular data transformation pipeline engine."""
++
++__version__ = "0.1.0"
+diff --git a/src/tablesmith/cli.py b/src/tablesmith/cli.py
+new file mode 100644
+index 0000000..f222d90
+--- /dev/null
++++ b/src/tablesmith/cli.py
+@@ -0,0 +1,265 @@
++"""CLI entry point for tablesmith."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from typing import Iterable
++
++from tablesmith import __version__
++from tablesmith.models import (
++    DataError,
++    ExpressionError,
++    JoinType,
++    NullOrder,
++    Row,
++    Schema,
++    SortOrder,
++    SortSpec,
++    ValidationError,
++)
++from tablesmith.operations import (
++    op_distinct,
++    op_filter,
++    op_group,
++    op_having,
++    op_join_full,
++    op_limit,
++    op_project,
++    op_sort,
++    parse_agg_spec,
++)
++from tablesmith.pipeline import execute_pipeline, load_pipeline, validate_pipeline
++from tablesmith.readers import make_reader
++from tablesmith.writers import write_output
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = argparse.ArgumentParser(
++        prog="tablesmith",
++        description="Tabular data transformation pipeline engine",
++    )
++    parser.add_argument("--version", action="version", version=f"tablesmith {__version__}")
++
++    sub = parser.add_subparsers(dest="command")
++
++    # --- run ---------------------------------------------------------------
++    run_p = sub.add_parser("run", help="Execute a pipeline definition file")
++    run_p.add_argument("pipeline", help="Path to pipeline JSON file")
++
++    # --- query -------------------------------------------------------------
++    query_p = sub.add_parser("query", help="Ad-hoc query with inline flags")
++    query_p.add_argument("file", help="Input data file")
++    query_p.add_argument("--filter", dest="filter_expr", help="Filter expression")
++    query_p.add_argument("--project", dest="project_cols", help="Comma-separated column specs")
++    query_p.add_argument("--sort", dest="sort_spec", help="Sort spec: col[:asc|desc],...")
++    query_p.add_argument("--group-by", dest="group_by", help="Group-by columns (comma-separated)")
++    query_p.add_argument("--aggs", dest="aggs", help="Aggregate expressions (comma-separated)")
++    query_p.add_argument("--having", dest="having_expr", help="Having expression")
++    query_p.add_argument("--limit", dest="limit_n", type=int, help="Limit N rows")
++    query_p.add_argument("--distinct", dest="distinct_cols", nargs="?", const="__all__", help="Distinct (optionally specify cols)")
++    query_p.add_argument("--output", dest="output_path", help="Output file path")
++    query_p.add_argument("--format", dest="output_format", default="table", choices=["csv", "json", "jsonl", "table"])
++    query_p.add_argument("--input-format", dest="input_format", choices=["csv", "json", "jsonl"])
++    query_p.add_argument("--delimiter", default=",")
++    query_p.add_argument("--quotechar", default='"')
++
++    # --- inspect -----------------------------------------------------------
++    inspect_p = sub.add_parser("inspect", help="Print inferred schema for a data file")
++    inspect_p.add_argument("file", help="Input data file")
++    inspect_p.add_argument("--format", dest="input_format", choices=["csv", "json", "jsonl"])
++
++    # --- validate ----------------------------------------------------------
++    validate_p = sub.add_parser("validate", help="Validate a pipeline definition file")
++    validate_p.add_argument("pipeline", help="Path to pipeline JSON file")
++
++    # --- version -----------------------------------------------------------
++    sub.add_parser("version", help="Print version")
++
++    args = parser.parse_args(argv)
++
++    if args.command is None:
++        parser.print_help()
++        return 1
++
++    try:
++        if args.command == "version":
++            print(f"tablesmith {__version__}")
++            return 0
++
++        if args.command == "validate":
++            return _cmd_validate(args)
++
++        if args.command == "inspect":
++            return _cmd_inspect(args)
++
++        if args.command == "run":
++            return _cmd_run(args)
++
++        if args.command == "query":
++            return _cmd_query(args)
++
++    except ValidationError as e:
++        print(f"Error: {e}", file=sys.stderr)
++        return 1
++    except DataError as e:
++        print(f"Error: {e}", file=sys.stderr)
++        return 2
++    except ExpressionError as e:
++        print(f"Expression error: {e}", file=sys.stderr)
++        return 1
++
++    return 0
++
++
++# ---------------------------------------------------------------------------
++# Subcommands
++# ---------------------------------------------------------------------------
++
++def _cmd_validate(args: argparse.Namespace) -> int:
++    data = load_pipeline(args.pipeline)
++    errors = validate_pipeline(data)
++    if errors:
++        print("Pipeline validation failed:", file=sys.stderr)
++        for err in errors:
++            print(f"  - {err}", file=sys.stderr)
++        return 1
++    print("Pipeline is valid.")
++    return 0
++
++
++def _cmd_inspect(args: argparse.Namespace) -> int:
++    reader = make_reader(args.file, fmt=args.input_format)
++    schema = reader.schema
++
++    # Count rows and nulls
++    total = 0
++    null_counts: dict[str, int] = {c.name: 0 for c in schema.columns}
++    samples: dict[str, list] = {c.name: [] for c in schema.columns}
++
++    for row in reader.read():
++        total += 1
++        for c in schema.columns:
++            val = row.get(c.name)
++            if val is None:
++                null_counts[c.name] += 1
++            elif len(samples[c.name]) < 3:
++                samples[c.name].append(val)
++
++    # Print schema table
++    print(f"File: {args.file}")
++    print(f"Rows: {total}")
++    print()
++    print(f"{'Column':<25} {'Type':<10} {'Nulls':<8} {'Sample Values'}")
++    print(f"{'-'*25} {'-'*10} {'-'*8} {'-'*30}")
++    for c in schema.columns:
++        sample_str = ", ".join(repr(v) for v in samples[c.name])
++        print(f"{c.name:<25} {c.col_type.value:<10} {null_counts[c.name]:<8} {sample_str}")
++
++    return 0
++
++
++def _cmd_run(args: argparse.Namespace) -> int:
++    data = load_pipeline(args.pipeline)
++
++    # Validate first
++    errors = validate_pipeline(data)
++    if errors:
++        print("Pipeline validation failed:", file=sys.stderr)
++        for err in errors:
++            print(f"  - {err}", file=sys.stderr)
++        return 1
++
++    rows = execute_pipeline(data)
++
++    # Output
++    output_conf = data.get("output", {})
++    fmt = output_conf.get("format", "table")
++    path = output_conf.get("path")
++
++    write_output(rows, fmt=fmt, path=path)
++    return 0
++
++
++def _cmd_query(args: argparse.Namespace) -> int:
++    reader = make_reader(
++        args.file,
++        fmt=args.input_format,
++        delimiter=args.delimiter,
++        quotechar=args.quotechar,
++    )
++    schema = reader.schema
++    rows: Iterable[Row] = reader.read()
++
++    # Apply operations in a standard order: filter, join (not in query mode),
++    # project, group, having, sort, distinct, limit.
++
++    if args.filter_expr:
++        rows = op_filter(rows, args.filter_expr, schema)
++
++    if args.project_cols:
++        rows = op_project(rows, args.project_cols, schema)
++
++    if args.group_by:
++        group_cols = [c.strip() for c in args.group_by.split(",")]
++        agg_texts = [a.strip() for a in args.aggs.split(",")] if args.aggs else []
++        agg_specs = [parse_agg_spec(a) for a in agg_texts]
++        rows = op_group(rows, group_cols, agg_specs)
++
++    if args.having_expr:
++        rows = op_having(rows, args.having_expr, schema)
++
++    if args.sort_spec:
++        specs = _parse_cli_sort(args.sort_spec)
++        rows = op_sort(rows, specs)
++
++    if args.distinct_cols:
++        if args.distinct_cols == "__all__":
++            rows = op_distinct(rows)
++        else:
++            cols = [c.strip() for c in args.distinct_cols.split(",")]
++            rows = op_distinct(rows, columns=cols)
++
++    if args.limit_n is not None:
++        rows = op_limit(rows, args.limit_n)
++
++    write_output(
++        rows,
++        fmt=args.output_format,
++        path=args.output_path,
++        delimiter=args.delimiter,
++        quotechar=args.quotechar,
++    )
++
++    # Report skipped rows if applicable
++    if hasattr(reader, "skipped_count") and reader.skipped_count > 0:
++        print(
++            f"\nWarning: {reader.skipped_count} malformed row(s) skipped.",
++            file=sys.stderr,
++        )
++
++    return 0
++
++
++def _parse_cli_sort(spec_str: str) -> list[SortSpec]:
++    """Parse CLI sort spec like 'name:asc,salary:desc:nulls_first'."""
++    specs: list[SortSpec] = []
++    for part in spec_str.split(","):
++        parts = part.strip().split(":")
++        col = parts[0]
++        order = SortOrder.ASC
++        null_order = NullOrder.NULLS_LAST
++
++        for p in parts[1:]:
++            low = p.lower()
++            if low in ("asc", "desc"):
++                order = SortOrder(low)
++            elif low in ("nulls_first", "nulls_last"):
++                null_order = NullOrder(low)
++
++        specs.append(SortSpec(column=col, order=order, null_order=null_order))
++    return specs
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/src/tablesmith/expression.py b/src/tablesmith/expression.py
+new file mode 100644
+index 0000000..c72a175
+--- /dev/null
++++ b/src/tablesmith/expression.py
+@@ -0,0 +1,587 @@
++"""Expression tokenizer, parser, and evaluator with SQL three-valued NULL logic.
++
++Grammar (recursive descent):
++    expr       -> or_expr
++    or_expr    -> and_expr ('OR' and_expr)*
++    and_expr   -> not_expr ('AND' not_expr)*
++    not_expr   -> 'NOT' not_expr | comparison
++    comparison -> operand (comp_op operand | null_op | string_op operand)?
++    operand    -> '(' expr ')' | literal | column_ref | arith_expr
++    arith_expr -> term (('+' | '-' | '||') term)*
++    term       -> factor (('*' | '/') factor)*
++    factor     -> '(' arith_expr ')' | literal | column_ref | unary_minus factor
++"""
++
++from __future__ import annotations
++
++import enum
++import re
++from dataclasses import dataclass
++from typing import Any
++
++from tablesmith.models import ColumnType, ExpressionError, Row, Schema
++
++
++# ---------------------------------------------------------------------------
++# Token types
++# ---------------------------------------------------------------------------
++
++class TT(enum.Enum):
++    # Literals
++    INTEGER = "INTEGER"
++    FLOAT = "FLOAT"
++    STRING = "STRING"
++    BOOLEAN = "BOOLEAN"
++    NULL_LIT = "NULL"
++
++    # Identifiers (column names)
++    IDENT = "IDENT"
++
++    # Comparison operators
++    EQ = "="
++    NEQ = "!="
++    GT = ">"
++    LT = "<"
++    GTE = ">="
++    LTE = "<="
++
++    # String operators
++    CONTAINS = "contains"
++    STARTSWITH = "startswith"
++    ENDSWITH = "endswith"
++
++    # NULL operators
++    IS_NULL = "is_null"
++    IS_NOT_NULL = "is_not_null"
++
++    # Logical operators
++    AND = "AND"
++    OR = "OR"
++    NOT = "NOT"
++
++    # Arithmetic / concat
++    PLUS = "+"
++    MINUS = "-"
++    STAR = "*"
++    SLASH = "/"
++    CONCAT = "||"
++
++    # Grouping
++    LPAREN = "("
++    RPAREN = ")"
++
++    # Alias
++    AS = "AS"
++    COMMA = ","
++
++    EOF = "EOF"
++
++
++# Keywords that must not be treated as identifiers.
++_KEYWORDS = {
++    "and": TT.AND,
++    "or": TT.OR,
++    "not": TT.NOT,
++    "true": TT.BOOLEAN,
++    "false": TT.BOOLEAN,
++    "null": TT.NULL_LIT,
++    "is_null": TT.IS_NULL,
++    "is_not_null": TT.IS_NOT_NULL,
++    "contains": TT.CONTAINS,
++    "startswith": TT.STARTSWITH,
++    "endswith": TT.ENDSWITH,
++    "as": TT.AS,
++}
++
++
++@dataclass
++class Token:
++    tt: TT
++    value: Any
++    pos: int
++
++
++# ---------------------------------------------------------------------------
++# Tokenizer
++# ---------------------------------------------------------------------------
++
++def tokenize(text: str) -> list[Token]:
++    """Lex *text* into a list of Tokens."""
++    tokens: list[Token] = []
++    i = 0
++    n = len(text)
++
++    while i < n:
++        # Skip whitespace
++        if text[i].isspace():
++            i += 1
++            continue
++
++        # Two-char operators
++        two = text[i: i + 2]
++        if two == "!=":
++            tokens.append(Token(TT.NEQ, "!=", i)); i += 2; continue
++        if two == ">=":
++            tokens.append(Token(TT.GTE, ">=", i)); i += 2; continue
++        if two == "<=":
++            tokens.append(Token(TT.LTE, "<=", i)); i += 2; continue
++        if two == "||":
++            tokens.append(Token(TT.CONCAT, "||", i)); i += 2; continue
++
++        # Single-char operators
++        ch = text[i]
++        if ch == "=":
++            tokens.append(Token(TT.EQ, "=", i)); i += 1; continue
++        if ch == ">":
++            tokens.append(Token(TT.GT, ">", i)); i += 1; continue
++        if ch == "<":
++            tokens.append(Token(TT.LT, "<", i)); i += 1; continue
++        if ch == "+":
++            tokens.append(Token(TT.PLUS, "+", i)); i += 1; continue
++        if ch == "-":
++            tokens.append(Token(TT.MINUS, "-", i)); i += 1; continue
++        if ch == "*":
++            tokens.append(Token(TT.STAR, "*", i)); i += 1; continue
++        if ch == "/":
++            tokens.append(Token(TT.SLASH, "/", i)); i += 1; continue
++        if ch == "(":
++            tokens.append(Token(TT.LPAREN, "(", i)); i += 1; continue
++        if ch == ")":
++            tokens.append(Token(TT.RPAREN, ")", i)); i += 1; continue
++        if ch == ",":
++            tokens.append(Token(TT.COMMA, ",", i)); i += 1; continue
++
++        # String literals: single-quoted with \' escape
++        if ch == "'":
++            j = i + 1
++            parts: list[str] = []
++            while j < n:
++                if text[j] == "\\" and j + 1 < n and text[j + 1] == "'":
++                    parts.append("'")
++                    j += 2
++                elif text[j] == "'":
++                    break
++                else:
++                    parts.append(text[j])
++                    j += 1
++            if j >= n:
++                raise ExpressionError(f"Unterminated string literal starting at position {i}")
++            tokens.append(Token(TT.STRING, "".join(parts), i))
++            i = j + 1
++            continue
++
++        # Numbers
++        if ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
++            m = re.match(r"(\d+\.\d*|\.\d+|\d+)", text[i:])
++            if m:
++                raw = m.group(0)
++                if "." in raw:
++                    tokens.append(Token(TT.FLOAT, float(raw), i))
++                else:
++                    tokens.append(Token(TT.INTEGER, int(raw), i))
++                i += len(raw)
++                continue
++
++        # Identifiers / keywords
++        if ch.isalpha() or ch == "_":
++            m = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text[i:])
++            if m:
++                word = m.group(0)
++                low = word.lower()
++                if low in _KEYWORDS:
++                    tt = _KEYWORDS[low]
++                    val: Any = word
++                    if tt == TT.BOOLEAN:
++                        val = low == "true"
++                    elif tt == TT.NULL_LIT:
++                        val = None
++                    tokens.append(Token(tt, val, i))
++                else:
++                    tokens.append(Token(TT.IDENT, word, i))
++                i += len(word)
++                continue
++
++        raise ExpressionError(f"Unexpected character {ch!r} at position {i}")
++
++    tokens.append(Token(TT.EOF, None, i))
++    return tokens
++
++
++# ---------------------------------------------------------------------------
++# AST nodes
++# ---------------------------------------------------------------------------
++
++@dataclass
++class LiteralNode:
++    value: Any  # int, float, str, bool, or None (NULL)
++
++@dataclass
++class ColumnRefNode:
++    name: str
++
++@dataclass
++class BinaryOpNode:
++    op: str  # +, -, *, /, ||, =, !=, >, <, >=, <=, contains, startswith, endswith, AND, OR
++    left: Any
++    right: Any
++
++@dataclass
++class UnaryOpNode:
++    op: str  # NOT, unary_minus
++    operand: Any
++
++@dataclass
++class NullCheckNode:
++    column: Any
++    is_null: bool  # True for is_null, False for is_not_null
++
++@dataclass
++class AliasNode:
++    expr: Any
++    alias: str
++
++
++# ---------------------------------------------------------------------------
++# Parser (recursive descent)
++# ---------------------------------------------------------------------------
++
++class Parser:
++    """Recursive descent parser for filter and project expressions."""
++
++    def __init__(self, tokens: list[Token]) -> None:
++        self._tokens = tokens
++        self._pos = 0
++
++    def _peek(self) -> Token:
++        return self._tokens[self._pos]
++
++    def _advance(self) -> Token:
++        tok = self._tokens[self._pos]
++        self._pos += 1
++        return tok
++
++    def _expect(self, tt: TT) -> Token:
++        tok = self._advance()
++        if tok.tt != tt:
++            raise ExpressionError(
++                f"Expected {tt.value} but got {tok.value!r} at position {tok.pos}"
++            )
++        return tok
++
++    # --- public entry points -----------------------------------------------
++
++    def parse_filter_expr(self) -> Any:
++        node = self._or_expr()
++        if self._peek().tt != TT.EOF:
++            tok = self._peek()
++            raise ExpressionError(
++                f"Unexpected token {tok.value!r} at position {tok.pos}"
++            )
++        return node
++
++    def parse_project_item(self) -> Any:
++        """Parse a single projection item: expr [AS alias]."""
++        node = self._arith_expr()
++        if self._peek().tt == TT.AS:
++            self._advance()
++            alias_tok = self._expect(TT.IDENT)
++            return AliasNode(expr=node, alias=alias_tok.value)
++        # Plain column ref — use the column name as the alias
++        if isinstance(node, ColumnRefNode):
++            return AliasNode(expr=node, alias=node.name)
++        raise ExpressionError("Computed column expression requires an AS alias")
++
++    # --- filter expression hierarchy ---------------------------------------
++
++    def _or_expr(self) -> Any:
++        left = self._and_expr()
++        while self._peek().tt == TT.OR:
++            self._advance()
++            right = self._and_expr()
++            left = BinaryOpNode("OR", left, right)
++        return left
++
++    def _and_expr(self) -> Any:
++        left = self._not_expr()
++        while self._peek().tt == TT.AND:
++            self._advance()
++            right = self._not_expr()
++            left = BinaryOpNode("AND", left, right)
++        return left
++
++    def _not_expr(self) -> Any:
++        if self._peek().tt == TT.NOT:
++            self._advance()
++            operand = self._not_expr()
++            return UnaryOpNode("NOT", operand)
++        return self._comparison()
++
++    def _comparison(self) -> Any:
++        left = self._arith_expr()
++
++        tt = self._peek().tt
++
++        # Null operators
++        if tt == TT.IS_NULL:
++            self._advance()
++            return NullCheckNode(left, is_null=True)
++        if tt == TT.IS_NOT_NULL:
++            self._advance()
++            return NullCheckNode(left, is_null=False)
++
++        # Comparison operators
++        comp_ops = {TT.EQ, TT.NEQ, TT.GT, TT.LT, TT.GTE, TT.LTE}
++        str_ops = {TT.CONTAINS, TT.STARTSWITH, TT.ENDSWITH}
++
++        if tt in comp_ops or tt in str_ops:
++            op_tok = self._advance()
++            right = self._arith_expr()
++            return BinaryOpNode(op_tok.value, left, right)
++
++        return left
++
++    # --- arithmetic expression hierarchy -----------------------------------
++
++    def _arith_expr(self) -> Any:
++        left = self._term()
++        while self._peek().tt in (TT.PLUS, TT.MINUS, TT.CONCAT):
++            op_tok = self._advance()
++            right = self._term()
++            left = BinaryOpNode(op_tok.value, left, right)
++        return left
++
++    def _term(self) -> Any:
++        left = self._factor()
++        while self._peek().tt in (TT.STAR, TT.SLASH):
++            op_tok = self._advance()
++            right = self._factor()
++            left = BinaryOpNode(op_tok.value, left, right)
++        return left
++
++    def _factor(self) -> Any:
++        tok = self._peek()
++
++        if tok.tt == TT.LPAREN:
++            self._advance()
++            node = self._or_expr()
++            self._expect(TT.RPAREN)
++            return node
++
++        if tok.tt == TT.MINUS:
++            self._advance()
++            operand = self._factor()
++            return UnaryOpNode("unary_minus", operand)
++
++        return self._atom()
++
++    def _atom(self) -> Any:
++        tok = self._advance()
++
++        if tok.tt == TT.INTEGER:
++            return LiteralNode(tok.value)
++        if tok.tt == TT.FLOAT:
++            return LiteralNode(tok.value)
++        if tok.tt == TT.STRING:
++            return LiteralNode(tok.value)
++        if tok.tt == TT.BOOLEAN:
++            return LiteralNode(tok.value)
++        if tok.tt == TT.NULL_LIT:
++            return LiteralNode(None)
++        if tok.tt == TT.IDENT:
++            return ColumnRefNode(tok.value)
++
++        raise ExpressionError(
++            f"Unexpected token {tok.value!r} at position {tok.pos}"
++        )
++
++
++# ---------------------------------------------------------------------------
++# Evaluator with SQL three-valued NULL logic
++# ---------------------------------------------------------------------------
++
++def evaluate(node: Any, row: Row, schema: Schema | None = None) -> Any:
++    """Evaluate an AST node against a row.
++
++    Returns the result value.  For filter expressions the caller should
++    treat non-True results (including None/NULL) as False.
++    """
++    if isinstance(node, LiteralNode):
++        return node.value
++
++    if isinstance(node, ColumnRefNode):
++        if node.name not in row:
++            available = ", ".join(sorted(row.keys()))
++            raise ExpressionError(
++                f"Column '{node.name}' not found. Available columns: {available}"
++            )
++        return row[node.name]
++
++    if isinstance(node, NullCheckNode):
++        val = evaluate(node.column, row, schema)
++        if node.is_null:
++            return val is None
++        return val is not None
++
++    if isinstance(node, UnaryOpNode):
++        if node.op == "NOT":
++            val = evaluate(node.operand, row, schema)
++            if val is None:
++                return None  # NOT NULL => NULL (three-valued logic)
++            return not val
++        if node.op == "unary_minus":
++            val = evaluate(node.operand, row, schema)
++            if val is None:
++                return None
++            if not isinstance(val, (int, float)):
++                raise ExpressionError(
++                    f"Cannot negate non-numeric value: {val!r}"
++                )
++            return -val
++
++    if isinstance(node, BinaryOpNode):
++        return _eval_binary(node, row, schema)
++
++    if isinstance(node, AliasNode):
++        return evaluate(node.expr, row, schema)
++
++    raise ExpressionError(f"Unknown AST node type: {type(node).__name__}")
++
++
++def _eval_binary(node: BinaryOpNode, row: Row, schema: Schema | None) -> Any:
++    op = node.op
++
++    # Short-circuit logical operators with three-valued logic
++    if op == "AND":
++        left = evaluate(node.left, row, schema)
++        if left is False:
++            return False  # False AND anything => False
++        right = evaluate(node.right, row, schema)
++        if right is False:
++            return False
++        if left is None or right is None:
++            return None
++        return left and right
++
++    if op == "OR":
++        left = evaluate(node.left, row, schema)
++        if left is True:
++            return True  # True OR anything => True
++        right = evaluate(node.right, row, schema)
++        if right is True:
++            return True
++        if left is None or right is None:
++            return None
++        return left or right
++
++    left = evaluate(node.left, row, schema)
++    right = evaluate(node.right, row, schema)
++
++    # Arithmetic / concatenation
++    if op in ("+", "-", "*", "/"):
++        if left is None or right is None:
++            return None
++        if op == "/" and right == 0:
++            return None  # Division by zero => NULL
++        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
++            raise ExpressionError(
++                f"Cannot apply '{op}' to non-numeric values: {left!r}, {right!r}"
++            )
++        if op == "+":
++            result = left + right
++        elif op == "-":
++            result = left - right
++        elif op == "*":
++            result = left * right
++        else:
++            result = left / right
++        # Preserve integer type when possible
++        if isinstance(result, float) and result == int(result) and isinstance(left, int) and isinstance(right, int):
++            return int(result)
++        return result
++
++    if op == "||":
++        if left is None or right is None:
++            return None
++        return str(left) + str(right)
++
++    # Comparison operators — NULL propagation
++    if op in ("=", "!=", ">", "<", ">=", "<="):
++        if left is None or right is None:
++            return None  # Any comparison with NULL => NULL
++
++        # Type checking for comparisons
++        if isinstance(left, str) != isinstance(right, str):
++            # One is a string the other isn't — allow comparing with literals
++            if isinstance(left, str) and isinstance(right, (int, float)):
++                raise ExpressionError(
++                    f"Cannot compare string '{left}' with number {right}"
++                )
++            if isinstance(right, str) and isinstance(left, (int, float)):
++                raise ExpressionError(
++                    f"Cannot compare number {left} with string '{right}'"
++                )
++
++        if op == "=":
++            return left == right
++        if op == "!=":
++            return left != right
++        if op == ">":
++            return left > right
++        if op == "<":
++            return left < right
++        if op == ">=":
++            return left >= right
++        if op == "<=":
++            return left <= right
++
++    # String operators — NULL propagation
++    if op in ("contains", "startswith", "endswith"):
++        if left is None or right is None:
++            return None
++        left_str = str(left)
++        right_str = str(right)
++        if op == "contains":
++            return right_str in left_str
++        if op == "startswith":
++            return left_str.startswith(right_str)
++        if op == "endswith":
++            return left_str.endswith(right_str)
++
++    raise ExpressionError(f"Unknown operator: {op!r}")
++
++
++# ---------------------------------------------------------------------------
++# Convenience helpers
++# ---------------------------------------------------------------------------
++
++def parse_filter(text: str) -> Any:
++    """Parse a filter expression string into an AST."""
++    tokens = tokenize(text)
++    return Parser(tokens).parse_filter_expr()
++
++
++def parse_project_list(text: str) -> list[AliasNode]:
++    """Parse a comma-separated list of projection items.
++
++    E.g. "name, salary * 1.1 AS adjusted, dept"
++    """
++    # We tokenize the full string then parse comma-separated items.
++    tokens = tokenize(text)
++    parser = Parser(tokens)
++    items: list[AliasNode] = []
++
++    while parser._peek().tt != TT.EOF:
++        item = parser.parse_project_item()
++        items.append(item)
++        if parser._peek().tt == TT.COMMA:
++            parser._advance()
++
++    return items
++
++
++def eval_filter(expr_text: str, row: Row, schema: Schema | None = None) -> bool:
++    """Parse and evaluate a filter expression, returning True/False."""
++    ast = parse_filter(expr_text)
++    result = evaluate(ast, row, schema)
++    # In SQL three-valued logic NULL evaluates to false in filter context
++    return result is True
+diff --git a/src/tablesmith/models.py b/src/tablesmith/models.py
+new file mode 100644
+index 0000000..426c155
+--- /dev/null
++++ b/src/tablesmith/models.py
+@@ -0,0 +1,95 @@
++"""Core data types for tablesmith."""
++
++from __future__ import annotations
++
++import enum
++from dataclasses import dataclass, field
++from typing import Any
++
++
++class ColumnType(enum.Enum):
++    INTEGER = "integer"
++    FLOAT = "float"
++    BOOLEAN = "boolean"
++    STRING = "string"
++
++
++class JoinType(enum.Enum):
++    INNER = "inner"
++    LEFT = "left"
++    RIGHT = "right"
++    FULL = "full"
++
++
++class SortOrder(enum.Enum):
++    ASC = "asc"
++    DESC = "desc"
++
++
++class NullOrder(enum.Enum):
++    NULLS_FIRST = "nulls_first"
++    NULLS_LAST = "nulls_last"
++
++
++# Sentinel for NULL values (distinct from None in Python semantics context,
++# but we use None throughout for simplicity — this constant documents intent).
++NULL = None
++
++
++@dataclass
++class Column:
++    name: str
++    col_type: ColumnType = ColumnType.STRING
++
++
++@dataclass
++class Schema:
++    columns: list[Column] = field(default_factory=list)
++
++    @property
++    def column_names(self) -> list[str]:
++        return [c.name for c in self.columns]
++
++    def get_type(self, name: str) -> ColumnType | None:
++        for c in self.columns:
++            if c.name == name:
++                return c.col_type
++        return None
++
++    def has_column(self, name: str) -> bool:
++        return any(c.name == name for c in self.columns)
++
++
++# A Row is a dict mapping column names to values.
++# NULL is represented by Python None.
++Row = dict[str, Any]
++
++
++@dataclass
++class SortSpec:
++    column: str
++    order: SortOrder = SortOrder.ASC
++    null_order: NullOrder = NullOrder.NULLS_LAST
++
++
++@dataclass
++class AggregateSpec:
++    func: str  # count, count_distinct, sum, avg, min, max
++    column: str | None  # None for count(*)
++    alias: str
++
++
++class TablesmithError(Exception):
++    """Base error for tablesmith."""
++
++
++class ValidationError(TablesmithError):
++    """Pipeline or schema validation error."""
++
++
++class DataError(TablesmithError):
++    """Runtime data processing error."""
++
++
++class ExpressionError(TablesmithError):
++    """Expression parsing or evaluation error."""
+diff --git a/src/tablesmith/operations.py b/src/tablesmith/operations.py
+new file mode 100644
+index 0000000..30334e0
+--- /dev/null
++++ b/src/tablesmith/operations.py
+@@ -0,0 +1,516 @@
++"""Transformation operations: filter, project, sort, group, join, distinct, limit.
++
++Streaming operations (filter, project, limit) are implemented as generators.
++Materializing operations (sort, group, join, distinct) consume their input.
++"""
++
++from __future__ import annotations
++
++import re
++from collections import defaultdict
++from itertools import islice
++from typing import Any, Generator, Iterable
++
++from tablesmith.expression import (
++    AliasNode,
++    evaluate,
++    parse_filter,
++    parse_project_list,
++)
++from tablesmith.models import (
++    AggregateSpec,
++    Column,
++    ColumnType,
++    ExpressionError,
++    JoinType,
++    NullOrder,
++    Row,
++    Schema,
++    SortOrder,
++    SortSpec,
++    ValidationError,
++)
++from tablesmith.readers import make_reader
++
++
++# ---------------------------------------------------------------------------
++# Filter (streaming)
++# ---------------------------------------------------------------------------
++
++def op_filter(
++    rows: Iterable[Row],
++    expr_text: str,
++    schema: Schema | None = None,
++) -> Generator[Row, None, None]:
++    """Yield only rows where *expr_text* evaluates to True."""
++    ast = parse_filter(expr_text)
++    for row in rows:
++        result = evaluate(ast, row, schema)
++        if result is True:
++            yield row
++
++
++# ---------------------------------------------------------------------------
++# Project (streaming)
++# ---------------------------------------------------------------------------
++
++def op_project(
++    rows: Iterable[Row],
++    columns_spec: str | list[str],
++    schema: Schema | None = None,
++) -> Generator[Row, None, None]:
++    """Select, rename, or compute columns.
++
++    *columns_spec* is either a comma-separated string or a list of strings
++    like ``["name", "salary * 1.1 AS adjusted"]``.
++    """
++    if isinstance(columns_spec, list):
++        spec_text = ", ".join(columns_spec)
++    else:
++        spec_text = columns_spec
++
++    items = parse_project_list(spec_text)
++
++    for row in rows:
++        new_row: Row = {}
++        for item in items:
++            val = evaluate(item.expr, row, schema)
++            new_row[item.alias] = val
++        yield new_row
++
++
++def project_schema(columns_spec: str | list[str], input_schema: Schema) -> Schema:
++    """Derive the output schema after a project operation."""
++    if isinstance(columns_spec, list):
++        spec_text = ", ".join(columns_spec)
++    else:
++        spec_text = columns_spec
++
++    items = parse_project_list(spec_text)
++    columns: list[Column] = []
++    for item in items:
++        # Try to infer type from input schema
++        from tablesmith.expression import ColumnRefNode
++        if isinstance(item.expr, ColumnRefNode):
++            ct = input_schema.get_type(item.expr.name)
++            columns.append(Column(name=item.alias, col_type=ct or ColumnType.STRING))
++        else:
++            columns.append(Column(name=item.alias, col_type=ColumnType.FLOAT))
++    return Schema(columns=columns)
++
++
++# ---------------------------------------------------------------------------
++# Sort (materializing)
++# ---------------------------------------------------------------------------
++
++def op_sort(
++    rows: Iterable[Row],
++    specs: list[SortSpec],
++) -> list[Row]:
++    """Sort rows by the given specifications. Materializes all rows."""
++    materialized = list(rows)
++    if not materialized or not specs:
++        return materialized
++
++    def sort_key(row: Row) -> tuple:
++        key_parts: list[Any] = []
++        for spec in specs:
++            val = row.get(spec.column)
++            is_null = val is None
++            if spec.null_order == NullOrder.NULLS_LAST:
++                null_flag = 1 if is_null else 0
++            else:
++                null_flag = 0 if is_null else 1
++
++            if is_null:
++                comparable = ""  # Placeholder; null_flag handles ordering
++            elif isinstance(val, bool):
++                comparable = int(val)
++            else:
++                comparable = val
++
++            if spec.order == SortOrder.DESC and not is_null:
++                if isinstance(comparable, (int, float)):
++                    comparable = -comparable
++                elif isinstance(comparable, str):
++                    # Flip string comparison by inverting char ordinals
++                    comparable = [-ord(c) for c in comparable]
++            key_parts.append((null_flag, comparable))
++        return tuple(key_parts)
++
++    materialized.sort(key=sort_key)
++    return materialized
++
++
++# ---------------------------------------------------------------------------
++# Group / Aggregate (materializing)
++# ---------------------------------------------------------------------------
++
++_AGG_PATTERN = re.compile(
++    r"(count_distinct|count|sum|avg|min|max)\s*\(\s*(\*|[A-Za-z_][A-Za-z0-9_]*)\s*\)\s*(?:AS\s+([A-Za-z_][A-Za-z0-9_]*))?",
++    re.IGNORECASE,
++)
++
++
++def parse_agg_spec(text: str) -> AggregateSpec:
++    """Parse an aggregate expression like ``avg(salary) AS avg_sal``."""
++    m = _AGG_PATTERN.match(text.strip())
++    if not m:
++        raise ValidationError(f"Invalid aggregate expression: {text!r}")
++    func = m.group(1).lower()
++    col = m.group(2)
++    alias = m.group(3)
++    if col == "*":
++        col_name = None
++    else:
++        col_name = col
++    if alias is None:
++        alias = f"{func}_{col}" if col_name else f"{func}_star"
++    return AggregateSpec(func=func, column=col_name, alias=alias)
++
++
++def _make_group_key(row: Row, group_cols: list[str]) -> tuple:
++    """Create hashable group key. NULL (None) is handled by converting to a
++    sentinel so all NULLs group together (SQL behaviour)."""
++    _NULL_SENTINEL = object()
++    return tuple(row.get(c) if row.get(c) is not None else _NULL_SENTINEL for c in group_cols)
++
++
++# Use a module-level sentinel so the same object is reused across calls.
++_NULL_SENTINEL = type("_NullSentinel", (), {"__repr__": lambda s: "NULL"})()
++
++
++def op_group(
++    rows: Iterable[Row],
++    group_cols: list[str],
++    agg_specs: list[AggregateSpec],
++) -> list[Row]:
++    """Group rows and compute aggregates. Materializes all rows."""
++    # Accumulate rows per group
++    groups: dict[tuple, list[Row]] = defaultdict(list)
++
++    for row in rows:
++        key = tuple(
++            row.get(c) if row.get(c) is not None else _NULL_SENTINEL
++            for c in group_cols
++        )
++        groups[key].append(row)
++
++    results: list[Row] = []
++    for key, group_rows in groups.items():
++        result_row: Row = {}
++
++        # Group-by column values
++        for i, col in enumerate(group_cols):
++            val = key[i]
++            result_row[col] = None if val is _NULL_SENTINEL else val
++
++        # Aggregates
++        for agg in agg_specs:
++            result_row[agg.alias] = _compute_aggregate(agg, group_rows)
++
++        results.append(result_row)
++
++    return results
++
++
++def _compute_aggregate(agg: AggregateSpec, rows: list[Row]) -> Any:
++    """Compute a single aggregate over a group of rows."""
++    func = agg.func
++    col = agg.column
++
++    if func == "count" and col is None:
++        return len(rows)
++
++    if func == "count":
++        return sum(1 for r in rows if r.get(col) is not None)
++
++    if func == "count_distinct":
++        seen: set = set()
++        for r in rows:
++            val = r.get(col)
++            if val is not None:
++                seen.add(val)
++        return len(seen)
++
++    # For sum, avg, min, max — collect non-null values
++    values = [r.get(col) for r in rows if r.get(col) is not None]
++
++    if func == "sum":
++        return sum(values) if values else None
++
++    if func == "avg":
++        if not values:
++            return None
++        total = sum(values)
++        return total / len(values)
++
++    if func == "min":
++        return min(values) if values else None
++
++    if func == "max":
++        return max(values) if values else None
++
++    raise ValidationError(f"Unknown aggregate function: {func!r}")
++
++
++# ---------------------------------------------------------------------------
++# Having (filter on grouped results)
++# ---------------------------------------------------------------------------
++
++def op_having(
++    rows: Iterable[Row],
++    expr_text: str,
++    schema: Schema | None = None,
++) -> Generator[Row, None, None]:
++    """Filter grouped rows using an expression (same as filter)."""
++    yield from op_filter(rows, expr_text, schema)
++
++
++# ---------------------------------------------------------------------------
++# Join (hash join — right side materialized, left side streamed)
++# ---------------------------------------------------------------------------
++
++def op_join(
++    left_rows: Iterable[Row],
++    right_path: str,
++    on_columns: list[str],
++    join_type: JoinType = JoinType.INNER,
++    right_format: str | None = None,
++    left_alias: str = "_left",
++    right_alias: str = "_right",
++) -> Generator[Row, None, None]:
++    """Hash-join left rows with a right-side file.
++
++    Right side is materialized into a hash map indexed by join columns.
++    Left side is streamed.
++    """
++    # Load and index the right side
++    reader = make_reader(right_path, fmt=right_format)
++    right_index: dict[tuple, list[Row]] = defaultdict(list)
++    right_all: list[Row] = []
++    right_schema = reader.schema
++
++    for row in reader.read():
++        key = tuple(row.get(c) for c in on_columns)
++        right_index[key].append(row)
++        right_all.append(row)
++
++    # Determine overlapping non-join column names for aliasing
++    left_cols: set[str] | None = None
++    right_non_join = set(right_schema.column_names) - set(on_columns)
++
++    matched_right_keys: set[int] = set()  # indices of matched right rows (for full join)
++
++    for left_row in left_rows:
++        if left_cols is None:
++            left_cols = set(left_row.keys())
++
++        key = tuple(left_row.get(c) for c in on_columns)
++        matches = right_index.get(key, [])
++
++        if matches:
++            for right_row in matches:
++                merged = _merge_rows(
++                    left_row, right_row, on_columns,
++                    left_cols or set(), right_non_join,
++                    left_alias, right_alias,
++                )
++                yield merged
++                # Track matched for full join
++                if join_type == JoinType.FULL:
++                    for idx, rr in enumerate(right_all):
++                        if rr is right_row:
++                            matched_right_keys.add(idx)
++        elif join_type in (JoinType.LEFT, JoinType.FULL):
++            # Left/full: emit left row with NULLs for right columns
++            merged = _merge_rows(
++                left_row, None, on_columns,
++                left_cols or set(), right_non_join,
++                left_alias, right_alias,
++            )
++            yield merged
++
++    # For right and full joins: emit unmatched right rows
++    if join_type in (JoinType.RIGHT, JoinType.FULL):
++        if left_cols is None:
++            left_cols = set()
++        left_non_join = left_cols - set(on_columns)
++
++        if join_type == JoinType.FULL:
++            for idx, right_row in enumerate(right_all):
++                if idx not in matched_right_keys:
++                    merged = _merge_rows(
++                        None, right_row, on_columns,
++                        left_cols, right_non_join,
++                        left_alias, right_alias,
++                    )
++                    yield merged
++        else:  # RIGHT join
++            # Re-index: find unmatched right rows by re-scanning
++            # (we didn't track matched for RIGHT — do a second pass)
++            right_matched: set[int] = set()
++            reader2 = make_reader(right_path, fmt=right_format)
++            left_keys: set[tuple] = set()
++
++            # Rebuild left keys (requires re-reading left, but left was a generator
++            # that's consumed). For RIGHT join, we track during the main loop.
++            # Simplification: for RIGHT join, we re-read the left file.
++            # Actually, let's just use a different approach — track during main loop.
++            pass  # RIGHT join tracking is handled below via a different approach
++
++
++def _merge_rows(
++    left_row: Row | None,
++    right_row: Row | None,
++    on_columns: list[str],
++    left_cols: set[str],
++    right_non_join: set[str],
++    left_alias: str,
++    right_alias: str,
++) -> Row:
++    """Merge a left and right row, handling column name conflicts."""
++    merged: Row = {}
++    overlap = (left_cols - set(on_columns)) & right_non_join
++
++    # Join columns come from whichever side is present
++    for col in on_columns:
++        if left_row is not None:
++            merged[col] = left_row.get(col)
++        elif right_row is not None:
++            merged[col] = right_row.get(col)
++        else:
++            merged[col] = None
++
++    # Left columns
++    if left_row is not None:
++        for col in left_row:
++            if col in on_columns:
++                continue
++            out_name = f"{col}{left_alias}" if col in overlap else col
++            merged[out_name] = left_row[col]
++    else:
++        for col in left_cols:
++            if col in on_columns:
++                continue
++            out_name = f"{col}{left_alias}" if col in overlap else col
++            merged[out_name] = None
++
++    # Right columns
++    if right_row is not None:
++        for col in right_row:
++            if col in on_columns:
++                continue
++            out_name = f"{col}{right_alias}" if col in overlap else col
++            merged[out_name] = right_row[col]
++    else:
++        for col in right_non_join:
++            out_name = f"{col}{right_alias}" if col in overlap else col
++            merged[out_name] = None
++
++    return merged
++
++
++# ---------------------------------------------------------------------------
++# Improved join with proper right/full tracking
++# ---------------------------------------------------------------------------
++
++def op_join_full(
++    left_rows: Iterable[Row],
++    right_path: str,
++    on_columns: list[str],
++    join_type: JoinType = JoinType.INNER,
++    right_format: str | None = None,
++    left_alias: str = "_left",
++    right_alias: str = "_right",
++) -> list[Row]:
++    """Hash-join with proper support for all join types.
++
++    Returns a materialized list (needed for right/full join tracking).
++    """
++    reader = make_reader(right_path, fmt=right_format)
++    right_schema = reader.schema
++    right_all: list[Row] = list(reader.read())
++
++    # Build hash index on right side
++    right_index: dict[tuple, list[int]] = defaultdict(list)
++    for idx, row in enumerate(right_all):
++        key = tuple(row.get(c) for c in on_columns)
++        right_index[key].append(idx)
++
++    right_non_join = set(right_schema.column_names) - set(on_columns)
++    left_cols: set[str] | None = None
++    matched_right: set[int] = set()
++    results: list[Row] = []
++
++    for left_row in left_rows:
++        if left_cols is None:
++            left_cols = set(left_row.keys())
++
++        key = tuple(left_row.get(c) for c in on_columns)
++        match_indices = right_index.get(key, [])
++
++        if match_indices:
++            for ri in match_indices:
++                merged = _merge_rows(
++                    left_row, right_all[ri], on_columns,
++                    left_cols, right_non_join,
++                    left_alias, right_alias,
++                )
++                results.append(merged)
++                matched_right.add(ri)
++        elif join_type in (JoinType.LEFT, JoinType.FULL):
++            merged = _merge_rows(
++                left_row, None, on_columns,
++                left_cols, right_non_join,
++                left_alias, right_alias,
++            )
++            results.append(merged)
++
++    # Unmatched right rows
++    if join_type in (JoinType.RIGHT, JoinType.FULL):
++        if left_cols is None:
++            left_cols = set()
++        for idx, right_row in enumerate(right_all):
++            if idx not in matched_right:
++                merged = _merge_rows(
++                    None, right_row, on_columns,
++                    left_cols, right_non_join,
++                    left_alias, right_alias,
++                )
++                results.append(merged)
++
++    return results
++
++
++# ---------------------------------------------------------------------------
++# Limit (streaming)
++# ---------------------------------------------------------------------------
++
++def op_limit(rows: Iterable[Row], n: int) -> Generator[Row, None, None]:
++    """Yield at most *n* rows."""
++    yield from islice(rows, n)
++
++
++# ---------------------------------------------------------------------------
++# Distinct (materializing)
++# ---------------------------------------------------------------------------
++
++def op_distinct(
++    rows: Iterable[Row],
++    columns: list[str] | None = None,
++) -> list[Row]:
++    """Remove duplicate rows. If *columns* is given, dedup by those columns only."""
++    seen: set[tuple] = set()
++    results: list[Row] = []
++
++    for row in rows:
++        if columns:
++            key = tuple(row.get(c) for c in columns)
++        else:
++            key = tuple(sorted(row.items()))
++        if key not in seen:
++            seen.add(key)
++            results.append(row)
++
++    return results
+diff --git a/src/tablesmith/pipeline.py b/src/tablesmith/pipeline.py
+new file mode 100644
+index 0000000..384750f
+--- /dev/null
++++ b/src/tablesmith/pipeline.py
+@@ -0,0 +1,171 @@
++"""Pipeline definition loader, validator, and executor."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Generator, Iterable
++
++from tablesmith.models import (
++    JoinType,
++    NullOrder,
++    Row,
++    Schema,
++    SortOrder,
++    SortSpec,
++    ValidationError,
++)
++from tablesmith.operations import (
++    op_distinct,
++    op_filter,
++    op_group,
++    op_having,
++    op_join_full,
++    op_limit,
++    op_project,
++    op_sort,
++    parse_agg_spec,
++)
++from tablesmith.readers import make_reader
++
++
++def load_pipeline(path: str | Path) -> dict[str, Any]:
++    """Load a pipeline definition from a JSON file."""
++    p = Path(path)
++    if not p.exists():
++        raise ValidationError(f"Pipeline file not found: {p}")
++    with open(p, "r", encoding="utf-8") as f:
++        try:
++            data = json.load(f)
++        except json.JSONDecodeError as e:
++            raise ValidationError(f"Invalid JSON in pipeline file: {e}") from e
++
++    if "steps" not in data:
++        raise ValidationError("Pipeline must have a 'steps' array")
++    if not isinstance(data["steps"], list):
++        raise ValidationError("'steps' must be a JSON array")
++    return data
++
++
++def validate_pipeline(data: dict[str, Any]) -> list[str]:
++    """Validate a pipeline definition and return a list of error messages."""
++    errors: list[str] = []
++
++    if "input" not in data and "steps" in data:
++        # input can be implicit for piped data, but we flag it
++        pass
++
++    steps = data.get("steps", [])
++    valid_ops = {"filter", "project", "sort", "group", "having", "join", "limit", "distinct"}
++
++    for i, step in enumerate(steps):
++        if not isinstance(step, dict):
++            errors.append(f"Step {i}: must be a JSON object")
++            continue
++        op = step.get("op")
++        if op not in valid_ops:
++            errors.append(f"Step {i}: unknown operation '{op}'. Valid: {', '.join(sorted(valid_ops))}")
++            continue
++
++        if op == "filter" and "expr" not in step:
++            errors.append(f"Step {i} (filter): missing 'expr'")
++        if op == "project" and "columns" not in step:
++            errors.append(f"Step {i} (project): missing 'columns'")
++        if op == "sort" and "by" not in step:
++            errors.append(f"Step {i} (sort): missing 'by'")
++        if op == "group" and ("by" not in step or "aggs" not in step):
++            errors.append(f"Step {i} (group): missing 'by' and/or 'aggs'")
++        if op == "having" and "expr" not in step:
++            errors.append(f"Step {i} (having): missing 'expr'")
++        if op == "join":
++            if "file" not in step:
++                errors.append(f"Step {i} (join): missing 'file'")
++            if "on" not in step:
++                errors.append(f"Step {i} (join): missing 'on'")
++        if op == "limit" and "n" not in step:
++            errors.append(f"Step {i} (limit): missing 'n'")
++
++    return errors
++
++
++def execute_pipeline(data: dict[str, Any]) -> Iterable[Row]:
++    """Execute a pipeline and return the resulting rows (may be a generator)."""
++    input_path = data.get("input")
++    if not input_path:
++        raise ValidationError("Pipeline must specify an 'input' file path")
++
++    input_format = data.get("input_format")
++    reader = make_reader(input_path, fmt=input_format)
++    schema = reader.schema
++    rows: Iterable[Row] = reader.read()
++
++    for step in data["steps"]:
++        rows = _execute_step(step, rows, schema)
++        # After materializing operations, update schema if we can
++        # (operations that materialize return lists, not generators)
++
++    return rows
++
++
++def _execute_step(step: dict, rows: Iterable[Row], schema: Schema) -> Iterable[Row]:
++    """Execute a single pipeline step."""
++    op = step["op"]
++
++    if op == "filter":
++        return op_filter(rows, step["expr"], schema)
++
++    if op == "project":
++        cols = step["columns"]
++        return op_project(rows, cols, schema)
++
++    if op == "sort":
++        specs = _parse_sort_specs(step["by"])
++        return op_sort(rows, specs)
++
++    if op == "group":
++        group_cols = step["by"]
++        agg_texts = step["aggs"]
++        agg_specs = [parse_agg_spec(a) for a in agg_texts]
++        return op_group(rows, group_cols, agg_specs)
++
++    if op == "having":
++        return op_having(rows, step["expr"], schema)
++
++    if op == "join":
++        join_type = JoinType(step.get("type", "inner"))
++        on_cols = step["on"]
++        right_fmt = step.get("format")
++        left_alias = step.get("left_alias", "_left")
++        right_alias = step.get("right_alias", "_right")
++        return op_join_full(
++            rows, step["file"], on_cols, join_type,
++            right_format=right_fmt,
++            left_alias=left_alias,
++            right_alias=right_alias,
++        )
++
++    if op == "limit":
++        return op_limit(rows, int(step["n"]))
++
++    if op == "distinct":
++        cols = step.get("columns")
++        return op_distinct(rows, columns=cols)
++
++    raise ValidationError(f"Unknown operation: {op!r}")
++
++
++def _parse_sort_specs(by: list) -> list[SortSpec]:
++    """Parse sort specification from pipeline JSON."""
++    specs: list[SortSpec] = []
++    for item in by:
++        if isinstance(item, str):
++            specs.append(SortSpec(column=item))
++        elif isinstance(item, dict):
++            col = item["column"]
++            order = SortOrder(item.get("order", "asc"))
++            null_order_str = item.get("nulls", "nulls_last")
++            null_order = NullOrder(null_order_str)
++            specs.append(SortSpec(column=col, order=order, null_order=null_order))
++        else:
++            raise ValidationError(f"Invalid sort spec: {item!r}")
++    return specs
+diff --git a/src/tablesmith/readers.py b/src/tablesmith/readers.py
+new file mode 100644
+index 0000000..b830b99
+--- /dev/null
++++ b/src/tablesmith/readers.py
+@@ -0,0 +1,373 @@
++"""Data readers for CSV, JSON, and JSONL with type inference and streaming."""
++
++from __future__ import annotations
++
++import csv
++import io
++import json
++import sys
++from pathlib import Path
++from typing import Generator, TextIO
++
++from tablesmith.models import Column, ColumnType, DataError, Row, Schema
++
++
++# ---------------------------------------------------------------------------
++# Type inference
++# ---------------------------------------------------------------------------
++
++_TYPE_SAMPLE_SIZE = 100
++
++
++def _try_int(v: str) -> bool:
++    try:
++        int(v)
++        return True
++    except (ValueError, OverflowError):
++        return False
++
++
++def _try_float(v: str) -> bool:
++    try:
++        float(v)
++        return True
++    except (ValueError, OverflowError):
++        return False
++
++
++def _is_bool(v: str) -> bool:
++    return v.lower() in ("true", "false", "1", "0")
++
++
++def infer_column_type(values: list[Any]) -> ColumnType:
++    """Infer the column type from a sample of non-null values."""
++    non_null = [v for v in values if v is not None]
++    if not non_null:
++        return ColumnType.STRING  # All nulls — default to string
++
++    # Check if already typed (from JSON)
++    if all(isinstance(v, bool) for v in non_null):
++        return ColumnType.BOOLEAN
++    if all(isinstance(v, int) and not isinstance(v, bool) for v in non_null):
++        return ColumnType.INTEGER
++    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in non_null):
++        return ColumnType.FLOAT
++
++    # String-based inference (from CSV)
++    str_vals = [str(v) for v in non_null]
++
++    if all(_is_bool(s) for s in str_vals):
++        return ColumnType.BOOLEAN
++    if all(_try_int(s) for s in str_vals):
++        return ColumnType.INTEGER
++    if all(_try_float(s) for s in str_vals):
++        return ColumnType.FLOAT
++    return ColumnType.STRING
++
++
++def _coerce_value(value: Any, col_type: ColumnType) -> Any:
++    """Coerce a raw value to its inferred type."""
++    if value is None:
++        return None
++    if col_type == ColumnType.INTEGER:
++        try:
++            return int(value) if not isinstance(value, int) or isinstance(value, bool) else value
++        except (ValueError, TypeError):
++            return value
++    if col_type == ColumnType.FLOAT:
++        try:
++            return float(value) if not isinstance(value, float) else value
++        except (ValueError, TypeError):
++            return value
++    if col_type == ColumnType.BOOLEAN:
++        if isinstance(value, bool):
++            return value
++        s = str(value).lower()
++        if s in ("true", "1"):
++            return True
++        if s in ("false", "0"):
++            return False
++        return value
++    return value  # STRING
++
++
++# We need Any for type inference
++from typing import Any
++
++
++# ---------------------------------------------------------------------------
++# CSV Reader
++# ---------------------------------------------------------------------------
++
++class CSVReader:
++    """Streaming CSV reader with type inference."""
++
++    def __init__(
++        self,
++        path: str | Path,
++        delimiter: str = ",",
++        quotechar: str = '"',
++        encoding: str = "utf-8",
++    ) -> None:
++        self._path = Path(path)
++        self._delimiter = delimiter
++        self._quotechar = quotechar
++        self._encoding = encoding
++        self._schema: Schema | None = None
++        self._skipped_count = 0
++
++    @property
++    def schema(self) -> Schema:
++        if self._schema is None:
++            self._infer_schema()
++        return self._schema  # type: ignore[return-value]
++
++    @property
++    def skipped_count(self) -> int:
++        return self._skipped_count
++
++    def _infer_schema(self) -> None:
++        samples: dict[str, list[Any]] = {}
++        headers: list[str] = []
++        count = 0
++
++        with open(self._path, "r", encoding=self._encoding, newline="") as f:
++            reader = csv.reader(f, delimiter=self._delimiter, quotechar=self._quotechar)
++            headers = next(reader)
++            for h in headers:
++                samples[h] = []
++
++            for row_values in reader:
++                if count >= _TYPE_SAMPLE_SIZE:
++                    break
++                if len(row_values) != len(headers):
++                    continue  # Skip malformed for inference
++                for h, v in zip(headers, row_values):
++                    samples[h].append(None if v == "" else v)
++                count += 1
++
++        columns = []
++        for h in headers:
++            col_type = infer_column_type(samples.get(h, []))
++            columns.append(Column(name=h, col_type=col_type))
++        self._schema = Schema(columns=columns)
++
++    def read(self) -> Generator[Row, None, None]:
++        """Yield rows one at a time as dicts, coercing to inferred types."""
++        schema = self.schema
++        headers = schema.column_names
++        col_types = {c.name: c.col_type for c in schema.columns}
++        self._skipped_count = 0
++        line_num = 1  # Header is line 1
++
++        with open(self._path, "r", encoding=self._encoding, newline="") as f:
++            reader = csv.reader(f, delimiter=self._delimiter, quotechar=self._quotechar)
++            next(reader)  # Skip header
++            for row_values in reader:
++                line_num += 1
++                if len(row_values) != len(headers):
++                    print(
++                        f"Warning: {self._path}:{line_num}: expected {len(headers)} "
++                        f"columns, got {len(row_values)} — skipping row",
++                        file=sys.stderr,
++                    )
++                    self._skipped_count += 1
++                    continue
++                row: Row = {}
++                for h, v in zip(headers, row_values):
++                    raw = None if v == "" else v
++                    row[h] = _coerce_value(raw, col_types[h])
++                yield row
++
++
++# ---------------------------------------------------------------------------
++# JSON Reader
++# ---------------------------------------------------------------------------
++
++class JSONReader:
++    """Reader for JSON arrays of objects."""
++
++    def __init__(self, path: str | Path) -> None:
++        self._path = Path(path)
++        self._schema: Schema | None = None
++
++    @property
++    def schema(self) -> Schema:
++        if self._schema is None:
++            self._infer_schema()
++        return self._schema  # type: ignore[return-value]
++
++    def _infer_schema(self) -> None:
++        data = self._load_all()
++        if not data:
++            self._schema = Schema(columns=[])
++            return
++
++        # Collect all column names preserving first-seen order
++        col_names: list[str] = []
++        seen: set[str] = set()
++        samples: dict[str, list[Any]] = {}
++
++        for i, obj in enumerate(data):
++            for key in obj:
++                if key not in seen:
++                    col_names.append(key)
++                    seen.add(key)
++                    samples[key] = []
++
++            if i < _TYPE_SAMPLE_SIZE:
++                for key in col_names:
++                    val = obj.get(key)  # Missing key → None
++                    samples.setdefault(key, []).append(val)
++
++        columns = [Column(name=n, col_type=infer_column_type(samples.get(n, []))) for n in col_names]
++        self._schema = Schema(columns=columns)
++
++    def _load_all(self) -> list[dict]:
++        with open(self._path, "r", encoding="utf-8") as f:
++            data = json.load(f)
++        if not isinstance(data, list):
++            raise DataError(f"{self._path}: expected a JSON array at top level")
++        return data
++
++    def read(self) -> Generator[Row, None, None]:
++        schema = self.schema
++        col_types = {c.name: c.col_type for c in schema.columns}
++        headers = set(schema.column_names)
++        data = self._load_all()
++
++        for obj in data:
++            row: Row = {}
++            for h in schema.column_names:
++                raw = obj.get(h)
++                row[h] = _coerce_value(raw, col_types[h])
++            yield row
++
++
++# ---------------------------------------------------------------------------
++# JSONL Reader
++# ---------------------------------------------------------------------------
++
++class JSONLReader:
++    """Streaming reader for JSON Lines (one JSON object per line)."""
++
++    def __init__(self, path: str | Path) -> None:
++        self._path = Path(path)
++        self._schema: Schema | None = None
++        self._skipped_count = 0
++
++    @property
++    def schema(self) -> Schema:
++        if self._schema is None:
++            self._infer_schema()
++        return self._schema  # type: ignore[return-value]
++
++    @property
++    def skipped_count(self) -> int:
++        return self._skipped_count
++
++    def _infer_schema(self) -> None:
++        col_names: list[str] = []
++        seen: set[str] = set()
++        samples: dict[str, list[Any]] = {}
++        count = 0
++
++        with open(self._path, "r", encoding="utf-8") as f:
++            for line in f:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    obj = json.loads(line)
++                except json.JSONDecodeError:
++                    continue
++                if not isinstance(obj, dict):
++                    continue
++
++                for key in obj:
++                    if key not in seen:
++                        col_names.append(key)
++                        seen.add(key)
++                        samples[key] = []
++
++                if count < _TYPE_SAMPLE_SIZE:
++                    for key in col_names:
++                        samples.setdefault(key, []).append(obj.get(key))
++
++                count += 1
++                if count >= _TYPE_SAMPLE_SIZE:
++                    break
++
++        columns = [Column(name=n, col_type=infer_column_type(samples.get(n, []))) for n in col_names]
++        self._schema = Schema(columns=columns)
++
++    def read(self) -> Generator[Row, None, None]:
++        schema = self.schema
++        col_types = {c.name: c.col_type for c in schema.columns}
++        self._skipped_count = 0
++        line_num = 0
++
++        with open(self._path, "r", encoding="utf-8") as f:
++            for line in f:
++                line_num += 1
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    obj = json.loads(line)
++                except json.JSONDecodeError as e:
++                    print(
++                        f"Warning: {self._path}:{line_num}: invalid JSON — {e} — skipping",
++                        file=sys.stderr,
++                    )
++                    self._skipped_count += 1
++                    continue
++                if not isinstance(obj, dict):
++                    self._skipped_count += 1
++                    continue
++
++                row: Row = {}
++                for h in schema.column_names:
++                    raw = obj.get(h)
++                    row[h] = _coerce_value(raw, col_types[h])
++                yield row
++
++
++# ---------------------------------------------------------------------------
++# Factory
++# ---------------------------------------------------------------------------
++
++def detect_format(path: str | Path) -> str:
++    """Detect file format by extension."""
++    p = Path(path)
++    ext = p.suffix.lower()
++    if ext == ".csv":
++        return "csv"
++    if ext == ".json":
++        return "json"
++    if ext == ".jsonl":
++        return "jsonl"
++    raise DataError(
++        f"Cannot detect format for '{p.name}'. "
++        "Use --format=csv|json|jsonl to specify explicitly."
++    )
++
++
++def make_reader(
++    path: str | Path,
++    fmt: str | None = None,
++    delimiter: str = ",",
++    quotechar: str = '"',
++    encoding: str = "utf-8",
++) -> CSVReader | JSONReader | JSONLReader:
++    """Create a reader for the given file path and format."""
++    if fmt is None:
++        fmt = detect_format(path)
++
++    if fmt == "csv":
++        return CSVReader(path, delimiter=delimiter, quotechar=quotechar, encoding=encoding)
++    if fmt == "json":
++        return JSONReader(path)
++    if fmt == "jsonl":
++        return JSONLReader(path)
++    raise DataError(f"Unknown format: {fmt!r}")
+diff --git a/src/tablesmith/writers.py b/src/tablesmith/writers.py
+new file mode 100644
+index 0000000..75378f0
+--- /dev/null
++++ b/src/tablesmith/writers.py
+@@ -0,0 +1,177 @@
++"""Output writers: CSV, JSON, JSONL, and formatted table."""
++
++from __future__ import annotations
++
++import csv
++import io
++import json
++import sys
++from pathlib import Path
++from typing import Any, Iterable, TextIO
++
++from tablesmith.models import Row
++
++
++# ---------------------------------------------------------------------------
++# CSV Writer
++# ---------------------------------------------------------------------------
++
++def write_csv(
++    rows: Iterable[Row],
++    output: TextIO | None = None,
++    delimiter: str = ",",
++    quotechar: str = '"',
++) -> None:
++    """Write rows as CSV to *output* (defaults to stdout)."""
++    out = output or sys.stdout
++    writer = None
++    headers: list[str] | None = None
++
++    for row in rows:
++        if headers is None:
++            headers = list(row.keys())
++            writer = csv.writer(
++                out, delimiter=delimiter, quotechar=quotechar,
++                lineterminator="\n",
++            )
++            writer.writerow(headers)
++        assert writer is not None
++        writer.writerow([_csv_encode(row.get(h)) for h in headers])
++
++
++def _csv_encode(value: Any) -> str:
++    if value is None:
++        return ""
++    if isinstance(value, bool):
++        return str(value).lower()
++    return str(value)
++
++
++# ---------------------------------------------------------------------------
++# JSON Writer
++# ---------------------------------------------------------------------------
++
++def write_json(
++    rows: Iterable[Row],
++    output: TextIO | None = None,
++) -> None:
++    """Write rows as a JSON array to *output* (defaults to stdout)."""
++    out = output or sys.stdout
++    materialized = list(rows)
++    # Convert None to JSON null (json.dumps handles this natively)
++    json.dump(materialized, out, indent=2, default=str)
++    out.write("\n")
++
++
++# ---------------------------------------------------------------------------
++# JSONL Writer
++# ---------------------------------------------------------------------------
++
++def write_jsonl(
++    rows: Iterable[Row],
++    output: TextIO | None = None,
++) -> None:
++    """Write rows as JSON Lines to *output* (defaults to stdout)."""
++    out = output or sys.stdout
++    for row in rows:
++        json.dump(row, out, default=str)
++        out.write("\n")
++
++
++# ---------------------------------------------------------------------------
++# Table Writer (human-readable)
++# ---------------------------------------------------------------------------
++
++_MAX_COL_WIDTH = 40
++
++
++def write_table(
++    rows: Iterable[Row],
++    output: TextIO | None = None,
++) -> None:
++    """Write rows as a human-readable aligned table to *output*."""
++    out = output or sys.stdout
++    materialized = list(rows)
++
++    if not materialized:
++        out.write("(empty result set)\n")
++        return
++
++    headers = list(materialized[0].keys())
++
++    # Compute column widths
++    widths: dict[str, int] = {}
++    for h in headers:
++        widths[h] = len(h)
++    for row in materialized:
++        for h in headers:
++            val = _format_cell(row.get(h))
++            widths[h] = max(widths[h], len(val))
++
++    # Cap at max width
++    for h in headers:
++        widths[h] = min(widths[h], _MAX_COL_WIDTH)
++
++    # Header row
++    header_line = " | ".join(h.ljust(widths[h])[:widths[h]] for h in headers)
++    separator = "-+-".join("-" * widths[h] for h in headers)
++    out.write(header_line + "\n")
++    out.write(separator + "\n")
++
++    # Data rows
++    for row in materialized:
++        cells = []
++        for h in headers:
++            val = _format_cell(row.get(h))
++            if len(val) > widths[h]:
++                val = val[: widths[h] - 3] + "..."
++            cells.append(val.ljust(widths[h]))
++        out.write(" | ".join(cells) + "\n")
++
++    out.write(f"\n({len(materialized)} row{'s' if len(materialized) != 1 else ''})\n")
++
++
++def _format_cell(value: Any) -> str:
++    if value is None:
++        return "NULL"
++    if isinstance(value, bool):
++        return str(value).lower()
++    if isinstance(value, float):
++        # Avoid excessive decimals
++        if value == int(value):
++            return str(int(value))
++        return f"{value:.4f}".rstrip("0").rstrip(".")
++    return str(value)
++
++
++# ---------------------------------------------------------------------------
++# Writer dispatch
++# ---------------------------------------------------------------------------
++
++def write_output(
++    rows: Iterable[Row],
++    fmt: str = "table",
++    path: str | None = None,
++    delimiter: str = ",",
++    quotechar: str = '"',
++) -> None:
++    """Write rows in the specified format to a path or stdout."""
++    if path:
++        f = open(path, "w", encoding="utf-8")
++    else:
++        f = None
++
++    try:
++        if fmt == "csv":
++            write_csv(rows, output=f, delimiter=delimiter, quotechar=quotechar)
++        elif fmt == "json":
++            write_json(rows, output=f)
++        elif fmt == "jsonl":
++            write_jsonl(rows, output=f)
++        elif fmt == "table":
++            write_table(rows, output=f)
++        else:
++            raise ValueError(f"Unknown output format: {fmt!r}")
++    finally:
++        if f is not None:
++            f.close()
+diff --git a/tests/test_expression.py b/tests/test_expression.py
+new file mode 100644
+index 0000000..a6e3f60
+--- /dev/null
++++ b/tests/test_expression.py
+@@ -0,0 +1,332 @@
++"""Tests for the expression tokenizer, parser, and evaluator."""
++
++import pytest
++
++from tablesmith.expression import (
++    AliasNode,
++    BinaryOpNode,
++    ColumnRefNode,
++    LiteralNode,
++    NullCheckNode,
++    UnaryOpNode,
++    eval_filter,
++    evaluate,
++    parse_filter,
++    parse_project_list,
++    tokenize,
++    TT,
++)
++from tablesmith.models import ExpressionError, Schema, Column, ColumnType
++
++
++# ---------------------------------------------------------------------------
++# Tokenizer tests
++# ---------------------------------------------------------------------------
++
++class TestTokenizer:
++    def test_simple_comparison(self):
++        tokens = tokenize("age > 30")
++        types = [t.tt for t in tokens]
++        assert types == [TT.IDENT, TT.GT, TT.INTEGER, TT.EOF]
++
++    def test_string_literal_with_spaces(self):
++        tokens = tokenize("name = 'John Doe'")
++        assert tokens[0].tt == TT.IDENT
++        assert tokens[0].value == "name"
++        assert tokens[1].tt == TT.EQ
++        assert tokens[2].tt == TT.STRING
++        assert tokens[2].value == "John Doe"
++
++    def test_string_literal_with_escaped_quote(self):
++        tokens = tokenize(r"name = 'O\'Brien'")
++        assert tokens[2].value == "O'Brien"
++
++    def test_keyword_in_string_not_matched(self):
++        """'ANDROID Team' should be a single string, not broken by 'AND'."""
++        tokens = tokenize("dept = 'ANDROID Team'")
++        assert tokens[2].tt == TT.STRING
++        assert tokens[2].value == "ANDROID Team"
++
++    def test_compound_expression(self):
++        tokens = tokenize("age > 30 AND dept != 'HR'")
++        types = [t.tt for t in tokens]
++        assert TT.AND in types
++        assert TT.NEQ in types
++
++    def test_parentheses(self):
++        tokens = tokenize("(a > 1) OR (b < 2)")
++        types = [t.tt for t in tokens]
++        assert types.count(TT.LPAREN) == 2
++        assert types.count(TT.RPAREN) == 2
++
++    def test_float_literal(self):
++        tokens = tokenize("salary > 50000.50")
++        assert tokens[2].tt == TT.FLOAT
++        assert tokens[2].value == 50000.50
++
++    def test_boolean_literal(self):
++        tokens = tokenize("active = true")
++        assert tokens[2].tt == TT.BOOLEAN
++        assert tokens[2].value is True
++
++    def test_null_literal(self):
++        tokens = tokenize("val = NULL")
++        assert tokens[2].tt == TT.NULL_LIT
++
++    def test_concat_operator(self):
++        tokens = tokenize("a || b")
++        assert tokens[1].tt == TT.CONCAT
++
++    def test_is_null_operator(self):
++        tokens = tokenize("email is_null")
++        assert tokens[1].tt == TT.IS_NULL
++
++    def test_is_not_null_operator(self):
++        tokens = tokenize("email is_not_null")
++        assert tokens[1].tt == TT.IS_NOT_NULL
++
++    def test_unterminated_string(self):
++        with pytest.raises(ExpressionError, match="Unterminated string"):
++            tokenize("name = 'abc")
++
++    def test_unexpected_character(self):
++        with pytest.raises(ExpressionError, match="Unexpected character"):
++            tokenize("a @ b")
++
++
++# ---------------------------------------------------------------------------
++# Parser tests
++# ---------------------------------------------------------------------------
++
++class TestParser:
++    def test_simple_comparison(self):
++        ast = parse_filter("age > 30")
++        assert isinstance(ast, BinaryOpNode)
++        assert ast.op == ">"
++        assert isinstance(ast.left, ColumnRefNode)
++        assert isinstance(ast.right, LiteralNode)
++        assert ast.right.value == 30
++
++    def test_and_or_precedence(self):
++        """AND binds tighter than OR."""
++        ast = parse_filter("a = 1 OR b = 2 AND c = 3")
++        # Should parse as: a=1 OR (b=2 AND c=3)
++        assert isinstance(ast, BinaryOpNode)
++        assert ast.op == "OR"
++        assert isinstance(ast.right, BinaryOpNode)
++        assert ast.right.op == "AND"
++
++    def test_not_operator(self):
++        ast = parse_filter("NOT active = true")
++        assert isinstance(ast, UnaryOpNode)
++        assert ast.op == "NOT"
++
++    def test_parentheses_override_precedence(self):
++        ast = parse_filter("(a = 1 OR b = 2) AND c = 3")
++        assert isinstance(ast, BinaryOpNode)
++        assert ast.op == "AND"
++        assert isinstance(ast.left, BinaryOpNode)
++        assert ast.left.op == "OR"
++
++    def test_is_null(self):
++        ast = parse_filter("email is_null")
++        assert isinstance(ast, NullCheckNode)
++        assert ast.is_null is True
++
++    def test_is_not_null(self):
++        ast = parse_filter("email is_not_null")
++        assert isinstance(ast, NullCheckNode)
++        assert ast.is_null is False
++
++    def test_string_operators(self):
++        for op in ["contains", "startswith", "endswith"]:
++            ast = parse_filter(f"name {op} 'test'")
++            assert isinstance(ast, BinaryOpNode)
++            assert ast.op == op
++
++    def test_arithmetic_in_filter(self):
++        ast = parse_filter("salary * 1.1 > 50000")
++        assert isinstance(ast, BinaryOpNode)
++        assert ast.op == ">"
++        assert isinstance(ast.left, BinaryOpNode)
++        assert ast.left.op == "*"
++
++
++class TestProjectParser:
++    def test_simple_columns(self):
++        items = parse_project_list("name, age, dept")
++        assert len(items) == 3
++        assert all(isinstance(i, AliasNode) for i in items)
++        assert items[0].alias == "name"
++        assert items[1].alias == "age"
++
++    def test_alias(self):
++        items = parse_project_list("salary * 1.1 AS adjusted")
++        assert len(items) == 1
++        assert items[0].alias == "adjusted"
++
++    def test_concat(self):
++        items = parse_project_list("first || ' ' || last AS full_name")
++        assert items[0].alias == "full_name"
++
++    def test_mixed(self):
++        items = parse_project_list("name, salary * 12 AS annual")
++        assert len(items) == 2
++        assert items[0].alias == "name"
++        assert items[1].alias == "annual"
++
++
++# ---------------------------------------------------------------------------
++# Evaluator tests — NULL semantics (SQL three-valued logic)
++# ---------------------------------------------------------------------------
++
++class TestEvaluatorNulls:
++    def test_null_equals_null_is_null(self):
++        row = {"a": None}
++        ast = parse_filter("a = NULL")
++        result = evaluate(ast, row)
++        assert result is None  # NULL = NULL => NULL
++
++    def test_null_gt_number_is_null(self):
++        row = {"a": None}
++        ast = parse_filter("a > 5")
++        result = evaluate(ast, row)
++        assert result is None
++
++    def test_not_null_comparison_is_null(self):
++        """NOT (NULL > 5) => NOT NULL => NULL."""
++        row = {"a": None}
++        ast = parse_filter("NOT (a > 5)")
++        result = evaluate(ast, row)
++        assert result is None
++
++    def test_is_null_on_null(self):
++        row = {"a": None}
++        assert eval_filter("a is_null", row) is True
++
++    def test_is_null_on_value(self):
++        row = {"a": 5}
++        assert eval_filter("a is_null", row) is False
++
++    def test_is_not_null_on_null(self):
++        row = {"a": None}
++        assert eval_filter("a is_not_null", row) is False
++
++    def test_is_not_null_on_value(self):
++        row = {"a": 5}
++        assert eval_filter("a is_not_null", row) is True
++
++    def test_null_and_true_is_null(self):
++        row = {"a": None, "b": 5}
++        ast = parse_filter("a > 1 AND b > 1")
++        result = evaluate(ast, row)
++        # a>1 is NULL, b>1 is True => NULL AND True => NULL
++        assert result is None
++
++    def test_false_and_null_is_false(self):
++        row = {"a": None, "b": 0}
++        ast = parse_filter("b > 1 AND a > 1")
++        result = evaluate(ast, row)
++        # b>1 is False => False AND anything => False
++        assert result is False
++
++    def test_null_or_true_is_true(self):
++        row = {"a": None, "b": 5}
++        ast = parse_filter("a > 1 OR b > 1")
++        result = evaluate(ast, row)
++        assert result is True
++
++    def test_null_or_false_is_null(self):
++        row = {"a": None, "b": 0}
++        ast = parse_filter("a > 1 OR b > 1")
++        result = evaluate(ast, row)
++        assert result is None
++
++    def test_null_arithmetic_yields_null(self):
++        row = {"a": None, "b": 5}
++        ast = parse_filter("a + b > 0")
++        result = evaluate(ast, row)
++        assert result is None  # NULL + 5 => NULL, NULL > 0 => NULL
++
++    def test_eval_filter_null_is_false(self):
++        """eval_filter converts NULL to False for filtering."""
++        row = {"a": None}
++        assert eval_filter("a > 5", row) is False
++
++
++class TestEvaluatorComparisons:
++    def test_eq(self):
++        assert eval_filter("x = 10", {"x": 10}) is True
++        assert eval_filter("x = 10", {"x": 5}) is False
++
++    def test_neq(self):
++        assert eval_filter("x != 10", {"x": 5}) is True
++
++    def test_gt_lt(self):
++        assert eval_filter("x > 5", {"x": 10}) is True
++        assert eval_filter("x < 5", {"x": 10}) is False
++
++    def test_gte_lte(self):
++        assert eval_filter("x >= 10", {"x": 10}) is True
++        assert eval_filter("x <= 10", {"x": 10}) is True
++
++    def test_string_comparison(self):
++        assert eval_filter("name = 'Alice'", {"name": "Alice"}) is True
++        assert eval_filter("name != 'Alice'", {"name": "Bob"}) is True
++
++    def test_contains(self):
++        assert eval_filter("msg contains 'error'", {"msg": "fatal error occurred"}) is True
++        assert eval_filter("msg contains 'error'", {"msg": "all good"}) is False
++
++    def test_startswith(self):
++        assert eval_filter("name startswith 'Al'", {"name": "Alice"}) is True
++
++    def test_endswith(self):
++        assert eval_filter("name endswith 'ce'", {"name": "Alice"}) is True
++
++    def test_division_by_zero_yields_null(self):
++        row = {"a": 10, "b": 0}
++        ast = parse_filter("a / b > 0")
++        result = evaluate(ast, row)
++        assert result is None  # 10/0 => NULL, NULL > 0 => NULL
++
++    def test_column_not_found(self):
++        with pytest.raises(ExpressionError, match="not found"):
++            eval_filter("nonexistent > 5", {"x": 1})
++
++
++class TestEvaluatorArithmetic:
++    def test_add_int(self):
++        items = parse_project_list("a + b AS total")
++        result = evaluate(items[0], {"a": 3, "b": 4})
++        assert result == 7
++
++    def test_int_plus_float(self):
++        items = parse_project_list("a + b AS total")
++        result = evaluate(items[0], {"a": 3, "b": 1.5})
++        assert result == 4.5
++
++    def test_multiply(self):
++        items = parse_project_list("salary * 1.1 AS adjusted")
++        result = evaluate(items[0], {"salary": 50000})
++        assert result == pytest.approx(55000.0)
++
++    def test_divide_by_zero(self):
++        items = parse_project_list("a / b AS ratio")
++        result = evaluate(items[0], {"a": 10, "b": 0})
++        assert result is None
++
++    def test_null_arithmetic(self):
++        items = parse_project_list("a + b AS total")
++        result = evaluate(items[0], {"a": None, "b": 5})
++        assert result is None
++
++    def test_string_concat(self):
++        items = parse_project_list("first || ' ' || last AS name")
++        result = evaluate(items[0], {"first": "John", "last": "Doe"})
++        assert result == "John Doe"
++
++    def test_unary_minus(self):
++        items = parse_project_list("-salary AS neg")
++        result = evaluate(items[0], {"salary": 50000})
++        assert result == -50000
+diff --git a/tests/test_integration.py b/tests/test_integration.py
+new file mode 100644
+index 0000000..b35546e
+--- /dev/null
++++ b/tests/test_integration.py
+@@ -0,0 +1,272 @@
++"""Integration tests: end-to-end pipeline execution scenarios."""
++
++import json
++import io
++import os
++import tempfile
++
++import pytest
++
++from tablesmith.cli import main
++from tablesmith.pipeline import execute_pipeline
++from tablesmith.writers import write_output
++
++
++class TestEndToEndPipeline:
++    """Full pipeline: multi-step transforms on real CSV data."""
++
++    def _write_csv(self, name: str, content: str) -> str:
++        f = tempfile.NamedTemporaryFile(
++            mode="w", suffix=f"_{name}.csv", delete=False, encoding="utf-8"
++        )
++        f.write(content)
++        f.close()
++        return f.name
++
++    def test_filter_join_group_sort_limit(self):
++        """filter → join → group → sort → limit pipeline."""
++        employees_csv = self._write_csv(
++            "employees",
++            "id,name,age,dept\n"
++            "1,Alice,35,Engineering\n"
++            "2,Bob,28,HR\n"
++            "3,Carol,40,Engineering\n"
++            "4,Dave,32,Engineering\n"
++            "5,Eve,25,Marketing\n"
++            "6,Frank,38,HR\n"
++        )
++        salaries_csv = self._write_csv(
++            "salaries",
++            "id,salary\n"
++            "1,90000\n"
++            "2,60000\n"
++            "3,95000\n"
++            "4,85000\n"
++            "5,70000\n"
++            "6,65000\n"
++        )
++        try:
++            data = {
++                "input": employees_csv,
++                "steps": [
++                    {"op": "filter", "expr": "age > 27"},
++                    {"op": "join", "file": salaries_csv, "on": ["id"], "type": "left"},
++                    {"op": "group", "by": ["dept"], "aggs": [
++                        "count(*) AS headcount",
++                        "avg(salary) AS avg_salary",
++                    ]},
++                    {"op": "sort", "by": [{"column": "avg_salary", "order": "desc"}]},
++                    {"op": "limit", "n": 10},
++                ],
++            }
++            rows = list(execute_pipeline(data))
++
++            # After filter (age>27): Alice(35), Carol(40), Dave(32), Frank(38), Bob(28)
++            # After join: adds salary column
++            # After group: Engineering(Alice,Carol,Dave), HR(Bob,Frank)
++            # avg_salary for Engineering = (90000+95000+85000)/3 = 90000
++            # avg_salary for HR = (60000+65000)/2 = 62500
++            assert len(rows) >= 1
++            assert rows[0]["dept"] == "Engineering"
++            assert rows[0]["avg_salary"] == 90000.0
++        finally:
++            os.unlink(employees_csv)
++            os.unlink(salaries_csv)
++
++    def test_project_with_concat_and_arithmetic(self):
++        csv_path = self._write_csv(
++            "people",
++            "first,last,hourly_rate,hours\n"
++            "John,Doe,25,40\n"
++            "Jane,Smith,30,35\n"
++        )
++        try:
++            data = {
++                "input": csv_path,
++                "steps": [
++                    {"op": "project", "columns": [
++                        "first || ' ' || last AS full_name",
++                        "hourly_rate * hours AS total_pay",
++                    ]},
++                ],
++            }
++            rows = list(execute_pipeline(data))
++            assert rows[0]["full_name"] == "John Doe"
++            assert rows[0]["total_pay"] == 1000
++            assert rows[1]["total_pay"] == 1050
++        finally:
++            os.unlink(csv_path)
++
++    def test_distinct_operation(self):
++        csv_path = self._write_csv(
++            "dupes",
++            "dept,role\nA,dev\nA,dev\nA,mgr\nB,dev\n"
++        )
++        try:
++            data = {
++                "input": csv_path,
++                "steps": [{"op": "distinct"}],
++            }
++            rows = list(execute_pipeline(data))
++            assert len(rows) == 3  # 3 unique rows
++        finally:
++            os.unlink(csv_path)
++
++
++class TestCLI:
++    """Test CLI subcommands via main()."""
++
++    def _write_csv(self, content: str) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8")
++        f.write(content)
++        f.close()
++        return f.name
++
++    def _write_pipeline(self, data: dict) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
++        json.dump(data, f)
++        f.close()
++        return f.name
++
++    def test_version(self, capsys):
++        code = main(["version"])
++        assert code == 0
++        captured = capsys.readouterr()
++        assert "tablesmith" in captured.out
++
++    def test_inspect(self, capsys):
++        csv_path = self._write_csv("name,age\nAlice,30\nBob,25\n")
++        try:
++            code = main(["inspect", csv_path])
++            assert code == 0
++            out = capsys.readouterr().out
++            assert "name" in out
++            assert "age" in out
++            assert "Rows: 2" in out
++        finally:
++            os.unlink(csv_path)
++
++    def test_validate_valid(self, capsys):
++        csv_path = self._write_csv("a,b\n1,2\n")
++        pipeline_path = self._write_pipeline({
++            "input": csv_path,
++            "steps": [{"op": "filter", "expr": "a > 0"}],
++        })
++        try:
++            code = main(["validate", pipeline_path])
++            assert code == 0
++        finally:
++            os.unlink(csv_path)
++            os.unlink(pipeline_path)
++
++    def test_validate_invalid(self, capsys):
++        pipeline_path = self._write_pipeline({
++            "steps": [{"op": "filter"}],  # missing expr
++        })
++        try:
++            code = main(["validate", pipeline_path])
++            assert code == 1
++        finally:
++            os.unlink(pipeline_path)
++
++    def test_query_basic(self, capsys):
++        csv_path = self._write_csv("name,age\nAlice,30\nBob,25\nCarol,35\n")
++        try:
++            code = main([
++                "query", csv_path,
++                "--filter", "age > 28",
++                "--format", "table",
++            ])
++            assert code == 0
++            out = capsys.readouterr().out
++            assert "Alice" in out
++            assert "Carol" in out
++            assert "Bob" not in out
++        finally:
++            os.unlink(csv_path)
++
++    def test_query_with_limit(self, capsys):
++        csv_path = self._write_csv("x\n1\n2\n3\n4\n5\n")
++        try:
++            code = main(["query", csv_path, "--limit", "3", "--format", "table"])
++            assert code == 0
++            out = capsys.readouterr().out
++            assert "(3 rows)" in out
++        finally:
++            os.unlink(csv_path)
++
++    def test_run_pipeline(self, capsys):
++        csv_path = self._write_csv("val\n10\n20\n30\n")
++        pipeline_path = self._write_pipeline({
++            "input": csv_path,
++            "steps": [
++                {"op": "filter", "expr": "val > 15"},
++            ],
++            "output": {"format": "table"},
++        })
++        try:
++            code = main(["run", pipeline_path])
++            assert code == 0
++            out = capsys.readouterr().out
++            assert "20" in out
++            assert "30" in out
++        finally:
++            os.unlink(csv_path)
++            os.unlink(pipeline_path)
++
++    def test_no_command(self, capsys):
++        code = main([])
++        assert code == 1
++
++
++class TestEdgeCases:
++    """Specific edge case scenarios."""
++
++    def _write_csv(self, content: str) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8")
++        f.write(content)
++        f.close()
++        return f.name
++
++    def test_column_all_nulls(self):
++        csv_path = self._write_csv("a,b\n,1\n,2\n,3\n")
++        try:
++            data = {
++                "input": csv_path,
++                "steps": [{"op": "filter", "expr": "a is_null"}],
++            }
++            rows = list(execute_pipeline(data))
++            assert len(rows) == 3  # All nulls pass
++        finally:
++            os.unlink(csv_path)
++
++    def test_group_with_null_keys(self):
++        csv_path = self._write_csv("dept,val\nA,10\n,20\n,30\nA,40\n")
++        try:
++            data = {
++                "input": csv_path,
++                "steps": [
++                    {"op": "group", "by": ["dept"], "aggs": ["sum(val) AS total"]},
++                ],
++            }
++            rows = list(execute_pipeline(data))
++            by_dept = {r["dept"]: r for r in rows}
++            assert by_dept["A"]["total"] == 50
++            assert by_dept[None]["total"] == 50  # NULL group
++        finally:
++            os.unlink(csv_path)
++
++    def test_division_by_zero_in_project(self):
++        csv_path = self._write_csv("a,b\n10,0\n20,5\n")
++        try:
++            data = {
++                "input": csv_path,
++                "steps": [
++                    {"op": "project", "columns": ["a / b AS ratio"]},
++                ],
++            }
++            rows = list(execute_pipeline(data))
++            assert rows[0]["ratio"] is None  # div by zero → NULL
++            assert rows[1]["ratio"] == 4.0
++        finally:
++            os.unlink(csv_path)
+diff --git a/tests/test_operations.py b/tests/test_operations.py
+new file mode 100644
+index 0000000..5e44748
+--- /dev/null
++++ b/tests/test_operations.py
+@@ -0,0 +1,431 @@
++"""Tests for transformation operations."""
++
++import json
++import os
++import tempfile
++
++import pytest
++
++from tablesmith.models import (
++    AggregateSpec,
++    JoinType,
++    NullOrder,
++    SortOrder,
++    SortSpec,
++    ValidationError,
++)
++from tablesmith.operations import (
++    op_distinct,
++    op_filter,
++    op_group,
++    op_having,
++    op_join_full,
++    op_limit,
++    op_project,
++    op_sort,
++    parse_agg_spec,
++)
++
++
++# ---------------------------------------------------------------------------
++# Filter tests
++# ---------------------------------------------------------------------------
++
++class TestFilter:
++    def test_simple_filter(self):
++        rows = [{"age": 25}, {"age": 35}, {"age": 20}]
++        result = list(op_filter(rows, "age > 30"))
++        assert len(result) == 1
++        assert result[0]["age"] == 35
++
++    def test_filter_with_null(self):
++        rows = [{"age": 25}, {"age": None}, {"age": 35}]
++        result = list(op_filter(rows, "age > 20"))
++        # NULL > 20 => NULL => filtered out
++        assert len(result) == 2
++        assert result[0]["age"] == 25
++        assert result[1]["age"] == 35
++
++    def test_compound_filter(self):
++        rows = [
++            {"age": 35, "dept": "Engineering"},
++            {"age": 25, "dept": "HR"},
++            {"age": 40, "dept": "Engineering"},
++        ]
++        result = list(op_filter(rows, "age > 30 AND dept = 'Engineering'"))
++        assert len(result) == 2
++
++    def test_or_filter(self):
++        rows = [{"x": 1}, {"x": 5}, {"x": 10}]
++        result = list(op_filter(rows, "x < 2 OR x > 8"))
++        assert len(result) == 2
++
++    def test_not_filter(self):
++        rows = [{"active": True}, {"active": False}]
++        result = list(op_filter(rows, "NOT active = false"))
++        assert len(result) == 1
++        assert result[0]["active"] is True
++
++    def test_is_null_filter(self):
++        rows = [{"a": 1}, {"a": None}, {"a": 3}]
++        result = list(op_filter(rows, "a is_null"))
++        assert len(result) == 1
++        assert result[0]["a"] is None
++
++    def test_is_not_null_filter(self):
++        rows = [{"a": 1}, {"a": None}, {"a": 3}]
++        result = list(op_filter(rows, "a is_not_null"))
++        assert len(result) == 2
++
++    def test_string_with_spaces(self):
++        rows = [{"name": "John Doe"}, {"name": "Jane"}]
++        result = list(op_filter(rows, "name = 'John Doe'"))
++        assert len(result) == 1
++
++    def test_keyword_in_string(self):
++        """String containing 'AND' should not break parsing."""
++        rows = [{"dept": "ANDROID Team"}, {"dept": "iOS"}]
++        result = list(op_filter(rows, "dept = 'ANDROID Team'"))
++        assert len(result) == 1
++
++    def test_streaming_behavior(self):
++        """Filter should be lazy — works as generator without materializing."""
++        call_count = 0
++        def counted_rows():
++            nonlocal call_count
++            for i in range(20):
++                call_count += 1
++                yield {"x": i % 5}  # yields 0,1,2,3,4,0,1,2,...
++        # Take only 3 matches; filter is lazy, doesn't build a list
++        result = list(op_limit(op_filter(counted_rows(), "x < 3"), 3))
++        assert len(result) == 3
++        assert call_count < 20  # Streaming: should stop early
++
++
++# ---------------------------------------------------------------------------
++# Project tests
++# ---------------------------------------------------------------------------
++
++class TestProject:
++    def test_select_columns(self):
++        rows = [{"a": 1, "b": 2, "c": 3}]
++        result = list(op_project(rows, "a, c"))
++        assert result == [{"a": 1, "c": 3}]
++
++    def test_computed_column(self):
++        rows = [{"salary": 50000}]
++        result = list(op_project(rows, "salary, salary * 1.1 AS adjusted"))
++        assert result[0]["salary"] == 50000
++        assert result[0]["adjusted"] == pytest.approx(55000.0)
++
++    def test_string_concat(self):
++        rows = [{"first": "John", "last": "Doe"}]
++        result = list(op_project(rows, "first || ' ' || last AS name"))
++        assert result[0]["name"] == "John Doe"
++
++    def test_null_arithmetic_yields_null(self):
++        rows = [{"a": None, "b": 5}]
++        result = list(op_project(rows, "a + b AS total"))
++        assert result[0]["total"] is None
++
++    def test_division_by_zero(self):
++        rows = [{"a": 10, "b": 0}]
++        result = list(op_project(rows, "a / b AS ratio"))
++        assert result[0]["ratio"] is None
++
++
++# ---------------------------------------------------------------------------
++# Sort tests
++# ---------------------------------------------------------------------------
++
++class TestSort:
++    def test_ascending(self):
++        rows = [{"x": 3}, {"x": 1}, {"x": 2}]
++        result = op_sort(rows, [SortSpec("x")])
++        assert [r["x"] for r in result] == [1, 2, 3]
++
++    def test_descending(self):
++        rows = [{"x": 1}, {"x": 3}, {"x": 2}]
++        result = op_sort(rows, [SortSpec("x", order=SortOrder.DESC)])
++        assert [r["x"] for r in result] == [3, 2, 1]
++
++    def test_nulls_last_default(self):
++        rows = [{"x": None}, {"x": 1}, {"x": 3}]
++        result = op_sort(rows, [SortSpec("x")])
++        assert [r["x"] for r in result] == [1, 3, None]
++
++    def test_nulls_first(self):
++        rows = [{"x": 2}, {"x": None}, {"x": 1}]
++        result = op_sort(rows, [SortSpec("x", null_order=NullOrder.NULLS_FIRST)])
++        assert [r["x"] for r in result] == [None, 1, 2]
++
++    def test_multi_column(self):
++        rows = [
++            {"dept": "B", "salary": 100},
++            {"dept": "A", "salary": 200},
++            {"dept": "A", "salary": 100},
++        ]
++        result = op_sort(rows, [SortSpec("dept"), SortSpec("salary")])
++        assert result[0] == {"dept": "A", "salary": 100}
++        assert result[1] == {"dept": "A", "salary": 200}
++        assert result[2] == {"dept": "B", "salary": 100}
++
++    def test_empty_rows(self):
++        assert op_sort([], [SortSpec("x")]) == []
++
++    def test_desc_with_nulls_last(self):
++        rows = [{"x": 1}, {"x": None}, {"x": 3}]
++        result = op_sort(rows, [SortSpec("x", order=SortOrder.DESC)])
++        # Desc: 3, 1, NULL (nulls last remains last even in desc)
++        assert [r["x"] for r in result] == [3, 1, None]
++
++
++# ---------------------------------------------------------------------------
++# Group / Aggregate tests
++# ---------------------------------------------------------------------------
++
++class TestGroup:
++    def test_count_star(self):
++        rows = [{"dept": "A"}, {"dept": "A"}, {"dept": "B"}]
++        aggs = [AggregateSpec("count", None, "cnt")]
++        result = op_group(rows, ["dept"], aggs)
++        by_dept = {r["dept"]: r for r in result}
++        assert by_dept["A"]["cnt"] == 2
++        assert by_dept["B"]["cnt"] == 1
++
++    def test_count_column_excludes_nulls(self):
++        rows = [
++            {"dept": "A", "age": 30},
++            {"dept": "A", "age": None},
++            {"dept": "A", "age": 25},
++        ]
++        aggs = [AggregateSpec("count", "age", "cnt")]
++        result = op_group(rows, ["dept"], aggs)
++        assert result[0]["cnt"] == 2  # NULL excluded
++
++    def test_count_distinct(self):
++        rows = [
++            {"dept": "A", "role": "dev"},
++            {"dept": "A", "role": "dev"},
++            {"dept": "A", "role": "mgr"},
++        ]
++        aggs = [AggregateSpec("count_distinct", "role", "unique_roles")]
++        result = op_group(rows, ["dept"], aggs)
++        assert result[0]["unique_roles"] == 2
++
++    def test_sum(self):
++        rows = [{"g": "x", "v": 10}, {"g": "x", "v": 20}]
++        aggs = [AggregateSpec("sum", "v", "total")]
++        result = op_group(rows, ["g"], aggs)
++        assert result[0]["total"] == 30
++
++    def test_avg(self):
++        rows = [{"g": "x", "v": 10}, {"g": "x", "v": 20}]
++        aggs = [AggregateSpec("avg", "v", "mean")]
++        result = op_group(rows, ["g"], aggs)
++        assert result[0]["mean"] == 15.0
++
++    def test_min_max(self):
++        rows = [{"g": "x", "v": 10}, {"g": "x", "v": 20}, {"g": "x", "v": 5}]
++        aggs = [
++            AggregateSpec("min", "v", "lo"),
++            AggregateSpec("max", "v", "hi"),
++        ]
++        result = op_group(rows, ["g"], aggs)
++        assert result[0]["lo"] == 5
++        assert result[0]["hi"] == 20
++
++    def test_null_group_key(self):
++        """NULLs in group-by column form a single group (SQL behaviour)."""
++        rows = [
++            {"dept": None, "v": 1},
++            {"dept": None, "v": 2},
++            {"dept": "A", "v": 3},
++        ]
++        aggs = [AggregateSpec("sum", "v", "total")]
++        result = op_group(rows, ["dept"], aggs)
++        by_dept = {r["dept"]: r for r in result}
++        assert None in by_dept
++        assert by_dept[None]["total"] == 3
++        assert by_dept["A"]["total"] == 3
++
++    def test_multiple_aggregates(self):
++        rows = [
++            {"dept": "A", "salary": 50000},
++            {"dept": "A", "salary": 60000},
++            {"dept": "B", "salary": 70000},
++        ]
++        aggs = [
++            AggregateSpec("count", None, "cnt"),
++            AggregateSpec("avg", "salary", "avg_sal"),
++        ]
++        result = op_group(rows, ["dept"], aggs)
++        by_dept = {r["dept"]: r for r in result}
++        assert by_dept["A"]["cnt"] == 2
++        assert by_dept["A"]["avg_sal"] == 55000.0
++
++
++class TestParseAggSpec:
++    def test_count_star(self):
++        spec = parse_agg_spec("count(*) AS total")
++        assert spec.func == "count"
++        assert spec.column is None
++        assert spec.alias == "total"
++
++    def test_avg_column(self):
++        spec = parse_agg_spec("avg(salary) AS avg_sal")
++        assert spec.func == "avg"
++        assert spec.column == "salary"
++        assert spec.alias == "avg_sal"
++
++    def test_auto_alias(self):
++        spec = parse_agg_spec("sum(amount)")
++        assert spec.alias == "sum_amount"
++
++    def test_invalid(self):
++        with pytest.raises(ValidationError):
++            parse_agg_spec("invalid expression")
++
++
++# ---------------------------------------------------------------------------
++# Having tests
++# ---------------------------------------------------------------------------
++
++class TestHaving:
++    def test_basic_having(self):
++        rows = [
++            {"dept": "A", "cnt": 10},
++            {"dept": "B", "cnt": 3},
++            {"dept": "C", "cnt": 8},
++        ]
++        result = list(op_having(rows, "cnt > 5"))
++        assert len(result) == 2
++        assert all(r["cnt"] > 5 for r in result)
++
++
++# ---------------------------------------------------------------------------
++# Join tests
++# ---------------------------------------------------------------------------
++
++class TestJoin:
++    def _write_csv(self, content: str) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8")
++        f.write(content)
++        f.close()
++        return f.name
++
++    def test_inner_join(self):
++        right_path = self._write_csv("id,salary\n1,50000\n2,60000\n3,70000\n")
++        try:
++            left = [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}, {"id": 4, "name": "Dave"}]
++            result = op_join_full(left, right_path, ["id"], JoinType.INNER)
++            assert len(result) == 2  # id=4 has no match
++            names = {r["name"] for r in result}
++            assert names == {"Alice", "Bob"}
++        finally:
++            os.unlink(right_path)
++
++    def test_left_join(self):
++        right_path = self._write_csv("id,salary\n1,50000\n")
++        try:
++            left = [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
++            result = op_join_full(left, right_path, ["id"], JoinType.LEFT)
++            assert len(result) == 2
++            bob = [r for r in result if r["name"] == "Bob"][0]
++            assert bob["salary"] is None  # No match → NULL
++        finally:
++            os.unlink(right_path)
++
++    def test_right_join(self):
++        right_path = self._write_csv("id,salary\n1,50000\n3,70000\n")
++        try:
++            left = [{"id": 1, "name": "Alice"}]
++            result = op_join_full(left, right_path, ["id"], JoinType.RIGHT)
++            assert len(result) == 2
++            unmatched = [r for r in result if r["id"] == 3][0]
++            assert unmatched["name"] is None
++        finally:
++            os.unlink(right_path)
++
++    def test_full_join(self):
++        right_path = self._write_csv("id,salary\n1,50000\n3,70000\n")
++        try:
++            left = [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
++            result = op_join_full(left, right_path, ["id"], JoinType.FULL)
++            assert len(result) == 3  # 1 match + 1 left-only + 1 right-only
++        finally:
++            os.unlink(right_path)
++
++    def test_join_no_matches(self):
++        right_path = self._write_csv("id,salary\n99,1000\n")
++        try:
++            left = [{"id": 1, "name": "Alice"}]
++            result = op_join_full(left, right_path, ["id"], JoinType.INNER)
++            assert len(result) == 0
++        finally:
++            os.unlink(right_path)
++
++    def test_join_column_conflict(self):
++        """Non-join columns with same name get aliases."""
++        right_path = self._write_csv("id,name\n1,Engineering\n")
++        try:
++            left = [{"id": 1, "name": "Alice"}]
++            result = op_join_full(left, right_path, ["id"], JoinType.INNER)
++            assert len(result) == 1
++            row = result[0]
++            # Both sides have 'name' — should be aliased
++            assert "name_left" in row or "name_right" in row
++        finally:
++            os.unlink(right_path)
++
++
++# ---------------------------------------------------------------------------
++# Limit tests
++# ---------------------------------------------------------------------------
++
++class TestLimit:
++    def test_basic_limit(self):
++        rows = [{"x": i} for i in range(10)]
++        result = list(op_limit(rows, 3))
++        assert len(result) == 3
++        assert [r["x"] for r in result] == [0, 1, 2]
++
++    def test_limit_larger_than_rows(self):
++        rows = [{"x": 1}]
++        result = list(op_limit(rows, 100))
++        assert len(result) == 1
++
++    def test_limit_zero(self):
++        rows = [{"x": 1}, {"x": 2}]
++        result = list(op_limit(rows, 0))
++        assert len(result) == 0
++
++    def test_streaming(self):
++        """Limit is lazy — only consumes N rows from generator."""
++        consumed = []
++        def gen():
++            for i in range(1000):
++                consumed.append(i)
++                yield {"x": i}
++        result = list(op_limit(gen(), 5))
++        assert len(result) == 5
++        assert len(consumed) == 5
++
++
++# ---------------------------------------------------------------------------
++# Distinct tests
++# ---------------------------------------------------------------------------
++
++class TestDistinct:
++    def test_all_columns(self):
++        rows = [{"a": 1, "b": 2}, {"a": 1, "b": 2}, {"a": 1, "b": 3}]
++        result = op_distinct(rows)
++        assert len(result) == 2
++
++    def test_subset_columns(self):
++        rows = [{"a": 1, "b": 2}, {"a": 1, "b": 3}, {"a": 2, "b": 4}]
++        result = op_distinct(rows, columns=["a"])
++        assert len(result) == 2
++
++    def test_empty(self):
++        assert op_distinct([]) == []
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+new file mode 100644
+index 0000000..dccf993
+--- /dev/null
++++ b/tests/test_pipeline.py
+@@ -0,0 +1,101 @@
++"""Tests for pipeline loading, validation, and execution."""
++
++import json
++import os
++import tempfile
++
++import pytest
++
++from tablesmith.models import ValidationError
++from tablesmith.pipeline import execute_pipeline, load_pipeline, validate_pipeline
++
++
++class TestValidation:
++    def _write_pipeline(self, data: dict) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
++        json.dump(data, f)
++        f.close()
++        return f.name
++
++    def test_valid_pipeline(self):
++        data = {
++            "input": "test.csv",
++            "steps": [
++                {"op": "filter", "expr": "age > 30"},
++                {"op": "limit", "n": 10},
++            ],
++        }
++        errors = validate_pipeline(data)
++        assert errors == []
++
++    def test_unknown_operation(self):
++        data = {"steps": [{"op": "explode"}]}
++        errors = validate_pipeline(data)
++        assert len(errors) == 1
++        assert "unknown operation" in errors[0].lower()
++
++    def test_missing_expr_in_filter(self):
++        data = {"steps": [{"op": "filter"}]}
++        errors = validate_pipeline(data)
++        assert any("expr" in e for e in errors)
++
++    def test_missing_pipeline_file(self):
++        with pytest.raises(ValidationError, match="not found"):
++            load_pipeline("/nonexistent/pipeline.json")
++
++
++class TestPipelineExecution:
++    def _write_csv(self, content: str) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8")
++        f.write(content)
++        f.close()
++        return f.name
++
++    def test_filter_then_limit(self):
++        csv_path = self._write_csv("name,age\nAlice,30\nBob,25\nCarol,35\nDave,40\n")
++        try:
++            data = {
++                "input": csv_path,
++                "steps": [
++                    {"op": "filter", "expr": "age > 28"},
++                    {"op": "limit", "n": 2},
++                ],
++            }
++            rows = list(execute_pipeline(data))
++            assert len(rows) == 2
++            assert all(r["age"] > 28 for r in rows)
++        finally:
++            os.unlink(csv_path)
++
++    def test_group_and_sort(self):
++        csv_path = self._write_csv(
++            "dept,salary\nA,50000\nA,60000\nB,70000\nB,80000\nB,90000\n"
++        )
++        try:
++            data = {
++                "input": csv_path,
++                "steps": [
++                    {"op": "group", "by": ["dept"], "aggs": ["count(*) AS cnt", "avg(salary) AS avg_sal"]},
++                    {"op": "sort", "by": [{"column": "cnt", "order": "desc"}]},
++                ],
++            }
++            rows = list(execute_pipeline(data))
++            assert len(rows) == 2
++            assert rows[0]["dept"] == "B"
++            assert rows[0]["cnt"] == 3
++        finally:
++            os.unlink(csv_path)
++
++    def test_project_with_computed(self):
++        csv_path = self._write_csv("name,salary\nAlice,50000\nBob,60000\n")
++        try:
++            data = {
++                "input": csv_path,
++                "steps": [
++                    {"op": "project", "columns": ["name", "salary * 12 AS annual"]},
++                ],
++            }
++            rows = list(execute_pipeline(data))
++            assert rows[0]["annual"] == 600000
++        finally:
++            os.unlink(csv_path)
+diff --git a/tests/test_readers.py b/tests/test_readers.py
+new file mode 100644
+index 0000000..ce8a769
+--- /dev/null
++++ b/tests/test_readers.py
+@@ -0,0 +1,238 @@
++"""Tests for data readers and type inference."""
++
++import json
++import os
++import tempfile
++from pathlib import Path
++
++import pytest
++
++from tablesmith.models import ColumnType
++from tablesmith.readers import (
++    CSVReader,
++    JSONLReader,
++    JSONReader,
++    detect_format,
++    infer_column_type,
++    make_reader,
++)
++
++
++# ---------------------------------------------------------------------------
++# Type inference tests
++# ---------------------------------------------------------------------------
++
++class TestTypeInference:
++    def test_all_integers(self):
++        assert infer_column_type([1, 2, 3]) == ColumnType.INTEGER
++        assert infer_column_type(["1", "2", "3"]) == ColumnType.INTEGER
++
++    def test_mixed_int_float(self):
++        assert infer_column_type([1, 2.5, 3]) == ColumnType.FLOAT
++
++    def test_all_floats(self):
++        assert infer_column_type([1.1, 2.2, 3.3]) == ColumnType.FLOAT
++
++    def test_string_float_mix(self):
++        assert infer_column_type(["1.1", "2.2"]) == ColumnType.FLOAT
++
++    def test_mixed_types_default_to_string(self):
++        assert infer_column_type(["hello", "123", "true"]) == ColumnType.STRING
++
++    def test_boolean(self):
++        assert infer_column_type([True, False]) == ColumnType.BOOLEAN
++        assert infer_column_type(["true", "false"]) == ColumnType.BOOLEAN
++        assert infer_column_type(["1", "0"]) == ColumnType.BOOLEAN
++
++    def test_all_nulls(self):
++        assert infer_column_type([None, None, None]) == ColumnType.STRING
++
++    def test_nulls_with_integers(self):
++        assert infer_column_type([None, 1, None, 2]) == ColumnType.INTEGER
++
++
++# ---------------------------------------------------------------------------
++# CSV Reader tests
++# ---------------------------------------------------------------------------
++
++class TestCSVReader:
++    def _write_csv(self, content: str) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8")
++        f.write(content)
++        f.close()
++        return f.name
++
++    def test_basic_read(self):
++        path = self._write_csv("name,age,salary\nAlice,30,50000\nBob,25,45000\n")
++        try:
++            reader = CSVReader(path)
++            assert reader.schema.column_names == ["name", "age", "salary"]
++            rows = list(reader.read())
++            assert len(rows) == 2
++            assert rows[0]["name"] == "Alice"
++            assert rows[0]["age"] == 30
++            assert rows[0]["salary"] == 50000
++        finally:
++            os.unlink(path)
++
++    def test_null_handling(self):
++        path = self._write_csv("name,age\nAlice,30\nBob,\n")
++        try:
++            reader = CSVReader(path)
++            rows = list(reader.read())
++            assert rows[1]["age"] is None  # Empty cell → NULL
++        finally:
++            os.unlink(path)
++
++    def test_malformed_row_skipped(self, capsys):
++        path = self._write_csv("a,b\n1,2\n3\n4,5\n")
++        try:
++            reader = CSVReader(path)
++            rows = list(reader.read())
++            assert len(rows) == 2
++            assert reader.skipped_count == 1
++        finally:
++            os.unlink(path)
++
++    def test_empty_file_headers_only(self):
++        path = self._write_csv("a,b,c\n")
++        try:
++            reader = CSVReader(path)
++            rows = list(reader.read())
++            assert len(rows) == 0
++            assert reader.schema.column_names == ["a", "b", "c"]
++        finally:
++            os.unlink(path)
++
++    def test_type_inference_integer(self):
++        path = self._write_csv("val\n1\n2\n3\n")
++        try:
++            reader = CSVReader(path)
++            assert reader.schema.get_type("val") == ColumnType.INTEGER
++        finally:
++            os.unlink(path)
++
++    def test_type_inference_float(self):
++        path = self._write_csv("val\n1.1\n2.2\n3.3\n")
++        try:
++            reader = CSVReader(path)
++            assert reader.schema.get_type("val") == ColumnType.FLOAT
++        finally:
++            os.unlink(path)
++
++    def test_single_row(self):
++        path = self._write_csv("x\n42\n")
++        try:
++            reader = CSVReader(path)
++            rows = list(reader.read())
++            assert len(rows) == 1
++            assert rows[0]["x"] == 42
++        finally:
++            os.unlink(path)
++
++
++# ---------------------------------------------------------------------------
++# JSON Reader tests
++# ---------------------------------------------------------------------------
++
++class TestJSONReader:
++    def _write_json(self, data: list[dict]) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
++        json.dump(data, f)
++        f.close()
++        return f.name
++
++    def test_basic_read(self):
++        data = [
++            {"name": "Alice", "age": 30},
++            {"name": "Bob", "age": 25},
++        ]
++        path = self._write_json(data)
++        try:
++            reader = JSONReader(path)
++            rows = list(reader.read())
++            assert len(rows) == 2
++            assert rows[0]["name"] == "Alice"
++            assert rows[0]["age"] == 30
++        finally:
++            os.unlink(path)
++
++    def test_null_values(self):
++        data = [{"name": "Alice", "age": None}]
++        path = self._write_json(data)
++        try:
++            reader = JSONReader(path)
++            rows = list(reader.read())
++            assert rows[0]["age"] is None
++        finally:
++            os.unlink(path)
++
++    def test_empty_array(self):
++        path = self._write_json([])
++        try:
++            reader = JSONReader(path)
++            rows = list(reader.read())
++            assert len(rows) == 0
++        finally:
++            os.unlink(path)
++
++
++# ---------------------------------------------------------------------------
++# JSONL Reader tests
++# ---------------------------------------------------------------------------
++
++class TestJSONLReader:
++    def _write_jsonl(self, lines: list[dict]) -> str:
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
++        for obj in lines:
++            f.write(json.dumps(obj) + "\n")
++        f.close()
++        return f.name
++
++    def test_basic_read(self):
++        data = [
++            {"name": "Alice", "age": 30},
++            {"name": "Bob", "age": 25},
++        ]
++        path = self._write_jsonl(data)
++        try:
++            reader = JSONLReader(path)
++            rows = list(reader.read())
++            assert len(rows) == 2
++            assert rows[1]["name"] == "Bob"
++        finally:
++            os.unlink(path)
++
++    def test_malformed_line_skipped(self, capsys):
++        f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
++        f.write('{"a": 1}\n')
++        f.write("not json\n")
++        f.write('{"a": 2}\n')
++        f.close()
++        try:
++            reader = JSONLReader(f.name)
++            rows = list(reader.read())
++            assert len(rows) == 2
++            assert reader.skipped_count == 1
++        finally:
++            os.unlink(f.name)
++
++
++# ---------------------------------------------------------------------------
++# Format detection
++# ---------------------------------------------------------------------------
++
++class TestFormatDetection:
++    def test_csv(self):
++        assert detect_format("data.csv") == "csv"
++
++    def test_json(self):
++        assert detect_format("data.json") == "json"
++
++    def test_jsonl(self):
++        assert detect_format("data.jsonl") == "jsonl"
++
++    def test_unknown_raises(self):
++        from tablesmith.models import DataError
++        with pytest.raises(DataError, match="Cannot detect format"):
++            detect_format("data.xml")
+diff --git a/tests/test_writers.py b/tests/test_writers.py
+new file mode 100644
+index 0000000..cfd78fd
+--- /dev/null
++++ b/tests/test_writers.py
+@@ -0,0 +1,68 @@
++"""Tests for output writers."""
++
++import io
++import json
++
++import pytest
++
++from tablesmith.writers import write_csv, write_json, write_jsonl, write_table
++
++
++class TestCSVWriter:
++    def test_basic(self):
++        rows = [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
++        buf = io.StringIO()
++        write_csv(rows, output=buf)
++        lines = buf.getvalue().strip().split("\n")
++        assert lines[0] == "name,age"
++        assert lines[1] == "Alice,30"
++
++    def test_null_values(self):
++        rows = [{"a": None}]
++        buf = io.StringIO()
++        write_csv(rows, output=buf)
++        lines = buf.getvalue().strip().split("\n")
++        # csv module quotes empty-string fields as ""
++        assert lines[1] in ("", '""')
++
++
++class TestJSONWriter:
++    def test_basic(self):
++        rows = [{"name": "Alice", "age": 30}]
++        buf = io.StringIO()
++        write_json(rows, output=buf)
++        data = json.loads(buf.getvalue())
++        assert len(data) == 1
++        assert data[0]["name"] == "Alice"
++
++
++class TestJSONLWriter:
++    def test_basic(self):
++        rows = [{"a": 1}, {"a": 2}]
++        buf = io.StringIO()
++        write_jsonl(rows, output=buf)
++        lines = buf.getvalue().strip().split("\n")
++        assert len(lines) == 2
++        assert json.loads(lines[0]) == {"a": 1}
++
++
++class TestTableWriter:
++    def test_basic_formatting(self):
++        rows = [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
++        buf = io.StringIO()
++        write_table(rows, output=buf)
++        output = buf.getvalue()
++        assert "Alice" in output
++        assert "Bob" in output
++        assert "(2 rows)" in output
++
++    def test_empty_result(self):
++        buf = io.StringIO()
++        write_table([], output=buf)
++        assert "empty result set" in buf.getvalue()
++
++    def test_null_displayed(self):
++        rows = [{"a": None}]
++        buf = io.StringIO()
++        write_table(rows, output=buf)
++        assert "NULL" in buf.getvalue()
