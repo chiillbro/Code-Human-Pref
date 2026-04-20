@@ -1,0 +1,1522 @@
+diff --git a/.claude/plans/concurrent-wandering-pie.md b/.claude/plans/concurrent-wandering-pie.md
+new file mode 100644
+index 0000000..8a50084
+--- /dev/null
++++ b/.claude/plans/concurrent-wandering-pie.md
+@@ -0,0 +1,183 @@
++# Multi-Currency Wallet System Implementation Plan
++
++## Context
++
++PiggyMetrics lets each income/expense Item carry its own Currency, and the statistics-service normalizes everything to USD for its datapoints, but the account-service has no concept of a wallet. There is no way for a user to see a total balance across all currencies converted into a preferred display currency. This plan adds a multi-currency wallet system to the account-service: per-currency balances, monthly normalization, currency conversion via the statistics-service, REST endpoints, and daily snapshots.
++
++---
++
++## Part 1: Statistics-Service (expose exchange rates)
++
++### 1.1 Add `/rates` endpoint to StatisticsController
++**Modify:** `statistics-service/src/main/java/.../statistics/controller/StatisticsController.java`
++- Inject `ExchangeRatesService` (alongside existing `StatisticsService`)
++- Add `GET /rates` method with `@PreAuthorize("#oauth2.hasScope('server')")` returning `Map<Currency, BigDecimal>` from `exchangeRatesService.getCurrentRates()`
++
++### 1.2 Add test for `/rates` endpoint
++**Modify:** `statistics-service/src/test/java/.../statistics/controller/StatisticsControllerTest.java`
++- Add `@Mock ExchangeRatesService exchangeRatesService`
++- Add `shouldGetCurrentRates()` test case
++
++---
++
++## Part 2: Account-Service Domain Model
++
++### 2.1 Add month ratios to TimePeriod enum
++**Modify:** `account-service/src/main/java/.../account/domain/TimePeriod.java`
++
++Currently a plain enum. Add a `monthRatio` field so `monthlyAmount = amount * period.getMonthRatio()`:
++- `YEAR(1.0/12.0)`, `QUARTER(1.0/3.0)`, `MONTH(1.0)`, `DAY(30.4368)`, `HOUR(30.4368*24.0)`
++
++### 2.2 Create Wallet domain class
++**New:** `account-service/src/main/java/.../account/domain/Wallet.java`
++
++Fields: `Map<Currency,BigDecimal> balances`, `Map<Currency,BigDecimal> convertedBalances`, `BigDecimal totalBalance`, `BigDecimal totalMonthlyIncome`, `BigDecimal totalMonthlyExpenses`, `BigDecimal netSavingsRatePercent`, `Currency baseCurrency`, `Date lastUpdated`
++
++### 2.3 Create WalletSnapshot + WalletSnapshotId
++**New:** `account-service/src/main/java/.../account/domain/WalletSnapshot.java` - `@Document(collection="wallet_snapshots")` with `@Id WalletSnapshotId id` and `Wallet wallet`
++
++**New:** `account-service/src/main/java/.../account/domain/WalletSnapshotId.java` - compound key with `String account` + `Date date` (mirrors DataPointId pattern from statistics-service)
++
++### 2.4 Add Wallet field to Account
++**Modify:** `account-service/src/main/java/.../account/domain/Account.java`
++- Add `private Wallet wallet` with getter/setter. Existing documents without wallet will deserialize to `null` (no backward compat issue).
++
++---
++
++## Part 3: Account-Service Infrastructure
++
++### 3.1 Create ExchangeRatesClient Feign interface
++**New:** `account-service/src/main/java/.../account/client/ExchangeRatesClient.java`
++- `@FeignClient(name="statistics-service", contextId="exchangeRatesClient", fallback=ExchangeRatesClientFallback.class)`
++- `GET /rates` returning `Map<Currency, BigDecimal>`
++
++### 3.2 Create ExchangeRatesClientFallback
++**New:** `account-service/src/main/java/.../account/client/ExchangeRatesClientFallback.java`
++- Returns hardcoded approximate rates: `USD=1, EUR=0.9, RUB=75.0`
++- Logs warning (follows StatisticsServiceClientFallback pattern)
++
++### 3.3 Create MongoDB converters for WalletSnapshotId
++**New:** `account-service/src/main/java/.../account/repository/converter/WalletSnapshotIdReaderConverter.java`
++**New:** `account-service/src/main/java/.../account/repository/converter/WalletSnapshotIdWriterConverter.java`
++- Follows DataPointId converter pattern from statistics-service
++
++### 3.4 Register converters in AccountApplication
++**Modify:** `account-service/src/main/java/.../account/AccountApplication.java`
++- Add `CustomConversionsConfig` inner class with `CustomConversions` bean (same pattern as StatisticsApplication)
++
++### 3.5 Create WalletSnapshotRepository
++**New:** `account-service/src/main/java/.../account/repository/WalletSnapshotRepository.java`
++- `CrudRepository<WalletSnapshot, WalletSnapshotId>`
++- `findByIdAccount(String account)`
++- `findByIdAccountAndIdDateBetween(String account, Date from, Date to)`
++
++---
++
++## Part 4: Account-Service Core Logic
++
++### 4.1 Create WalletService interface
++**New:** `account-service/src/main/java/.../account/service/WalletService.java`
++- `Wallet getWallet(String accountName)`
++- `Wallet recalculate(String accountName)`
++- `Wallet changeBaseCurrency(String accountName, Currency currency)`
++- `List<WalletSnapshot> getHistory(String accountName, Date from, Date to)`
++
++### 4.2 Create WalletServiceImpl
++**New:** `account-service/src/main/java/.../account/service/WalletServiceImpl.java`
++
++Core `buildWallet(Account, Currency baseCurrency)` method:
++1. Fetch rates from `exchangeRatesClient.getRates()`
++2. Normalize all income items to monthly amounts: `amount * period.getMonthRatio()`
++3. Normalize all expense items to monthly amounts
++4. Compute per-currency native balances (income - expense per currency)
++5. Convert each per-currency balance to base display currency
++6. Sum total monthly income/expenses in base currency
++7. Add Saving amount (converted to base currency) to get total balance: `totalBalance = (totalIncome - totalExpenses) + savingInBase`
++8. Compute savings rate: `(income - expenses) / income * 100`
++
++`recalculate()` - loads account, calls buildWallet, saves wallet on account, saves daily snapshot
++`changeBaseCurrency()` - loads account, calls buildWallet with new currency, saves
++`saveSnapshot()` - uses compound ID (account + start-of-day) so same-day saves upsert
++
++Dependencies: `AccountRepository`, `WalletSnapshotRepository`, `ExchangeRatesClient` (no circular dependency with AccountService)
++
++### 4.3 Wire into AccountServiceImpl.saveChanges()
++**Modify:** `account-service/src/main/java/.../account/service/AccountServiceImpl.java`
++- Inject `WalletService`
++- After existing save + statisticsClient call, add `walletService.recalculate(name)` wrapped in try-catch (wallet failure must not break account save)
++
++---
++
++## Part 5: REST Endpoints
++
++### 5.1 Create WalletController
++**New:** `account-service/src/main/java/.../account/controller/WalletController.java`
++- `GET /current/wallet` - get current wallet
++- `POST /current/wallet/refresh` - force recalculate
++- `PUT /current/wallet/currency` - change base currency (body: Currency enum value)
++- `GET /current/wallet/history?from=X&to=Y` - wallet snapshots by date range
++
++All use `Principal` for auth (consistent with AccountController). All fall under existing `.anyRequest().authenticated()` security config.
++
++---
++
++## Part 6: Tests
++
++### 6.1 WalletServiceTest
++**New:** `account-service/src/test/java/.../account/service/WalletServiceTest.java`
++- Tests: single currency, multi-currency, time period normalization, saving inclusion, savings rate, base currency change, null incomes/expenses, account not found, snapshot creation
++
++### 6.2 WalletControllerTest
++**New:** `account-service/src/test/java/.../account/controller/WalletControllerTest.java`
++- Tests: GET wallet, POST refresh, PUT currency, GET history
++
++### 6.3 ExchangeRatesClientFallbackTest
++**New:** `account-service/src/test/java/.../account/client/ExchangeRatesClientFallbackTest.java`
++
++### 6.4 Update existing AccountServiceTest
++**Modify:** `account-service/src/test/java/.../account/service/AccountServiceTest.java`
++- Add `@Mock WalletService walletService` so saveChanges test works with new injection
++
++### 6.5 Update existing StatisticsControllerTest
++**Modify:** `statistics-service/src/test/java/.../statistics/controller/StatisticsControllerTest.java`
++- Add `@Mock ExchangeRatesService` + test for `/rates`
++
++---
++
++## File Summary
++
++**New files (11):**
++- `account-service/.../client/ExchangeRatesClient.java`
++- `account-service/.../client/ExchangeRatesClientFallback.java`
++- `account-service/.../domain/Wallet.java`
++- `account-service/.../domain/WalletSnapshot.java`
++- `account-service/.../domain/WalletSnapshotId.java`
++- `account-service/.../repository/WalletSnapshotRepository.java`
++- `account-service/.../repository/converter/WalletSnapshotIdReaderConverter.java`
++- `account-service/.../repository/converter/WalletSnapshotIdWriterConverter.java`
++- `account-service/.../service/WalletService.java`
++- `account-service/.../service/WalletServiceImpl.java`
++- `account-service/.../controller/WalletController.java`
++
++**New test files (3):**
++- `account-service/.../service/WalletServiceTest.java`
++- `account-service/.../controller/WalletControllerTest.java`
++- `account-service/.../client/ExchangeRatesClientFallbackTest.java`
++
++**Modified files (7):**
++- `statistics-service/.../controller/StatisticsController.java` (add `/rates` endpoint)
++- `statistics-service/.../controller/StatisticsControllerTest.java` (add rates test)
++- `account-service/.../domain/TimePeriod.java` (add month ratios)
++- `account-service/.../domain/Account.java` (add wallet field)
++- `account-service/.../service/AccountServiceImpl.java` (trigger wallet recalculation)
++- `account-service/.../AccountApplication.java` (register MongoDB converters)
++- `account-service/.../service/AccountServiceTest.java` (add WalletService mock)
++
++---
++
++## Verification
++
++1. `mvn test -pl statistics-service` - all existing + new rates endpoint test pass
++2. `mvn test -pl account-service` - all existing + new wallet tests pass
++3. `mvn package` for both services - clean build
++4. Existing GET/PUT endpoints return same structure (wallet is additive `null` field on old accounts)
+diff --git a/account-service/src/main/java/com/piggymetrics/account/AccountApplication.java b/account-service/src/main/java/com/piggymetrics/account/AccountApplication.java
+index a3b68ae..83348ff 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/AccountApplication.java
++++ b/account-service/src/main/java/com/piggymetrics/account/AccountApplication.java
+@@ -1,13 +1,20 @@
+ package com.piggymetrics.account;
+ 
++import com.piggymetrics.account.repository.converter.WalletSnapshotIdReaderConverter;
++import com.piggymetrics.account.repository.converter.WalletSnapshotIdWriterConverter;
+ import org.springframework.boot.SpringApplication;
+ import org.springframework.boot.autoconfigure.SpringBootApplication;
+ import org.springframework.cloud.client.circuitbreaker.EnableCircuitBreaker;
+ import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
+ import org.springframework.cloud.openfeign.EnableFeignClients;
++import org.springframework.context.annotation.Bean;
++import org.springframework.context.annotation.Configuration;
++import org.springframework.data.mongodb.core.convert.CustomConversions;
+ import org.springframework.security.config.annotation.method.configuration.EnableGlobalMethodSecurity;
+ import org.springframework.security.oauth2.config.annotation.web.configuration.EnableOAuth2Client;
+ 
++import java.util.Arrays;
++
+ @SpringBootApplication
+ @EnableDiscoveryClient
+ @EnableOAuth2Client
+@@ -20,4 +27,14 @@ public class AccountApplication {
+ 		SpringApplication.run(AccountApplication.class, args);
+ 	}
+ 
++	@Configuration
++	static class CustomConversionsConfig {
++
++		@Bean
++		public CustomConversions customConversions() {
++			return new CustomConversions(Arrays.asList(
++					new WalletSnapshotIdReaderConverter(),
++					new WalletSnapshotIdWriterConverter()));
++		}
++	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
+index 7943fb5..b9ca748 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
++++ b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClient.java
+@@ -1,16 +1,23 @@
+ package com.piggymetrics.account.client;
+ 
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Currency;
+ import org.springframework.cloud.openfeign.FeignClient;
+ import org.springframework.http.MediaType;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RequestMethod;
+ 
++import java.math.BigDecimal;
++import java.util.Map;
++
+ @FeignClient(name = "statistics-service", fallback = StatisticsServiceClientFallback.class)
+ public interface StatisticsServiceClient {
+ 
+ 	@RequestMapping(method = RequestMethod.PUT, value = "/statistics/{accountName}", consumes = MediaType.APPLICATION_JSON_UTF8_VALUE)
+ 	void updateStatistics(@PathVariable("accountName") String accountName, Account account);
+ 
++	@RequestMapping(method = RequestMethod.GET, value = "/rates")
++	Map<Currency, BigDecimal> getRates();
++
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
+index 21c9167..8eae514 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
++++ b/account-service/src/main/java/com/piggymetrics/account/client/StatisticsServiceClientFallback.java
+@@ -1,18 +1,34 @@
+ package com.piggymetrics.account.client;
+ 
+ import com.piggymetrics.account.domain.Account;
++import com.piggymetrics.account.domain.Currency;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.stereotype.Component;
+ 
++import java.math.BigDecimal;
++import java.util.HashMap;
++import java.util.Map;
++
+ /**
+  * @author cdov
+  */
+ @Component
+ public class StatisticsServiceClientFallback implements StatisticsServiceClient {
+     private static final Logger LOGGER = LoggerFactory.getLogger(StatisticsServiceClientFallback.class);
++
+     @Override
+     public void updateStatistics(String accountName, Account account) {
+         LOGGER.error("Error during update statistics for account: {}", accountName);
+     }
++
++    @Override
++    public Map<Currency, BigDecimal> getRates() {
++        LOGGER.warn("Statistics service unavailable, using fallback exchange rates");
++        Map<Currency, BigDecimal> fallbackRates = new HashMap<>();
++        fallbackRates.put(Currency.USD, BigDecimal.ONE);
++        fallbackRates.put(Currency.EUR, new BigDecimal("0.9"));
++        fallbackRates.put(Currency.RUB, new BigDecimal("75.0"));
++        return fallbackRates;
++    }
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/controller/WalletController.java b/account-service/src/main/java/com/piggymetrics/account/controller/WalletController.java
+new file mode 100644
+index 0000000..52ea084
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/controller/WalletController.java
+@@ -0,0 +1,43 @@
++package com.piggymetrics.account.controller;
++
++import com.piggymetrics.account.domain.Currency;
++import com.piggymetrics.account.domain.Wallet;
++import com.piggymetrics.account.domain.WalletSnapshot;
++import com.piggymetrics.account.service.WalletService;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.format.annotation.DateTimeFormat;
++import org.springframework.web.bind.annotation.*;
++
++import java.security.Principal;
++import java.util.Date;
++import java.util.List;
++
++@RestController
++public class WalletController {
++
++	@Autowired
++	private WalletService walletService;
++
++	@RequestMapping(path = "/current/wallet", method = RequestMethod.GET)
++	public Wallet getCurrentWallet(Principal principal) {
++		return walletService.getWallet(principal.getName());
++	}
++
++	@RequestMapping(path = "/current/wallet/refresh", method = RequestMethod.POST)
++	public Wallet refreshCurrentWallet(Principal principal) {
++		return walletService.recalculate(principal.getName());
++	}
++
++	@RequestMapping(path = "/current/wallet/currency", method = RequestMethod.PUT)
++	public Wallet changeBaseCurrency(Principal principal, @RequestBody Currency currency) {
++		return walletService.changeBaseCurrency(principal.getName(), currency);
++	}
++
++	@RequestMapping(path = "/current/wallet/history", method = RequestMethod.GET)
++	public List<WalletSnapshot> getWalletHistory(
++			Principal principal,
++			@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) Date from,
++			@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) Date to) {
++		return walletService.getHistory(principal.getName(), from, to);
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/Account.java b/account-service/src/main/java/com/piggymetrics/account/domain/Account.java
+index 59d98ac..d3e325c 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/Account.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/Account.java
+@@ -32,6 +32,8 @@ public class Account {
+ 	@Length(min = 0, max = 20_000)
+ 	private String note;
+ 
++	private Wallet wallet;
++
+ 	public String getName() {
+ 		return name;
+ 	}
+@@ -79,4 +81,12 @@ public class Account {
+ 	public void setNote(String note) {
+ 		this.note = note;
+ 	}
++
++	public Wallet getWallet() {
++		return wallet;
++	}
++
++	public void setWallet(Wallet wallet) {
++		this.wallet = wallet;
++	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/TimePeriod.java b/account-service/src/main/java/com/piggymetrics/account/domain/TimePeriod.java
+index 04d3f80..e3e62d4 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/domain/TimePeriod.java
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/TimePeriod.java
+@@ -1,7 +1,30 @@
+ package com.piggymetrics.account.domain;
+ 
++import java.math.BigDecimal;
++
+ public enum TimePeriod {
+ 
+-	YEAR, QUARTER, MONTH, DAY, HOUR
++	YEAR(1.0 / 12.0),
++	QUARTER(1.0 / 3.0),
++	MONTH(1.0),
++	DAY(30.4368),
++	HOUR(30.4368 * 24.0);
++
++	private final double monthRatio;
++
++	TimePeriod(double monthRatio) {
++		this.monthRatio = monthRatio;
++	}
++
++	/**
++	 * Returns the multiplier to convert an amount in this period to a monthly amount.
++	 * monthlyAmount = amount * getMonthRatio()
++	 */
++	public BigDecimal getMonthRatio() {
++		return BigDecimal.valueOf(monthRatio);
++	}
+ 
++	public static TimePeriod getBase() {
++		return MONTH;
++	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/Wallet.java b/account-service/src/main/java/com/piggymetrics/account/domain/Wallet.java
+new file mode 100644
+index 0000000..e07ba87
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/Wallet.java
+@@ -0,0 +1,88 @@
++package com.piggymetrics.account.domain;
++
++import java.math.BigDecimal;
++import java.util.Date;
++import java.util.Map;
++
++public class Wallet {
++
++	private Map<Currency, BigDecimal> balances;
++
++	private Map<Currency, BigDecimal> convertedBalances;
++
++	private BigDecimal totalBalance;
++
++	private BigDecimal totalMonthlyIncome;
++
++	private BigDecimal totalMonthlyExpenses;
++
++	private BigDecimal netSavingsRatePercent;
++
++	private Currency baseCurrency;
++
++	private Date lastUpdated;
++
++	public Map<Currency, BigDecimal> getBalances() {
++		return balances;
++	}
++
++	public void setBalances(Map<Currency, BigDecimal> balances) {
++		this.balances = balances;
++	}
++
++	public Map<Currency, BigDecimal> getConvertedBalances() {
++		return convertedBalances;
++	}
++
++	public void setConvertedBalances(Map<Currency, BigDecimal> convertedBalances) {
++		this.convertedBalances = convertedBalances;
++	}
++
++	public BigDecimal getTotalBalance() {
++		return totalBalance;
++	}
++
++	public void setTotalBalance(BigDecimal totalBalance) {
++		this.totalBalance = totalBalance;
++	}
++
++	public BigDecimal getTotalMonthlyIncome() {
++		return totalMonthlyIncome;
++	}
++
++	public void setTotalMonthlyIncome(BigDecimal totalMonthlyIncome) {
++		this.totalMonthlyIncome = totalMonthlyIncome;
++	}
++
++	public BigDecimal getTotalMonthlyExpenses() {
++		return totalMonthlyExpenses;
++	}
++
++	public void setTotalMonthlyExpenses(BigDecimal totalMonthlyExpenses) {
++		this.totalMonthlyExpenses = totalMonthlyExpenses;
++	}
++
++	public BigDecimal getNetSavingsRatePercent() {
++		return netSavingsRatePercent;
++	}
++
++	public void setNetSavingsRatePercent(BigDecimal netSavingsRatePercent) {
++		this.netSavingsRatePercent = netSavingsRatePercent;
++	}
++
++	public Currency getBaseCurrency() {
++		return baseCurrency;
++	}
++
++	public void setBaseCurrency(Currency baseCurrency) {
++		this.baseCurrency = baseCurrency;
++	}
++
++	public Date getLastUpdated() {
++		return lastUpdated;
++	}
++
++	public void setLastUpdated(Date lastUpdated) {
++		this.lastUpdated = lastUpdated;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/WalletSnapshot.java b/account-service/src/main/java/com/piggymetrics/account/domain/WalletSnapshot.java
+new file mode 100644
+index 0000000..53a0e98
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/WalletSnapshot.java
+@@ -0,0 +1,29 @@
++package com.piggymetrics.account.domain;
++
++import org.springframework.data.annotation.Id;
++import org.springframework.data.mongodb.core.mapping.Document;
++
++@Document(collection = "wallet_snapshots")
++public class WalletSnapshot {
++
++	@Id
++	private WalletSnapshotId id;
++
++	private Wallet wallet;
++
++	public WalletSnapshotId getId() {
++		return id;
++	}
++
++	public void setId(WalletSnapshotId id) {
++		this.id = id;
++	}
++
++	public Wallet getWallet() {
++		return wallet;
++	}
++
++	public void setWallet(Wallet wallet) {
++		this.wallet = wallet;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/domain/WalletSnapshotId.java b/account-service/src/main/java/com/piggymetrics/account/domain/WalletSnapshotId.java
+new file mode 100644
+index 0000000..36d5958
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/domain/WalletSnapshotId.java
+@@ -0,0 +1,34 @@
++package com.piggymetrics.account.domain;
++
++import java.io.Serializable;
++import java.util.Date;
++
++public class WalletSnapshotId implements Serializable {
++
++	private static final long serialVersionUID = 1L;
++
++	private String account;
++
++	private Date date;
++
++	public WalletSnapshotId() {
++	}
++
++	public WalletSnapshotId(String account, Date date) {
++		this.account = account;
++		this.date = date;
++	}
++
++	public String getAccount() {
++		return account;
++	}
++
++	public Date getDate() {
++		return date;
++	}
++
++	@Override
++	public String toString() {
++		return "WalletSnapshotId{account='" + account + "', date=" + date + '}';
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/repository/WalletSnapshotRepository.java b/account-service/src/main/java/com/piggymetrics/account/repository/WalletSnapshotRepository.java
+new file mode 100644
+index 0000000..c2481f2
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/repository/WalletSnapshotRepository.java
+@@ -0,0 +1,17 @@
++package com.piggymetrics.account.repository;
++
++import com.piggymetrics.account.domain.WalletSnapshot;
++import com.piggymetrics.account.domain.WalletSnapshotId;
++import org.springframework.data.repository.CrudRepository;
++import org.springframework.stereotype.Repository;
++
++import java.util.Date;
++import java.util.List;
++
++@Repository
++public interface WalletSnapshotRepository extends CrudRepository<WalletSnapshot, WalletSnapshotId> {
++
++	List<WalletSnapshot> findByIdAccount(String account);
++
++	List<WalletSnapshot> findByIdAccountAndIdDateBetween(String account, Date from, Date to);
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/repository/converter/WalletSnapshotIdReaderConverter.java b/account-service/src/main/java/com/piggymetrics/account/repository/converter/WalletSnapshotIdReaderConverter.java
+new file mode 100644
+index 0000000..926582b
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/repository/converter/WalletSnapshotIdReaderConverter.java
+@@ -0,0 +1,21 @@
++package com.piggymetrics.account.repository.converter;
++
++import com.mongodb.DBObject;
++import com.piggymetrics.account.domain.WalletSnapshotId;
++import org.springframework.core.convert.converter.Converter;
++import org.springframework.stereotype.Component;
++
++import java.util.Date;
++
++@Component
++public class WalletSnapshotIdReaderConverter implements Converter<DBObject, WalletSnapshotId> {
++
++	@Override
++	public WalletSnapshotId convert(DBObject object) {
++
++		Date date = (Date) object.get("date");
++		String account = (String) object.get("account");
++
++		return new WalletSnapshotId(account, date);
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/repository/converter/WalletSnapshotIdWriterConverter.java b/account-service/src/main/java/com/piggymetrics/account/repository/converter/WalletSnapshotIdWriterConverter.java
+new file mode 100644
+index 0000000..ef7dae0
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/repository/converter/WalletSnapshotIdWriterConverter.java
+@@ -0,0 +1,24 @@
++package com.piggymetrics.account.repository.converter;
++
++import com.mongodb.BasicDBObject;
++import com.mongodb.DBObject;
++import com.piggymetrics.account.domain.WalletSnapshotId;
++import org.springframework.core.convert.converter.Converter;
++import org.springframework.stereotype.Component;
++
++@Component
++public class WalletSnapshotIdWriterConverter implements Converter<WalletSnapshotId, DBObject> {
++
++	private static final int FIELDS = 2;
++
++	@Override
++	public DBObject convert(WalletSnapshotId id) {
++
++		DBObject object = new BasicDBObject(FIELDS);
++
++		object.put("date", id.getDate());
++		object.put("account", id.getAccount());
++
++		return object;
++	}
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
+index 8594bf5..bb9947f 100644
+--- a/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
++++ b/account-service/src/main/java/com/piggymetrics/account/service/AccountServiceImpl.java
+@@ -30,6 +30,9 @@ public class AccountServiceImpl implements AccountService {
+ 	@Autowired
+ 	private AccountRepository repository;
+ 
++	@Autowired
++	private WalletService walletService;
++
+ 	/**
+ 	 * {@inheritDoc}
+ 	 */
+@@ -88,5 +91,11 @@ public class AccountServiceImpl implements AccountService {
+ 		log.debug("account {} changes has been saved", name);
+ 
+ 		statisticsClient.updateStatistics(name, account);
++
++		try {
++			walletService.recalculate(name);
++		} catch (Exception e) {
++			log.warn("Failed to recalculate wallet for account {}: {}", name, e.getMessage());
++		}
+ 	}
+ }
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/WalletService.java b/account-service/src/main/java/com/piggymetrics/account/service/WalletService.java
+new file mode 100644
+index 0000000..f5d22b6
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/WalletService.java
+@@ -0,0 +1,34 @@
++package com.piggymetrics.account.service;
++
++import com.piggymetrics.account.domain.Currency;
++import com.piggymetrics.account.domain.Wallet;
++import com.piggymetrics.account.domain.WalletSnapshot;
++
++import java.util.Date;
++import java.util.List;
++
++public interface WalletService {
++
++	/**
++	 * Retrieves the current wallet for the given account.
++	 */
++	Wallet getWallet(String accountName);
++
++	/**
++	 * Force-recalculates the wallet for the given account.
++	 * Fetches fresh exchange rates, recomputes all aggregates,
++	 * persists to Account and creates/updates a daily snapshot.
++	 */
++	Wallet recalculate(String accountName);
++
++	/**
++	 * Changes the base display currency for the account's wallet
++	 * and triggers a recalculation.
++	 */
++	Wallet changeBaseCurrency(String accountName, Currency currency);
++
++	/**
++	 * Returns wallet snapshots for the given account within a date range.
++	 */
++	List<WalletSnapshot> getHistory(String accountName, Date from, Date to);
++}
+diff --git a/account-service/src/main/java/com/piggymetrics/account/service/WalletServiceImpl.java b/account-service/src/main/java/com/piggymetrics/account/service/WalletServiceImpl.java
+new file mode 100644
+index 0000000..b842e1a
+--- /dev/null
++++ b/account-service/src/main/java/com/piggymetrics/account/service/WalletServiceImpl.java
+@@ -0,0 +1,204 @@
++package com.piggymetrics.account.service;
++
++import com.piggymetrics.account.client.StatisticsServiceClient;
++import com.piggymetrics.account.domain.*;
++import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.repository.WalletSnapshotRepository;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.stereotype.Service;
++import org.springframework.util.Assert;
++
++import java.math.BigDecimal;
++import java.math.RoundingMode;
++import java.time.Instant;
++import java.time.LocalDate;
++import java.time.ZoneId;
++import java.util.Date;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++
++@Service
++public class WalletServiceImpl implements WalletService {
++
++	private final Logger log = LoggerFactory.getLogger(getClass());
++
++	@Autowired
++	private AccountRepository accountRepository;
++
++	@Autowired
++	private WalletSnapshotRepository snapshotRepository;
++
++	@Autowired
++	private StatisticsServiceClient statisticsClient;
++
++	@Override
++	public Wallet getWallet(String accountName) {
++		Assert.hasLength(accountName);
++		Account account = accountRepository.findByName(accountName);
++		Assert.notNull(account, "can't find account with name " + accountName);
++		return account.getWallet();
++	}
++
++	@Override
++	public Wallet recalculate(String accountName) {
++		Assert.hasLength(accountName);
++		Account account = accountRepository.findByName(accountName);
++		Assert.notNull(account, "can't find account with name " + accountName);
++
++		Currency baseCurrency = Currency.getDefault();
++		if (account.getWallet() != null && account.getWallet().getBaseCurrency() != null) {
++			baseCurrency = account.getWallet().getBaseCurrency();
++		}
++
++		Wallet wallet = buildWallet(account, baseCurrency);
++
++		account.setWallet(wallet);
++		accountRepository.save(account);
++
++		saveSnapshot(accountName, wallet);
++
++		log.debug("wallet recalculated for account {}", accountName);
++		return wallet;
++	}
++
++	@Override
++	public Wallet changeBaseCurrency(String accountName, Currency currency) {
++		Assert.hasLength(accountName);
++		Assert.notNull(currency);
++
++		Account account = accountRepository.findByName(accountName);
++		Assert.notNull(account, "can't find account with name " + accountName);
++
++		Wallet wallet = buildWallet(account, currency);
++
++		account.setWallet(wallet);
++		accountRepository.save(account);
++
++		saveSnapshot(accountName, wallet);
++
++		log.debug("wallet base currency changed to {} for account {}", currency, accountName);
++		return wallet;
++	}
++
++	@Override
++	public List<WalletSnapshot> getHistory(String accountName, Date from, Date to) {
++		Assert.hasLength(accountName);
++		Assert.notNull(from);
++		Assert.notNull(to);
++		return snapshotRepository.findByIdAccountAndIdDateBetween(accountName, from, to);
++	}
++
++	Wallet buildWallet(Account account, Currency baseCurrency) {
++		Map<Currency, BigDecimal> rates = statisticsClient.getRates();
++
++		Map<Currency, BigDecimal> monthlyIncomeByCurrency = new HashMap<>();
++		if (account.getIncomes() != null) {
++			for (Item item : account.getIncomes()) {
++				BigDecimal monthlyAmount = item.getAmount()
++						.multiply(item.getPeriod().getMonthRatio())
++						.setScale(4, RoundingMode.HALF_UP);
++				monthlyIncomeByCurrency.merge(item.getCurrency(), monthlyAmount, BigDecimal::add);
++			}
++		}
++
++		Map<Currency, BigDecimal> monthlyExpenseByCurrency = new HashMap<>();
++		if (account.getExpenses() != null) {
++			for (Item item : account.getExpenses()) {
++				BigDecimal monthlyAmount = item.getAmount()
++						.multiply(item.getPeriod().getMonthRatio())
++						.setScale(4, RoundingMode.HALF_UP);
++				monthlyExpenseByCurrency.merge(item.getCurrency(), monthlyAmount, BigDecimal::add);
++			}
++		}
++
++		Set<Currency> allCurrencies = new HashSet<>();
++		allCurrencies.addAll(monthlyIncomeByCurrency.keySet());
++		allCurrencies.addAll(monthlyExpenseByCurrency.keySet());
++
++		Map<Currency, BigDecimal> balances = new HashMap<>();
++		for (Currency c : allCurrencies) {
++			BigDecimal income = monthlyIncomeByCurrency.getOrDefault(c, BigDecimal.ZERO);
++			BigDecimal expense = monthlyExpenseByCurrency.getOrDefault(c, BigDecimal.ZERO);
++			balances.put(c, income.subtract(expense));
++		}
++
++		Map<Currency, BigDecimal> convertedBalances = new HashMap<>();
++		for (Map.Entry<Currency, BigDecimal> entry : balances.entrySet()) {
++			convertedBalances.put(entry.getKey(),
++					convert(entry.getValue(), entry.getKey(), baseCurrency, rates));
++		}
++
++		BigDecimal totalMonthlyIncome = BigDecimal.ZERO;
++		for (Map.Entry<Currency, BigDecimal> entry : monthlyIncomeByCurrency.entrySet()) {
++			totalMonthlyIncome = totalMonthlyIncome.add(
++					convert(entry.getValue(), entry.getKey(), baseCurrency, rates));
++		}
++		totalMonthlyIncome = totalMonthlyIncome.setScale(4, RoundingMode.HALF_UP);
++
++		BigDecimal totalMonthlyExpenses = BigDecimal.ZERO;
++		for (Map.Entry<Currency, BigDecimal> entry : monthlyExpenseByCurrency.entrySet()) {
++			totalMonthlyExpenses = totalMonthlyExpenses.add(
++					convert(entry.getValue(), entry.getKey(), baseCurrency, rates));
++		}
++		totalMonthlyExpenses = totalMonthlyExpenses.setScale(4, RoundingMode.HALF_UP);
++
++		BigDecimal savingInBase = BigDecimal.ZERO;
++		if (account.getSaving() != null && account.getSaving().getAmount() != null) {
++			savingInBase = convert(account.getSaving().getAmount(),
++					account.getSaving().getCurrency(), baseCurrency, rates);
++		}
++
++		BigDecimal netMonthly = totalMonthlyIncome.subtract(totalMonthlyExpenses);
++		BigDecimal totalBalance = netMonthly.add(savingInBase).setScale(4, RoundingMode.HALF_UP);
++
++		BigDecimal savingsRate = BigDecimal.ZERO;
++		if (totalMonthlyIncome.compareTo(BigDecimal.ZERO) > 0) {
++			savingsRate = netMonthly
++					.divide(totalMonthlyIncome, 4, RoundingMode.HALF_UP)
++					.multiply(new BigDecimal("100"))
++					.setScale(2, RoundingMode.HALF_UP);
++		}
++
++		Wallet wallet = new Wallet();
++		wallet.setBalances(balances);
++		wallet.setConvertedBalances(convertedBalances);
++		wallet.setTotalBalance(totalBalance);
++		wallet.setTotalMonthlyIncome(totalMonthlyIncome);
++		wallet.setTotalMonthlyExpenses(totalMonthlyExpenses);
++		wallet.setNetSavingsRatePercent(savingsRate);
++		wallet.setBaseCurrency(baseCurrency);
++		wallet.setLastUpdated(new Date());
++
++		return wallet;
++	}
++
++	private BigDecimal convert(BigDecimal amount, Currency from, Currency to,
++							   Map<Currency, BigDecimal> rates) {
++		if (from == to) {
++			return amount;
++		}
++		BigDecimal fromRate = rates.getOrDefault(from, BigDecimal.ONE);
++		BigDecimal toRate = rates.getOrDefault(to, BigDecimal.ONE);
++		BigDecimal ratio = toRate.divide(fromRate, 4, RoundingMode.HALF_UP);
++		return amount.multiply(ratio).setScale(4, RoundingMode.HALF_UP);
++	}
++
++	private void saveSnapshot(String accountName, Wallet wallet) {
++		Instant instant = LocalDate.now().atStartOfDay()
++				.atZone(ZoneId.systemDefault()).toInstant();
++
++		WalletSnapshotId snapshotId = new WalletSnapshotId(accountName, Date.from(instant));
++
++		WalletSnapshot snapshot = new WalletSnapshot();
++		snapshot.setId(snapshotId);
++		snapshot.setWallet(wallet);
++
++		snapshotRepository.save(snapshot);
++		log.debug("wallet snapshot saved for account {} on {}", accountName, snapshotId.getDate());
++	}
++}
+diff --git a/account-service/src/test/java/com/piggymetrics/account/client/ExchangeRatesClientFallbackTest.java b/account-service/src/test/java/com/piggymetrics/account/client/ExchangeRatesClientFallbackTest.java
+new file mode 100644
+index 0000000..7c44f9e
+--- /dev/null
++++ b/account-service/src/test/java/com/piggymetrics/account/client/ExchangeRatesClientFallbackTest.java
+@@ -0,0 +1,25 @@
++package com.piggymetrics.account.client;
++
++import com.piggymetrics.account.domain.Currency;
++import org.junit.Test;
++
++import java.math.BigDecimal;
++import java.util.Map;
++
++import static org.junit.Assert.*;
++
++public class ExchangeRatesClientFallbackTest {
++
++	private final StatisticsServiceClientFallback fallback = new StatisticsServiceClientFallback();
++
++	@Test
++	public void shouldReturnFallbackRates() {
++		Map<Currency, BigDecimal> rates = fallback.getRates();
++
++		assertNotNull(rates);
++		assertEquals(3, rates.size());
++		assertEquals(BigDecimal.ONE, rates.get(Currency.USD));
++		assertEquals(new BigDecimal("0.9"), rates.get(Currency.EUR));
++		assertEquals(new BigDecimal("75.0"), rates.get(Currency.RUB));
++	}
++}
+diff --git a/account-service/src/test/java/com/piggymetrics/account/controller/WalletControllerTest.java b/account-service/src/test/java/com/piggymetrics/account/controller/WalletControllerTest.java
+new file mode 100644
+index 0000000..df02b33
+--- /dev/null
++++ b/account-service/src/test/java/com/piggymetrics/account/controller/WalletControllerTest.java
+@@ -0,0 +1,126 @@
++package com.piggymetrics.account.controller;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.piggymetrics.account.domain.Currency;
++import com.piggymetrics.account.domain.Wallet;
++import com.piggymetrics.account.domain.WalletSnapshot;
++import com.piggymetrics.account.domain.WalletSnapshotId;
++import com.piggymetrics.account.service.WalletService;
++import com.sun.security.auth.UserPrincipal;
++import org.junit.Before;
++import org.junit.Test;
++import org.junit.runner.RunWith;
++import org.mockito.InjectMocks;
++import org.mockito.Mock;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.http.MediaType;
++import org.springframework.test.context.junit4.SpringRunner;
++import org.springframework.test.web.servlet.MockMvc;
++import org.springframework.test.web.servlet.setup.MockMvcBuilders;
++
++import java.math.BigDecimal;
++import java.util.*;
++
++import static org.mockito.Mockito.when;
++import static org.mockito.MockitoAnnotations.initMocks;
++import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
++import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
++
++@RunWith(SpringRunner.class)
++@SpringBootTest
++public class WalletControllerTest {
++
++	private static final ObjectMapper mapper = new ObjectMapper();
++
++	@InjectMocks
++	private WalletController walletController;
++
++	@Mock
++	private WalletService walletService;
++
++	private MockMvc mockMvc;
++
++	@Before
++	public void setup() {
++		initMocks(this);
++		this.mockMvc = MockMvcBuilders.standaloneSetup(walletController).build();
++	}
++
++	@Test
++	public void shouldGetCurrentWallet() throws Exception {
++
++		Wallet wallet = createTestWallet();
++
++		when(walletService.getWallet("test")).thenReturn(wallet);
++
++		mockMvc.perform(get("/current/wallet").principal(new UserPrincipal("test")))
++				.andExpect(jsonPath("$.baseCurrency").value("USD"))
++				.andExpect(jsonPath("$.totalBalance").value(10000))
++				.andExpect(jsonPath("$.totalMonthlyIncome").value(9000))
++				.andExpect(jsonPath("$.totalMonthlyExpenses").value(500))
++				.andExpect(status().isOk());
++	}
++
++	@Test
++	public void shouldRefreshWallet() throws Exception {
++
++		Wallet wallet = createTestWallet();
++
++		when(walletService.recalculate("test")).thenReturn(wallet);
++
++		mockMvc.perform(post("/current/wallet/refresh").principal(new UserPrincipal("test")))
++				.andExpect(jsonPath("$.baseCurrency").value("USD"))
++				.andExpect(jsonPath("$.totalBalance").value(10000))
++				.andExpect(status().isOk());
++	}
++
++	@Test
++	public void shouldChangeBaseCurrency() throws Exception {
++
++		Wallet wallet = createTestWallet();
++		wallet.setBaseCurrency(Currency.EUR);
++
++		when(walletService.changeBaseCurrency("test", Currency.EUR)).thenReturn(wallet);
++
++		mockMvc.perform(put("/current/wallet/currency")
++				.principal(new UserPrincipal("test"))
++				.contentType(MediaType.APPLICATION_JSON)
++				.content("\"EUR\""))
++				.andExpect(jsonPath("$.baseCurrency").value("EUR"))
++				.andExpect(status().isOk());
++	}
++
++	@Test
++	public void shouldGetWalletHistory() throws Exception {
++
++		WalletSnapshot snapshot = new WalletSnapshot();
++		snapshot.setId(new WalletSnapshotId("test", new Date()));
++		snapshot.setWallet(createTestWallet());
++
++		when(walletService.getHistory(org.mockito.ArgumentMatchers.eq("test"),
++				org.mockito.ArgumentMatchers.any(Date.class),
++				org.mockito.ArgumentMatchers.any(Date.class)))
++				.thenReturn(Arrays.asList(snapshot));
++
++		mockMvc.perform(get("/current/wallet/history")
++				.principal(new UserPrincipal("test"))
++				.param("from", "2024-01-01")
++				.param("to", "2024-12-31"))
++				.andExpect(jsonPath("$[0].wallet.baseCurrency").value("USD"))
++				.andExpect(status().isOk());
++	}
++
++	private Wallet createTestWallet() {
++		Wallet wallet = new Wallet();
++		wallet.setBaseCurrency(Currency.USD);
++		wallet.setTotalBalance(new BigDecimal("10000"));
++		wallet.setTotalMonthlyIncome(new BigDecimal("9000"));
++		wallet.setTotalMonthlyExpenses(new BigDecimal("500"));
++		wallet.setNetSavingsRatePercent(new BigDecimal("94.44"));
++		wallet.setBalances(new HashMap<>());
++		wallet.setConvertedBalances(new HashMap<>());
++		wallet.setLastUpdated(new Date());
++		return wallet;
++	}
++}
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
+index 675d54c..f9041b0 100644
+--- a/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
++++ b/account-service/src/test/java/com/piggymetrics/account/service/AccountServiceTest.java
+@@ -31,6 +31,9 @@ public class AccountServiceTest {
+ 	@Mock
+ 	private AccountRepository repository;
+ 
++	@Mock
++	private WalletService walletService;
++
+ 	@Before
+ 	public void setup() {
+ 		initMocks(this);
+diff --git a/account-service/src/test/java/com/piggymetrics/account/service/WalletServiceTest.java b/account-service/src/test/java/com/piggymetrics/account/service/WalletServiceTest.java
+new file mode 100644
+index 0000000..96307f8
+--- /dev/null
++++ b/account-service/src/test/java/com/piggymetrics/account/service/WalletServiceTest.java
+@@ -0,0 +1,308 @@
++package com.piggymetrics.account.service;
++
++import com.piggymetrics.account.client.StatisticsServiceClient;
++import com.piggymetrics.account.domain.*;
++import com.piggymetrics.account.repository.AccountRepository;
++import com.piggymetrics.account.repository.WalletSnapshotRepository;
++import org.junit.Before;
++import org.junit.Test;
++import org.mockito.InjectMocks;
++import org.mockito.Mock;
++
++import java.math.BigDecimal;
++import java.util.Arrays;
++import java.util.Collections;
++import java.util.Date;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.*;
++import static org.mockito.Mockito.*;
++import static org.mockito.MockitoAnnotations.initMocks;
++
++public class WalletServiceTest {
++
++	@InjectMocks
++	private WalletServiceImpl walletService;
++
++	@Mock
++	private AccountRepository accountRepository;
++
++	@Mock
++	private WalletSnapshotRepository snapshotRepository;
++
++	@Mock
++	private StatisticsServiceClient statisticsClient;
++
++	@Before
++	public void setup() {
++		initMocks(this);
++
++		Map<Currency, BigDecimal> rates = new HashMap<>();
++		rates.put(Currency.USD, BigDecimal.ONE);
++		rates.put(Currency.EUR, new BigDecimal("0.9"));
++		rates.put(Currency.RUB, new BigDecimal("75.0"));
++		when(statisticsClient.getRates()).thenReturn(rates);
++	}
++
++	@Test
++	public void shouldRecalculateWalletWithSingleCurrency() {
++
++		Item salary = createItem("Salary", new BigDecimal("9100"), Currency.USD, TimePeriod.MONTH);
++		Item grocery = createItem("Grocery", new BigDecimal("500"), Currency.USD, TimePeriod.MONTH);
++
++		Saving saving = createSaving(new BigDecimal("1500"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(Arrays.asList(salary));
++		account.setExpenses(Arrays.asList(grocery));
++		account.setSaving(saving);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet wallet = walletService.recalculate("test");
++
++		assertNotNull(wallet);
++		assertEquals(Currency.USD, wallet.getBaseCurrency());
++		assertEquals(0, new BigDecimal("9100.0000").compareTo(wallet.getTotalMonthlyIncome()));
++		assertEquals(0, new BigDecimal("500.0000").compareTo(wallet.getTotalMonthlyExpenses()));
++
++		// totalBalance = (9100 - 500) + 1500 = 10100
++		assertEquals(0, new BigDecimal("10100.0000").compareTo(wallet.getTotalBalance()));
++
++		// savingsRate = (9100-500)/9100 * 100 = 94.51%
++		assertTrue(wallet.getNetSavingsRatePercent().compareTo(BigDecimal.ZERO) > 0);
++
++		verify(accountRepository, times(1)).save(account);
++		verify(snapshotRepository, times(1)).save(any(WalletSnapshot.class));
++	}
++
++	@Test
++	public void shouldRecalculateWalletWithMultipleCurrencies() {
++
++		Item salaryUsd = createItem("Salary", new BigDecimal("5000"), Currency.USD, TimePeriod.MONTH);
++		Item salaryEur = createItem("Freelance", new BigDecimal("1000"), Currency.EUR, TimePeriod.MONTH);
++		Item grocery = createItem("Grocery", new BigDecimal("300"), Currency.USD, TimePeriod.MONTH);
++
++		Saving saving = createSaving(new BigDecimal("2000"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(Arrays.asList(salaryUsd, salaryEur));
++		account.setExpenses(Arrays.asList(grocery));
++		account.setSaving(saving);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet wallet = walletService.recalculate("test");
++
++		assertNotNull(wallet);
++		assertEquals(Currency.USD, wallet.getBaseCurrency());
++
++		// Should have balances for both USD and EUR
++		assertNotNull(wallet.getBalances());
++		assertTrue(wallet.getBalances().containsKey(Currency.USD));
++		assertTrue(wallet.getBalances().containsKey(Currency.EUR));
++
++		// USD balance: 5000 - 300 = 4700
++		assertEquals(0, new BigDecimal("4700").compareTo(wallet.getBalances().get(Currency.USD)));
++		// EUR balance: 1000 (income only)
++		assertEquals(0, new BigDecimal("1000.0000").compareTo(wallet.getBalances().get(Currency.EUR)));
++
++		assertNotNull(wallet.getConvertedBalances());
++		assertTrue(wallet.getTotalMonthlyIncome().compareTo(new BigDecimal("5000")) > 0);
++	}
++
++	@Test
++	public void shouldNormalizeTimePeriods() {
++
++		// $120 per DAY = $120 * 30.4368 per month = ~3652.42
++		Item daily = createItem("Daily", new BigDecimal("120"), Currency.USD, TimePeriod.DAY);
++		// $120000 per YEAR = $120000 / 12 per month = $10000
++		Item yearly = createItem("Yearly", new BigDecimal("120000"), Currency.USD, TimePeriod.YEAR);
++
++		Saving saving = createSaving(new BigDecimal("0"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(Arrays.asList(yearly));
++		account.setExpenses(Arrays.asList(daily));
++		account.setSaving(saving);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet wallet = walletService.recalculate("test");
++
++		// Monthly income: 120000 / 12 = 10000
++		assertEquals(0, new BigDecimal("10000.0000").compareTo(wallet.getTotalMonthlyIncome()));
++
++		// Monthly expense: 120 * 30.4368 = 3652.4160
++		assertEquals(0, new BigDecimal("3652.4160").compareTo(wallet.getTotalMonthlyExpenses()));
++	}
++
++	@Test
++	public void shouldIncludeSavingInTotalBalance() {
++
++		Saving saving = createSaving(new BigDecimal("5000"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(Collections.emptyList());
++		account.setExpenses(Collections.emptyList());
++		account.setSaving(saving);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet wallet = walletService.recalculate("test");
++
++		// No income or expenses, total balance = saving only
++		assertEquals(0, new BigDecimal("5000.0000").compareTo(wallet.getTotalBalance()));
++	}
++
++	@Test
++	public void shouldCalculateNetSavingsRate() {
++
++		Item salary = createItem("Salary", new BigDecimal("10000"), Currency.USD, TimePeriod.MONTH);
++		Item rent = createItem("Rent", new BigDecimal("3000"), Currency.USD, TimePeriod.MONTH);
++
++		Saving saving = createSaving(new BigDecimal("0"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(Arrays.asList(salary));
++		account.setExpenses(Arrays.asList(rent));
++		account.setSaving(saving);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet wallet = walletService.recalculate("test");
++
++		// savingsRate = (10000 - 3000) / 10000 * 100 = 70.00%
++		assertEquals(0, new BigDecimal("70.00").compareTo(wallet.getNetSavingsRatePercent()));
++	}
++
++	@Test
++	public void shouldChangeBaseCurrency() {
++
++		Item salary = createItem("Salary", new BigDecimal("10000"), Currency.USD, TimePeriod.MONTH);
++
++		Saving saving = createSaving(new BigDecimal("0"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(Arrays.asList(salary));
++		account.setExpenses(Collections.emptyList());
++		account.setSaving(saving);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet wallet = walletService.changeBaseCurrency("test", Currency.EUR);
++
++		assertEquals(Currency.EUR, wallet.getBaseCurrency());
++		// 10000 USD * (0.9 EUR/USD) = 9000 EUR
++		assertEquals(0, new BigDecimal("9000.0000").compareTo(wallet.getTotalMonthlyIncome()));
++
++		verify(accountRepository, times(1)).save(account);
++	}
++
++	@Test(expected = IllegalArgumentException.class)
++	public void shouldFailWhenAccountNotFound() {
++		when(accountRepository.findByName("nonexistent")).thenReturn(null);
++		walletService.recalculate("nonexistent");
++	}
++
++	@Test
++	public void shouldHandleNullIncomesAndExpenses() {
++
++		Saving saving = createSaving(new BigDecimal("1000"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(null);
++		account.setExpenses(null);
++		account.setSaving(saving);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet wallet = walletService.recalculate("test");
++
++		assertNotNull(wallet);
++		assertEquals(0, BigDecimal.ZERO.compareTo(wallet.getTotalMonthlyIncome().stripTrailingZeros()));
++		assertEquals(0, BigDecimal.ZERO.compareTo(wallet.getTotalMonthlyExpenses().stripTrailingZeros()));
++		assertEquals(0, new BigDecimal("1000.0000").compareTo(wallet.getTotalBalance()));
++	}
++
++	@Test
++	public void shouldReturnWalletHistory() {
++
++		Date from = new Date(1000000000L);
++		Date to = new Date(2000000000L);
++
++		List<WalletSnapshot> snapshots = Arrays.asList(new WalletSnapshot());
++		when(snapshotRepository.findByIdAccountAndIdDateBetween("test", from, to)).thenReturn(snapshots);
++
++		List<WalletSnapshot> result = walletService.getHistory("test", from, to);
++		assertEquals(1, result.size());
++	}
++
++	@Test
++	public void shouldGetExistingWallet() {
++
++		Wallet existingWallet = new Wallet();
++		existingWallet.setBaseCurrency(Currency.EUR);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setWallet(existingWallet);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet result = walletService.getWallet("test");
++		assertNotNull(result);
++		assertEquals(Currency.EUR, result.getBaseCurrency());
++	}
++
++	@Test
++	public void shouldPreserveExistingBaseCurrencyOnRecalculate() {
++
++		Wallet existingWallet = new Wallet();
++		existingWallet.setBaseCurrency(Currency.EUR);
++
++		Saving saving = createSaving(new BigDecimal("0"), Currency.USD);
++
++		Account account = new Account();
++		account.setName("test");
++		account.setIncomes(Collections.emptyList());
++		account.setExpenses(Collections.emptyList());
++		account.setSaving(saving);
++		account.setWallet(existingWallet);
++
++		when(accountRepository.findByName("test")).thenReturn(account);
++
++		Wallet wallet = walletService.recalculate("test");
++
++		assertEquals(Currency.EUR, wallet.getBaseCurrency());
++	}
++
++	private Item createItem(String title, BigDecimal amount, Currency currency, TimePeriod period) {
++		Item item = new Item();
++		item.setTitle(title);
++		item.setAmount(amount);
++		item.setCurrency(currency);
++		item.setPeriod(period);
++		item.setIcon("icon");
++		return item;
++	}
++
++	private Saving createSaving(BigDecimal amount, Currency currency) {
++		Saving saving = new Saving();
++		saving.setAmount(amount);
++		saving.setCurrency(currency);
++		saving.setInterest(BigDecimal.ZERO);
++		saving.setDeposit(false);
++		saving.setCapitalization(false);
++		return saving;
++	}
++}
+diff --git a/statistics-service/src/main/java/com/piggymetrics/statistics/controller/StatisticsController.java b/statistics-service/src/main/java/com/piggymetrics/statistics/controller/StatisticsController.java
+index 788737b..70d3d2f 100644
+--- a/statistics-service/src/main/java/com/piggymetrics/statistics/controller/StatisticsController.java
++++ b/statistics-service/src/main/java/com/piggymetrics/statistics/controller/StatisticsController.java
+@@ -1,15 +1,19 @@
+ package com.piggymetrics.statistics.controller;
+ 
+ import com.piggymetrics.statistics.domain.Account;
++import com.piggymetrics.statistics.domain.Currency;
+ import com.piggymetrics.statistics.domain.timeseries.DataPoint;
++import com.piggymetrics.statistics.service.ExchangeRatesService;
+ import com.piggymetrics.statistics.service.StatisticsService;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.security.access.prepost.PreAuthorize;
+ import org.springframework.web.bind.annotation.*;
+ 
+ import javax.validation.Valid;
++import java.math.BigDecimal;
+ import java.security.Principal;
+ import java.util.List;
++import java.util.Map;
+ 
+ @RestController
+ public class StatisticsController {
+@@ -17,6 +21,9 @@ public class StatisticsController {
+ 	@Autowired
+ 	private StatisticsService statisticsService;
+ 
++	@Autowired
++	private ExchangeRatesService exchangeRatesService;
++
+ 	@RequestMapping(value = "/current", method = RequestMethod.GET)
+ 	public List<DataPoint> getCurrentAccountStatistics(Principal principal) {
+ 		return statisticsService.findByAccountName(principal.getName());
+@@ -33,4 +40,10 @@ public class StatisticsController {
+ 	public void saveAccountStatistics(@PathVariable String accountName, @Valid @RequestBody Account account) {
+ 		statisticsService.save(accountName, account);
+ 	}
++
++	@PreAuthorize("#oauth2.hasScope('server')")
++	@RequestMapping(value = "/rates", method = RequestMethod.GET)
++	public Map<Currency, BigDecimal> getCurrentRates() {
++		return exchangeRatesService.getCurrentRates();
++	}
+ }
+diff --git a/statistics-service/src/test/java/com/piggymetrics/statistics/controller/StatisticsControllerTest.java b/statistics-service/src/test/java/com/piggymetrics/statistics/controller/StatisticsControllerTest.java
+index 6040a21..07cb27e 100644
+--- a/statistics-service/src/test/java/com/piggymetrics/statistics/controller/StatisticsControllerTest.java
++++ b/statistics-service/src/test/java/com/piggymetrics/statistics/controller/StatisticsControllerTest.java
+@@ -9,6 +9,7 @@ import com.piggymetrics.statistics.domain.Saving;
+ import com.piggymetrics.statistics.domain.TimePeriod;
+ import com.piggymetrics.statistics.domain.timeseries.DataPoint;
+ import com.piggymetrics.statistics.domain.timeseries.DataPointId;
++import com.piggymetrics.statistics.service.ExchangeRatesService;
+ import com.piggymetrics.statistics.service.StatisticsService;
+ import com.sun.security.auth.UserPrincipal;
+ import org.junit.Before;
+@@ -24,6 +25,8 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+ 
+ import java.math.BigDecimal;
+ import java.util.Date;
++import java.util.HashMap;
++import java.util.Map;
+ 
+ import static org.mockito.ArgumentMatchers.any;
+ import static org.mockito.ArgumentMatchers.anyString;
+@@ -48,6 +51,9 @@ public class StatisticsControllerTest {
+ 	@Mock
+ 	private StatisticsService statisticsService;
+ 
++	@Mock
++	private ExchangeRatesService exchangeRatesService;
++
+ 	private MockMvc mockMvc;
+ 
+ 	@Before
+@@ -118,4 +124,21 @@ public class StatisticsControllerTest {
+ 
+ 		verify(statisticsService, times(1)).save(anyString(), any(Account.class));
+ 	}
++
++	@Test
++	public void shouldGetCurrentRates() throws Exception {
++
++		Map<Currency, BigDecimal> rates = new HashMap<>();
++		rates.put(Currency.USD, BigDecimal.ONE);
++		rates.put(Currency.EUR, new BigDecimal("0.85"));
++		rates.put(Currency.RUB, new BigDecimal("73.5"));
++
++		when(exchangeRatesService.getCurrentRates()).thenReturn(rates);
++
++		mockMvc.perform(get("/rates"))
++				.andExpect(jsonPath("$.USD").value(1))
++				.andExpect(jsonPath("$.EUR").value(0.85))
++				.andExpect(jsonPath("$.RUB").value(73.5))
++				.andExpect(status().isOk());
++	}
+ }
+\ No newline at end of file
