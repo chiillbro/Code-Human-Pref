@@ -1,0 +1,618 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..4da7d25
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,6 @@
++__pycache__/
++*.pyc
++.schedmax/
++*.egg-info/
++build/
++dist/
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..f74c2c5
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,42 @@
++# schedmax
++
++A self-contained CLI for resource scheduling (meeting rooms, shared equipment,
++on-call rotations). No external infrastructure — state lives in a local JSON
++file under `.schedmax/db.json`. Python standard library only.
++
++## Install (editable)
++
++```
++pip install -e .
++```
++
++This provides the `schedctl` command. You can also run `python -m schedmax`.
++
++## Commands
++
++```
++schedctl init [--timezone UTC]
++schedctl resource add --name <name> [--description ...] \
++                     [--availability "MON 09:00-17:00,TUE 09:00-12:00"]
++schedctl resource list
++schedctl book --resource <name> --start "YYYY-MM-DD HH:MM" \
++              --end "YYYY-MM-DD HH:MM" --title <title> --by <person>
++schedctl cancel --id <booking-id>
++schedctl list [--resource <name>] [--all]
++```
++
++## Rules
++
++- Resource names are unique and must not contain whitespace.
++- Availability is a set of weekly recurring `DAY HH:MM-HH:MM` windows.
++- A booking must lie fully inside one availability window on its weekday,
++  cannot start in the past, must have end > start, duration 1 min–24 h, and
++  must not overlap any other booking for the same resource.
++- Datetimes without a timezone are interpreted in the database timezone set
++  at `init` time.
++
++## Data location
++
++`schedctl` walks up from the current directory to find `.schedmax/db.json`,
++similar to how `git` finds `.git`. Run `init` in the directory you want to
++own the schedule.
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..a02f8dd
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,15 @@
++[build-system]
++requires = ["setuptools>=61"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "schedmax"
++version = "0.1.0"
++description = "Self-contained CLI for resource scheduling (rooms, equipment, on-call)."
++requires-python = ">=3.11"
++
++[project.scripts]
++schedctl = "schedmax.cli:main"
++
++[tool.setuptools.packages.find]
++include = ["schedmax*"]
+diff --git a/schedmax/__init__.py b/schedmax/__init__.py
+new file mode 100644
+index 0000000..3dc1f76
+--- /dev/null
++++ b/schedmax/__init__.py
+@@ -0,0 +1 @@
++__version__ = "0.1.0"
+diff --git a/schedmax/__main__.py b/schedmax/__main__.py
+new file mode 100644
+index 0000000..bfdcd0c
+--- /dev/null
++++ b/schedmax/__main__.py
+@@ -0,0 +1,4 @@
++from .cli import main
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/schedmax/cli.py b/schedmax/cli.py
+new file mode 100644
+index 0000000..7e1cf62
+--- /dev/null
++++ b/schedmax/cli.py
+@@ -0,0 +1,136 @@
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++from . import __version__, service, storage
++from .models import WEEKDAYS, ValidationError, parse_availability_spec
++
++
++def _cmd_init(args: argparse.Namespace) -> int:
++    path = storage.init_db(timezone=args.timezone)
++    print(f"initialized schedmax at {path} (timezone={args.timezone})")
++    return 0
++
++
++def _cmd_resource_add(args: argparse.Namespace) -> int:
++    slots = parse_availability_spec(args.availability or "")
++    r = service.add_resource(args.name, args.description or "", slots)
++    print(f"added resource '{r.name}' with {len(r.availability)} availability slot(s)")
++    return 0
++
++
++def _cmd_resource_list(_: argparse.Namespace) -> int:
++    resources = service.list_resources()
++    if not resources:
++        print("(no resources)")
++        return 0
++    for r in resources:
++        desc = f" - {r.description}" if r.description else ""
++        print(f"{r.name}{desc}")
++        if r.availability:
++            for s in r.availability:
++                print(f"    {WEEKDAYS[s.weekday]} {s.start}-{s.end}")
++        else:
++            print("    (no availability defined)")
++    return 0
++
++
++def _cmd_book(args: argparse.Namespace) -> int:
++    b = service.create_booking(
++        resource_name=args.resource,
++        start_s=args.start,
++        end_s=args.end,
++        title=args.title,
++        booked_by=args.by,
++    )
++    print(f"booked {b.id}: {b.resource} {b.start} -> {b.end} '{b.title}' by {b.booked_by}")
++    return 0
++
++
++def _cmd_cancel(args: argparse.Namespace) -> int:
++    b = service.cancel_booking(args.id)
++    print(f"cancelled {b.id} ({b.resource} {b.start} -> {b.end})")
++    return 0
++
++
++def _cmd_list(args: argparse.Namespace) -> int:
++    bookings = service.list_bookings(resource=args.resource, include_past=args.all)
++    if not bookings:
++        print("(no bookings)")
++        return 0
++    for b in bookings:
++        print(
++            f"{b.id}  {b.resource:<16}  {b.start} -> {b.end}  "
++            f"{b.title!r} by {b.booked_by}"
++        )
++    return 0
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="schedctl",
++        description="schedmax: self-contained resource scheduling CLI",
++    )
++    parser.add_argument("--version", action="version", version=f"schedmax {__version__}")
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    p_init = sub.add_parser("init", help="initialize a schedmax database in cwd")
++    p_init.add_argument("--timezone", default="UTC", help="IANA timezone (default UTC)")
++    p_init.set_defaults(func=_cmd_init)
++
++    p_res = sub.add_parser("resource", help="manage resources")
++    res_sub = p_res.add_subparsers(dest="resource_cmd", required=True)
++
++    p_res_add = res_sub.add_parser("add", help="add a resource")
++    p_res_add.add_argument("--name", required=True)
++    p_res_add.add_argument("--description", default="")
++    p_res_add.add_argument(
++        "--availability",
++        default="",
++        help="comma-separated slots like 'MON 09:00-17:00,TUE 09:00-12:00'",
++    )
++    p_res_add.set_defaults(func=_cmd_resource_add)
++
++    p_res_list = res_sub.add_parser("list", help="list resources")
++    p_res_list.set_defaults(func=_cmd_resource_list)
++
++    p_book = sub.add_parser("book", help="create a booking")
++    p_book.add_argument("--resource", required=True)
++    p_book.add_argument("--start", required=True, help="'YYYY-MM-DD HH:MM' or ISO-8601")
++    p_book.add_argument("--end", required=True, help="'YYYY-MM-DD HH:MM' or ISO-8601")
++    p_book.add_argument("--title", required=True)
++    p_book.add_argument("--by", required=True, help="name of the person booking")
++    p_book.set_defaults(func=_cmd_book)
++
++    p_cancel = sub.add_parser("cancel", help="cancel a booking by id")
++    p_cancel.add_argument("--id", required=True)
++    p_cancel.set_defaults(func=_cmd_cancel)
++
++    p_list = sub.add_parser("list", help="list bookings")
++    p_list.add_argument("--resource", default=None)
++    p_list.add_argument("--all", action="store_true", help="include past bookings")
++    p_list.set_defaults(func=_cmd_list)
++
++    return parser
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = build_parser()
++    args = parser.parse_args(argv)
++    try:
++        return args.func(args)
++    except ValidationError as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++    except FileNotFoundError as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++    except FileExistsError as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/schedmax/models.py b/schedmax/models.py
+new file mode 100644
+index 0000000..97401cd
+--- /dev/null
++++ b/schedmax/models.py
+@@ -0,0 +1,150 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field, asdict
++from datetime import datetime, time, timedelta
++from typing import Iterable
++
++WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
++WEEKDAY_INDEX = {name: i for i, name in enumerate(WEEKDAYS)}
++
++
++class ValidationError(ValueError):
++    pass
++
++
++@dataclass
++class AvailabilitySlot:
++    weekday: int  # 0 = Monday
++    start: str    # "HH:MM"
++    end: str      # "HH:MM"
++
++    def validate(self) -> None:
++        if self.weekday not in range(7):
++            raise ValidationError(f"invalid weekday: {self.weekday}")
++        s = _parse_hhmm(self.start)
++        e = _parse_hhmm(self.end)
++        if not (s < e):
++            raise ValidationError(
++                f"availability start {self.start} must be before end {self.end}"
++            )
++
++    def to_dict(self) -> dict:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, d: dict) -> "AvailabilitySlot":
++        return cls(weekday=int(d["weekday"]), start=d["start"], end=d["end"])
++
++
++@dataclass
++class Resource:
++    name: str
++    description: str = ""
++    availability: list[AvailabilitySlot] = field(default_factory=list)
++
++    def validate(self) -> None:
++        if not self.name or not self.name.strip():
++            raise ValidationError("resource name is required")
++        if any(c.isspace() for c in self.name):
++            raise ValidationError("resource name must not contain whitespace")
++        for slot in self.availability:
++            slot.validate()
++
++    def to_dict(self) -> dict:
++        return {
++            "name": self.name,
++            "description": self.description,
++            "availability": [s.to_dict() for s in self.availability],
++        }
++
++    @classmethod
++    def from_dict(cls, d: dict) -> "Resource":
++        return cls(
++            name=d["name"],
++            description=d.get("description", ""),
++            availability=[AvailabilitySlot.from_dict(s) for s in d.get("availability", [])],
++        )
++
++
++@dataclass
++class Booking:
++    id: str
++    resource: str
++    start: str  # ISO-8601
++    end: str    # ISO-8601
++    title: str
++    booked_by: str
++
++    def start_dt(self) -> datetime:
++        return datetime.fromisoformat(self.start)
++
++    def end_dt(self) -> datetime:
++        return datetime.fromisoformat(self.end)
++
++    def to_dict(self) -> dict:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, d: dict) -> "Booking":
++        return cls(**d)
++
++
++def _parse_hhmm(s: str) -> time:
++    try:
++        hh, mm = s.split(":")
++        return time(int(hh), int(mm))
++    except Exception as exc:
++        raise ValidationError(f"invalid time '{s}', expected HH:MM") from exc
++
++
++def parse_availability_spec(spec: str) -> list[AvailabilitySlot]:
++    """Parse 'MON 09:00-17:00,TUE 09:00-12:00' style specs."""
++    slots: list[AvailabilitySlot] = []
++    if not spec.strip():
++        return slots
++    for chunk in spec.split(","):
++        chunk = chunk.strip()
++        if not chunk:
++            continue
++        parts = chunk.split()
++        if len(parts) != 2:
++            raise ValidationError(
++                f"invalid availability entry '{chunk}', expected 'DAY HH:MM-HH:MM'"
++            )
++        day_s, range_s = parts
++        day_key = day_s.upper()
++        if day_key not in WEEKDAY_INDEX:
++            raise ValidationError(f"unknown weekday '{day_s}'")
++        if "-" not in range_s:
++            raise ValidationError(f"invalid time range '{range_s}'")
++        start_s, end_s = range_s.split("-", 1)
++        slot = AvailabilitySlot(
++            weekday=WEEKDAY_INDEX[day_key], start=start_s, end=end_s
++        )
++        slot.validate()
++        slots.append(slot)
++    return slots
++
++
++def fits_within_availability(
++    start: datetime, end: datetime, availability: Iterable[AvailabilitySlot]
++) -> bool:
++    """Booking must lie within a single availability slot on its weekday."""
++    if start.date() != end.date():
++        # Require slots on each covered day; keep simple: disallow multi-day.
++        return False
++    wd = start.weekday()
++    for slot in availability:
++        if slot.weekday != wd:
++            continue
++        s_t = _parse_hhmm(slot.start)
++        e_t = _parse_hhmm(slot.end)
++        slot_start = start.replace(hour=s_t.hour, minute=s_t.minute, second=0, microsecond=0)
++        slot_end = start.replace(hour=e_t.hour, minute=e_t.minute, second=0, microsecond=0)
++        if slot_start <= start and end <= slot_end:
++            return True
++    return False
++
++
++def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
++    return a_start < b_end and b_start < a_end
+diff --git a/schedmax/service.py b/schedmax/service.py
+new file mode 100644
+index 0000000..afe9a94
+--- /dev/null
++++ b/schedmax/service.py
+@@ -0,0 +1,155 @@
++from __future__ import annotations
++
++import uuid
++from datetime import datetime, timedelta
++from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
++
++from . import storage
++from .models import (
++    AvailabilitySlot,
++    Booking,
++    Resource,
++    ValidationError,
++    fits_within_availability,
++    overlaps,
++)
++
++MIN_BOOKING = timedelta(minutes=1)
++MAX_BOOKING = timedelta(days=1)
++
++
++def _tz(data: dict) -> ZoneInfo:
++    name = data.get("timezone", "UTC")
++    try:
++        return ZoneInfo(name)
++    except ZoneInfoNotFoundError as exc:
++        raise ValidationError(f"unknown timezone in db: {name}") from exc
++
++
++def add_resource(
++    name: str, description: str, availability: list[AvailabilitySlot]
++) -> Resource:
++    data = storage.load()
++    if any(r["name"] == name for r in data["resources"]):
++        raise ValidationError(f"resource '{name}' already exists")
++    resource = Resource(name=name, description=description, availability=availability)
++    resource.validate()
++    data["resources"].append(resource.to_dict())
++    storage.save(data)
++    return resource
++
++
++def list_resources() -> list[Resource]:
++    data = storage.load()
++    return [Resource.from_dict(r) for r in data["resources"]]
++
++
++def _get_resource(data: dict, name: str) -> Resource:
++    for r in data["resources"]:
++        if r["name"] == name:
++            return Resource.from_dict(r)
++    raise ValidationError(f"resource '{name}' not found")
++
++
++def parse_dt(s: str, tz: ZoneInfo) -> datetime:
++    """Parse 'YYYY-MM-DD HH:MM' or full ISO; attach tz if naive."""
++    s = s.strip()
++    try:
++        if "T" in s:
++            dt = datetime.fromisoformat(s)
++        else:
++            dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
++    except ValueError as exc:
++        raise ValidationError(
++            f"invalid datetime '{s}', expected 'YYYY-MM-DD HH:MM' or ISO-8601"
++        ) from exc
++    if dt.tzinfo is None:
++        dt = dt.replace(tzinfo=tz)
++    return dt
++
++
++def create_booking(
++    resource_name: str,
++    start_s: str,
++    end_s: str,
++    title: str,
++    booked_by: str,
++    now: datetime | None = None,
++) -> Booking:
++    if not title.strip():
++        raise ValidationError("title is required")
++    if not booked_by.strip():
++        raise ValidationError("booked_by is required")
++
++    data = storage.load()
++    tz = _tz(data)
++    resource = _get_resource(data, resource_name)
++
++    start = parse_dt(start_s, tz)
++    end = parse_dt(end_s, tz)
++    current = now or datetime.now(tz=tz)
++
++    if end <= start:
++        raise ValidationError("end must be after start")
++    duration = end - start
++    if duration < MIN_BOOKING:
++        raise ValidationError("booking duration must be at least 1 minute")
++    if duration > MAX_BOOKING:
++        raise ValidationError("booking duration must not exceed 24 hours")
++    if start < current:
++        raise ValidationError("cannot book in the past")
++
++    if not fits_within_availability(start, end, resource.availability):
++        raise ValidationError(
++            f"booking is outside '{resource.name}' availability"
++        )
++
++    for b in data["bookings"]:
++        if b["resource"] != resource.name:
++            continue
++        existing = Booking.from_dict(b)
++        if overlaps(start, end, existing.start_dt(), existing.end_dt()):
++            raise ValidationError(
++                f"overlaps existing booking {existing.id} "
++                f"({existing.start} -> {existing.end})"
++            )
++
++    booking = Booking(
++        id=uuid.uuid4().hex[:8],
++        resource=resource.name,
++        start=start.isoformat(),
++        end=end.isoformat(),
++        title=title.strip(),
++        booked_by=booked_by.strip(),
++    )
++    data["bookings"].append(booking.to_dict())
++    storage.save(data)
++    return booking
++
++
++def cancel_booking(booking_id: str) -> Booking:
++    data = storage.load()
++    for i, b in enumerate(data["bookings"]):
++        if b["id"] == booking_id:
++            removed = Booking.from_dict(data["bookings"].pop(i))
++            storage.save(data)
++            return removed
++    raise ValidationError(f"booking '{booking_id}' not found")
++
++
++def list_bookings(
++    resource: str | None = None, include_past: bool = False
++) -> list[Booking]:
++    data = storage.load()
++    tz = _tz(data)
++    now = datetime.now(tz=tz)
++    out: list[Booking] = []
++    for b in data["bookings"]:
++        if resource and b["resource"] != resource:
++            continue
++        bk = Booking.from_dict(b)
++        if not include_past and bk.end_dt() < now:
++            continue
++        out.append(bk)
++    out.sort(key=lambda x: x.start_dt())
++    return out
+diff --git a/schedmax/storage.py b/schedmax/storage.py
+new file mode 100644
+index 0000000..caad7e0
+--- /dev/null
++++ b/schedmax/storage.py
+@@ -0,0 +1,55 @@
++import json
++import os
++from pathlib import Path
++
++DB_DIRNAME = ".schedmax"
++DB_FILENAME = "db.json"
++
++
++def db_path(root: Path | None = None) -> Path:
++    root = root or Path.cwd()
++    return root / DB_DIRNAME / DB_FILENAME
++
++
++def find_db(start: Path | None = None) -> Path | None:
++    cur = (start or Path.cwd()).resolve()
++    for p in [cur, *cur.parents]:
++        candidate = p / DB_DIRNAME / DB_FILENAME
++        if candidate.exists():
++            return candidate
++    return None
++
++
++def init_db(root: Path | None = None, timezone: str = "UTC") -> Path:
++    path = db_path(root)
++    if path.exists():
++        raise FileExistsError(f"schedmax already initialized at {path}")
++    path.parent.mkdir(parents=True, exist_ok=False)
++    data = {"version": 1, "timezone": timezone, "resources": [], "bookings": []}
++    _write(path, data)
++    return path
++
++
++def load(path: Path | None = None) -> dict:
++    p = path or find_db()
++    if p is None:
++        raise FileNotFoundError(
++            "No schedmax database found. Run `schedctl init` first."
++        )
++    with open(p, "r", encoding="utf-8") as f:
++        return json.load(f)
++
++
++def save(data: dict, path: Path | None = None) -> None:
++    p = path or find_db()
++    if p is None:
++        raise FileNotFoundError("No schedmax database found.")
++    _write(p, data)
++
++
++def _write(path: Path, data: dict) -> None:
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    with open(tmp, "w", encoding="utf-8") as f:
++        json.dump(data, f, indent=2, sort_keys=False)
++        f.write("\n")
++    os.replace(tmp, path)

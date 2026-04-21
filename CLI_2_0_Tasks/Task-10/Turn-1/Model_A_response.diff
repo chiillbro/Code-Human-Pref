@@ -1,0 +1,888 @@
+diff --git a/schedctl b/schedctl
+new file mode 100644
+index 0000000..cdc1ef3
+--- /dev/null
++++ b/schedctl
+@@ -0,0 +1,5 @@
++#!/usr/bin/env python3
++import sys
++from schedmax.cli import main
++
++sys.exit(main())
+diff --git a/schedmax/__init__.py b/schedmax/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/schedmax/cli.py b/schedmax/cli.py
+new file mode 100644
+index 0000000..9def09a
+--- /dev/null
++++ b/schedmax/cli.py
+@@ -0,0 +1,80 @@
++import argparse
++import sys
++
++from schedmax.commands import (
++    book_cmd,
++    cancel_cmd,
++    init_cmd,
++    list_cmd,
++    resource_add_cmd,
++    resource_list_cmd,
++)
++
++
++def build_parser():
++    parser = argparse.ArgumentParser(
++        prog="schedctl",
++        description="SchedMax — resource scheduling CLI",
++    )
++    sub = parser.add_subparsers(dest="command")
++
++    sub.add_parser("init", help="Initialize the schedmax store")
++
++    res_parser = sub.add_parser("resource", help="Manage resources")
++    res_sub = res_parser.add_subparsers(dest="resource_command")
++
++    add_p = res_sub.add_parser("add", help="Add a new resource")
++    add_p.add_argument("name", help="Unique resource name (e.g. room-101)")
++    add_p.add_argument("--description", "-d", default="", help="Resource description")
++    add_p.add_argument(
++        "--availability", "-a", action="append",
++        help="Availability slot, e.g. 'mon 09:00-17:00' (repeatable)",
++    )
++
++    res_sub.add_parser("list", help="List all resources")
++
++    book_p = sub.add_parser("book", help="Create a booking")
++    book_p.add_argument("resource", help="Resource name to book")
++    book_p.add_argument("--title", "-t", required=True, help="Booking title")
++    book_p.add_argument("--by", "-b", required=True, help="Person making the booking")
++    book_p.add_argument("--start", "-s", required=True, help="Start time (YYYY-MM-DD HH:MM)")
++    book_p.add_argument("--end", "-e", required=True, help="End time (YYYY-MM-DD HH:MM)")
++
++    cancel_p = sub.add_parser("cancel", help="Cancel a booking")
++    cancel_p.add_argument("id", help="Booking ID to cancel")
++
++    list_p = sub.add_parser("list", help="List bookings")
++    list_p.add_argument("--resource", "-r", help="Filter by resource name")
++    list_p.add_argument("--date", "-d", help="Filter by date (YYYY-MM-DD)")
++    list_p.add_argument("--all", action="store_true", help="Include past bookings")
++
++    return parser
++
++
++def main():
++    parser = build_parser()
++    args = parser.parse_args()
++
++    if args.command is None:
++        parser.print_help()
++        return 1
++
++    dispatch = {
++        "init": init_cmd,
++        "book": book_cmd,
++        "cancel": cancel_cmd,
++        "list": list_cmd,
++    }
++
++    if args.command in dispatch:
++        return dispatch[args.command](args)
++
++    if args.command == "resource":
++        if getattr(args, "resource_command", None) is None:
++            parser.parse_args(["resource", "--help"])
++            return 1
++        resource_dispatch = {"add": resource_add_cmd, "list": resource_list_cmd}
++        return resource_dispatch[args.resource_command](args)
++
++    parser.print_help()
++    return 1
+diff --git a/schedmax/commands.py b/schedmax/commands.py
+new file mode 100644
+index 0000000..13949dd
+--- /dev/null
++++ b/schedmax/commands.py
+@@ -0,0 +1,173 @@
++import uuid
++
++from schedmax import store
++from schedmax.validators import (
++    check_availability_overlaps,
++    parse_availability,
++    parse_datetime,
++    validate_booking,
++    validate_resource_name,
++)
++
++
++def init_cmd(args):
++    if store.is_initialized():
++        print("Already initialized.")
++        return 1
++    store.init()
++    print("Initialized schedmax store in .schedmax/")
++    return 0
++
++
++def resource_add_cmd(args):
++    data = store.load()
++
++    name = args.name
++    err = validate_resource_name(name)
++    if err:
++        print(f"Error: {err}")
++        return 1
++
++    if name in data["resources"]:
++        print(f"Error: resource '{name}' already exists.")
++        return 1
++
++    availability = []
++    for raw in args.availability or []:
++        try:
++            slot = parse_availability(raw)
++        except ValueError as e:
++            print(f"Error: {e}")
++            return 1
++        availability.append(slot)
++
++    if not availability:
++        print("Error: at least one --availability slot is required (e.g. 'mon 09:00-17:00').")
++        return 1
++
++    overlap_err = check_availability_overlaps(availability)
++    if overlap_err:
++        print(f"Error: {overlap_err}")
++        return 1
++
++    resource = {
++        "name": name,
++        "description": args.description or "",
++        "availability": availability,
++    }
++    data["resources"][name] = resource
++    store.save(data)
++    print(f"Resource '{name}' added.")
++    return 0
++
++
++def resource_list_cmd(args):
++    data = store.load()
++    resources = data["resources"]
++
++    if not resources:
++        print("No resources defined.")
++        return 0
++
++    for name, res in sorted(resources.items()):
++        desc = f" — {res['description']}" if res.get("description") else ""
++        print(f"  {name}{desc}")
++        for slot in res.get("availability", []):
++            print(f"    {slot['day'].capitalize():12s} {slot['start']}-{slot['end']}")
++
++    return 0
++
++
++def book_cmd(args):
++    data = store.load()
++
++    resource_name = args.resource
++    if resource_name not in data["resources"]:
++        print(f"Error: resource '{resource_name}' not found.")
++        return 1
++
++    resource = data["resources"][resource_name]
++
++    try:
++        start_dt = parse_datetime(args.start)
++        end_dt = parse_datetime(args.end)
++    except ValueError as e:
++        print(f"Error: {e}")
++        return 1
++
++    resource_bookings = [b for b in data["bookings"] if b["resource"] == resource_name]
++    errors = validate_booking(resource, start_dt, end_dt, resource_bookings)
++    if errors:
++        for err in errors:
++            print(f"Error: {err}")
++        return 1
++
++    booking_id = uuid.uuid4().hex[:8]
++    booking = {
++        "id": booking_id,
++        "resource": resource_name,
++        "title": args.title,
++        "booked_by": args.by,
++        "start": start_dt.strftime("%Y-%m-%dT%H:%M"),
++        "end": end_dt.strftime("%Y-%m-%dT%H:%M"),
++    }
++    data["bookings"].append(booking)
++    store.save(data)
++
++    print(f"Booked '{args.title}' on {resource_name}")
++    print(f"  {start_dt.strftime('%Y-%m-%d %H:%M')} to {end_dt.strftime('%H:%M')}")
++    print(f"  ID: {booking_id}")
++    return 0
++
++
++def cancel_cmd(args):
++    data = store.load()
++
++    booking_id = args.id
++    for i, b in enumerate(data["bookings"]):
++        if b["id"] == booking_id:
++            removed = data["bookings"].pop(i)
++            store.save(data)
++            print(f"Cancelled booking '{removed['title']}' ({removed['id']})")
++            return 0
++
++    print(f"Error: booking '{booking_id}' not found.")
++    return 1
++
++
++def list_cmd(args):
++    data = store.load()
++    bookings = data["bookings"]
++
++    if args.resource:
++        bookings = [b for b in bookings if b["resource"] == args.resource]
++
++    if args.date:
++        try:
++            from datetime import datetime
++
++            filter_date = datetime.strptime(args.date, "%Y-%m-%d").date()
++        except ValueError:
++            print(f"Error: invalid date '{args.date}'. Expected YYYY-MM-DD.")
++            return 1
++        bookings = [b for b in bookings if parse_datetime(b["start"]).date() == filter_date]
++
++    bookings.sort(key=lambda b: b["start"])
++
++    if not args.all and not args.date:
++        from datetime import datetime
++
++        now = datetime.now()
++        bookings = [b for b in bookings if parse_datetime(b["end"]) > now]
++
++    if not bookings:
++        print("No bookings found.")
++        return 0
++
++    for b in bookings:
++        start = parse_datetime(b["start"])
++        end = parse_datetime(b["end"])
++        print(f"  [{b['id']}] {b['resource']} | {b['title']}")
++        print(f"           {start.strftime('%Y-%m-%d %H:%M')} — {end.strftime('%H:%M')} | by {b['booked_by']}")
++
++    return 0
+diff --git a/schedmax/store.py b/schedmax/store.py
+new file mode 100644
+index 0000000..6e1b4c2
+--- /dev/null
++++ b/schedmax/store.py
+@@ -0,0 +1,34 @@
++import json
++from pathlib import Path
++
++STORE_DIR = ".schedmax"
++STORE_FILE = "data.json"
++
++
++def _store_path():
++    return Path(STORE_DIR) / STORE_FILE
++
++
++def is_initialized():
++    return _store_path().exists()
++
++
++def init():
++    path = _store_path()
++    if path.exists():
++        return False
++    Path(STORE_DIR).mkdir(parents=True, exist_ok=True)
++    data = {"resources": {}, "bookings": []}
++    path.write_text(json.dumps(data, indent=2))
++    return True
++
++
++def load():
++    path = _store_path()
++    if not path.exists():
++        raise SystemExit("Error: not initialized. Run 'schedctl init' first.")
++    return json.loads(path.read_text())
++
++
++def save(data):
++    _store_path().write_text(json.dumps(data, indent=2))
+diff --git a/schedmax/validators.py b/schedmax/validators.py
+new file mode 100644
+index 0000000..cc19ab3
+--- /dev/null
++++ b/schedmax/validators.py
+@@ -0,0 +1,127 @@
++import re
++from datetime import datetime
++
++DAY_NAMES = [
++    "monday", "tuesday", "wednesday", "thursday",
++    "friday", "saturday", "sunday",
++]
++DAY_ABBREVS = {
++    "mon": "monday", "tue": "tuesday", "wed": "wednesday",
++    "thu": "thursday", "fri": "friday", "sat": "saturday", "sun": "sunday",
++}
++
++
++def validate_resource_name(name):
++    if not name:
++        return "Resource name cannot be empty."
++    if len(name) > 64:
++        return "Resource name must be 64 characters or fewer."
++    if not re.match(r"^[a-zA-Z0-9_-]+$", name):
++        return "Resource name can only contain letters, numbers, hyphens, and underscores."
++    return None
++
++
++def parse_availability(raw):
++    """Parse 'mon 09:00-17:00' into {'day': 'monday', 'start': '09:00', 'end': '17:00'}."""
++    parts = raw.strip().split()
++    if len(parts) != 2:
++        raise ValueError(f"Invalid availability format: '{raw}'. Expected: 'mon 09:00-17:00'")
++
++    day_str, time_range = parts
++    day_str = day_str.lower()
++
++    if day_str in DAY_ABBREVS:
++        day = DAY_ABBREVS[day_str]
++    elif day_str in DAY_NAMES:
++        day = day_str
++    else:
++        raise ValueError(f"Invalid day: '{day_str}'. Use: mon, tue, wed, thu, fri, sat, sun")
++
++    time_parts = time_range.split("-")
++    if len(time_parts) != 2:
++        raise ValueError(f"Invalid time range: '{time_range}'. Expected: 'HH:MM-HH:MM'")
++
++    start_str, end_str = time_parts
++    for t in (start_str, end_str):
++        try:
++            datetime.strptime(t, "%H:%M")
++        except ValueError:
++            raise ValueError(f"Invalid time: '{t}'. Expected HH:MM format.")
++
++    if start_str >= end_str:
++        raise ValueError(f"Start time must be before end time: {start_str}-{end_str}")
++
++    return {"day": day, "start": start_str, "end": end_str}
++
++
++def parse_datetime(raw):
++    """Parse 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DDTHH:MM'."""
++    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
++        try:
++            return datetime.strptime(raw, fmt)
++        except ValueError:
++            continue
++    raise ValueError(f"Invalid datetime: '{raw}'. Expected: 'YYYY-MM-DD HH:MM'")
++
++
++def check_availability_overlaps(slots):
++    """Check for overlapping availability slots on the same day. Returns error string or None."""
++    by_day = {}
++    for slot in slots:
++        day = slot["day"]
++        if day not in by_day:
++            by_day[day] = []
++        for existing in by_day[day]:
++            if slot["start"] < existing["end"] and slot["end"] > existing["start"]:
++                return (
++                    f"Overlapping availability on {day}: "
++                    f"{existing['start']}-{existing['end']} and {slot['start']}-{slot['end']}"
++                )
++        by_day[day].append(slot)
++    return None
++
++
++def validate_booking(resource, start_dt, end_dt, existing_bookings):
++    """Validate a booking. Returns list of error strings (empty if valid)."""
++    errors = []
++
++    now = datetime.now()
++    if start_dt <= now:
++        errors.append("Booking start time is in the past.")
++
++    if end_dt <= start_dt:
++        errors.append("End time must be after start time.")
++
++    if start_dt.date() != end_dt.date():
++        errors.append("Booking must start and end on the same day.")
++
++    if errors:
++        return errors
++
++    booking_day = DAY_NAMES[start_dt.weekday()]
++    booking_start = start_dt.strftime("%H:%M")
++    booking_end = end_dt.strftime("%H:%M")
++
++    available = any(
++        slot["day"] == booking_day
++        and slot["start"] <= booking_start
++        and slot["end"] >= booking_end
++        for slot in resource.get("availability", [])
++    )
++
++    if not available:
++        errors.append(
++            f"Booking time ({booking_day} {booking_start}-{booking_end}) "
++            f"is outside the resource's availability."
++        )
++
++    for existing in existing_bookings:
++        ex_start = parse_datetime(existing["start"])
++        ex_end = parse_datetime(existing["end"])
++        if start_dt < ex_end and end_dt > ex_start:
++            errors.append(
++                f"Overlaps with existing booking '{existing['title']}' "
++                f"({existing['start']} to {existing['end']})."
++            )
++
++    return errors
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_commands.py b/tests/test_commands.py
+new file mode 100644
+index 0000000..ec9c80d
+--- /dev/null
++++ b/tests/test_commands.py
+@@ -0,0 +1,237 @@
++import json
++import os
++import shutil
++import tempfile
++import unittest
++from unittest.mock import patch
++
++from schedmax import store
++from schedmax.commands import (
++    book_cmd,
++    cancel_cmd,
++    init_cmd,
++    list_cmd,
++    resource_add_cmd,
++    resource_list_cmd,
++)
++
++
++class CommandTestBase(unittest.TestCase):
++    """Run each test inside a fresh temporary directory."""
++
++    def setUp(self):
++        self._orig_dir = os.getcwd()
++        self._tmp_dir = tempfile.mkdtemp()
++        os.chdir(self._tmp_dir)
++
++    def tearDown(self):
++        os.chdir(self._orig_dir)
++        shutil.rmtree(self._tmp_dir)
++
++    @staticmethod
++    def _args(**kwargs):
++        class Args:
++            pass
++        a = Args()
++        for k, v in kwargs.items():
++            setattr(a, k, v)
++        return a
++
++
++class TestInit(CommandTestBase):
++    def test_init_creates_store(self):
++        rc = init_cmd(self._args())
++        self.assertEqual(rc, 0)
++        self.assertTrue(store.is_initialized())
++        data = store.load()
++        self.assertEqual(data, {"resources": {}, "bookings": []})
++
++    def test_double_init(self):
++        init_cmd(self._args())
++        rc = init_cmd(self._args())
++        self.assertEqual(rc, 1)
++
++
++class TestResourceAdd(CommandTestBase):
++    def setUp(self):
++        super().setUp()
++        init_cmd(self._args())
++
++    def test_add_resource(self):
++        args = self._args(
++            name="room-101",
++            description="First floor",
++            availability=["mon 09:00-17:00", "tue 09:00-17:00"],
++        )
++        rc = resource_add_cmd(args)
++        self.assertEqual(rc, 0)
++        data = store.load()
++        self.assertIn("room-101", data["resources"])
++        self.assertEqual(len(data["resources"]["room-101"]["availability"]), 2)
++
++    def test_duplicate_resource(self):
++        args = self._args(name="room-101", description="", availability=["mon 09:00-17:00"])
++        resource_add_cmd(args)
++        rc = resource_add_cmd(args)
++        self.assertEqual(rc, 1)
++
++    def test_no_availability(self):
++        args = self._args(name="room-101", description="", availability=None)
++        rc = resource_add_cmd(args)
++        self.assertEqual(rc, 1)
++
++    def test_invalid_availability(self):
++        args = self._args(name="room-101", description="", availability=["bad"])
++        rc = resource_add_cmd(args)
++        self.assertEqual(rc, 1)
++
++    def test_overlapping_availability(self):
++        args = self._args(
++            name="room-101", description="",
++            availability=["mon 09:00-14:00", "mon 13:00-17:00"],
++        )
++        rc = resource_add_cmd(args)
++        self.assertEqual(rc, 1)
++
++    def test_invalid_name(self):
++        args = self._args(name="room 101", description="", availability=["mon 09:00-17:00"])
++        rc = resource_add_cmd(args)
++        self.assertEqual(rc, 1)
++
++
++class TestResourceList(CommandTestBase):
++    def setUp(self):
++        super().setUp()
++        init_cmd(self._args())
++
++    def test_empty_list(self):
++        rc = resource_list_cmd(self._args())
++        self.assertEqual(rc, 0)
++
++    def test_list_resources(self):
++        resource_add_cmd(self._args(
++            name="room-101", description="Big room",
++            availability=["mon 09:00-17:00"],
++        ))
++        rc = resource_list_cmd(self._args())
++        self.assertEqual(rc, 0)
++
++
++class TestBookAndCancel(CommandTestBase):
++    def setUp(self):
++        super().setUp()
++        init_cmd(self._args())
++        resource_add_cmd(self._args(
++            name="room-101", description="",
++            availability=[f"{d} 09:00-17:00" for d in ("mon", "tue", "wed", "thu", "fri")],
++        ))
++
++    def _next_weekday_at(self, hour):
++        from datetime import datetime, timedelta
++        now = datetime.now()
++        # Find next weekday (mon-fri)
++        days = 1
++        while True:
++            candidate = now + timedelta(days=days)
++            if candidate.weekday() < 5:
++                return candidate.replace(hour=hour, minute=0, second=0, microsecond=0)
++            days += 1
++
++    def test_book_and_list(self):
++        dt = self._next_weekday_at(10)
++        end = self._next_weekday_at(11)
++        args = self._args(
++            resource="room-101",
++            title="Standup",
++            by="alice",
++            start=dt.strftime("%Y-%m-%d %H:%M"),
++            end=end.strftime("%Y-%m-%d %H:%M"),
++        )
++        rc = book_cmd(args)
++        self.assertEqual(rc, 0)
++
++        data = store.load()
++        self.assertEqual(len(data["bookings"]), 1)
++        self.assertEqual(data["bookings"][0]["title"], "Standup")
++
++        # List
++        rc = list_cmd(self._args(resource=None, date=None, all=False))
++        self.assertEqual(rc, 0)
++
++    def test_book_nonexistent_resource(self):
++        dt = self._next_weekday_at(10)
++        end = self._next_weekday_at(11)
++        args = self._args(
++            resource="nope",
++            title="X",
++            by="bob",
++            start=dt.strftime("%Y-%m-%d %H:%M"),
++            end=end.strftime("%Y-%m-%d %H:%M"),
++        )
++        rc = book_cmd(args)
++        self.assertEqual(rc, 1)
++
++    def test_overlapping_booking(self):
++        dt = self._next_weekday_at(10)
++        end = self._next_weekday_at(11)
++        book_cmd(self._args(
++            resource="room-101", title="A", by="alice",
++            start=dt.strftime("%Y-%m-%d %H:%M"),
++            end=end.strftime("%Y-%m-%d %H:%M"),
++        ))
++        rc = book_cmd(self._args(
++            resource="room-101", title="B", by="bob",
++            start=dt.strftime("%Y-%m-%d %H:%M"),
++            end=end.strftime("%Y-%m-%d %H:%M"),
++        ))
++        self.assertEqual(rc, 1)
++
++    def test_cancel(self):
++        dt = self._next_weekday_at(10)
++        end = self._next_weekday_at(11)
++        book_cmd(self._args(
++            resource="room-101", title="Meeting", by="alice",
++            start=dt.strftime("%Y-%m-%d %H:%M"),
++            end=end.strftime("%Y-%m-%d %H:%M"),
++        ))
++        data = store.load()
++        bid = data["bookings"][0]["id"]
++
++        rc = cancel_cmd(self._args(id=bid))
++        self.assertEqual(rc, 0)
++        data = store.load()
++        self.assertEqual(len(data["bookings"]), 0)
++
++    def test_cancel_nonexistent(self):
++        rc = cancel_cmd(self._args(id="nonexist"))
++        self.assertEqual(rc, 1)
++
++    def test_list_filter_by_resource(self):
++        dt = self._next_weekday_at(14)
++        end = self._next_weekday_at(15)
++        book_cmd(self._args(
++            resource="room-101", title="X", by="a",
++            start=dt.strftime("%Y-%m-%d %H:%M"),
++            end=end.strftime("%Y-%m-%d %H:%M"),
++        ))
++        rc = list_cmd(self._args(resource="room-101", date=None, all=False))
++        self.assertEqual(rc, 0)
++        rc = list_cmd(self._args(resource="nope", date=None, all=False))
++        self.assertEqual(rc, 0)  # no error, just empty
++
++    def test_list_filter_by_date(self):
++        dt = self._next_weekday_at(14)
++        end = self._next_weekday_at(15)
++        book_cmd(self._args(
++            resource="room-101", title="X", by="a",
++            start=dt.strftime("%Y-%m-%d %H:%M"),
++            end=end.strftime("%Y-%m-%d %H:%M"),
++        ))
++        rc = list_cmd(self._args(
++            resource=None, date=dt.strftime("%Y-%m-%d"), all=False,
++        ))
++        self.assertEqual(rc, 0)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_validators.py b/tests/test_validators.py
+new file mode 100644
+index 0000000..13f490f
+--- /dev/null
++++ b/tests/test_validators.py
+@@ -0,0 +1,184 @@
++import unittest
++from datetime import datetime, timedelta
++
++from schedmax.validators import (
++    check_availability_overlaps,
++    parse_availability,
++    parse_datetime,
++    validate_booking,
++    validate_resource_name,
++)
++
++
++class TestResourceNameValidation(unittest.TestCase):
++    def test_valid_names(self):
++        for name in ("room-101", "projector_2", "A", "desk-3B"):
++            self.assertIsNone(validate_resource_name(name))
++
++    def test_empty_name(self):
++        self.assertIsNotNone(validate_resource_name(""))
++
++    def test_special_characters(self):
++        self.assertIsNotNone(validate_resource_name("room 101"))
++        self.assertIsNotNone(validate_resource_name("room@101"))
++
++    def test_too_long(self):
++        self.assertIsNotNone(validate_resource_name("x" * 65))
++        self.assertIsNone(validate_resource_name("x" * 64))
++
++
++class TestParseAvailability(unittest.TestCase):
++    def test_abbreviation(self):
++        slot = parse_availability("mon 09:00-17:00")
++        self.assertEqual(slot, {"day": "monday", "start": "09:00", "end": "17:00"})
++
++    def test_full_day_name(self):
++        slot = parse_availability("friday 08:00-12:00")
++        self.assertEqual(slot, {"day": "friday", "start": "08:00", "end": "12:00"})
++
++    def test_case_insensitive(self):
++        slot = parse_availability("MON 09:00-17:00")
++        self.assertEqual(slot["day"], "monday")
++
++    def test_invalid_day(self):
++        with self.assertRaises(ValueError):
++            parse_availability("xyz 09:00-17:00")
++
++    def test_invalid_format(self):
++        with self.assertRaises(ValueError):
++            parse_availability("mon")
++
++    def test_start_after_end(self):
++        with self.assertRaises(ValueError):
++            parse_availability("mon 17:00-09:00")
++
++    def test_equal_start_end(self):
++        with self.assertRaises(ValueError):
++            parse_availability("mon 09:00-09:00")
++
++    def test_invalid_time(self):
++        with self.assertRaises(ValueError):
++            parse_availability("mon 25:00-17:00")
++
++
++class TestAvailabilityOverlaps(unittest.TestCase):
++    def test_no_overlap(self):
++        slots = [
++            {"day": "monday", "start": "09:00", "end": "12:00"},
++            {"day": "monday", "start": "13:00", "end": "17:00"},
++        ]
++        self.assertIsNone(check_availability_overlaps(slots))
++
++    def test_overlap(self):
++        slots = [
++            {"day": "monday", "start": "09:00", "end": "14:00"},
++            {"day": "monday", "start": "13:00", "end": "17:00"},
++        ]
++        self.assertIsNotNone(check_availability_overlaps(slots))
++
++    def test_different_days_no_overlap(self):
++        slots = [
++            {"day": "monday", "start": "09:00", "end": "17:00"},
++            {"day": "tuesday", "start": "09:00", "end": "17:00"},
++        ]
++        self.assertIsNone(check_availability_overlaps(slots))
++
++
++class TestParseDatetime(unittest.TestCase):
++    def test_space_format(self):
++        dt = parse_datetime("2026-04-22 10:00")
++        self.assertEqual(dt, datetime(2026, 4, 22, 10, 0))
++
++    def test_t_format(self):
++        dt = parse_datetime("2026-04-22T10:00")
++        self.assertEqual(dt, datetime(2026, 4, 22, 10, 0))
++
++    def test_with_seconds(self):
++        dt = parse_datetime("2026-04-22T10:00:00")
++        self.assertEqual(dt, datetime(2026, 4, 22, 10, 0))
++
++    def test_invalid(self):
++        with self.assertRaises(ValueError):
++            parse_datetime("not-a-date")
++
++
++class TestValidateBooking(unittest.TestCase):
++    def _resource(self, availability=None):
++        if availability is None:
++            availability = [{"day": "wednesday", "start": "09:00", "end": "17:00"}]
++        return {"name": "room-101", "availability": availability}
++
++    def _future_wed(self):
++        """Return next Wednesday at 10:00."""
++        now = datetime.now()
++        days_ahead = 2 - now.weekday()  # wednesday = 2
++        if days_ahead <= 0:
++            days_ahead += 7
++        return now.replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
++
++    def test_valid_booking(self):
++        start = self._future_wed()
++        end = start.replace(hour=11)
++        errors = validate_booking(self._resource(), start, end, [])
++        self.assertEqual(errors, [])
++
++    def test_past_booking(self):
++        start = datetime(2020, 1, 1, 10, 0)
++        end = datetime(2020, 1, 1, 11, 0)
++        errors = validate_booking(self._resource(), start, end, [])
++        self.assertTrue(any("past" in e.lower() for e in errors))
++
++    def test_end_before_start(self):
++        start = self._future_wed()
++        end = start.replace(hour=9)
++        errors = validate_booking(self._resource(), start, end, [])
++        self.assertTrue(any("after" in e.lower() for e in errors))
++
++    def test_multi_day_booking(self):
++        start = self._future_wed()
++        end = start + timedelta(days=1)
++        errors = validate_booking(self._resource(), start, end, [])
++        self.assertTrue(any("same day" in e.lower() for e in errors))
++
++    def test_outside_availability(self):
++        start = self._future_wed().replace(hour=7)
++        end = start.replace(hour=8)
++        errors = validate_booking(self._resource(), start, end, [])
++        self.assertTrue(any("availability" in e.lower() for e in errors))
++
++    def test_wrong_day(self):
++        # Book on Thursday when only Wednesday is available
++        start = self._future_wed() + timedelta(days=1)
++        end = start.replace(hour=11)
++        errors = validate_booking(self._resource(), start, end, [])
++        self.assertTrue(any("availability" in e.lower() for e in errors))
++
++    def test_overlap_detection(self):
++        start = self._future_wed()
++        end = start.replace(hour=11)
++        existing = [{
++            "title": "Existing",
++            "start": start.strftime("%Y-%m-%dT%H:%M"),
++            "end": end.strftime("%Y-%m-%dT%H:%M"),
++        }]
++        new_start = start.replace(hour=10, minute=30)
++        new_end = start.replace(hour=11, minute=30)
++        errors = validate_booking(self._resource(), new_start, new_end, existing)
++        self.assertTrue(any("overlap" in e.lower() for e in errors))
++
++    def test_adjacent_no_overlap(self):
++        start = self._future_wed()
++        end = start.replace(hour=11)
++        existing = [{
++            "title": "Existing",
++            "start": start.strftime("%Y-%m-%dT%H:%M"),
++            "end": end.strftime("%Y-%m-%dT%H:%M"),
++        }]
++        new_start = start.replace(hour=11)
++        new_end = start.replace(hour=12)
++        errors = validate_booking(self._resource(), new_start, new_end, existing)
++        self.assertEqual(errors, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
