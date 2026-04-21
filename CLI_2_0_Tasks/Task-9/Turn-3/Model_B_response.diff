@@ -1,0 +1,356 @@
+diff --git a/tablesmith/cli.py b/tablesmith/cli.py
+index b339902..39cc537 100644
+--- a/tablesmith/cli.py
++++ b/tablesmith/cli.py
+@@ -168,6 +168,13 @@ def _cmd_run(argv: List[str]) -> int:
+ 
+ # -------------------------------------------------------------- inspect ---
+ 
++def _hashable(v: Any) -> Any:
++    """Make a value safe for insertion into a set."""
++    if isinstance(v, (list, dict)):
++        return str(v)
++    return v
++
++
+ def _infer_type_label(values: list) -> str:
+     """Given the typed values for a column, return a human label."""
+     types = set()
+@@ -232,13 +239,20 @@ def _cmd_inspect(argv: List[str]) -> int:
+         nulls = sum(1 for v in values if v is None)
+         non_null = [v for v in values if v is not None]
+         samples = non_null[:5]
+-        schema.append({
++        distinct = len(set(_hashable(v) for v in non_null))
++        typ = _infer_type_label(values)
++        numerics = [v for v in non_null if isinstance(v, (int, float))]
++        entry: Dict[str, Any] = {
+             "column": col,
+-            "type": _infer_type_label(values),
++            "type": typ,
+             "nulls": nulls,
+             "total": len(values),
++            "distinct": distinct,
++            "min": min(numerics) if numerics else None,
++            "max": max(numerics) if numerics else None,
+             "samples": samples,
+-        })
++        }
++        schema.append(entry)
+ 
+     if args.output_format == "json":
+         json.dump(schema, sys.stdout, indent=2, default=str)
+@@ -255,18 +269,29 @@ def _cmd_inspect(argv: List[str]) -> int:
+     type_w = max(len(s["type"]) for s in schema)
+     type_w = max(type_w, 4)
+ 
++    def _fmt_minmax(v: Any) -> str:
++        if v is None:
++            return "—"
++        return str(v)
++
+     header = (
+         f"{'Column':<{name_w}}  {'Type':<{type_w}}  "
+-        f"{'Nulls':>5}  {'Total':>5}  Sample"
++        f"{'Nulls':>5}  {'Total':>5}  {'Dist':>5}  "
++        f"{'Min':>10}  {'Max':>10}  Sample"
++    )
++    sep = (
++        f"{'─' * name_w}  {'─' * type_w}  {'─' * 5}  {'─' * 5}  {'─' * 5}  "
++        f"{'─' * 10}  {'─' * 10}  {'─' * 20}"
+     )
+-    sep = f"{'─' * name_w}  {'─' * type_w}  {'─' * 5}  {'─' * 5}  {'─' * 30}"
+     print(header)
+     print(sep)
+     for s in schema:
+         sample_str = ", ".join(_format_sample(v) for v in s["samples"])
+         print(
+             f"{s['column']:<{name_w}}  {s['type']:<{type_w}}  "
+-            f"{s['nulls']:>5}  {s['total']:>5}  {sample_str}"
++            f"{s['nulls']:>5}  {s['total']:>5}  {s['distinct']:>5}  "
++            f"{_fmt_minmax(s['min']):>10}  {_fmt_minmax(s['max']):>10}  "
++            f"{sample_str}"
+         )
+     return 0
+ 
+diff --git a/tablesmith/ops.py b/tablesmith/ops.py
+index 16a3161..bd8ae55 100644
+--- a/tablesmith/ops.py
++++ b/tablesmith/ops.py
+@@ -398,14 +398,25 @@ class Group(Op):
+     name = "group"
+     aliases = ("groupby", "agg")
+     cli_help = (
+-        "KEYS:AGGS — e.g. 'dept:sum(salary),avg(age),count()' ; "
++        "KEYS:AGGS [having EXPR] — e.g. 'dept:sum(salary) as total,count() having total > 100000' ; "
+         "aggregates: " + ", ".join(sorted(set(_AGGS)))
+     )
+ 
+-    def __init__(self, by: List[str], aggs: List[Tuple[str, Optional[str], str]]):
++    def __init__(
++        self,
++        by: List[str],
++        aggs: List[Tuple[str, Optional[str], str]],
++        having: Optional[str] = None,
++    ):
+         # aggs: list of (func, column_or_None, output_name)
+         self.by = by
+         self.aggs = aggs
++        self.having_src = having
++        self.having_expr: Optional[Expression] = None
++        if having:
++            # validate the expression parses; column check deferred to apply/validate
++            out_cols = set(self.by) | {alias for _, _, alias in self.aggs}
++            self.having_expr = Expression(having, columns=out_cols)
+ 
+     @classmethod
+     def from_cli(cls, arg):
+@@ -417,10 +428,17 @@ class Group(Op):
+             )
+         keys_part, aggs_part = arg.split(":", 1)
+         by = [k.strip() for k in keys_part.split(",") if k.strip()]
++        # split off " having EXPR" from the end of the aggs string
++        having = None
++        low = aggs_part.lower()
++        hpos = low.find(" having ")
++        if hpos != -1:
++            having = aggs_part[hpos + 8:].strip()
++            aggs_part = aggs_part[:hpos]
+         aggs = cls._parse_aggs(aggs_part)
+         if not by:
+             raise TablesmithError("group requires at least one key column", step="group")
+-        return cls(by, aggs)
++        return cls(by, aggs, having=having)
+ 
+     @staticmethod
+     def _parse_aggs(s: str) -> List[Tuple[str, Optional[str], str]]:
+@@ -483,7 +501,8 @@ class Group(Op):
+                     aggs.append((fn, col, alias))
+         if not aggs:
+             aggs = [("count", None, "count")]
+-        return cls(list(by), aggs)
++        having = spec.get("having")
++        return cls(list(by), aggs, having=having)
+ 
+     def validate_columns(self, available: set) -> None:
+         needed = list(self.by) + [c for _, c, _ in self.aggs if c]
+@@ -519,8 +538,31 @@ class Group(Op):
+                             hint=f"check that column '{col}' is numeric",
+                         )
+             out.append(nr)
++        if self.having_expr:
++            filtered: Rows = []
++            for nr in out:
++                try:
++                    if self.having_expr.eval(nr):
++                        filtered.append(nr)
++                except TablesmithError as e:
++                    if e.step is None:
++                        e.step = "group/having"
++                    raise
++            out = filtered
+         return out
+ 
++    def describe(self):
++        parts = [
++            "group " + ",".join(self.by) + ":" +
++            ",".join(
++                f"{fn}({col or '*'})" + (f" as {alias}" if alias != (fn if col is None else f"{fn}_{col}") else "")
++                for fn, col, alias in self.aggs
++            ),
++        ]
++        if self.having_src:
++            parts.append(f"having {self.having_src}")
++        return " ".join(parts)
++
+ 
+ # -------------------------------------------------------------------- join
+ @register
+diff --git a/tests/test_hardening.py b/tests/test_hardening.py
+index b2f7de0..22820b3 100644
+--- a/tests/test_hardening.py
++++ b/tests/test_hardening.py
+@@ -507,5 +507,183 @@ class PipelineInlineCombinedTest(unittest.TestCase):
+         self.assertEqual(len(parts), 2)
+ 
+ 
++class InspectDistinctMinMaxTest(unittest.TestCase):
++    """Inspect schema must include distinct count and min/max for numeric columns."""
++
++    def setUp(self):
++        self.path = _write_tmp(_PEOPLE_CSV)
++
++    def tearDown(self):
++        os.unlink(self.path)
++
++    def _get_schema(self):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = _cmd_inspect([self.path, "-F", "json"])
++        finally:
++            sys.stdout = old_stdout
++        self.assertEqual(rc, 0)
++        return {e["column"]: e for e in json.loads(buf.getvalue())}
++
++    # ---- distinct ----
++
++    def test_distinct_present_in_schema(self):
++        by_col = self._get_schema()
++        for entry in by_col.values():
++            self.assertIn("distinct", entry)
++
++    def test_distinct_for_numeric_column(self):
++        by_col = self._get_schema()
++        # age has 5 non-null distinct values: 34, 29, 41, 23, 38
++        self.assertEqual(by_col["age"]["distinct"], 5)
++
++    def test_distinct_for_string_column(self):
++        by_col = self._get_schema()
++        # dept has 3 distinct values: eng, sales, ops
++        self.assertEqual(by_col["dept"]["distinct"], 3)
++
++    def test_distinct_for_unique_column(self):
++        by_col = self._get_schema()
++        # name has 6 unique values
++        self.assertEqual(by_col["name"]["distinct"], 6)
++
++    # ---- min / max for numeric ----
++
++    def test_min_max_for_int_column(self):
++        by_col = self._get_schema()
++        self.assertEqual(by_col["salary"]["min"], 61000)
++        self.assertEqual(by_col["salary"]["max"], 142000)
++
++    def test_min_max_for_int_with_nulls(self):
++        by_col = self._get_schema()
++        # age: min=23, max=41 (Frank's null is excluded)
++        self.assertEqual(by_col["age"]["min"], 23)
++        self.assertEqual(by_col["age"]["max"], 41)
++
++    def test_min_max_null_for_string_column(self):
++        by_col = self._get_schema()
++        self.assertIsNone(by_col["name"]["min"])
++        self.assertIsNone(by_col["name"]["max"])
++        self.assertIsNone(by_col["dept"]["min"])
++        self.assertIsNone(by_col["dept"]["max"])
++
++    # ---- backward compat ----
++
++    def test_existing_fields_still_present(self):
++        """New fields must not break the existing contract."""
++        by_col = self._get_schema()
++        required = {"column", "type", "nulls", "total", "samples", "distinct", "min", "max"}
++        for entry in by_col.values():
++            self.assertTrue(required <= set(entry.keys()), f"missing in {entry}")
++
++    # ---- text output ----
++
++    def test_text_output_includes_dist_header(self):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            _cmd_inspect([self.path])
++        finally:
++            sys.stdout = old_stdout
++        header = buf.getvalue().splitlines()[0]
++        self.assertIn("Dist", header)
++        self.assertIn("Min", header)
++        self.assertIn("Max", header)
++
++
++class GroupHavingTest(unittest.TestCase):
++    """Group operations must support a 'having' clause that filters
++    aggregated results using the existing expression parser."""
++
++    def setUp(self):
++        self.path = _write_tmp(_PEOPLE_CSV)
++        self.rows = read_rows(self.path)
++
++    def tearDown(self):
++        os.unlink(self.path)
++
++    # ---- basic having behaviour ----
++
++    def test_having_filters_aggregated_rows(self):
++        g = Group.from_cli("dept:avg(salary) as avg_sal,count() having avg_sal > 80000")
++        result = g.apply(self.rows)
++        depts = [r["dept"] for r in result]
++        # eng avg=119000 > 80000 ✓, sales avg=74500 ✗, ops avg=70000 ✗
++        self.assertEqual(depts, ["eng"])
++
++    def test_having_keeps_matching_groups(self):
++        g = Group.from_cli("dept:count() as n having n >= 2")
++        result = g.apply(self.rows)
++        depts = {r["dept"] for r in result}
++        # eng has 3, sales has 2, ops has 1
++        self.assertEqual(depts, {"eng", "sales"})
++
++    def test_having_can_use_group_key(self):
++        """Having can reference group-by columns, not just agg aliases."""
++        g = Group.from_cli('dept:count() having dept == "eng"')
++        result = g.apply(self.rows)
++        self.assertEqual(len(result), 1)
++        self.assertEqual(result[0]["dept"], "eng")
++
++    def test_no_having_returns_all_groups(self):
++        g = Group.from_cli("dept:count()")
++        result = g.apply(self.rows)
++        self.assertEqual(len(result), 3)
++
++    def test_having_removes_all_when_none_match(self):
++        g = Group.from_cli("dept:count() as n having n > 1000")
++        result = g.apply(self.rows)
++        self.assertEqual(result, [])
++
++    # ---- having via pipeline file ----
++
++    def test_having_from_spec(self):
++        spec = {
++            "by": "dept",
++            "aggs": "sum(salary) as total",
++            "having": "total > 200000",
++        }
++        g = Group.from_spec(spec)
++        result = g.apply(self.rows)
++        # eng total=357000 > 200000 ✓
++        self.assertEqual(len(result), 1)
++        self.assertEqual(result[0]["dept"], "eng")
++
++    # ---- having error propagation ----
++
++    def test_having_unknown_alias_fails_at_construction(self):
++        """Referencing a name that is neither a group key nor an agg alias
++        must fail immediately with ColumnError, not at apply time."""
++        with self.assertRaises(ColumnError) as ctx:
++            Group.from_cli("dept:avg(salary) having bogus > 100")
++        err = str(ctx.exception)
++        self.assertIn("bogus", err)
++        self.assertIn("unknown column", err)
++
++    def test_having_error_shows_available_aliases(self):
++        with self.assertRaises(ColumnError) as ctx:
++            Group.from_cli("dept:avg(salary) as avg_sal having bogus > 100")
++        err = str(ctx.exception)
++        self.assertIn("available columns:", err)
++        self.assertIn("avg_sal", err)
++        self.assertIn("dept", err)
++
++    def test_having_syntax_error_raises(self):
++        from tablesmith.errors import ExpressionError
++        with self.assertRaises(ExpressionError):
++            Group.from_cli("dept:count() having >!>")
++
++    def test_having_appears_in_describe(self):
++        g = Group.from_cli("dept:avg(salary) as avg_sal having avg_sal > 100000")
++        desc = g.describe()
++        self.assertIn("having", desc)
++        self.assertIn("avg_sal > 100000", desc)
++
++
+ if __name__ == "__main__":
+     unittest.main()

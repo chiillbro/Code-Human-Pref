@@ -1,0 +1,493 @@
+diff --git a/tablesmith/cli.py b/tablesmith/cli.py
+index b339902..200717d 100644
+--- a/tablesmith/cli.py
++++ b/tablesmith/cli.py
+@@ -232,11 +232,28 @@ def _cmd_inspect(argv: List[str]) -> int:
+         nulls = sum(1 for v in values if v is None)
+         non_null = [v for v in values if v is not None]
+         samples = non_null[:5]
++        type_label = _infer_type_label(values)
++        # distinct: number of unique non-null values. Unhashable values
++        # (lists, dicts from JSON) are compared by their string form.
++        try:
++            distinct = len(set(non_null))
++        except TypeError:
++            distinct = len({str(v) for v in non_null})
++        # min/max: only for numeric columns; None for everything else so the
++        # JSON shape stays consistent.
++        col_min: Any = None
++        col_max: Any = None
++        if type_label in ("int", "float") and non_null:
++            col_min = min(non_null)
++            col_max = max(non_null)
+         schema.append({
+             "column": col,
+-            "type": _infer_type_label(values),
++            "type": type_label,
+             "nulls": nulls,
+             "total": len(values),
++            "distinct": distinct,
++            "min": col_min,
++            "max": col_max,
+             "samples": samples,
+         })
+ 
+@@ -250,23 +267,31 @@ def _cmd_inspect(argv: List[str]) -> int:
+         print("(no columns)")
+         return 0
+ 
+-    name_w = max(len(s["column"]) for s in schema)
+-    name_w = max(name_w, 6)  # min "Column"
+-    type_w = max(len(s["type"]) for s in schema)
+-    type_w = max(type_w, 4)
++    def _mm(v: Any) -> str:
++        return "" if v is None else str(v)
++
++    name_w = max(max(len(s["column"]) for s in schema), 6)
++    type_w = max(max(len(s["type"]) for s in schema), 4)
++    min_w = max(max(len(_mm(s["min"])) for s in schema), 3)
++    max_w = max(max(len(_mm(s["max"])) for s in schema), 3)
+ 
+     header = (
+         f"{'Column':<{name_w}}  {'Type':<{type_w}}  "
+-        f"{'Nulls':>5}  {'Total':>5}  Sample"
++        f"{'Nulls':>5}  {'Total':>5}  {'Distinct':>8}  "
++        f"{'Min':>{min_w}}  {'Max':>{max_w}}  Sample"
++    )
++    sep = (
++        f"{'─' * name_w}  {'─' * type_w}  {'─' * 5}  {'─' * 5}  {'─' * 8}  "
++        f"{'─' * min_w}  {'─' * max_w}  {'─' * 30}"
+     )
+-    sep = f"{'─' * name_w}  {'─' * type_w}  {'─' * 5}  {'─' * 5}  {'─' * 30}"
+     print(header)
+     print(sep)
+     for s in schema:
+         sample_str = ", ".join(_format_sample(v) for v in s["samples"])
+         print(
+             f"{s['column']:<{name_w}}  {s['type']:<{type_w}}  "
+-            f"{s['nulls']:>5}  {s['total']:>5}  {sample_str}"
++            f"{s['nulls']:>5}  {s['total']:>5}  {s['distinct']:>8}  "
++            f"{_mm(s['min']):>{min_w}}  {_mm(s['max']):>{max_w}}  {sample_str}"
+         )
+     return 0
+ 
+diff --git a/tablesmith/ops.py b/tablesmith/ops.py
+index 16a3161..de107b3 100644
+--- a/tablesmith/ops.py
++++ b/tablesmith/ops.py
+@@ -398,29 +398,60 @@ class Group(Op):
+     name = "group"
+     aliases = ("groupby", "agg")
+     cli_help = (
+-        "KEYS:AGGS — e.g. 'dept:sum(salary),avg(age),count()' ; "
++        "KEYS:AGGS [having EXPR] — e.g. 'dept:avg(salary) as s,count() having s>100000' ; "
+         "aggregates: " + ", ".join(sorted(set(_AGGS)))
+     )
+ 
+-    def __init__(self, by: List[str], aggs: List[Tuple[str, Optional[str], str]]):
++    def __init__(
++        self,
++        by: List[str],
++        aggs: List[Tuple[str, Optional[str], str]],
++        having: Optional[str] = None,
++    ):
+         # aggs: list of (func, column_or_None, output_name)
+         self.by = by
+         self.aggs = aggs
++        self.having_src = having
++        self.having: Optional[Expression] = None
++        if having:
++            # The having clause may only reference group keys + aggregate
++            # aliases. Passing `columns=` makes Expression() fail fast at
++            # construction time on any unknown alias.
++            out_cols = set(by) | {alias for _, _, alias in aggs}
++            try:
++                self.having = Expression(having, columns=out_cols)
++            except TablesmithError as e:
++                e.step = "group"
++                if e.hint is None:
++                    e.hint = (
++                        "having can reference: " + ", ".join(sorted(out_cols))
++                    )
++                raise
+ 
+     @classmethod
+     def from_cli(cls, arg):
++        # peel off an optional trailing "... having EXPR"
++        having: Optional[str] = None
++        low = arg.lower()
++        if " having " in low:
++            idx = low.index(" having ")
++            arg, having = arg[:idx].strip(), arg[idx + len(" having ") :].strip()
++            if not having:
++                raise TablesmithError(
++                    "having clause requires an expression", step="group"
++                )
+         if ":" not in arg:
+             raise TablesmithError(
+                 "group requires 'KEYS:AGGS'",
+                 step="group",
+-                hint="e.g. --group 'dept:sum(salary),count()'",
++                hint="e.g. --group 'dept:sum(salary),count() having count > 1'",
+             )
+         keys_part, aggs_part = arg.split(":", 1)
+         by = [k.strip() for k in keys_part.split(",") if k.strip()]
+         aggs = cls._parse_aggs(aggs_part)
+         if not by:
+             raise TablesmithError("group requires at least one key column", step="group")
+-        return cls(by, aggs)
++        return cls(by, aggs, having=having)
+ 
+     @staticmethod
+     def _parse_aggs(s: str) -> List[Tuple[str, Optional[str], str]]:
+@@ -483,13 +514,15 @@ class Group(Op):
+                     aggs.append((fn, col, alias))
+         if not aggs:
+             aggs = [("count", None, "count")]
+-        return cls(list(by), aggs)
++        return cls(list(by), aggs, having=spec.get("having"))
+ 
+     def validate_columns(self, available: set) -> None:
+         needed = list(self.by) + [c for _, c, _ in self.aggs if c]
+         for c in needed:
+             if c not in available:
+                 raise unknown_column(c, available, step="group")
++        # having is validated against output columns at construction time;
++        # nothing more to do here.
+ 
+     def output_columns(self, available: List[str]) -> List[str]:
+         return list(self.by) + [alias for _, _, alias in self.aggs]
+@@ -519,8 +552,26 @@ class Group(Op):
+                             hint=f"check that column '{col}' is numeric",
+                         )
+             out.append(nr)
++
++        if self.having is not None:
++            kept: Rows = []
++            for i, r in enumerate(out):
++                try:
++                    if self.having.eval(r):
++                        kept.append(r)
++                except TablesmithError as e:
++                    e.step = "group"
++                    e.row_index = i
++                    raise
++            out = kept
+         return out
+ 
++    def describe(self):
++        d = "group " + ",".join(self.by) + ":" + ",".join(a for _, _, a in self.aggs)
++        if self.having_src:
++            d += f" having {self.having_src}"
++        return d
++
+ 
+ # -------------------------------------------------------------------- join
+ @register
+diff --git a/tests/test_hardening.py b/tests/test_hardening.py
+index b2f7de0..199f10b 100644
+--- a/tests/test_hardening.py
++++ b/tests/test_hardening.py
+@@ -113,7 +113,9 @@ class InspectOutputShapeTest(unittest.TestCase):
+         os.unlink(self.path)
+ 
+     def test_inspect_json_has_all_fields(self):
+-        """Each entry in JSON inspect output must have column/type/nulls/total/samples."""
++        """Each entry in JSON inspect output must have all schema fields,
++        including the original column/type/nulls/total/samples for
++        backward compatibility."""
+         import io, sys
+         buf = io.StringIO()
+         old_stdout = sys.stdout
+@@ -126,7 +128,10 @@ class InspectOutputShapeTest(unittest.TestCase):
+         schema = json.loads(buf.getvalue())
+         self.assertIsInstance(schema, list)
+         self.assertEqual(len(schema), 5)  # id, name, age, dept, salary
+-        required_keys = {"column", "type", "nulls", "total", "samples"}
++        required_keys = {
++            "column", "type", "nulls", "total", "samples",
++            "distinct", "min", "max",
++        }
+         for entry in schema:
+             self.assertTrue(
+                 required_keys <= set(entry.keys()),
+@@ -507,5 +512,279 @@ class PipelineInlineCombinedTest(unittest.TestCase):
+         self.assertEqual(len(parts), 2)
+ 
+ 
++class InspectDistinctMinMaxTest(unittest.TestCase):
++    """The schema must report distinct counts for every column and
++    min/max for numeric columns only."""
++
++    def setUp(self):
++        self.path = _write_tmp(_PEOPLE_CSV)
++
++    def tearDown(self):
++        os.unlink(self.path)
++
++    def _schema(self, path=None):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = _cmd_inspect([path or self.path, "-F", "json"])
++        finally:
++            sys.stdout = old_stdout
++        self.assertEqual(rc, 0)
++        return {e["column"]: e for e in json.loads(buf.getvalue())}
++
++    # ---- distinct ----
++    def test_distinct_ignores_nulls(self):
++        s = self._schema()
++        # 6 rows, Frank's age is null → 5 distinct non-null ages
++        self.assertEqual(s["age"]["distinct"], 5)
++
++    def test_distinct_counts_unique_values(self):
++        s = self._schema()
++        # dept has eng,eng,sales,sales,eng,ops → 3 distinct
++        self.assertEqual(s["dept"]["distinct"], 3)
++        # id has 6 unique values
++        self.assertEqual(s["id"]["distinct"], 6)
++
++    def test_distinct_present_for_non_numeric(self):
++        s = self._schema()
++        self.assertIn("distinct", s["name"])
++        self.assertEqual(s["name"]["distinct"], 6)
++
++    # ---- min/max numeric ----
++    def test_minmax_for_int_column(self):
++        s = self._schema()
++        self.assertEqual(s["salary"]["min"], 61000)
++        self.assertEqual(s["salary"]["max"], 142000)
++        self.assertEqual(s["id"]["min"], 1)
++        self.assertEqual(s["id"]["max"], 6)
++
++    def test_minmax_ignores_nulls(self):
++        s = self._schema()
++        # age has a null (Frank); min/max computed over non-null only
++        self.assertEqual(s["age"]["min"], 23)
++        self.assertEqual(s["age"]["max"], 41)
++
++    def test_minmax_for_float_column(self):
++        path = _write_tmp("x\n1.5\n2.25\n0.5\n", suffix=".csv")
++        try:
++            s = self._schema(path)
++            self.assertEqual(s["x"]["type"], "float")
++            self.assertEqual(s["x"]["min"], 0.5)
++            self.assertEqual(s["x"]["max"], 2.25)
++        finally:
++            os.unlink(path)
++
++    # ---- min/max non-numeric ----
++    def test_minmax_null_for_string_column(self):
++        s = self._schema()
++        self.assertIsNone(s["name"]["min"])
++        self.assertIsNone(s["name"]["max"])
++        self.assertIsNone(s["dept"]["min"])
++        self.assertIsNone(s["dept"]["max"])
++
++    def test_minmax_null_for_bool_column(self):
++        path = _write_tmp("flag\ntrue\nfalse\ntrue\n", suffix=".csv")
++        try:
++            s = self._schema(path)
++            self.assertEqual(s["flag"]["type"], "bool")
++            self.assertIsNone(s["flag"]["min"])
++            self.assertIsNone(s["flag"]["max"])
++            self.assertEqual(s["flag"]["distinct"], 2)
++        finally:
++            os.unlink(path)
++
++    def test_minmax_null_for_all_null_column(self):
++        path = _write_tmp("a,b\n1,\n2,\n", suffix=".csv")
++        try:
++            s = self._schema(path)
++            self.assertIsNone(s["b"]["min"])
++            self.assertIsNone(s["b"]["max"])
++            self.assertEqual(s["b"]["distinct"], 0)
++        finally:
++            os.unlink(path)
++
++    # ---- text rendering ----
++    def test_text_output_has_new_columns(self):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            _cmd_inspect([self.path])
++        finally:
++            sys.stdout = old_stdout
++        header = buf.getvalue().splitlines()[0]
++        for col in ("Distinct", "Min", "Max"):
++            self.assertIn(col, header)
++
++
++class GroupHavingTest(unittest.TestCase):
++    """group … having EXPR filters aggregated rows using the expression engine."""
++
++    def setUp(self):
++        self.path = _write_tmp(_PEOPLE_CSV)
++        self.rows = read_rows(self.path)
++
++    def tearDown(self):
++        os.unlink(self.path)
++
++    def test_having_filters_on_aggregate_alias(self):
++        g = Group.from_cli("dept:avg(salary) as avg_sal,count() having avg_sal > 100000")
++        out = g.apply(self.rows)
++        self.assertEqual(len(out), 1)
++        self.assertEqual(out[0]["dept"], "eng")
++        self.assertGreater(out[0]["avg_sal"], 100000)
++
++    def test_having_filters_on_default_alias(self):
++        """When no AS is given, alias defaults to fn_col → avg_salary."""
++        g = Group.from_cli("dept:avg(salary) having avg_salary > 100000")
++        out = g.apply(self.rows)
++        self.assertEqual([r["dept"] for r in out], ["eng"])
++
++    def test_having_on_count(self):
++        g = Group.from_cli("dept:count() having count > 1")
++        out = g.apply(self.rows)
++        depts = {r["dept"] for r in out}
++        self.assertEqual(depts, {"eng", "sales"})
++
++    def test_having_can_reference_group_key(self):
++        g = Group.from_cli('dept:count() having dept != "ops"')
++        out = g.apply(self.rows)
++        self.assertNotIn("ops", {r["dept"] for r in out})
++
++    def test_having_compound_expression(self):
++        g = Group.from_cli(
++            "dept:avg(salary) as a,count() having a > 70000 and count >= 2"
++        )
++        out = g.apply(self.rows)
++        depts = {r["dept"] for r in out}
++        self.assertEqual(depts, {"eng", "sales"})
++
++    def test_without_having_returns_all_groups(self):
++        """Backward compat: omitting having keeps all groups."""
++        g = Group.from_cli("dept:count()")
++        out = g.apply(self.rows)
++        self.assertEqual(len(out), 3)
++
++    def test_having_from_spec(self):
++        g = Group.from_spec({
++            "by": "dept",
++            "agg": ["avg(salary) as avg_sal"],
++            "having": "avg_sal > 100000",
++        })
++        out = g.apply(self.rows)
++        self.assertEqual([r["dept"] for r in out], ["eng"])
++
++    def test_having_via_cli_end_to_end(self):
++        import io, sys
++        buf = io.StringIO()
++        old_stdout = sys.stdout
++        sys.stdout = buf
++        try:
++            rc = cli_main([
++                self.path,
++                "--group", "dept:avg(salary) as a having a > 100000",
++                "-F", "json",
++            ])
++        finally:
++            sys.stdout = old_stdout
++        self.assertEqual(rc, 0)
++        rows = json.loads(buf.getvalue())
++        self.assertEqual(len(rows), 1)
++        self.assertEqual(rows[0]["dept"], "eng")
++
++
++class GroupHavingErrorTest(unittest.TestCase):
++    """having must fail fast on unknown aliases and surface a useful error."""
++
++    def setUp(self):
++        self.path = _write_tmp(_PEOPLE_CSV)
++        self.rows = read_rows(self.path)
++
++    def tearDown(self):
++        os.unlink(self.path)
++
++    def test_unknown_alias_raises_at_construction(self):
++        """The bad alias is caught before any rows are touched."""
++        with self.assertRaises(ColumnError) as ctx:
++            Group.from_cli("dept:avg(salary) as avg_sal having avgsal > 100000")
++        rendered = str(ctx.exception)
++        self.assertIn("avgsal", rendered)
++
++    def test_unknown_alias_shows_available_aliases(self):
++        with self.assertRaises(ColumnError) as ctx:
++            Group.from_cli("dept:avg(salary) as avg_sal having bogus > 1")
++        rendered = str(ctx.exception)
++        self.assertIn("bogus", rendered)
++        self.assertIn("available columns:", rendered)
++        # the listed columns must be the *output* columns of the group
++        self.assertIn("avg_sal", rendered)
++        self.assertIn("dept", rendered)
++
++    def test_unknown_alias_suggests_close_match(self):
++        with self.assertRaises(ColumnError) as ctx:
++            Group.from_cli("dept:count() having coumt > 1")
++        rendered = str(ctx.exception)
++        self.assertIn("did you mean", rendered)
++        self.assertIn("count", rendered)
++
++    def test_unknown_alias_from_spec(self):
++        with self.assertRaises(ColumnError):
++            Group.from_spec({
++                "by": "dept",
++                "agg": ["avg(salary) as a"],
++                "having": "wrong > 1",
++            })
++
++    def test_having_syntax_error_propagates(self):
++        with self.assertRaises(TablesmithError) as ctx:
++            Group.from_cli("dept:count() having count >")
++        self.assertIn("invalid expression", str(ctx.exception))
++
++    def test_validate_subcommand_catches_bad_having(self):
++        doc = {
++            "input": self.path,
++            "steps": [
++                {"op": "group", "by": "dept",
++                 "agg": ["avg(salary) as a"], "having": "wrong > 1"},
++            ],
++        }
++        pipe_path = _write_tmp(json.dumps(doc), suffix=".json")
++        try:
++            import io, sys
++            buf = io.StringIO()
++            old_stderr = sys.stderr
++            sys.stderr = buf
++            try:
++                rc = _cmd_validate([pipe_path])
++            finally:
++                sys.stderr = old_stderr
++            self.assertEqual(rc, 1)
++            self.assertIn("wrong", buf.getvalue())
++            self.assertIn("unknown column", buf.getvalue())
++        finally:
++            os.unlink(pipe_path)
++
++    def test_cli_reports_step_context(self):
++        """CLI error output includes step #N [group] context."""
++        import io, sys
++        buf = io.StringIO()
++        old_stderr = sys.stderr
++        sys.stderr = buf
++        try:
++            rc = cli_main([
++                self.path,
++                "--group", "dept:count() having nope > 1",
++            ])
++        finally:
++            sys.stderr = old_stderr
++        self.assertEqual(rc, 1)
++        msg = buf.getvalue()
++        self.assertIn("[group]", msg)
++        self.assertIn("nope", msg)
++
++
+ if __name__ == "__main__":
+     unittest.main()
