@@ -1,0 +1,1692 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..4da7d25
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,6 @@
++__pycache__/
++*.pyc
++.schedmax/
++*.egg-info/
++build/
++dist/
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..fa38390
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,52 @@
++# schedmax
++
++A self-contained CLI for resource scheduling (meeting rooms, shared equipment,
++on-call rotations). No external infrastructure — state lives in a local JSON
++file under `.schedmax/db.json`. Python standard library only.
++
++## Install (editable)
++
++```
++pip install -e .
++```
++
++This provides the `schedctl` command. You can also run `python -m schedmax`.
++
++## Commands
++
++```
++schedctl init [--force]
++schedctl resource add --name <name> [--description ...] [--timezone Asia/Tokyo] \
++                     [--availability "MON 09:00-17:00,FRI 22:00-02:00"]
++schedctl resource list
++schedctl book --resource <name> --start "YYYY-MM-DD HH:MM" \
++              --end "YYYY-MM-DD HH:MM" --title <title> --by <person>
++schedctl cancel --id <booking-id>
++schedctl list [--resource <name>] [--all]
++schedctl check --resource <name> --start "YYYY-MM-DD HH:MM" --end "YYYY-MM-DD HH:MM"
++```
++
++## Rules
++
++- Resource names are unique and must not contain whitespace.
++- Each resource has its own IANA timezone (default UTC). Naive datetime inputs
++  are interpreted in the resource's timezone; bookings are stored in UTC.
++- Availability is a set of weekly recurring `DAY HH:MM-HH:MM` windows.
++  Cross-midnight slots like `FRI 22:00-02:00` work naturally.
++- A booking must lie fully inside one availability window, cannot start in the
++  past, must have end > start, duration 1 min–24 h, and must not overlap any
++  other booking for the same resource.
++- `schedctl list` shows times in each resource's local timezone.
++- `schedctl check` validates availability and conflicts without creating a booking.
++
++## Data location
++
++`schedctl` walks up from the current directory to find `.schedmax/db.json`,
++similar to how `git` finds `.git`. Run `init` in the directory you want to
++own the schedule. Use `--force` to reinitialize (overwrites existing data).
++
++## Tests
++
++```
++python -m pytest tests/ -v
++```
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..a02f8dd
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,15 @@
++[build-system]
++requires = ["setuptools>=61"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "schedmax"
++version = "0.1.0"
++description = "Self-contained CLI for resource scheduling (rooms, equipment, on-call)."
++requires-python = ">=3.11"
++
++[project.scripts]
++schedctl = "schedmax.cli:main"
++
++[tool.setuptools.packages.find]
++include = ["schedmax*"]
+diff --git a/schedmax/__init__.py b/schedmax/__init__.py
+new file mode 100644
+index 0000000..3dc1f76
+--- /dev/null
++++ b/schedmax/__init__.py
+@@ -0,0 +1 @@
++__version__ = "0.1.0"
+diff --git a/schedmax/__main__.py b/schedmax/__main__.py
+new file mode 100644
+index 0000000..bfdcd0c
+--- /dev/null
++++ b/schedmax/__main__.py
+@@ -0,0 +1,4 @@
++from .cli import main
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/schedmax/cli.py b/schedmax/cli.py
+new file mode 100644
+index 0000000..46dc471
+--- /dev/null
++++ b/schedmax/cli.py
+@@ -0,0 +1,215 @@
++from __future__ import annotations
++
++import argparse
++import sys
++
++from . import __version__, service, storage
++from .models import WEEKDAYS, ValidationError, parse_availability_spec
++
++
++def _cmd_init(args: argparse.Namespace) -> int:
++    path = storage.init_db(force=args.force)
++    action = "reinitialized" if args.force else "initialized"
++    print(f"{action} schedmax at {path}")
++    return 0
++
++
++def _cmd_resource_add(args: argparse.Namespace) -> int:
++    slots = parse_availability_spec(args.availability or "")
++    r = service.add_resource(
++        args.name, args.description or "", slots, timezone=args.timezone
++    )
++    print(f"added resource '{r.name}' ({r.timezone}) with {len(r.availability)} availability slot(s)")
++    return 0
++
++
++def _cmd_resource_list(_: argparse.Namespace) -> int:
++    resources = service.list_resources()
++    if not resources:
++        print("(no resources)")
++        return 0
++    for r in resources:
++        desc = f" - {r.description}" if r.description else ""
++        print(f"{r.name} ({r.timezone}){desc}")
++        if r.availability:
++            for s in r.availability:
++                suffix = " [overnight]" if s.crosses_midnight else ""
++                print(f"    {WEEKDAYS[s.weekday]} {s.start}-{s.end}{suffix}")
++        else:
++            print("    (no availability defined)")
++    return 0
++
++
++def _cmd_book(args: argparse.Namespace) -> int:
++    b = service.create_booking(
++        resource_name=args.resource,
++        start_s=args.start,
++        end_s=args.end,
++        title=args.title,
++        booked_by=args.by,
++    )
++    print(f"booked {b.id}: {b.resource} {b.start} -> {b.end} (UTC) '{b.title}' by {b.booked_by}")
++    return 0
++
++
++def _cmd_cancel(args: argparse.Namespace) -> int:
++    b = service.cancel_booking(args.id)
++    print(f"cancelled {b.id} ({b.resource} {b.start} -> {b.end})")
++    return 0
++
++
++def _cmd_list(args: argparse.Namespace) -> int:
++    bookings = service.list_bookings(resource=args.resource, include_past=args.all)
++    if not bookings:
++        print("(no bookings)")
++        return 0
++    resources = {r.name: r for r in service.list_resources()}
++    for b in bookings:
++        res = resources.get(b.resource)
++        if res:
++            tz = service.validate_timezone(res.timezone)
++            local_start = b.start_dt().astimezone(tz)
++            local_end = b.end_dt().astimezone(tz)
++            time_str = (
++                f"{local_start.strftime('%Y-%m-%d %H:%M')} -> "
++                f"{local_end.strftime('%Y-%m-%d %H:%M')} {res.timezone}"
++            )
++        else:
++            time_str = f"{b.start} -> {b.end} UTC"
++        print(
++            f"{b.id}  {b.resource:<16}  {time_str}  "
++            f"{b.title!r} by {b.booked_by}"
++        )
++    return 0
++
++
++def _cmd_check(args: argparse.Namespace) -> int:
++    result = service.check_availability(
++        resource_name=args.resource,
++        start_s=args.start,
++        end_s=args.end,
++    )
++    r = result.resource
++    start_wd = WEEKDAYS[result.start.weekday()]
++    end_wd = WEEKDAYS[result.end.weekday()]
++
++    print(f"resource: {r.name} ({r.timezone})")
++    if result.start.date() == result.end.date():
++        print(
++            f"requested: {result.start.strftime('%Y-%m-%d %H:%M')} -> "
++            f"{result.end.strftime('%H:%M')} ({start_wd})"
++        )
++    else:
++        print(
++            f"requested: {result.start.strftime('%Y-%m-%d %H:%M')} ({start_wd}) -> "
++            f"{result.end.strftime('%Y-%m-%d %H:%M')} ({end_wd})"
++        )
++    print()
++
++    if result.within_availability:
++        slot = result.matching_slot
++        tag = " [overnight]" if slot.crosses_midnight else ""
++        print(f"availability: OK (within {WEEKDAYS[slot.weekday]} {slot.start}-{slot.end}{tag})")
++    else:
++        print("availability: OUTSIDE defined availability windows")
++
++    if result.conflicts:
++        tz = service.validate_timezone(r.timezone)
++        print(f"conflicts: {len(result.conflicts)}")
++        for c in result.conflicts:
++            local_s = c.start_dt().astimezone(tz)
++            local_e = c.end_dt().astimezone(tz)
++            print(
++                f"  - {c.id}: '{c.title}' by {c.booked_by} "
++                f"({local_s.strftime('%H:%M')} -> {local_e.strftime('%H:%M')})"
++            )
++    else:
++        print("conflicts: none")
++
++    print()
++    if result.available:
++        print("result: AVAILABLE")
++    else:
++        reasons = []
++        if not result.within_availability:
++            reasons.append("outside availability")
++        if result.conflicts:
++            reasons.append(f"{len(result.conflicts)} conflict(s)")
++        print(f"result: NOT AVAILABLE ({', '.join(reasons)})")
++
++    return 0 if result.available else 1
++
++
++def build_parser() -> argparse.ArgumentParser:
++    parser = argparse.ArgumentParser(
++        prog="schedctl",
++        description="schedmax: self-contained resource scheduling CLI",
++    )
++    parser.add_argument("--version", action="version", version=f"schedmax {__version__}")
++    sub = parser.add_subparsers(dest="command", required=True)
++
++    p_init = sub.add_parser("init", help="initialize a schedmax database in cwd")
++    p_init.add_argument("--force", action="store_true", help="overwrite existing database")
++    p_init.set_defaults(func=_cmd_init)
++
++    p_res = sub.add_parser("resource", help="manage resources")
++    res_sub = p_res.add_subparsers(dest="resource_cmd", required=True)
++
++    p_res_add = res_sub.add_parser("add", help="add a resource")
++    p_res_add.add_argument("--name", required=True)
++    p_res_add.add_argument("--description", default="")
++    p_res_add.add_argument("--timezone", default="UTC", help="IANA timezone (default UTC)")
++    p_res_add.add_argument(
++        "--availability",
++        default="",
++        help="comma-separated slots like 'MON 09:00-17:00,FRI 22:00-02:00'",
++    )
++    p_res_add.set_defaults(func=_cmd_resource_add)
++
++    p_res_list = res_sub.add_parser("list", help="list resources")
++    p_res_list.set_defaults(func=_cmd_resource_list)
++
++    p_book = sub.add_parser("book", help="create a booking")
++    p_book.add_argument("--resource", required=True)
++    p_book.add_argument("--start", required=True, help="'YYYY-MM-DD HH:MM' in resource timezone")
++    p_book.add_argument("--end", required=True, help="'YYYY-MM-DD HH:MM' in resource timezone")
++    p_book.add_argument("--title", required=True)
++    p_book.add_argument("--by", required=True, help="name of the person booking")
++    p_book.set_defaults(func=_cmd_book)
++
++    p_cancel = sub.add_parser("cancel", help="cancel a booking by id")
++    p_cancel.add_argument("--id", required=True)
++    p_cancel.set_defaults(func=_cmd_cancel)
++
++    p_list = sub.add_parser("list", help="list bookings")
++    p_list.add_argument("--resource", default=None)
++    p_list.add_argument("--all", action="store_true", help="include past bookings")
++    p_list.set_defaults(func=_cmd_list)
++
++    p_check = sub.add_parser("check", help="check availability without booking")
++    p_check.add_argument("--resource", required=True)
++    p_check.add_argument("--start", required=True, help="'YYYY-MM-DD HH:MM' in resource timezone")
++    p_check.add_argument("--end", required=True, help="'YYYY-MM-DD HH:MM' in resource timezone")
++    p_check.set_defaults(func=_cmd_check)
++
++    return parser
++
++
++def main(argv: list[str] | None = None) -> int:
++    parser = build_parser()
++    args = parser.parse_args(argv)
++    try:
++        return args.func(args)
++    except ValidationError as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++    except FileNotFoundError as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++    except FileExistsError as e:
++        print(f"error: {e}", file=sys.stderr)
++        return 2
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/schedmax/models.py b/schedmax/models.py
+new file mode 100644
+index 0000000..a0cf8ee
+--- /dev/null
++++ b/schedmax/models.py
+@@ -0,0 +1,198 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field, asdict
++from datetime import datetime, date, time, timedelta
++from typing import Iterable
++
++WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
++WEEKDAY_INDEX = {name: i for i, name in enumerate(WEEKDAYS)}
++
++
++class ValidationError(ValueError):
++    pass
++
++
++def _parse_hhmm(s: str) -> time:
++    try:
++        hh, mm = s.split(":")
++        return time(int(hh), int(mm))
++    except Exception as exc:
++        raise ValidationError(f"invalid time '{s}', expected HH:MM") from exc
++
++
++@dataclass
++class AvailabilitySlot:
++    weekday: int  # 0 = Monday
++    start: str    # "HH:MM"
++    end: str      # "HH:MM"
++
++    @property
++    def crosses_midnight(self) -> bool:
++        return _parse_hhmm(self.end) <= _parse_hhmm(self.start)
++
++    def validate(self) -> None:
++        if self.weekday not in range(7):
++            raise ValidationError(f"invalid weekday: {self.weekday}")
++        s = _parse_hhmm(self.start)
++        e = _parse_hhmm(self.end)
++        if s == e:
++            raise ValidationError(
++                f"availability start and end cannot be identical ({self.start})"
++            )
++
++    def to_dict(self) -> dict:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, d: dict) -> AvailabilitySlot:
++        return cls(weekday=int(d["weekday"]), start=d["start"], end=d["end"])
++
++
++@dataclass
++class Resource:
++    name: str
++    description: str = ""
++    timezone: str = "UTC"
++    availability: list[AvailabilitySlot] = field(default_factory=list)
++
++    def validate(self) -> None:
++        if not self.name or not self.name.strip():
++            raise ValidationError("resource name is required")
++        if any(c.isspace() for c in self.name):
++            raise ValidationError("resource name must not contain whitespace")
++        for slot in self.availability:
++            slot.validate()
++
++    def to_dict(self) -> dict:
++        return {
++            "name": self.name,
++            "description": self.description,
++            "timezone": self.timezone,
++            "availability": [s.to_dict() for s in self.availability],
++        }
++
++    @classmethod
++    def from_dict(cls, d: dict) -> Resource:
++        return cls(
++            name=d["name"],
++            description=d.get("description", ""),
++            timezone=d.get("timezone", "UTC"),
++            availability=[AvailabilitySlot.from_dict(s) for s in d.get("availability", [])],
++        )
++
++
++@dataclass
++class Booking:
++    id: str
++    resource: str
++    start: str  # ISO-8601 in UTC
++    end: str    # ISO-8601 in UTC
++    title: str
++    booked_by: str
++
++    def start_dt(self) -> datetime:
++        return datetime.fromisoformat(self.start)
++
++    def end_dt(self) -> datetime:
++        return datetime.fromisoformat(self.end)
++
++    def to_dict(self) -> dict:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, d: dict) -> Booking:
++        return cls(**d)
++
++
++@dataclass
++class CheckResult:
++    resource: Resource
++    start: datetime
++    end: datetime
++    within_availability: bool
++    matching_slot: AvailabilitySlot | None
++    conflicts: list[Booking]
++
++    @property
++    def available(self) -> bool:
++        return self.within_availability and not self.conflicts
++
++
++def _slot_window(slot: AvailabilitySlot, ref: date) -> tuple[datetime, datetime] | None:
++    s_t = _parse_hhmm(slot.start)
++    e_t = _parse_hhmm(slot.end)
++    wd = ref.weekday()
++
++    if not slot.crosses_midnight:
++        if wd == slot.weekday:
++            return (
++                datetime.combine(ref, s_t),
++                datetime.combine(ref, e_t),
++            )
++    else:
++        # Evening portion: booking starts on the slot's weekday
++        if wd == slot.weekday:
++            return (
++                datetime.combine(ref, s_t),
++                datetime.combine(ref + timedelta(days=1), e_t),
++            )
++        # Morning-after portion: booking starts the day after the slot's weekday
++        if wd == (slot.weekday + 1) % 7:
++            return (
++                datetime.combine(ref - timedelta(days=1), s_t),
++                datetime.combine(ref, e_t),
++            )
++    return None
++
++
++def find_matching_slot(
++    start: datetime, end: datetime, availability: Iterable[AvailabilitySlot]
++) -> AvailabilitySlot | None:
++    start_naive = start.replace(tzinfo=None)
++    end_naive = end.replace(tzinfo=None)
++    for slot in availability:
++        window = _slot_window(slot, start_naive.date())
++        if window is None:
++            continue
++        w_start, w_end = window
++        if w_start <= start_naive and end_naive <= w_end:
++            return slot
++    return None
++
++
++def fits_within_availability(
++    start: datetime, end: datetime, availability: Iterable[AvailabilitySlot]
++) -> bool:
++    return find_matching_slot(start, end, availability) is not None
++
++
++def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
++    return a_start < b_end and b_start < a_end
++
++
++def parse_availability_spec(spec: str) -> list[AvailabilitySlot]:
++    slots: list[AvailabilitySlot] = []
++    if not spec.strip():
++        return slots
++    for chunk in spec.split(","):
++        chunk = chunk.strip()
++        if not chunk:
++            continue
++        parts = chunk.split()
++        if len(parts) != 2:
++            raise ValidationError(
++                f"invalid availability entry '{chunk}', expected 'DAY HH:MM-HH:MM'"
++            )
++        day_s, range_s = parts
++        day_key = day_s.upper()
++        if day_key not in WEEKDAY_INDEX:
++            raise ValidationError(f"unknown weekday '{day_s}'")
++        if "-" not in range_s:
++            raise ValidationError(f"invalid time range '{range_s}'")
++        start_s, end_s = range_s.split("-", 1)
++        slot = AvailabilitySlot(
++            weekday=WEEKDAY_INDEX[day_key], start=start_s, end=end_s
++        )
++        slot.validate()
++        slots.append(slot)
++    return slots
+diff --git a/schedmax/service.py b/schedmax/service.py
+new file mode 100644
+index 0000000..7de76fc
+--- /dev/null
++++ b/schedmax/service.py
+@@ -0,0 +1,207 @@
++from __future__ import annotations
++
++import uuid
++from datetime import datetime, timedelta
++from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
++
++from . import storage
++from .models import (
++    AvailabilitySlot,
++    Booking,
++    CheckResult,
++    Resource,
++    ValidationError,
++    find_matching_slot,
++    fits_within_availability,
++    overlaps,
++)
++
++MIN_BOOKING = timedelta(minutes=1)
++MAX_BOOKING = timedelta(days=1)
++UTC = ZoneInfo("UTC")
++
++
++def validate_timezone(name: str) -> ZoneInfo:
++    if not name or not name.strip():
++        raise ValidationError("timezone is required")
++    try:
++        return ZoneInfo(name)
++    except (KeyError, ZoneInfoNotFoundError) as exc:
++        raise ValidationError(f"unknown timezone '{name}'") from exc
++
++
++def _resource_tz(resource: Resource) -> ZoneInfo:
++    return validate_timezone(resource.timezone)
++
++
++def add_resource(
++    name: str,
++    description: str,
++    availability: list[AvailabilitySlot],
++    timezone: str = "UTC",
++) -> Resource:
++    validate_timezone(timezone)
++    data = storage.load()
++    if any(r["name"] == name for r in data["resources"]):
++        raise ValidationError(f"resource '{name}' already exists")
++    resource = Resource(
++        name=name, description=description, timezone=timezone, availability=availability
++    )
++    resource.validate()
++    data["resources"].append(resource.to_dict())
++    storage.save(data)
++    return resource
++
++
++def list_resources() -> list[Resource]:
++    data = storage.load()
++    return [Resource.from_dict(r) for r in data["resources"]]
++
++
++def _get_resource(data: dict, name: str) -> Resource:
++    for r in data["resources"]:
++        if r["name"] == name:
++            return Resource.from_dict(r)
++    raise ValidationError(f"resource '{name}' not found")
++
++
++def parse_dt(s: str, tz: ZoneInfo) -> datetime:
++    s = s.strip()
++    try:
++        if "T" in s:
++            dt = datetime.fromisoformat(s)
++        else:
++            dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
++    except ValueError as exc:
++        raise ValidationError(
++            f"invalid datetime '{s}', expected 'YYYY-MM-DD HH:MM' or ISO-8601"
++        ) from exc
++    if dt.tzinfo is None:
++        dt = dt.replace(tzinfo=tz)
++    return dt
++
++
++def create_booking(
++    resource_name: str,
++    start_s: str,
++    end_s: str,
++    title: str,
++    booked_by: str,
++    now: datetime | None = None,
++) -> Booking:
++    if not title.strip():
++        raise ValidationError("title is required")
++    if not booked_by.strip():
++        raise ValidationError("booked_by is required")
++
++    data = storage.load()
++    resource = _get_resource(data, resource_name)
++    tz = _resource_tz(resource)
++
++    start = parse_dt(start_s, tz)
++    end = parse_dt(end_s, tz)
++    current = now or datetime.now(tz=UTC)
++
++    if end <= start:
++        raise ValidationError("end must be after start")
++    duration = end - start
++    if duration < MIN_BOOKING:
++        raise ValidationError("booking duration must be at least 1 minute")
++    if duration > MAX_BOOKING:
++        raise ValidationError("booking duration must not exceed 24 hours")
++    if start < current:
++        raise ValidationError("cannot book in the past")
++
++    if not fits_within_availability(start, end, resource.availability):
++        raise ValidationError(
++            f"booking is outside '{resource.name}' availability"
++        )
++
++    start_utc = start.astimezone(UTC)
++    end_utc = end.astimezone(UTC)
++
++    for b in data["bookings"]:
++        if b["resource"] != resource.name:
++            continue
++        existing = Booking.from_dict(b)
++        if overlaps(start_utc, end_utc, existing.start_dt(), existing.end_dt()):
++            raise ValidationError(
++                f"overlaps existing booking {existing.id} "
++                f"({existing.start} -> {existing.end})"
++            )
++
++    booking = Booking(
++        id=uuid.uuid4().hex[:8],
++        resource=resource.name,
++        start=start_utc.isoformat(),
++        end=end_utc.isoformat(),
++        title=title.strip(),
++        booked_by=booked_by.strip(),
++    )
++    data["bookings"].append(booking.to_dict())
++    storage.save(data)
++    return booking
++
++
++def cancel_booking(booking_id: str) -> Booking:
++    data = storage.load()
++    for i, b in enumerate(data["bookings"]):
++        if b["id"] == booking_id:
++            removed = Booking.from_dict(data["bookings"].pop(i))
++            storage.save(data)
++            return removed
++    raise ValidationError(f"booking '{booking_id}' not found")
++
++
++def list_bookings(
++    resource: str | None = None, include_past: bool = False
++) -> list[Booking]:
++    data = storage.load()
++    now = datetime.now(tz=UTC)
++    out: list[Booking] = []
++    for b in data["bookings"]:
++        if resource and b["resource"] != resource:
++            continue
++        bk = Booking.from_dict(b)
++        if not include_past and bk.end_dt() < now:
++            continue
++        out.append(bk)
++    out.sort(key=lambda x: x.start_dt())
++    return out
++
++
++def check_availability(
++    resource_name: str,
++    start_s: str,
++    end_s: str,
++) -> CheckResult:
++    data = storage.load()
++    resource = _get_resource(data, resource_name)
++    tz = _resource_tz(resource)
++
++    start = parse_dt(start_s, tz)
++    end = parse_dt(end_s, tz)
++
++    if end <= start:
++        raise ValidationError("end must be after start")
++
++    matching = find_matching_slot(start, end, resource.availability)
++
++    start_utc = start.astimezone(UTC)
++    end_utc = end.astimezone(UTC)
++    conflicts: list[Booking] = []
++    for b in data["bookings"]:
++        if b["resource"] != resource.name:
++            continue
++        existing = Booking.from_dict(b)
++        if overlaps(start_utc, end_utc, existing.start_dt(), existing.end_dt()):
++            conflicts.append(existing)
++
++    return CheckResult(
++        resource=resource,
++        start=start,
++        end=end,
++        within_availability=matching is not None,
++        matching_slot=matching,
++        conflicts=conflicts,
++    )
+diff --git a/schedmax/storage.py b/schedmax/storage.py
+new file mode 100644
+index 0000000..8cab58a
+--- /dev/null
++++ b/schedmax/storage.py
+@@ -0,0 +1,68 @@
++import json
++import os
++from pathlib import Path
++
++DB_DIRNAME = ".schedmax"
++DB_FILENAME = "db.json"
++
++
++def db_path(root: Path | None = None) -> Path:
++    root = root or Path.cwd()
++    return root / DB_DIRNAME / DB_FILENAME
++
++
++def find_db(start: Path | None = None) -> Path | None:
++    cur = (start or Path.cwd()).resolve()
++    for p in [cur, *cur.parents]:
++        candidate = p / DB_DIRNAME / DB_FILENAME
++        if candidate.exists():
++            return candidate
++    return None
++
++
++def init_db(root: Path | None = None, force: bool = False) -> Path:
++    path = db_path(root)
++    if path.exists():
++        if not force:
++            try:
++                with open(path, "r", encoding="utf-8") as f:
++                    json.load(f)
++                raise FileExistsError(f"schedmax already initialized at {path}")
++            except json.JSONDecodeError:
++                raise FileExistsError(
++                    f"corrupt database at {path}, use `schedctl init --force` to reinitialize"
++                )
++    path.parent.mkdir(parents=True, exist_ok=True)
++    data = {"version": 1, "resources": [], "bookings": []}
++    _write(path, data)
++    return path
++
++
++def load(path: Path | None = None) -> dict:
++    p = path or find_db()
++    if p is None:
++        raise FileNotFoundError(
++            "No schedmax database found. Run `schedctl init` first."
++        )
++    try:
++        with open(p, "r", encoding="utf-8") as f:
++            return json.load(f)
++    except json.JSONDecodeError as exc:
++        raise FileNotFoundError(
++            f"corrupt database at {p}, reinitialize with `schedctl init --force`"
++        ) from exc
++
++
++def save(data: dict, path: Path | None = None) -> None:
++    p = path or find_db()
++    if p is None:
++        raise FileNotFoundError("No schedmax database found.")
++    _write(p, data)
++
++
++def _write(path: Path, data: dict) -> None:
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    with open(tmp, "w", encoding="utf-8") as f:
++        json.dump(data, f, indent=2, sort_keys=False)
++        f.write("\n")
++    os.replace(tmp, path)
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_models.py b/tests/test_models.py
+new file mode 100644
+index 0000000..eefff2b
+--- /dev/null
++++ b/tests/test_models.py
+@@ -0,0 +1,310 @@
++import unittest
++from datetime import datetime, time
++
++from schedmax.models import (
++    AvailabilitySlot,
++    Resource,
++    ValidationError,
++    _parse_hhmm,
++    _slot_window,
++    find_matching_slot,
++    fits_within_availability,
++    overlaps,
++    parse_availability_spec,
++)
++
++
++class TestParseHHMM(unittest.TestCase):
++    def test_valid_times(self):
++        self.assertEqual(_parse_hhmm("09:00"), time(9, 0))
++        self.assertEqual(_parse_hhmm("23:59"), time(23, 59))
++        self.assertEqual(_parse_hhmm("00:00"), time(0, 0))
++
++    def test_invalid_times(self):
++        with self.assertRaises(ValidationError):
++            _parse_hhmm("25:00")
++        with self.assertRaises(ValidationError):
++            _parse_hhmm("abc")
++        with self.assertRaises(ValidationError):
++            _parse_hhmm("")
++
++
++class TestAvailabilitySlot(unittest.TestCase):
++    def test_normal_slot(self):
++        slot = AvailabilitySlot(weekday=0, start="09:00", end="17:00")
++        slot.validate()
++        self.assertFalse(slot.crosses_midnight)
++
++    def test_cross_midnight_slot(self):
++        slot = AvailabilitySlot(weekday=4, start="22:00", end="02:00")
++        slot.validate()
++        self.assertTrue(slot.crosses_midnight)
++
++    def test_end_at_midnight(self):
++        slot = AvailabilitySlot(weekday=4, start="22:00", end="00:00")
++        slot.validate()
++        self.assertTrue(slot.crosses_midnight)
++
++    def test_identical_start_end_rejected(self):
++        slot = AvailabilitySlot(weekday=0, start="09:00", end="09:00")
++        with self.assertRaises(ValidationError):
++            slot.validate()
++
++    def test_invalid_weekday(self):
++        slot = AvailabilitySlot(weekday=7, start="09:00", end="17:00")
++        with self.assertRaises(ValidationError):
++            slot.validate()
++
++    def test_roundtrip(self):
++        slot = AvailabilitySlot(weekday=3, start="10:00", end="14:00")
++        restored = AvailabilitySlot.from_dict(slot.to_dict())
++        self.assertEqual(slot.weekday, restored.weekday)
++        self.assertEqual(slot.start, restored.start)
++        self.assertEqual(slot.end, restored.end)
++
++
++class TestParseAvailabilitySpec(unittest.TestCase):
++    def test_normal_slots(self):
++        slots = parse_availability_spec("MON 09:00-17:00,TUE 10:00-12:00")
++        self.assertEqual(len(slots), 2)
++        self.assertEqual(slots[0].weekday, 0)
++        self.assertEqual(slots[1].weekday, 1)
++        self.assertEqual(slots[0].start, "09:00")
++        self.assertEqual(slots[0].end, "17:00")
++
++    def test_cross_midnight_spec(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        self.assertEqual(len(slots), 1)
++        self.assertTrue(slots[0].crosses_midnight)
++
++    def test_empty_spec(self):
++        self.assertEqual(parse_availability_spec(""), [])
++        self.assertEqual(parse_availability_spec("  "), [])
++
++    def test_bad_weekday(self):
++        with self.assertRaises(ValidationError):
++            parse_availability_spec("XYZ 09:00-17:00")
++
++    def test_missing_time_range(self):
++        with self.assertRaises(ValidationError):
++            parse_availability_spec("MON")
++
++    def test_case_insensitive(self):
++        slots = parse_availability_spec("mon 09:00-17:00")
++        self.assertEqual(slots[0].weekday, 0)
++
++
++class TestSlotWindow(unittest.TestCase):
++    """Test _slot_window (concrete time-range generation)."""
++
++    def test_normal_matching_day(self):
++        slot = AvailabilitySlot(weekday=2, start="09:00", end="17:00")
++        # 2026-04-22 = Wednesday (weekday 2)
++        from datetime import date
++        window = _slot_window(slot, date(2026, 4, 22))
++        self.assertIsNotNone(window)
++        self.assertEqual(window[0], datetime(2026, 4, 22, 9, 0))
++        self.assertEqual(window[1], datetime(2026, 4, 22, 17, 0))
++
++    def test_normal_wrong_day(self):
++        slot = AvailabilitySlot(weekday=0, start="09:00", end="17:00")
++        from datetime import date
++        self.assertIsNone(_slot_window(slot, date(2026, 4, 22)))
++
++    def test_cross_midnight_evening(self):
++        slot = AvailabilitySlot(weekday=4, start="22:00", end="02:00")
++        from datetime import date
++        # 2026-04-24 = Friday (weekday 4)
++        window = _slot_window(slot, date(2026, 4, 24))
++        self.assertIsNotNone(window)
++        self.assertEqual(window[0], datetime(2026, 4, 24, 22, 0))
++        self.assertEqual(window[1], datetime(2026, 4, 25, 2, 0))
++
++    def test_cross_midnight_morning_after(self):
++        slot = AvailabilitySlot(weekday=4, start="22:00", end="02:00")
++        from datetime import date
++        # 2026-04-25 = Saturday (weekday 5), day after Friday
++        window = _slot_window(slot, date(2026, 4, 25))
++        self.assertIsNotNone(window)
++        self.assertEqual(window[0], datetime(2026, 4, 24, 22, 0))
++        self.assertEqual(window[1], datetime(2026, 4, 25, 2, 0))
++
++    def test_cross_midnight_unrelated_day(self):
++        slot = AvailabilitySlot(weekday=4, start="22:00", end="02:00")
++        from datetime import date
++        # 2026-04-22 = Wednesday — not Friday or Saturday
++        self.assertIsNone(_slot_window(slot, date(2026, 4, 22)))
++
++    def test_sunday_cross_midnight_into_monday(self):
++        slot = AvailabilitySlot(weekday=6, start="23:00", end="01:00")
++        from datetime import date
++        # 2026-04-26 = Sunday
++        window = _slot_window(slot, date(2026, 4, 26))
++        self.assertEqual(window[0], datetime(2026, 4, 26, 23, 0))
++        self.assertEqual(window[1], datetime(2026, 4, 27, 1, 0))
++        # Monday morning-after check
++        window2 = _slot_window(slot, date(2026, 4, 27))
++        self.assertEqual(window2[0], datetime(2026, 4, 26, 23, 0))
++        self.assertEqual(window2[1], datetime(2026, 4, 27, 1, 0))
++
++
++class TestFitsWithinAvailability(unittest.TestCase):
++    def test_same_day_within(self):
++        slots = [AvailabilitySlot(2, "09:00", "17:00")]
++        start = datetime(2026, 4, 22, 10, 0)
++        end = datetime(2026, 4, 22, 11, 0)
++        self.assertTrue(fits_within_availability(start, end, slots))
++
++    def test_same_day_outside_hours(self):
++        slots = [AvailabilitySlot(2, "09:00", "17:00")]
++        start = datetime(2026, 4, 22, 18, 0)
++        end = datetime(2026, 4, 22, 19, 0)
++        self.assertFalse(fits_within_availability(start, end, slots))
++
++    def test_wrong_weekday(self):
++        slots = [AvailabilitySlot(0, "09:00", "17:00")]
++        start = datetime(2026, 4, 22, 10, 0)
++        end = datetime(2026, 4, 22, 11, 0)
++        self.assertFalse(fits_within_availability(start, end, slots))
++
++    def test_exact_boundary(self):
++        slots = [AvailabilitySlot(2, "09:00", "17:00")]
++        start = datetime(2026, 4, 22, 9, 0)
++        end = datetime(2026, 4, 22, 17, 0)
++        self.assertTrue(fits_within_availability(start, end, slots))
++
++    def test_exceeds_end(self):
++        slots = [AvailabilitySlot(2, "09:00", "17:00")]
++        start = datetime(2026, 4, 22, 16, 0)
++        end = datetime(2026, 4, 22, 17, 1)
++        self.assertFalse(fits_within_availability(start, end, slots))
++
++    def test_cross_midnight_evening_booking(self):
++        slots = [AvailabilitySlot(4, "22:00", "02:00")]
++        start = datetime(2026, 4, 24, 23, 0)
++        end = datetime(2026, 4, 25, 1, 0)
++        self.assertTrue(fits_within_availability(start, end, slots))
++
++    def test_cross_midnight_morning_booking(self):
++        slots = [AvailabilitySlot(4, "22:00", "02:00")]
++        start = datetime(2026, 4, 25, 0, 30)
++        end = datetime(2026, 4, 25, 1, 30)
++        self.assertTrue(fits_within_availability(start, end, slots))
++
++    def test_cross_midnight_past_end(self):
++        slots = [AvailabilitySlot(4, "22:00", "02:00")]
++        start = datetime(2026, 4, 25, 2, 30)
++        end = datetime(2026, 4, 25, 3, 30)
++        self.assertFalse(fits_within_availability(start, end, slots))
++
++    def test_cross_midnight_wrong_weekday(self):
++        slots = [AvailabilitySlot(4, "22:00", "02:00")]
++        start = datetime(2026, 4, 23, 23, 0)
++        end = datetime(2026, 4, 24, 1, 0)
++        self.assertFalse(fits_within_availability(start, end, slots))
++
++    def test_cross_midnight_full_slot(self):
++        slots = [AvailabilitySlot(4, "22:00", "02:00")]
++        start = datetime(2026, 4, 24, 22, 0)
++        end = datetime(2026, 4, 25, 2, 0)
++        self.assertTrue(fits_within_availability(start, end, slots))
++
++    def test_no_availability(self):
++        self.assertFalse(
++            fits_within_availability(datetime(2026, 4, 22, 10), datetime(2026, 4, 22, 11), [])
++        )
++
++    def test_with_tz_aware_datetimes(self):
++        from zoneinfo import ZoneInfo
++        slots = [AvailabilitySlot(2, "09:00", "17:00")]
++        tz = ZoneInfo("Asia/Tokyo")
++        start = datetime(2026, 4, 22, 10, 0, tzinfo=tz)
++        end = datetime(2026, 4, 22, 11, 0, tzinfo=tz)
++        self.assertTrue(fits_within_availability(start, end, slots))
++
++    def test_multiple_slots(self):
++        slots = [
++            AvailabilitySlot(0, "09:00", "12:00"),
++            AvailabilitySlot(0, "13:00", "17:00"),
++        ]
++        self.assertTrue(fits_within_availability(
++            datetime(2026, 4, 20, 9, 0), datetime(2026, 4, 20, 11, 0), slots
++        ))
++        self.assertTrue(fits_within_availability(
++            datetime(2026, 4, 20, 14, 0), datetime(2026, 4, 20, 16, 0), slots
++        ))
++        self.assertFalse(fits_within_availability(
++            datetime(2026, 4, 20, 11, 0), datetime(2026, 4, 20, 14, 0), slots
++        ))
++
++
++class TestFindMatchingSlot(unittest.TestCase):
++    def test_returns_matching_slot(self):
++        wed = AvailabilitySlot(2, "09:00", "17:00")
++        slot = find_matching_slot(datetime(2026, 4, 22, 10), datetime(2026, 4, 22, 11), [wed])
++        self.assertIs(slot, wed)
++
++    def test_returns_none_when_no_match(self):
++        slot = find_matching_slot(
++            datetime(2026, 4, 22, 10), datetime(2026, 4, 22, 11), []
++        )
++        self.assertIsNone(slot)
++
++
++class TestOverlaps(unittest.TestCase):
++    def test_overlapping(self):
++        self.assertTrue(overlaps(
++            datetime(2026, 1, 1, 10), datetime(2026, 1, 1, 12),
++            datetime(2026, 1, 1, 11), datetime(2026, 1, 1, 13),
++        ))
++
++    def test_adjacent_no_overlap(self):
++        self.assertFalse(overlaps(
++            datetime(2026, 1, 1, 10), datetime(2026, 1, 1, 12),
++            datetime(2026, 1, 1, 12), datetime(2026, 1, 1, 13),
++        ))
++
++    def test_contained(self):
++        self.assertTrue(overlaps(
++            datetime(2026, 1, 1, 10), datetime(2026, 1, 1, 15),
++            datetime(2026, 1, 1, 11), datetime(2026, 1, 1, 13),
++        ))
++
++    def test_no_overlap(self):
++        self.assertFalse(overlaps(
++            datetime(2026, 1, 1, 10), datetime(2026, 1, 1, 11),
++            datetime(2026, 1, 1, 14), datetime(2026, 1, 1, 15),
++        ))
++
++
++class TestResource(unittest.TestCase):
++    def test_validate_empty_name(self):
++        with self.assertRaises(ValidationError):
++            Resource(name="").validate()
++
++    def test_validate_whitespace_name(self):
++        with self.assertRaises(ValidationError):
++            Resource(name="room 1").validate()
++
++    def test_roundtrip(self):
++        r = Resource(
++            name="room-1",
++            description="test",
++            timezone="Asia/Tokyo",
++            availability=[AvailabilitySlot(0, "09:00", "17:00")],
++        )
++        r2 = Resource.from_dict(r.to_dict())
++        self.assertEqual(r.name, r2.name)
++        self.assertEqual(r.timezone, r2.timezone)
++        self.assertEqual(r.description, r2.description)
++        self.assertEqual(len(r2.availability), 1)
++
++    def test_from_dict_defaults(self):
++        r = Resource.from_dict({"name": "x"})
++        self.assertEqual(r.timezone, "UTC")
++        self.assertEqual(r.description, "")
++        self.assertEqual(r.availability, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_service.py b/tests/test_service.py
+new file mode 100644
+index 0000000..da688ca
+--- /dev/null
++++ b/tests/test_service.py
+@@ -0,0 +1,394 @@
++import os
++import shutil
++import tempfile
++import unittest
++from datetime import datetime, timedelta
++from zoneinfo import ZoneInfo
++
++from schedmax import service, storage
++from schedmax.models import ValidationError, parse_availability_spec
++
++NOW = datetime(2026, 4, 1, tzinfo=ZoneInfo("UTC"))
++ALL_WEEK = "MON 09:00-17:00,TUE 09:00-17:00,WED 09:00-17:00,THU 09:00-17:00,FRI 09:00-17:00,SAT 09:00-17:00,SUN 09:00-17:00"
++
++
++class ServiceTestCase(unittest.TestCase):
++    def setUp(self):
++        self.tmpdir = tempfile.mkdtemp()
++        self.orig_cwd = os.getcwd()
++        os.chdir(self.tmpdir)
++        storage.init_db()
++
++    def tearDown(self):
++        os.chdir(self.orig_cwd)
++        shutil.rmtree(self.tmpdir)
++
++
++class TestValidateTimezone(unittest.TestCase):
++    def test_valid_iana(self):
++        tz = service.validate_timezone("America/New_York")
++        self.assertEqual(str(tz), "America/New_York")
++
++    def test_utc(self):
++        tz = service.validate_timezone("UTC")
++        self.assertIsNotNone(tz)
++
++    def test_asia_tokyo(self):
++        tz = service.validate_timezone("Asia/Tokyo")
++        self.assertEqual(str(tz), "Asia/Tokyo")
++
++    def test_invalid(self):
++        with self.assertRaises(ValidationError):
++            service.validate_timezone("Not/Real")
++
++    def test_empty(self):
++        with self.assertRaises(ValidationError):
++            service.validate_timezone("")
++
++    def test_whitespace(self):
++        with self.assertRaises(ValidationError):
++            service.validate_timezone("   ")
++
++
++class TestAddResource(ServiceTestCase):
++    def test_add_with_timezone(self):
++        slots = parse_availability_spec("MON 09:00-17:00")
++        r = service.add_resource("conf-tokyo", "Tokyo room", slots, timezone="Asia/Tokyo")
++        self.assertEqual(r.name, "conf-tokyo")
++        self.assertEqual(r.timezone, "Asia/Tokyo")
++
++    def test_default_utc(self):
++        r = service.add_resource("room", "test", [])
++        self.assertEqual(r.timezone, "UTC")
++
++    def test_invalid_timezone_rejected(self):
++        with self.assertRaises(ValidationError):
++            service.add_resource("room", "", [], timezone="Fake/TZ")
++
++    def test_duplicate_rejected(self):
++        service.add_resource("room", "", [])
++        with self.assertRaises(ValidationError) as ctx:
++            service.add_resource("room", "", [])
++        self.assertIn("already exists", str(ctx.exception))
++
++    def test_persisted(self):
++        service.add_resource("room", "desc", [], timezone="America/New_York")
++        resources = service.list_resources()
++        self.assertEqual(len(resources), 1)
++        self.assertEqual(resources[0].timezone, "America/New_York")
++
++
++class TestCreateBooking(ServiceTestCase):
++    def test_booking_stored_in_utc(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots, timezone="Asia/Tokyo")
++        # 2026-04-22 WED, 10:00 Tokyo = 01:00 UTC
++        b = service.create_booking(
++            "room", "2026-04-22 10:00", "2026-04-22 11:00",
++            "standup", "alice", now=NOW,
++        )
++        self.assertEqual(b.start_dt().hour, 1)
++        self.assertEqual(b.end_dt().hour, 2)
++        self.assertEqual(b.start_dt().tzname(), "UTC")
++
++    def test_booking_in_eastern_timezone(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("east-room", "", slots, timezone="America/New_York")
++        b = service.create_booking(
++            "east-room", "2026-04-22 10:00", "2026-04-22 11:00",
++            "meeting", "bob", now=NOW,
++        )
++        # America/New_York in April is EDT = UTC-4
++        self.assertEqual(b.start_dt().hour, 14)
++        self.assertEqual(b.end_dt().hour, 15)
++
++    def test_overlap_detected(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        service.create_booking(
++            "room", "2026-04-22 10:00", "2026-04-22 12:00",
++            "first", "alice", now=NOW,
++        )
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "room", "2026-04-22 11:00", "2026-04-22 13:00",
++                "second", "bob", now=NOW,
++            )
++        self.assertIn("overlaps", str(ctx.exception))
++
++    def test_adjacent_bookings_allowed(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        service.create_booking(
++            "room", "2026-04-22 10:00", "2026-04-22 11:00",
++            "first", "alice", now=NOW,
++        )
++        b = service.create_booking(
++            "room", "2026-04-22 11:00", "2026-04-22 12:00",
++            "second", "bob", now=NOW,
++        )
++        self.assertIsNotNone(b.id)
++
++    def test_past_booking_rejected(self):
++        slots = parse_availability_spec("MON 09:00-17:00")
++        service.add_resource("room", "", slots)
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "room", "2020-01-06 10:00", "2020-01-06 11:00",
++                "past", "alice",
++            )
++        self.assertIn("past", str(ctx.exception))
++
++    def test_outside_availability(self):
++        slots = parse_availability_spec("MON 09:00-17:00")
++        service.add_resource("room", "", slots)
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "room", "2026-04-20 18:00", "2026-04-20 19:00",
++                "late", "alice", now=NOW,
++            )
++        self.assertIn("availability", str(ctx.exception))
++
++    def test_end_before_start_rejected(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        with self.assertRaises(ValidationError):
++            service.create_booking(
++                "room", "2026-04-22 12:00", "2026-04-22 10:00",
++                "backwards", "alice", now=NOW,
++            )
++
++    def test_unknown_resource(self):
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "nope", "2026-04-22 10:00", "2026-04-22 11:00",
++                "x", "alice", now=NOW,
++            )
++        self.assertIn("not found", str(ctx.exception))
++
++    def test_empty_title_rejected(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        with self.assertRaises(ValidationError):
++            service.create_booking(
++                "room", "2026-04-22 10:00", "2026-04-22 11:00",
++                "  ", "alice", now=NOW,
++            )
++
++    def test_empty_booked_by_rejected(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        with self.assertRaises(ValidationError):
++            service.create_booking(
++                "room", "2026-04-22 10:00", "2026-04-22 11:00",
++                "meeting", "  ", now=NOW,
++            )
++
++    def test_exceeds_24h_rejected(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "room", "2026-04-22 09:00", "2026-04-23 10:00",
++                "long", "alice", now=NOW,
++            )
++        self.assertIn("24 hours", str(ctx.exception))
++
++
++class TestCrossMidnightBooking(ServiceTestCase):
++    def test_friday_overnight(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        service.add_resource("room", "", slots)
++        b = service.create_booking(
++            "room", "2026-04-24 23:00", "2026-04-25 01:00",
++            "late session", "alice", now=NOW,
++        )
++        self.assertIsNotNone(b.id)
++
++    def test_full_overnight_slot(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        service.add_resource("room", "", slots)
++        b = service.create_booking(
++            "room", "2026-04-24 22:00", "2026-04-25 02:00",
++            "full slot", "alice", now=NOW,
++        )
++        self.assertIsNotNone(b.id)
++
++    def test_morning_after_portion(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        service.add_resource("room", "", slots)
++        b = service.create_booking(
++            "room", "2026-04-25 00:30", "2026-04-25 01:30",
++            "early sat", "alice", now=NOW,
++        )
++        self.assertIsNotNone(b.id)
++
++    def test_past_overnight_end_rejected(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        service.add_resource("room", "", slots)
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "room", "2026-04-25 02:30", "2026-04-25 03:30",
++                "too late", "alice", now=NOW,
++            )
++        self.assertIn("availability", str(ctx.exception))
++
++    def test_overnight_overlap(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        service.add_resource("room", "", slots)
++        service.create_booking(
++            "room", "2026-04-24 22:00", "2026-04-25 00:00",
++            "first", "alice", now=NOW,
++        )
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "room", "2026-04-24 23:00", "2026-04-25 01:00",
++                "conflict", "bob", now=NOW,
++            )
++        self.assertIn("overlaps", str(ctx.exception))
++
++    def test_overnight_no_overlap(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        service.add_resource("room", "", slots)
++        service.create_booking(
++            "room", "2026-04-24 22:00", "2026-04-24 23:30",
++            "early", "alice", now=NOW,
++        )
++        b = service.create_booking(
++            "room", "2026-04-24 23:30", "2026-04-25 01:00",
++            "late", "bob", now=NOW,
++        )
++        self.assertIsNotNone(b.id)
++
++    def test_overnight_with_timezone(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        service.add_resource("room", "", slots, timezone="Asia/Tokyo")
++        # FRI 23:00 Tokyo = FRI 14:00 UTC (UTC+9)
++        b = service.create_booking(
++            "room", "2026-04-24 23:00", "2026-04-25 01:00",
++            "tokyo late", "alice", now=NOW,
++        )
++        self.assertEqual(b.start_dt().hour, 14)
++        self.assertEqual(b.start_dt().day, 24)
++
++
++class TestCancelBooking(ServiceTestCase):
++    def test_cancel(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        b = service.create_booking(
++            "room", "2026-04-22 10:00", "2026-04-22 11:00",
++            "meeting", "alice", now=NOW,
++        )
++        removed = service.cancel_booking(b.id)
++        self.assertEqual(removed.id, b.id)
++        bookings = service.list_bookings(include_past=True)
++        self.assertEqual(len(bookings), 0)
++
++    def test_cancel_unknown_id(self):
++        with self.assertRaises(ValidationError):
++            service.cancel_booking("nonexistent")
++
++
++class TestListBookings(ServiceTestCase):
++    def test_list_filters_resource(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room-a", "", slots)
++        service.add_resource("room-b", "", slots)
++        service.create_booking("room-a", "2026-04-22 10:00", "2026-04-22 11:00", "a", "alice", now=NOW)
++        service.create_booking("room-b", "2026-04-22 10:00", "2026-04-22 11:00", "b", "bob", now=NOW)
++        a_only = service.list_bookings(resource="room-a", include_past=True)
++        self.assertEqual(len(a_only), 1)
++        self.assertEqual(a_only[0].resource, "room-a")
++
++    def test_list_sorted(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        service.create_booking("room", "2026-04-22 14:00", "2026-04-22 15:00", "later", "alice", now=NOW)
++        service.create_booking("room", "2026-04-22 10:00", "2026-04-22 11:00", "earlier", "alice", now=NOW)
++        bookings = service.list_bookings(include_past=True)
++        self.assertEqual(bookings[0].title, "earlier")
++        self.assertEqual(bookings[1].title, "later")
++
++
++class TestCheckAvailability(ServiceTestCase):
++    def test_available(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        result = service.check_availability("room", "2026-04-22 10:00", "2026-04-22 11:00")
++        self.assertTrue(result.available)
++        self.assertTrue(result.within_availability)
++        self.assertIsNotNone(result.matching_slot)
++        self.assertEqual(len(result.conflicts), 0)
++
++    def test_conflict_detected(self):
++        slots = parse_availability_spec(ALL_WEEK)
++        service.add_resource("room", "", slots)
++        service.create_booking(
++            "room", "2026-04-22 10:00", "2026-04-22 12:00",
++            "existing", "alice", now=NOW,
++        )
++        result = service.check_availability("room", "2026-04-22 11:00", "2026-04-22 13:00")
++        self.assertFalse(result.available)
++        self.assertTrue(result.within_availability)
++        self.assertEqual(len(result.conflicts), 1)
++        self.assertEqual(result.conflicts[0].title, "existing")
++
++    def test_outside_availability(self):
++        slots = parse_availability_spec("MON 09:00-17:00")
++        service.add_resource("room", "", slots)
++        result = service.check_availability("room", "2026-04-21 10:00", "2026-04-21 11:00")
++        self.assertFalse(result.available)
++        self.assertFalse(result.within_availability)
++        self.assertIsNone(result.matching_slot)
++
++    def test_both_problems(self):
++        slots = parse_availability_spec("MON 09:00-12:00")
++        service.add_resource("room", "", slots)
++        service.create_booking(
++            "room", "2026-04-20 09:00", "2026-04-20 10:00",
++            "booked", "alice", now=NOW,
++        )
++        # Check a MON afternoon: outside availability AND overlaps if extended
++        result = service.check_availability("room", "2026-04-20 09:30", "2026-04-20 13:00")
++        self.assertFalse(result.available)
++        self.assertFalse(result.within_availability)
++        self.assertEqual(len(result.conflicts), 1)
++
++    def test_check_cross_midnight(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        service.add_resource("room", "", slots)
++        result = service.check_availability("room", "2026-04-24 23:00", "2026-04-25 01:00")
++        self.assertTrue(result.available)
++        self.assertTrue(result.matching_slot.crosses_midnight)
++
++    def test_check_with_timezone(self):
++        slots = parse_availability_spec("WED 09:00-17:00")
++        service.add_resource("room", "", slots, timezone="Asia/Tokyo")
++        result = service.check_availability("room", "2026-04-22 10:00", "2026-04-22 11:00")
++        self.assertTrue(result.available)
++
++    def test_end_before_start_rejected(self):
++        service.add_resource("room", "", [])
++        with self.assertRaises(ValidationError):
++            service.check_availability("room", "2026-04-22 12:00", "2026-04-22 10:00")
++
++
++class TestParseDt(unittest.TestCase):
++    def test_naive_gets_tz(self):
++        tz = ZoneInfo("Asia/Tokyo")
++        dt = service.parse_dt("2026-04-22 10:00", tz)
++        self.assertEqual(str(dt.tzinfo), "Asia/Tokyo")
++
++    def test_iso_with_tz_preserved(self):
++        tz = ZoneInfo("UTC")
++        dt = service.parse_dt("2026-04-22T10:00:00+05:30", tz)
++        self.assertEqual(dt.utcoffset().total_seconds(), 5.5 * 3600)
++
++    def test_invalid_format(self):
++        with self.assertRaises(ValidationError):
++            service.parse_dt("not a date", ZoneInfo("UTC"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_storage.py b/tests/test_storage.py
+new file mode 100644
+index 0000000..9913d65
+--- /dev/null
++++ b/tests/test_storage.py
+@@ -0,0 +1,147 @@
++import json
++import os
++import shutil
++import tempfile
++import unittest
++from pathlib import Path
++
++from schedmax import storage
++
++
++class TestInitDb(unittest.TestCase):
++    def setUp(self):
++        self.tmpdir = tempfile.mkdtemp()
++        self.orig_cwd = os.getcwd()
++        os.chdir(self.tmpdir)
++
++    def tearDown(self):
++        os.chdir(self.orig_cwd)
++        shutil.rmtree(self.tmpdir)
++
++    def test_fresh_init(self):
++        path = storage.init_db()
++        self.assertTrue(path.exists())
++        data = storage.load()
++        self.assertEqual(data["version"], 1)
++        self.assertEqual(data["resources"], [])
++        self.assertEqual(data["bookings"], [])
++
++    def test_double_init_rejected(self):
++        storage.init_db()
++        with self.assertRaises(FileExistsError) as ctx:
++            storage.init_db()
++        self.assertIn("already initialized", str(ctx.exception))
++
++    def test_partial_init_dir_only(self):
++        (Path(self.tmpdir) / ".schedmax").mkdir()
++        path = storage.init_db()
++        self.assertTrue(path.exists())
++        data = storage.load()
++        self.assertEqual(data["version"], 1)
++
++    def test_corrupt_db_without_force(self):
++        path = storage.db_path()
++        path.parent.mkdir(parents=True)
++        path.write_text("{bad json", encoding="utf-8")
++        with self.assertRaises(FileExistsError) as ctx:
++            storage.init_db()
++        self.assertIn("corrupt", str(ctx.exception))
++        self.assertIn("--force", str(ctx.exception))
++
++    def test_corrupt_db_with_force(self):
++        path = storage.db_path()
++        path.parent.mkdir(parents=True)
++        path.write_text("{bad json", encoding="utf-8")
++        storage.init_db(force=True)
++        data = storage.load()
++        self.assertEqual(data["version"], 1)
++
++    def test_force_overwrites_valid_db(self):
++        storage.init_db()
++        data = storage.load()
++        data["resources"].append({"name": "old"})
++        storage.save(data)
++        storage.init_db(force=True)
++        data = storage.load()
++        self.assertEqual(data["resources"], [])
++
++    def test_explicit_root(self):
++        subdir = Path(self.tmpdir) / "sub"
++        subdir.mkdir()
++        path = storage.init_db(root=subdir)
++        self.assertTrue((subdir / ".schedmax" / "db.json").exists())
++
++
++class TestLoadSave(unittest.TestCase):
++    def setUp(self):
++        self.tmpdir = tempfile.mkdtemp()
++        self.orig_cwd = os.getcwd()
++        os.chdir(self.tmpdir)
++        storage.init_db()
++
++    def tearDown(self):
++        os.chdir(self.orig_cwd)
++        shutil.rmtree(self.tmpdir)
++
++    def test_roundtrip(self):
++        data = storage.load()
++        data["resources"].append({"name": "room-1"})
++        storage.save(data)
++        data2 = storage.load()
++        self.assertEqual(len(data2["resources"]), 1)
++        self.assertEqual(data2["resources"][0]["name"], "room-1")
++
++    def test_load_corrupt_db(self):
++        path = storage.find_db()
++        path.write_text("not json", encoding="utf-8")
++        with self.assertRaises(FileNotFoundError) as ctx:
++            storage.load()
++        self.assertIn("corrupt", str(ctx.exception))
++
++    def test_load_no_db(self):
++        os.chdir("/tmp")
++        with self.assertRaises(FileNotFoundError):
++            storage.load(path=None)
++
++    def test_atomic_write(self):
++        data = storage.load()
++        data["test"] = "value"
++        storage.save(data)
++        tmp_file = storage.db_path().with_suffix(".json.tmp")
++        self.assertFalse(tmp_file.exists())
++
++
++class TestFindDb(unittest.TestCase):
++    def setUp(self):
++        self.tmpdir = tempfile.mkdtemp()
++        self.orig_cwd = os.getcwd()
++        os.chdir(self.tmpdir)
++        storage.init_db()
++
++    def tearDown(self):
++        os.chdir(self.orig_cwd)
++        shutil.rmtree(self.tmpdir)
++
++    def test_finds_in_cwd(self):
++        self.assertIsNotNone(storage.find_db())
++
++    def test_walks_up(self):
++        subdir = Path(self.tmpdir) / "a" / "b" / "c"
++        subdir.mkdir(parents=True)
++        os.chdir(subdir)
++        found = storage.find_db()
++        self.assertIsNotNone(found)
++        self.assertEqual(found.parent.parent.resolve(), Path(self.tmpdir).resolve())
++
++    def test_returns_none_when_not_found(self):
++        other = tempfile.mkdtemp()
++        try:
++            os.chdir(other)
++            self.assertIsNone(storage.find_db())
++        finally:
++            os.chdir(self.orig_cwd)
++            shutil.rmtree(other)
++
++
++if __name__ == "__main__":
++    unittest.main()

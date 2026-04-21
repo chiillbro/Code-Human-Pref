@@ -1,0 +1,984 @@
+diff --git a/schedmax/cli.py b/schedmax/cli.py
+index 7e1cf62..dd67be0 100644
+--- a/schedmax/cli.py
++++ b/schedmax/cli.py
+@@ -2,22 +2,28 @@ from __future__ import annotations
+ 
+ import argparse
+ import sys
+-from pathlib import Path
+ 
+ from . import __version__, service, storage
+ from .models import WEEKDAYS, ValidationError, parse_availability_spec
+ 
+ 
+ def _cmd_init(args: argparse.Namespace) -> int:
+-    path = storage.init_db(timezone=args.timezone)
+-    print(f"initialized schedmax at {path} (timezone={args.timezone})")
++    # Validate the default tz up front so we don't create a dir then fail.
++    service._zone(args.timezone)
++    path = storage.init_db(default_timezone=args.timezone)
++    print(f"initialized schedmax at {path} (default_timezone={args.timezone})")
+     return 0
+ 
+ 
+ def _cmd_resource_add(args: argparse.Namespace) -> int:
+     slots = parse_availability_spec(args.availability or "")
+-    r = service.add_resource(args.name, args.description or "", slots)
+-    print(f"added resource '{r.name}' with {len(r.availability)} availability slot(s)")
++    r = service.add_resource(
++        args.name, args.description or "", slots, tz_name=args.timezone
++    )
++    print(
++        f"added resource '{r.name}' (tz={r.timezone}) "
++        f"with {len(r.availability)} availability slot(s)"
++    )
+     return 0
+ 
+ 
+@@ -28,10 +34,11 @@ def _cmd_resource_list(_: argparse.Namespace) -> int:
+         return 0
+     for r in resources:
+         desc = f" - {r.description}" if r.description else ""
+-        print(f"{r.name}{desc}")
++        print(f"{r.name} [{r.timezone}]{desc}")
+         if r.availability:
+             for s in r.availability:
+-                print(f"    {WEEKDAYS[s.weekday]} {s.start}-{s.end}")
++                wrap = "  (wraps midnight)" if s.wraps_midnight() else ""
++                print(f"    {WEEKDAYS[s.weekday]} {s.start}-{s.end}{wrap}")
+         else:
+             print("    (no availability defined)")
+     return 0
+@@ -45,10 +52,39 @@ def _cmd_book(args: argparse.Namespace) -> int:
+         title=args.title,
+         booked_by=args.by,
+     )
+-    print(f"booked {b.id}: {b.resource} {b.start} -> {b.end} '{b.title}' by {b.booked_by}")
++    print(
++        f"booked {b.id}: {b.resource} {b.start} -> {b.end} "
++        f"'{b.title}' by {b.booked_by}"
++    )
+     return 0
+ 
+ 
++def _cmd_check(args: argparse.Namespace) -> int:
++    resource, start_utc, end_utc, result = service.check_booking(
++        resource_name=args.resource, start_s=args.start, end_s=args.end
++    )
++    print(f"resource : {resource.name} [{resource.timezone}]")
++    print(f"start    : {start_utc.isoformat()} (UTC)")
++    print(f"end      : {end_utc.isoformat()} (UTC)")
++    if result.window_local is not None:
++        ws, we = result.window_local
++        print(
++            f"fits within availability window "
++            f"{ws.isoformat()} -> {we.isoformat()} (local {resource.timezone})"
++        )
++    if result.conflicts:
++        print("conflicts:")
++        for c in result.conflicts:
++            print(f"  {c.id}  {c.start} -> {c.end}  '{c.title}' by {c.booked_by}")
++    if result.ok:
++        print("OK: booking would be accepted")
++        return 0
++    print("NOT OK:")
++    for reason in result.reasons:
++        print(f"  - {reason}")
++    return 1
++
++
+ def _cmd_cancel(args: argparse.Namespace) -> int:
+     b = service.cancel_booking(args.id)
+     print(f"cancelled {b.id} ({b.resource} {b.start} -> {b.end})")
+@@ -73,11 +109,17 @@ def build_parser() -> argparse.ArgumentParser:
+         prog="schedctl",
+         description="schedmax: self-contained resource scheduling CLI",
+     )
+-    parser.add_argument("--version", action="version", version=f"schedmax {__version__}")
++    parser.add_argument(
++        "--version", action="version", version=f"schedmax {__version__}"
++    )
+     sub = parser.add_subparsers(dest="command", required=True)
+ 
+     p_init = sub.add_parser("init", help="initialize a schedmax database in cwd")
+-    p_init.add_argument("--timezone", default="UTC", help="IANA timezone (default UTC)")
++    p_init.add_argument(
++        "--timezone",
++        default="UTC",
++        help="default IANA timezone for new resources (default UTC)",
++    )
+     p_init.set_defaults(func=_cmd_init)
+ 
+     p_res = sub.add_parser("resource", help="manage resources")
+@@ -86,24 +128,41 @@ def build_parser() -> argparse.ArgumentParser:
+     p_res_add = res_sub.add_parser("add", help="add a resource")
+     p_res_add.add_argument("--name", required=True)
+     p_res_add.add_argument("--description", default="")
++    p_res_add.add_argument(
++        "--timezone",
++        default=None,
++        help="IANA timezone (defaults to the db's default_timezone)",
++    )
+     p_res_add.add_argument(
+         "--availability",
+         default="",
+-        help="comma-separated slots like 'MON 09:00-17:00,TUE 09:00-12:00'",
++        help=(
++            "comma-separated slots like 'MON 09:00-17:00,FRI 22:00-02:00'. "
++            "If end <= start, the slot wraps past midnight."
++        ),
+     )
+     p_res_add.set_defaults(func=_cmd_resource_add)
+ 
+     p_res_list = res_sub.add_parser("list", help="list resources")
+     p_res_list.set_defaults(func=_cmd_resource_list)
+ 
++    def _add_book_args(sp: argparse.ArgumentParser) -> None:
++        sp.add_argument("--resource", required=True)
++        sp.add_argument("--start", required=True, help="resource-local or ISO-8601")
++        sp.add_argument("--end", required=True, help="resource-local or ISO-8601")
++
+     p_book = sub.add_parser("book", help="create a booking")
+-    p_book.add_argument("--resource", required=True)
+-    p_book.add_argument("--start", required=True, help="'YYYY-MM-DD HH:MM' or ISO-8601")
+-    p_book.add_argument("--end", required=True, help="'YYYY-MM-DD HH:MM' or ISO-8601")
++    _add_book_args(p_book)
+     p_book.add_argument("--title", required=True)
+     p_book.add_argument("--by", required=True, help="name of the person booking")
+     p_book.set_defaults(func=_cmd_book)
+ 
++    p_check = sub.add_parser(
++        "check", help="validate a would-be booking without creating it"
++    )
++    _add_book_args(p_check)
++    p_check.set_defaults(func=_cmd_check)
++
+     p_cancel = sub.add_parser("cancel", help="cancel a booking by id")
+     p_cancel.add_argument("--id", required=True)
+     p_cancel.set_defaults(func=_cmd_cancel)
+@@ -124,10 +183,7 @@ def main(argv: list[str] | None = None) -> int:
+     except ValidationError as e:
+         print(f"error: {e}", file=sys.stderr)
+         return 2
+-    except FileNotFoundError as e:
+-        print(f"error: {e}", file=sys.stderr)
+-        return 2
+-    except FileExistsError as e:
++    except (FileNotFoundError, FileExistsError, RuntimeError) as e:
+         print(f"error: {e}", file=sys.stderr)
+         return 2
+ 
+diff --git a/schedmax/models.py b/schedmax/models.py
+index 97401cd..8e54088 100644
+--- a/schedmax/models.py
++++ b/schedmax/models.py
+@@ -1,7 +1,7 @@
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass, field, asdict
+-from datetime import datetime, time, timedelta
++from datetime import date, datetime, time, timedelta
+ from typing import Iterable
+ 
+ WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+@@ -14,20 +14,23 @@ class ValidationError(ValueError):
+ 
+ @dataclass
+ class AvailabilitySlot:
+-    weekday: int  # 0 = Monday
+-    start: str    # "HH:MM"
+-    end: str      # "HH:MM"
++    weekday: int         # 0 = Monday — the *starting* weekday of the window
++    start: str           # "HH:MM"
++    end: str             # "HH:MM" — if <= start, window wraps into the next day
+ 
+     def validate(self) -> None:
+         if self.weekday not in range(7):
+             raise ValidationError(f"invalid weekday: {self.weekday}")
+         s = _parse_hhmm(self.start)
+         e = _parse_hhmm(self.end)
+-        if not (s < e):
++        if s == e:
+             raise ValidationError(
+-                f"availability start {self.start} must be before end {self.end}"
++                f"availability start and end are equal ({self.start})"
+             )
+ 
++    def wraps_midnight(self) -> bool:
++        return _parse_hhmm(self.end) <= _parse_hhmm(self.start)
++
+     def to_dict(self) -> dict:
+         return asdict(self)
+ 
+@@ -39,6 +42,7 @@ class AvailabilitySlot:
+ @dataclass
+ class Resource:
+     name: str
++    timezone: str
+     description: str = ""
+     availability: list[AvailabilitySlot] = field(default_factory=list)
+ 
+@@ -47,12 +51,15 @@ class Resource:
+             raise ValidationError("resource name is required")
+         if any(c.isspace() for c in self.name):
+             raise ValidationError("resource name must not contain whitespace")
++        if not self.timezone:
++            raise ValidationError("resource timezone is required")
+         for slot in self.availability:
+             slot.validate()
+ 
+     def to_dict(self) -> dict:
+         return {
+             "name": self.name,
++            "timezone": self.timezone,
+             "description": self.description,
+             "availability": [s.to_dict() for s in self.availability],
+         }
+@@ -61,8 +68,11 @@ class Resource:
+     def from_dict(cls, d: dict) -> "Resource":
+         return cls(
+             name=d["name"],
++            timezone=d["timezone"],
+             description=d.get("description", ""),
+-            availability=[AvailabilitySlot.from_dict(s) for s in d.get("availability", [])],
++            availability=[
++                AvailabilitySlot.from_dict(s) for s in d.get("availability", [])
++            ],
+         )
+ 
+ 
+@@ -70,8 +80,8 @@ class Resource:
+ class Booking:
+     id: str
+     resource: str
+-    start: str  # ISO-8601
+-    end: str    # ISO-8601
++    start: str  # ISO-8601 in UTC, e.g. "2026-04-22T10:00:00+00:00"
++    end: str
+     title: str
+     booked_by: str
+ 
+@@ -98,7 +108,7 @@ def _parse_hhmm(s: str) -> time:
+ 
+ 
+ def parse_availability_spec(spec: str) -> list[AvailabilitySlot]:
+-    """Parse 'MON 09:00-17:00,TUE 09:00-12:00' style specs."""
++    """Parse 'MON 09:00-17:00,FRI 22:00-02:00' style specs."""
+     slots: list[AvailabilitySlot] = []
+     if not spec.strip():
+         return slots
+@@ -126,25 +136,49 @@ def parse_availability_spec(spec: str) -> list[AvailabilitySlot]:
+     return slots
+ 
+ 
+-def fits_within_availability(
+-    start: datetime, end: datetime, availability: Iterable[AvailabilitySlot]
++def _concrete_window(
++    slot: AvailabilitySlot, anchor_day: date
++) -> tuple[datetime, datetime] | None:
++    """Return (start, end) naive-local datetimes for `slot` starting on
++    `anchor_day`, or None if the slot's starting weekday doesn't match."""
++    if anchor_day.weekday() != slot.weekday:
++        return None
++    s = _parse_hhmm(slot.start)
++    e = _parse_hhmm(slot.end)
++    start_dt = datetime.combine(anchor_day, s)
++    if slot.wraps_midnight():
++        end_dt = datetime.combine(anchor_day + timedelta(days=1), e)
++    else:
++        end_dt = datetime.combine(anchor_day, e)
++    return start_dt, end_dt
++
++
++def containing_window(
++    start_local: datetime,
++    end_local: datetime,
++    availability: Iterable[AvailabilitySlot],
++) -> tuple[datetime, datetime] | None:
++    """Find an availability window (in local naive time) that fully contains
++    [start_local, end_local]. Considers days around the booking so
++    cross-midnight slots are handled correctly."""
++    # Consider any anchor day from the day before booking start to the day
++    # of booking end — a slot's anchor can only be on one of those.
++    candidates = []
++    d = start_local.date() - timedelta(days=1)
++    last = end_local.date()
++    while d <= last:
++        for slot in availability:
++            w = _concrete_window(slot, d)
++            if w is not None:
++                candidates.append(w)
++        d += timedelta(days=1)
++    for ws, we in candidates:
++        if ws <= start_local and end_local <= we:
++            return ws, we
++    return None
++
++
++def overlaps(
++    a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime
+ ) -> bool:
+-    """Booking must lie within a single availability slot on its weekday."""
+-    if start.date() != end.date():
+-        # Require slots on each covered day; keep simple: disallow multi-day.
+-        return False
+-    wd = start.weekday()
+-    for slot in availability:
+-        if slot.weekday != wd:
+-            continue
+-        s_t = _parse_hhmm(slot.start)
+-        e_t = _parse_hhmm(slot.end)
+-        slot_start = start.replace(hour=s_t.hour, minute=s_t.minute, second=0, microsecond=0)
+-        slot_end = start.replace(hour=e_t.hour, minute=e_t.minute, second=0, microsecond=0)
+-        if slot_start <= start and end <= slot_end:
+-            return True
+-    return False
+-
+-
+-def overlaps(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool:
+     return a_start < b_end and b_start < a_end
+diff --git a/schedmax/service.py b/schedmax/service.py
+index afe9a94..0320fe6 100644
+--- a/schedmax/service.py
++++ b/schedmax/service.py
+@@ -1,7 +1,8 @@
+ from __future__ import annotations
+ 
+ import uuid
+-from datetime import datetime, timedelta
++from dataclasses import dataclass
++from datetime import datetime, timedelta, timezone
+ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+ 
+ from . import storage
+@@ -10,29 +11,38 @@ from .models import (
+     Booking,
+     Resource,
+     ValidationError,
+-    fits_within_availability,
++    containing_window,
+     overlaps,
+ )
+ 
+ MIN_BOOKING = timedelta(minutes=1)
+-MAX_BOOKING = timedelta(days=1)
++MAX_BOOKING = timedelta(days=7)
+ 
+ 
+-def _tz(data: dict) -> ZoneInfo:
+-    name = data.get("timezone", "UTC")
++def _zone(name: str) -> ZoneInfo:
+     try:
+         return ZoneInfo(name)
+     except ZoneInfoNotFoundError as exc:
+-        raise ValidationError(f"unknown timezone in db: {name}") from exc
++        raise ValidationError(f"unknown IANA timezone: '{name}'") from exc
+ 
+ 
+ def add_resource(
+-    name: str, description: str, availability: list[AvailabilitySlot]
++    name: str,
++    description: str,
++    availability: list[AvailabilitySlot],
++    tz_name: str | None = None,
+ ) -> Resource:
+     data = storage.load()
+     if any(r["name"] == name for r in data["resources"]):
+         raise ValidationError(f"resource '{name}' already exists")
+-    resource = Resource(name=name, description=description, availability=availability)
++    effective_tz = tz_name or data.get("default_timezone", "UTC")
++    _zone(effective_tz)  # validate IANA name
++    resource = Resource(
++        name=name,
++        timezone=effective_tz,
++        description=description,
++        availability=availability,
++    )
+     resource.validate()
+     data["resources"].append(resource.to_dict())
+     storage.save(data)
+@@ -51,12 +61,15 @@ def _get_resource(data: dict, name: str) -> Resource:
+     raise ValidationError(f"resource '{name}' not found")
+ 
+ 
+-def parse_dt(s: str, tz: ZoneInfo) -> datetime:
+-    """Parse 'YYYY-MM-DD HH:MM' or full ISO; attach tz if naive."""
++def parse_dt_local(s: str, tz: ZoneInfo) -> datetime:
++    """Parse 'YYYY-MM-DD HH:MM' (resource-local) or ISO-8601 (any offset).
++    Returns a tz-aware datetime in UTC."""
+     s = s.strip()
+     try:
+-        if "T" in s:
+-            dt = datetime.fromisoformat(s)
++        if "T" in s or "+" in s or s.endswith("Z"):
++            # Support trailing Z.
++            iso = s[:-1] + "+00:00" if s.endswith("Z") else s
++            dt = datetime.fromisoformat(iso)
+         else:
+             dt = datetime.strptime(s, "%Y-%m-%d %H:%M")
+     except ValueError as exc:
+@@ -65,7 +78,88 @@ def parse_dt(s: str, tz: ZoneInfo) -> datetime:
+         ) from exc
+     if dt.tzinfo is None:
+         dt = dt.replace(tzinfo=tz)
+-    return dt
++    return dt.astimezone(timezone.utc)
++
++
++@dataclass
++class CheckResult:
++    ok: bool
++    reasons: list[str]
++    window_local: tuple[datetime, datetime] | None  # inclusive availability window
++    conflicts: list[Booking]
++
++
++def _validate_booking_inputs(
++    resource: Resource,
++    start_utc: datetime,
++    end_utc: datetime,
++    now_utc: datetime,
++    existing_bookings: list[Booking],
++) -> CheckResult:
++    reasons: list[str] = []
++    window = None
++    conflicts: list[Booking] = []
++
++    if end_utc <= start_utc:
++        reasons.append("end must be after start")
++    else:
++        duration = end_utc - start_utc
++        if duration < MIN_BOOKING:
++            reasons.append("booking duration must be at least 1 minute")
++        if duration > MAX_BOOKING:
++            reasons.append(f"booking duration must not exceed {MAX_BOOKING.days} days")
++
++    if start_utc < now_utc:
++        reasons.append("cannot book in the past")
++
++    # Availability check is done in the resource's local time.
++    tz = _zone(resource.timezone)
++    start_local = start_utc.astimezone(tz).replace(tzinfo=None)
++    end_local = end_utc.astimezone(tz).replace(tzinfo=None)
++    if end_utc > start_utc:
++        window = containing_window(start_local, end_local, resource.availability)
++        if window is None:
++            reasons.append(
++                f"booking is outside '{resource.name}' availability"
++            )
++
++    for b in existing_bookings:
++        if b.resource != resource.name:
++            continue
++        if overlaps(start_utc, end_utc, b.start_dt(), b.end_dt()):
++            conflicts.append(b)
++    if conflicts:
++        ids = ", ".join(c.id for c in conflicts)
++        reasons.append(f"overlaps existing booking(s): {ids}")
++
++    return CheckResult(
++        ok=not reasons,
++        reasons=reasons,
++        window_local=window,
++        conflicts=conflicts,
++    )
++
++
++def check_booking(
++    resource_name: str,
++    start_s: str,
++    end_s: str,
++    now_utc: datetime | None = None,
++) -> tuple[Resource, datetime, datetime, CheckResult]:
++    data = storage.load()
++    resource = _get_resource(data, resource_name)
++    tz = _zone(resource.timezone)
++    start_utc = parse_dt_local(start_s, tz)
++    end_utc = parse_dt_local(end_s, tz)
++    bookings = [Booking.from_dict(b) for b in data["bookings"]]
++    result = _validate_booking_inputs(
++        resource,
++        start_utc,
++        end_utc,
++        now_utc or datetime.now(tz=timezone.utc),
++        bookings,
++    )
++    return resource, start_utc, end_utc, result
+ 
+ 
+ def create_booking(
+@@ -74,7 +168,7 @@ def create_booking(
+     end_s: str,
+     title: str,
+     booked_by: str,
+-    now: datetime | None = None,
++    now_utc: datetime | None = None,
+ ) -> Booking:
+     if not title.strip():
+         raise ValidationError("title is required")
+@@ -82,43 +176,26 @@ def create_booking(
+         raise ValidationError("booked_by is required")
+ 
+     data = storage.load()
+-    tz = _tz(data)
+     resource = _get_resource(data, resource_name)
+-
+-    start = parse_dt(start_s, tz)
+-    end = parse_dt(end_s, tz)
+-    current = now or datetime.now(tz=tz)
+-
+-    if end <= start:
+-        raise ValidationError("end must be after start")
+-    duration = end - start
+-    if duration < MIN_BOOKING:
+-        raise ValidationError("booking duration must be at least 1 minute")
+-    if duration > MAX_BOOKING:
+-        raise ValidationError("booking duration must not exceed 24 hours")
+-    if start < current:
+-        raise ValidationError("cannot book in the past")
+-
+-    if not fits_within_availability(start, end, resource.availability):
+-        raise ValidationError(
+-            f"booking is outside '{resource.name}' availability"
+-        )
+-
+-    for b in data["bookings"]:
+-        if b["resource"] != resource.name:
+-            continue
+-        existing = Booking.from_dict(b)
+-        if overlaps(start, end, existing.start_dt(), existing.end_dt()):
+-            raise ValidationError(
+-                f"overlaps existing booking {existing.id} "
+-                f"({existing.start} -> {existing.end})"
+-            )
++    tz = _zone(resource.timezone)
++    start_utc = parse_dt_local(start_s, tz)
++    end_utc = parse_dt_local(end_s, tz)
++    bookings = [Booking.from_dict(b) for b in data["bookings"]]
++    result = _validate_booking_inputs(
++        resource,
++        start_utc,
++        end_utc,
++        now_utc or datetime.now(tz=timezone.utc),
++        bookings,
++    )
++    if not result.ok:
++        raise ValidationError("; ".join(result.reasons))
+ 
+     booking = Booking(
+         id=uuid.uuid4().hex[:8],
+         resource=resource.name,
+-        start=start.isoformat(),
+-        end=end.isoformat(),
++        start=start_utc.isoformat(),
++        end=end_utc.isoformat(),
+         title=title.strip(),
+         booked_by=booked_by.strip(),
+     )
+@@ -141,14 +218,13 @@ def list_bookings(
+     resource: str | None = None, include_past: bool = False
+ ) -> list[Booking]:
+     data = storage.load()
+-    tz = _tz(data)
+-    now = datetime.now(tz=tz)
++    now_utc = datetime.now(tz=timezone.utc)
+     out: list[Booking] = []
+     for b in data["bookings"]:
+         if resource and b["resource"] != resource:
+             continue
+         bk = Booking.from_dict(b)
+-        if not include_past and bk.end_dt() < now:
++        if not include_past and bk.end_dt() < now_utc:
+             continue
+         out.append(bk)
+     out.sort(key=lambda x: x.start_dt())
+diff --git a/schedmax/storage.py b/schedmax/storage.py
+index caad7e0..7be78c9 100644
+--- a/schedmax/storage.py
++++ b/schedmax/storage.py
+@@ -4,6 +4,7 @@ from pathlib import Path
+ 
+ DB_DIRNAME = ".schedmax"
+ DB_FILENAME = "db.json"
++DB_VERSION = 2
+ 
+ 
+ def db_path(root: Path | None = None) -> Path:
+@@ -20,12 +21,27 @@ def find_db(start: Path | None = None) -> Path | None:
+     return None
+ 
+ 
+-def init_db(root: Path | None = None, timezone: str = "UTC") -> Path:
++def init_db(root: Path | None = None, default_timezone: str = "UTC") -> Path:
++    """Create a fresh DB. Refuses to touch an existing or partial install."""
+     path = db_path(root)
++    dir_ = path.parent
+     if path.exists():
+         raise FileExistsError(f"schedmax already initialized at {path}")
+-    path.parent.mkdir(parents=True, exist_ok=False)
+-    data = {"version": 1, "timezone": timezone, "resources": [], "bookings": []}
++    if dir_.exists():
++        # Partial or foreign state — don't silently repair.
++        contents = sorted(p.name for p in dir_.iterdir())
++        raise FileExistsError(
++            f"{dir_} exists but contains no {DB_FILENAME} "
++            f"(found: {contents or 'empty'}). "
++            f"Remove {dir_} and re-run init."
++        )
++    dir_.mkdir(parents=True, exist_ok=False)
++    data = {
++        "version": DB_VERSION,
++        "default_timezone": default_timezone,
++        "resources": [],
++        "bookings": [],
++    }
+     _write(path, data)
+     return path
+ 
+@@ -36,8 +52,18 @@ def load(path: Path | None = None) -> dict:
+         raise FileNotFoundError(
+             "No schedmax database found. Run `schedctl init` first."
+         )
+-    with open(p, "r", encoding="utf-8") as f:
+-        return json.load(f)
++    try:
++        with open(p, "r", encoding="utf-8") as f:
++            data = json.load(f)
++    except json.JSONDecodeError as exc:
++        raise RuntimeError(f"schedmax database at {p} is corrupt: {exc}") from exc
++    version = data.get("version")
++    if version != DB_VERSION:
++        raise RuntimeError(
++            f"schedmax database at {p} is version {version}, "
++            f"expected {DB_VERSION}. Remove {p.parent} and re-run init."
++        )
++    return data
+ 
+ 
+ def save(data: dict, path: Path | None = None) -> None:
+
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/test_schedmax.py b/tests/test_schedmax.py
+new file mode 100644
+index 0000000..59b4610
+--- /dev/null
++++ b/tests/test_schedmax.py
+@@ -0,0 +1,315 @@
++"""Unit tests for schedmax.
++
++Run: `python -m unittest discover -s tests -v` from the repo root.
++"""
++from __future__ import annotations
++
++import io
++import json
++import tempfile
++import unittest
++from contextlib import redirect_stderr, redirect_stdout
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from unittest import mock
++
++from schedmax import cli, service, storage
++from schedmax.models import (
++    AvailabilitySlot,
++    ValidationError,
++    containing_window,
++    parse_availability_spec,
++)
++
++
++def _fake_now(utc_iso: str):
++    """Return a mock datetime.now-like replacement for service._validate_booking_inputs."""
++    fixed = datetime.fromisoformat(utc_iso)
++    return fixed
++
++
++class _DBTestCase(unittest.TestCase):
++    """Gives each test its own .schedmax DB by chdir'ing into a temp dir."""
++
++    def setUp(self) -> None:
++        self._tmp = tempfile.TemporaryDirectory()
++        self.tmp_path = Path(self._tmp.name)
++        self._cwd_patch = mock.patch("pathlib.Path.cwd", return_value=self.tmp_path)
++        self._cwd_patch.start()
++
++    def tearDown(self) -> None:
++        self._cwd_patch.stop()
++        self._tmp.cleanup()
++
++
++class TestInitRobustness(_DBTestCase):
++    def test_init_creates_db(self):
++        path = storage.init_db(default_timezone="UTC")
++        self.assertTrue(path.exists())
++        data = json.loads(path.read_text())
++        self.assertEqual(data["version"], storage.DB_VERSION)
++        self.assertEqual(data["default_timezone"], "UTC")
++
++    def test_init_refuses_to_overwrite_existing_db(self):
++        storage.init_db()
++        with self.assertRaises(FileExistsError):
++            storage.init_db()
++
++    def test_init_refuses_partial_directory(self):
++        # Simulate a partially-initialized state: the dir exists but no db.json.
++        (self.tmp_path / storage.DB_DIRNAME).mkdir()
++        (self.tmp_path / storage.DB_DIRNAME / "stray.txt").write_text("hi")
++        with self.assertRaises(FileExistsError) as ctx:
++            storage.init_db()
++        self.assertIn("contains no", str(ctx.exception))
++        # Original dir and contents untouched.
++        self.assertTrue((self.tmp_path / storage.DB_DIRNAME / "stray.txt").exists())
++
++    def test_load_rejects_corrupt_db(self):
++        storage.init_db()
++        storage.db_path().write_text("{ not json")
++        with self.assertRaises(RuntimeError):
++            storage.load()
++
++    def test_load_rejects_wrong_version(self):
++        storage.init_db()
++        p = storage.db_path()
++        data = json.loads(p.read_text())
++        data["version"] = 99
++        p.write_text(json.dumps(data))
++        with self.assertRaises(RuntimeError):
++            storage.load()
++
++
++class TestTimezoneValidation(_DBTestCase):
++    def setUp(self):
++        super().setUp()
++        storage.init_db(default_timezone="UTC")
++
++    def test_add_resource_with_valid_iana_tz(self):
++        r = service.add_resource("conf-tokyo", "", [], tz_name="Asia/Tokyo")
++        self.assertEqual(r.timezone, "Asia/Tokyo")
++
++    def test_add_resource_rejects_unknown_tz(self):
++        with self.assertRaises(ValidationError):
++            service.add_resource("bad", "", [], tz_name="Mars/Olympus_Mons")
++
++    def test_add_resource_defaults_to_db_default_tz(self):
++        r = service.add_resource("conf-utc", "", [])
++        self.assertEqual(r.timezone, "UTC")
++
++    def test_init_cli_rejects_unknown_tz(self):
++        # Wipe the already-initialized DB, then try init via CLI with bad tz.
++        import shutil
++
++        shutil.rmtree(self.tmp_path / storage.DB_DIRNAME)
++        buf = io.StringIO()
++        with redirect_stderr(buf):
++            rc = cli.main(["init", "--timezone", "Not/A_Zone"])
++        self.assertEqual(rc, 2)
++        self.assertIn("unknown IANA timezone", buf.getvalue())
++        # Crucially, no .schedmax dir was left behind.
++        self.assertFalse((self.tmp_path / storage.DB_DIRNAME).exists())
++
++
++class TestResourceLocalBookingSemantics(_DBTestCase):
++    """9am in Tokyo == 9am local for conf-tokyo, regardless of caller's clock."""
++
++    def setUp(self):
++        super().setUp()
++        storage.init_db()
++        service.add_resource(
++            "conf-tokyo",
++            "",
++            parse_availability_spec("MON 09:00-17:00,TUE 09:00-17:00"),
++            tz_name="Asia/Tokyo",
++        )
++        service.add_resource(
++            "conf-nyc",
++            "",
++            parse_availability_spec("MON 09:00-17:00,TUE 09:00-17:00"),
++            tz_name="America/New_York",
++        )
++
++    def test_local_time_stored_as_utc(self):
++        # 2026-04-21 is a Tuesday.
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        b = service.create_booking(
++            "conf-tokyo",
++            "2026-04-21 09:00",
++            "2026-04-21 10:00",
++            "standup",
++            "alice",
++            now_utc=now,
++        )
++        # Tokyo is UTC+9, so 09:00 JST == 00:00 UTC.
++        self.assertEqual(b.start, "2026-04-21T00:00:00+00:00")
++        self.assertEqual(b.end, "2026-04-21T01:00:00+00:00")
++
++    def test_same_wallclock_in_different_tz_does_not_conflict(self):
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        service.create_booking(
++            "conf-tokyo", "2026-04-21 09:00", "2026-04-21 10:00",
++            "t", "a", now_utc=now,
++        )
++        # Same wallclock (09:00) on NYC resource should succeed; different UTC.
++        b = service.create_booking(
++            "conf-nyc", "2026-04-21 09:00", "2026-04-21 10:00",
++            "t", "a", now_utc=now,
++        )
++        self.assertEqual(b.start, "2026-04-21T13:00:00+00:00")  # EDT = UTC-4
++
++    def test_overlap_detected_when_utc_intervals_collide(self):
++        """A Tokyo booking and an NYC booking pointed at the same UTC moment
++        on the same resource must conflict; on different resources they don't."""
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        service.create_booking(
++            "conf-tokyo", "2026-04-21 09:00", "2026-04-21 10:00",
++            "t1", "a", now_utc=now,
++        )
++        # Same resource, ISO input expressing the exact same UTC instant.
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "conf-tokyo",
++                "2026-04-21T00:30:00+00:00",
++                "2026-04-21T01:30:00+00:00",
++                "t2", "b", now_utc=now,
++            )
++        self.assertIn("overlaps", str(ctx.exception))
++
++
++class TestCrossMidnight(unittest.TestCase):
++    def test_wraps_midnight_detection(self):
++        self.assertTrue(AvailabilitySlot(4, "22:00", "02:00").wraps_midnight())
++        self.assertFalse(AvailabilitySlot(4, "09:00", "17:00").wraps_midnight())
++
++    def test_containing_window_non_wrapping(self):
++        slots = parse_availability_spec("MON 09:00-17:00")
++        # Monday 2026-04-20 10:00 -> 11:00
++        w = containing_window(
++            datetime(2026, 4, 20, 10, 0), datetime(2026, 4, 20, 11, 0), slots
++        )
++        self.assertIsNotNone(w)
++
++    def test_containing_window_wrapping_covers_both_sides(self):
++        slots = parse_availability_spec("FRI 22:00-02:00")
++        # Booking entirely before midnight on Friday.
++        self.assertIsNotNone(containing_window(
++            datetime(2026, 4, 24, 22, 30), datetime(2026, 4, 24, 23, 30), slots
++        ))
++        # Booking crossing midnight.
++        self.assertIsNotNone(containing_window(
++            datetime(2026, 4, 24, 23, 30), datetime(2026, 4, 25, 1, 30), slots
++        ))
++        # Booking entirely in the Saturday AM tail.
++        self.assertIsNotNone(containing_window(
++            datetime(2026, 4, 25, 0, 30), datetime(2026, 4, 25, 1, 30), slots
++        ))
++        # Booking starting inside the Saturday tail but ending past slot end.
++        self.assertIsNone(containing_window(
++            datetime(2026, 4, 25, 1, 30), datetime(2026, 4, 25, 3, 0), slots
++        ))
++        # Booking on Saturday daytime — not covered (slot's weekday anchor is FRI).
++        self.assertIsNone(containing_window(
++            datetime(2026, 4, 25, 10, 0), datetime(2026, 4, 25, 11, 0), slots
++        ))
++
++
++class TestCrossMidnightBooking(_DBTestCase):
++    def setUp(self):
++        super().setUp()
++        storage.init_db()
++        service.add_resource(
++            "dj-booth",
++            "",
++            parse_availability_spec("FRI 22:00-02:00"),
++            tz_name="UTC",
++        )
++
++    def test_overnight_booking_accepted(self):
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        # 2026-04-24 is a Friday.
++        b = service.create_booking(
++            "dj-booth",
++            "2026-04-24 23:00",
++            "2026-04-25 01:00",
++            "set", "dj", now_utc=now,
++        )
++        self.assertEqual(b.start, "2026-04-24T23:00:00+00:00")
++        self.assertEqual(b.end, "2026-04-25T01:00:00+00:00")
++
++    def test_booking_past_slot_end_rejected(self):
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        with self.assertRaises(ValidationError) as ctx:
++            service.create_booking(
++                "dj-booth",
++                "2026-04-25 01:30",
++                "2026-04-25 03:00",
++                "late", "dj", now_utc=now,
++            )
++        self.assertIn("outside", str(ctx.exception))
++
++
++class TestCheckCommand(_DBTestCase):
++    def setUp(self):
++        super().setUp()
++        storage.init_db()
++        service.add_resource(
++            "room-101", "",
++            parse_availability_spec("WED 09:00-17:00"),
++            tz_name="UTC",
++        )
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        service.create_booking(
++            "room-101", "2026-04-22 10:00", "2026-04-22 11:00",
++            "planning", "alice", now_utc=now,
++        )
++
++    def test_check_ok(self):
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        _, _, _, result = service.check_booking(
++            "room-101", "2026-04-22 12:00", "2026-04-22 13:00", now_utc=now,
++        )
++        self.assertTrue(result.ok)
++        self.assertIsNotNone(result.window_local)
++        self.assertEqual(result.conflicts, [])
++
++    def test_check_reports_overlap(self):
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        _, _, _, result = service.check_booking(
++            "room-101", "2026-04-22 10:30", "2026-04-22 11:30", now_utc=now,
++        )
++        self.assertFalse(result.ok)
++        self.assertEqual(len(result.conflicts), 1)
++        self.assertTrue(any("overlap" in r for r in result.reasons))
++
++    def test_check_reports_outside_availability(self):
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        _, _, _, result = service.check_booking(
++            "room-101", "2026-04-22 18:00", "2026-04-22 19:00", now_utc=now,
++        )
++        self.assertFalse(result.ok)
++        self.assertIsNone(result.window_local)
++
++    def test_check_does_not_mutate_db(self):
++        before = storage.db_path().read_text()
++        now = datetime(2026, 4, 20, 0, 0, tzinfo=timezone.utc)
++        service.check_booking(
++            "room-101", "2026-04-22 12:00", "2026-04-22 13:00", now_utc=now,
++        )
++        self.assertEqual(storage.db_path().read_text(), before)
++
++    def test_check_cli_exit_codes(self):
++        buf = io.StringIO()
++        with redirect_stdout(buf):
++            rc = cli.main([
++                "check", "--resource", "room-101",
++                "--start", "2026-04-22 10:30", "--end", "2026-04-22 11:30",
++            ])
++        # Conflict -> exit 1.
++        self.assertEqual(rc, 1)
++        self.assertIn("NOT OK", buf.getvalue())
++
++
++if __name__ == "__main__":
++    unittest.main()
